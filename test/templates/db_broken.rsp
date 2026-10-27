@@ -1,0 +1,4 @@
+# template from an unknown future release: none of the known keys
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v99.0.0
+setupType=
+homeLocation=

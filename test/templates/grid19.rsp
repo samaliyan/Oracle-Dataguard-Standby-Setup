@@ -1,0 +1,24 @@
+###############################################################################
+## Copyright(c) Oracle Corporation 1998,2019. All rights reserved.           ##
+## Grid Infrastructure response file (mock of the shipped template)          ##
+###############################################################################
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+INVENTORY_LOCATION=
+oracle.install.option=
+ORACLE_BASE=
+oracle.install.asm.OSDBA=
+oracle.install.asm.OSOPER=
+oracle.install.asm.OSASM=
+oracle.install.crs.config.scanType=
+oracle.install.crs.config.clusterName=
+oracle.install.asm.SYSASMPassword=
+oracle.install.asm.diskGroup.name=
+oracle.install.asm.diskGroup.redundancy=
+oracle.install.asm.diskGroup.AUSize=
+oracle.install.asm.diskGroup.disksWithFailureGroupNames=
+oracle.install.asm.diskGroup.disks=
+oracle.install.asm.diskGroup.diskDiscoveryString=
+oracle.install.asm.monitorPassword=
+oracle.install.asm.configureAFD=
+oracle.install.crs.rootconfig.executeRootScript=
+oracle.install.config.managementOption=

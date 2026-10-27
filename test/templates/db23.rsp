@@ -1,0 +1,17 @@
+#-------------------------------------------------------------------------------
+# db_install.rsp (mock of a 23ai style template with short key names)
+#-------------------------------------------------------------------------------
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v23.0.0
+installOption=
+UNIX_GROUP_NAME=
+INVENTORY_LOCATION=
+ORACLE_HOME=
+ORACLE_BASE=
+installEdition=
+OSDBA=
+OSOPER=
+OSBACKUPDBA=
+OSDGDBA=
+OSKMDBA=
+OSRACDBA=
+executeRootScript=

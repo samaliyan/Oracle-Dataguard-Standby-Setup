@@ -1,0 +1,22 @@
+###############################################################################
+## Copyright(c) Oracle Corporation 1998, 2014. All rights reserved.          ##
+## grid_install.rsp (mock of the 12.1.0.2 template)                           ##
+###############################################################################
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v12.1.0
+ORACLE_HOSTNAME=
+INVENTORY_LOCATION=
+SELECTED_LANGUAGES=
+oracle.install.option=
+ORACLE_BASE=
+ORACLE_HOME=
+oracle.install.asm.OSDBA=
+oracle.install.asm.OSOPER=
+oracle.install.asm.OSASM=
+oracle.install.asm.SYSASMPassword=
+oracle.install.asm.diskGroup.name=
+oracle.install.asm.diskGroup.redundancy=
+oracle.install.asm.diskGroup.AUSize=
+oracle.install.asm.diskGroup.disks=
+oracle.install.asm.diskGroup.diskDiscoveryString=
+oracle.install.asm.monitorPassword=
+oracle.installer.autoupdates.option=

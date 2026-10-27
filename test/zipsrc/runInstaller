@@ -1,0 +1,11 @@
+#!/bin/bash
+echo "runInstaller user=$(id -un) args=$*" >> /tmp/dgt/state/calls.log
+rsp=""; while [[ $# -gt 0 ]]; do [[ "$1" == "-responseFile" ]] && { rsp=$2; shift; }; shift; done
+[[ -r "$rsp" ]] || { echo "[FATAL] rsp"; exit 1; }
+grep -q '^oracle.install.option=INSTALL_DB_SWONLY$' "$rsp" || { echo "[FATAL] option"; exit 1; }
+grep -q '^oracle.install.db.InstallEdition=EE$' "$rsp" || { echo "[FATAL] edition"; exit 1; }
+inv=$(grep '^INVENTORY_LOCATION=' "$rsp" | cut -d= -f2)
+dh=$(cd "$(dirname "$0")" && pwd)
+echo "<HOME NAME=\"OraDB21Home1\" LOC=\"$dh\" TYPE=\"O\" IDX=\"2\"/>" >> "$inv/ContentsXML/inventory.xml" || { echo "[FATAL] [INS-32035] cannot write inventory"; exit 1; }
+python3 -c "import json;f='/tmp/dgt/state/standby.json';d=json.load(open(f));d['rooh']=1;json.dump(d,open(f,'w'))"
+echo "Successfully Setup Software."; exit 0
