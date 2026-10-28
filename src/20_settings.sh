@@ -74,13 +74,13 @@ load_settings() {
   LOAD_ERR=""; DROPPED_KEYS=""
   [[ -f "$SETTINGS_FILE" ]] || return 1
   if ! settings_file_safe "$SETTINGS_FILE"; then
-    LOAD_ERR="$SETTINGS_FILE must be a file owned by root and not writable by others"
+    LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
     [[ "$soft" == "soft" ]] && return 1; fatal "$LOAD_ERR"
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     line=${line%%#*}; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
-    if [[ "$line" != *=* ]]; then LOAD_ERR="Bad line (no KEY=VALUE): $line"; break; fi
+    if [[ "$line" != *=* ]]; then LOAD_ERR="This line is not KEY=VALUE: $line"; break; fi
     key=${line%%=*}; val=${line#*=}
     case "$key" in
       GRID_ZIP) key=GRID_MEDIA; SETTINGS_UPGRADED=1 ;;
@@ -98,7 +98,8 @@ load_settings() {
   done < "$SETTINGS_FILE"
   if [[ -n "$LOAD_ERR" ]]; then
     [[ "$soft" == "soft" ]] && return 1
-    fatal "$SETTINGS_FILE: $LOAD_ERR   (fix or delete the file, then run again)"
+    fatal "$SETTINGS_FILE: $LOAD_ERR
+Fix or delete the file, then run the script again."
   fi
   return 0
 }
@@ -133,7 +134,7 @@ save_settings() {
       [[ ${LSNR_ASSUMED:-0} -eq 1 && ( "$k" == PORT || "$k" == LISTENER_NAME || "$k" == PRIMARY_SERVICE ) ]] && continue
       printf '%s=%s\n' "$k" "${!k}"
     done
-  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE (disk full?)"; return 1; }
+  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
   # values the script itself sets after you accepted (ASM method, installer files) stay accepted
   [[ ${SETTINGS_ACCEPTED:-0} -eq 1 ]] && save_accepted
   return 0
@@ -172,41 +173,43 @@ validate_settings() {
   for s in $SETTING_SPECS; do
     v=${s%%:*}; t=${s#*:}
     if [[ "$OPTIONAL_KEYS" != *" $v "* ]]; then
-      [[ -n "${!v}" ]] || { bad "Setting $v is empty"; bad_n=1; continue; }
+      [[ -n "${!v}" ]] || { bad "$v is empty."; bad_n=1; continue; }
     fi
-    valid_value "$t" "${!v}" || { bad "Setting $v has an invalid value: ${!v}"; bad_n=1; }
+    valid_value "$t" "${!v}" || { bad "$v has an invalid value: ${!v}"; bad_n=1; }
   done
   for v in DB_HOME ORACLE_BASE GRID_HOME GRID_BASE INVENTORY_DIR; do
     case "${!v}" in /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/root|/home|/proc|/sys|/dev|/dev/*|/tmp)
-      bad "$v points to a system folder: ${!v}"; bad_n=1 ;; esac
+      bad "$v is a system folder: ${!v}"; bad_n=1 ;; esac
   done
   if [[ "$USE_GRID" == "yes" ]]; then
-    [[ -n "$GRID_HOME" && -n "$GRID_BASE" ]] || { bad "GRID_HOME and GRID_BASE are needed (the primary uses ASM)"; bad_n=1; }
+    [[ -n "$GRID_HOME" && -n "$GRID_BASE" ]] || { bad "GRID_HOME and GRID_BASE are needed, because the primary uses ASM."; bad_n=1; }
     # the standby uses the same paths as the primary: a layout that works on the primary is kept (only noted)
-    [[ "$GRID_HOME/" != "$GRID_BASE/"* ]] || warn "GRID_HOME $GRID_HOME is inside GRID_BASE $GRID_BASE (as on primary; kept)"
-    [[ "$GRID_HOME/" != "$ORACLE_BASE/"* ]] || warn "GRID_HOME $GRID_HOME is inside ORACLE_BASE $ORACLE_BASE (as on primary; kept)"
-    [[ -n "$DATA_DG" ]] || { bad "DATA_DG (the first ASM disk group) is empty"; bad_n=1; }
+    [[ "$GRID_HOME/" != "$GRID_BASE/"* ]] || warn "The Grid home $GRID_HOME is inside the Grid base $GRID_BASE. This is the same on the primary, so it is kept."
+    [[ "$GRID_HOME/" != "$ORACLE_BASE/"* ]] || warn "The Grid home $GRID_HOME is inside the Oracle base $ORACLE_BASE. This is the same on the primary, so it is kept."
+    [[ -n "$DATA_DG" ]] || { bad "DATA_DG (the first ASM disk group) is empty."; bad_n=1; }
   elif all_locs | grep -q '^+'; then
-    bad "USE_GRID must be yes: the primary keeps files in ASM"; bad_n=1
+    bad "USE_GRID must be yes, because the primary keeps files in ASM."; bad_n=1
   fi
-  [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "Database names with \$ or # ($DB_NAME / $PRIMARY_UNIQUE) are not supported by this script"; bad_n=1; }
-  [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server (not empty, not 127.x)"; bad_n=1; }
-  [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the primary IP"; bad_n=1; }
-  [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the primary host name"; bad_n=1; }
+  [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
+  [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
+  [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
+  [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
   if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
-    bad "STANDBY_IP $STANDBY_IP is not an address of this server"; bad_n=1
+    bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
-  [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "Standby db_unique_name must differ from primary"; bad_n=1; }
-  [[ "${PRIMARY_TNS,,}" != "${STANDBY_TNS,,}" ]] || { bad "The two TNS aliases must differ"; bad_n=1; }
-  [[ ${#STANDBY_SID} -le 12 ]] || { bad "STANDBY_SID '$STANDBY_SID' is longer than 12 characters"; bad_n=1; }
-  [[ "$STANDBY_SID" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { bad "STANDBY_SID must start with a letter and use only letters, digits and _"; bad_n=1; }
-  [[ ${#STANDBY_UNIQUE} -le 30 ]] || { bad "STANDBY_UNIQUE is longer than 30 characters"; bad_n=1; }
-  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 16 ]] || { bad "AUX_CHANNELS must be 1-16"; bad_n=1; }
-  [[ -z "$RU_DIR" || -d "$RU_DIR" ]] || { bad "RU_DIR $RU_DIR is not a folder"; bad_n=1; }
+  [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "STANDBY_UNIQUE must differ from the db_unique_name of the primary."; bad_n=1; }
+  [[ "${PRIMARY_TNS,,}" != "${STANDBY_TNS,,}" ]] || { bad "PRIMARY_TNS and STANDBY_TNS must differ."; bad_n=1; }
+  [[ ${#STANDBY_SID} -le 12 ]] || { bad "STANDBY_SID '$STANDBY_SID' is longer than 12 characters."; bad_n=1; }
+  [[ "$STANDBY_SID" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { bad "STANDBY_SID must start with a letter and use only letters, digits and _."; bad_n=1; }
+  [[ ${#STANDBY_UNIQUE} -le 30 ]] || { bad "STANDBY_UNIQUE is longer than 30 characters."; bad_n=1; }
+  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 16 ]] || { bad "AUX_CHANNELS must be a number from 1 to 16."; bad_n=1; }
+  [[ -z "$RU_DIR" || -d "$RU_DIR" ]] || { bad "RU_DIR $RU_DIR is not a folder."; bad_n=1; }
   if [[ -n "$RU_DIR" ]]; then
-    [[ -n "$OPATCH_ZIP" && -f "$OPATCH_ZIP" ]] || { bad "RU_DIR needs OPATCH_ZIP: the newest OPatch zip (p6880880), the one in the base media is too old"; bad_n=1; }
+    [[ -n "$OPATCH_ZIP" && -f "$OPATCH_ZIP" ]] || { bad "RU_DIR needs OPATCH_ZIP, the newest OPatch zip (p6880880).
+The OPatch in the base media is too old."; bad_n=1; }
   fi
-  [[ -z "$OPATCH_ZIP" || -f "$OPATCH_ZIP" ]] || { bad "OPATCH_ZIP $OPATCH_ZIP is not a file"; bad_n=1; }
+  [[ -z "$OPATCH_ZIP" || -f "$OPATCH_ZIP" ]] || { bad "OPATCH_ZIP $OPATCH_ZIP is not a file."; bad_n=1; }
+
   return $bad_n
 }
 
@@ -268,41 +271,61 @@ single_owner() { [[ "$ORACLE_USER" == "$GRID_USER" ]]; }
 use_grid() { [[ "$USE_GRID" == "yes" ]]; }
 
 show_settings() {
-  local fmt='      %-22s %s\n' l
-  printf '\n      %sPRIMARY (read from %s at every run)%s\n' "$C_W" "$PRIMARY_IP" "$C_N"
-  printf "$fmt" "host" "$PRIMARY_HOST"
+  # two short sections; the names of the keys are in the settings file (the editor shows them)
+  local fmt='        %-17s %s\n' l first=1
+  printf '\n      %sPrimary%s  %s(read from %s at every run)%s\n' "$C_W" "$C_N" "$C_D" "$PRIMARY_IP" "$C_N"
+  printf "$fmt" "Host" "$PRIMARY_HOST"
+  printf "$fmt" "Database" "$DB_NAME, unique name $PRIMARY_UNIQUE"
   printf "$fmt" "ORACLE_SID" "$PRIMARY_SID"
-  printf "$fmt" "db_name / unique" "$DB_NAME / $PRIMARY_UNIQUE"
-  printf "$fmt" "version / CDB" "$PRIMARY_VERSION / $PRIMARY_CDB"
-  if [[ ${LSNR_ASSUMED:-0} -eq 1 ]]; then printf "$fmt" "service / port" "$PRIMARY_SERVICE / $PORT  (listener $LISTENER_NAME)  ASSUMED"; printf "$fmt" "" "(no running listener on primary offered the service: check them; correct them with e)"
-  else printf "$fmt" "service / port" "$PRIMARY_SERVICE / $PORT  (listener $LISTENER_NAME)"; fi
-  [[ -n "${DB_EDITION:-}" ]] && printf "$fmt" "edition" "$DB_EDITION"
-  printf "$fmt" "database size" "$(human_mb "$PRIMARY_DB_MB")"
-  printf "$fmt" "storage" "$(use_grid && printf 'ASM (Oracle Restart will be installed here)' || printf 'file system (no Grid needed here)')"
-  while IFS= read -r l; do printf "$fmt" "" "${l%%:*}  ($(human_mb "${l##*:}"))"; done < <(loc_list)
-  printf "$fmt" "recovery area" "${FRA_LOC:-not set}${FRA_LOC:+  ($FRA_MB MB on primary)}"
-  printf "$fmt" "archive destination" "${ARCH_LOC:-not set}"
-  printf "$fmt" "DB home" "$DB_HOME"
+  printf "$fmt" "Version" "$PRIMARY_VERSION, CDB $PRIMARY_CDB"
+  if [[ ${LSNR_ASSUMED:-0} -eq 1 ]]; then
+    printf "$fmt" "Service" "$PRIMARY_SERVICE  (assumed)"
+    printf "$fmt" "Listener" "$LISTENER_NAME, port $PORT  (assumed)"
+    printf "$fmt" "" "${C_Y}No running listener offers this service. Check these two lines.${C_N}"
+  else
+    printf "$fmt" "Service" "$PRIMARY_SERVICE"
+    printf "$fmt" "Listener" "$LISTENER_NAME, port $PORT"
+  fi
+  printf "$fmt" "Size" "$(human_mb "$PRIMARY_DB_MB")"
+  [[ -n "${DB_EDITION:-}" ]] && printf "$fmt" "Edition" "$DB_EDITION"
+  printf "$fmt" "Storage" "$(use_grid && printf 'ASM (Oracle Restart will be installed here)' || printf 'File system (no Grid needed here)')"
+  while IFS= read -r l; do
+    printf "$fmt" "$([[ $first -eq 1 ]] && printf 'Data files')" "${l%%:*}  ($(human_mb "${l##*:}"))"; first=0
+  done < <(loc_list)
+  printf "$fmt" "Recovery area" "${FRA_LOC:-not set}${FRA_LOC:+  ($(human_mb "$FRA_MB") on the primary)}"
+  printf "$fmt" "Archive logs" "${ARCH_LOC:-not set}"
+  printf "$fmt" "Database home" "$DB_HOME"
   use_grid && printf "$fmt" "Grid home" "$GRID_HOME"
   printf "$fmt" "Oracle base" "$ORACLE_BASE"
   use_grid && printf "$fmt" "Grid base" "$GRID_BASE"
-  printf "$fmt" "inventory" "$INVENTORY_DIR"
-  if single_owner; then printf "$fmt" "owner" "$ORACLE_USER ($ORACLE_UID) owns everything"
-  else printf "$fmt" "users" "$ORACLE_USER ($ORACLE_UID)  $GRID_USER ($GRID_UID)"; fi
-  printf "$fmt" "groups" "$GROUP_GIDS"
-  printf "$fmt" "homes, users, paths" "the same here (fixed: RMAN copies the files without renaming)"
-  printf '\n      %sSTANDBY (this server; you may change these: e)%s   (key in the settings file)\n' "$C_W" "$C_N"
-  printf "$fmt" "host / IP" "$STANDBY_HOST / $STANDBY_IP   (STANDBY_HOST, STANDBY_IP)"
-  printf "$fmt" "db_unique_name" "$STANDBY_UNIQUE   (STANDBY_UNIQUE)"
-  [[ "$STANDBY_UNIQUE" == *_SB ]] && printf "$fmt" "" "(_SB, not _STBY: ORACLE_SID can have at most 12 characters)"
-  printf "$fmt" "ORACLE_SID" "$STANDBY_SID   (STANDBY_SID)"
-  printf "$fmt" "service" "$STANDBY_SERVICE   (STANDBY_SERVICE)"
-  printf "$fmt" "TNS aliases" "$PRIMARY_TNS (primary)   $STANDBY_TNS (standby)   (PRIMARY_TNS, STANDBY_TNS)"
-  printf "$fmt" "listener" "$SB_LSNR, port $PORT   (always LISTENER here; with Grid it is created by Grid)"
-  printf "$fmt" "installer files" "${GRID_MEDIA:-}${GRID_MEDIA:+  }${DB_MEDIA:-found later (step 3.1)}   (GRID_MEDIA, DB_MEDIA)"
-  [[ -n "$RU_DIR" ]] && printf "$fmt" "release update" "$RU_DIR (applied by the installer)   (RU_DIR, OPATCH_ZIP)"
-  use_grid && printf "$fmt" "ASM disk method" "${ASM_METHOD:-decided in step 2.12}   (ASM_METHOD)"
-  printf "$fmt" "RMAN channels" "$AUX_CHANNELS   (AUX_CHANNELS)"
+  printf "$fmt" "Inventory" "$INVENTORY_DIR"
+  if single_owner; then printf "$fmt" "Owner" "$ORACLE_USER ($ORACLE_UID), owns all Oracle software"
+  else printf "$fmt" "Users" "$ORACLE_USER ($ORACLE_UID), $GRID_USER ($GRID_UID)"; fi
+  local gl="" gn=0 g lab="Groups"
+  for g in ${GROUP_GIDS//,/ }; do
+    gl+="${gl:+, }$g"; gn=$((gn + 1))
+    [[ $gn -eq 4 ]] && { printf "$fmt" "$lab" "$gl"; lab=""; gl=""; gn=0; }
+  done
+  [[ -n "$gl" ]] && printf "$fmt" "$lab" "$gl"
+  printf '        %sThis server gets the same homes, users and paths.%s\n' "$C_D" "$C_N"
+
+  printf '\n      %sThis server (standby)%s  %s(change with e)%s\n' "$C_W" "$C_N" "$C_D" "$C_N"
+  printf "$fmt" "Host" "$STANDBY_HOST, $STANDBY_IP"
+  printf "$fmt" "db_unique_name" "$STANDBY_UNIQUE"
+  printf "$fmt" "ORACLE_SID" "$STANDBY_SID"
+  [[ "$STANDBY_UNIQUE" == *_SB ]] && printf "$fmt" "" "${C_D}_SB, not _STBY: an ORACLE_SID has at most 12 characters${C_N}"
+  printf "$fmt" "Service" "$STANDBY_SERVICE"
+  printf "$fmt" "TNS aliases" "$PRIMARY_TNS (primary), $STANDBY_TNS (standby)"
+  printf "$fmt" "Listener" "$SB_LSNR, port $PORT"
+  if [[ -n "$GRID_MEDIA$DB_MEDIA" ]]; then
+    local lab="Installer files"
+    for l in ${GRID_MEDIA//,/ } ${DB_MEDIA//,/ }; do printf "$fmt" "$lab" "$l"; lab=""; done
+    [[ -z "$DB_MEDIA" ]] && printf "$fmt" "" "database files: found later (step 3.1)"
+  else printf "$fmt" "Installer files" "found later (step 3.1)"; fi
+  [[ -n "$RU_DIR" ]] && printf "$fmt" "Release Update" "$RU_DIR"
+  [[ -n "$OPATCH_ZIP" ]] && printf "$fmt" "OPatch" "$OPATCH_ZIP"
+  use_grid && printf "$fmt" "ASM disk method" "${ASM_METHOD:-decided in step 2.12}"
+  printf "$fmt" "RMAN channels" "$AUX_CHANNELS"
   printf '\n'
   _log SETTINGS "$(for k in $(all_setting_keys); do printf '%s=%s ' "$k" "${!k}"; done)"
 }

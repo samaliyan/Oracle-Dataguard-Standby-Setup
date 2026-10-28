@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.0"
+readonly SCRIPT_VERSION="5.1"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -78,10 +78,16 @@ OS_ID=""; OS_MAJOR=""; PKG=""
 # Output and logging
 #------------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-  C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1;34m'; C_C=$'\e[36m'; C_M=$'\e[1;35m'; C_D=$'\e[2m'; C_W=$'\e[1m'; C_N=$'\e[0m'
+  C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1;34m'; C_C=$'\e[36m'; C_M=$'\e[35m'; C_D=$'\e[2m'; C_W=$'\e[1m'; C_N=$'\e[0m'
 else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_M=""; C_D=""; C_W=""; C_N=""
 fi
+# Symbols: real ones on a UTF-8 terminal, plain ASCII otherwise (each one is one column wide)
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) S_OK='✔'; S_WARN='!'; S_BAD='✘'; S_TODO='→'; S_WAIT='…'; S_ASK='?'; S_END='›'; S_HR='─'; S_HR2='━'; S_DOT='·' ;;
+  *) S_OK='+'; S_WARN='!'; S_BAD='x'; S_TODO='>'; S_WAIT='.'; S_ASK='?'; S_END='>'; S_HR='-'; S_HR2='='; S_DOT='-' ;;
+esac
+rule() { local n=$1 c=${2:-$S_HR} out="" i; for ((i = 0; i < n; i++)); do out+=$c; done; printf '%s' "$out"; }   # $1 width, $2 character
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
@@ -104,7 +110,7 @@ mask_pw() {
 
 _log() {
   [[ -n "$LOG_FILE" ]] || return 0
-  printf '%s | %-6s | %s\n' "$(ts)" "$1" "$2" | mask_pw >> "$LOG_FILE"
+  printf '%s | %-6s | %s\n' "$(ts)" "$1" "$2" | sed 's/\x1b\[[0-9;]*m//g' | mask_pw >> "$LOG_FILE"
 }
 
 log_block() {
@@ -116,38 +122,52 @@ log_block() {
   } | mask_pw >> "$LOG_FILE"
 }
 
+# Screen layout of a step:   "  Step 1.5  Title"  then 4 spaces + symbol + text; more lines of a message at 6 spaces
 say()  { printf '      %s\n' "$*"; _log INFO "$*"; }
-ok()   { printf '      %s[ OK ]%s %s\n' "$C_G" "$C_N" "$*"; _log OK "$*"; }
+_mark() { # $1 color $2 symbol $3 log tag, rest = text (first line after the symbol, other lines under it)
+  local col=$1 sym=$2 tag=$3 l first=1; shift 3
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    if [[ $first -eq 1 ]]; then printf '    %s%s%s %s\n' "$col" "$sym" "$C_N" "$l"; first=0
+    else [[ -n "$l" ]] && printf '      %s\n' "$l"; fi
+  done <<< "$*"
+  _log "$tag" "$*"
+}
+ok()   { _mark "$C_G" "$S_OK" OK "$*"; }
 WARN_LIST=()
 warn() {
   _log WARN "$*"
   local w="[${CUR_STEP:-start}] $*" x
   for x in "${WARN_LIST[@]+"${WARN_LIST[@]}"}"; do [[ "$x" == "$w" ]] && return 0; done   # same warning again (a re-check): shown and listed once
-  printf '      %s[WARN]%s %s\n' "$C_Y" "$C_N" "$*"
+  local l first=1
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    if [[ $first -eq 1 ]]; then printf '    %s%s %s%s\n' "$C_Y" "$S_WARN" "$l" "$C_N"; first=0
+    else [[ -n "$l" ]] && printf '      %s%s%s\n' "$C_Y" "$l" "$C_N"; fi
+  done <<< "$*"
   WARN_COUNT=$((WARN_COUNT + 1)); WARN_LIST+=("$w")
 }
-bad()  { printf '      %s[FAIL]%s %s\n' "$C_R" "$C_N" "$*"; _log FAIL "$*"; }
-todo() { printf '      %s[TODO]%s %s\n' "$C_M" "$C_N" "$*"; _log TODO "$*"; }
-wait_msg() { printf '      %s[WAIT]%s %s\n' "$C_D" "$C_N" "$*"; _log WAIT "$*"; }
+bad()  { _mark "$C_R" "$S_BAD" FAIL "$*"; }
+todo() { _mark "$C_M" "$S_TODO" TODO "$*"; }
+wait_msg() { _mark "$C_D" "$S_WAIT" WAIT "$*"; }
 
 hint() {
-  # explanations and advice: plain text, indented (questions are cyan, commands are in boxes)
+  # explanations and advice: plain text under the message they belong to
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '             %s\n' "$line"
+    printf '      %s\n' "$line"
     _log HINT "$line"
   done
 }
 
 block() {
-  # $1 = label (Plan/Using/Now), stdin = lines
+  # $1 = label (Status / Plan / Details / Fix; old names Now: Plan: Using: are mapped), stdin = lines
   local label=$1 line first=1
+  case "$label" in "Now:") label="Status" ;; "Plan:") label="Plan" ;; "Using:") label="Details" ;; "Fix:") label="Fix" ;; esac
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     if [[ $first -eq 1 ]]; then
-      printf '      %s%-7s%s %s\n' "$C_W" "$label" "$C_N" "$line"; first=0
+      printf '    %s%-8s%s %s\n' "$C_D" "$label" "$C_N" "$line"; first=0
     else
-      printf '              %s\n' "$line"
+      printf '             %s\n' "$line"
     fi
     _log "${label^^}" "$line"
   done
@@ -155,8 +175,9 @@ block() {
 
 primary_note() {
   # what was done on the primary by this run (the duplicate is the only thing that works against it)
-  if [[ ${DUP_RAN:-0} -eq 1 ]]; then printf 'On the primary this script ran only read-only commands and the RMAN duplicate you confirmed.'
-  else printf 'This script changed nothing on the primary server.'; fi
+  # what THE SCRIPT did there; the commands the admin ran are listed with the changes ("You changed the primary yourself")
+  if [[ ${DUP_RAN:-0} -eq 1 ]]; then printf 'The script itself ran only read-only checks and the RMAN copy on the primary.'
+  else printf 'The script itself changed nothing on the primary.'; fi
 }
 
 user_stop() {
@@ -175,8 +196,8 @@ fatal() {
     FATAL_SEEN=1
     if [[ ${#STEP_ORDER[@]} -gt 0 ]] && declare -F summary >/dev/null; then CUR_STEP_SAVE=$CUR_STEP; summary; CUR_STEP=$CUR_STEP_SAVE; fi
   fi
-  if [[ $STOPPED_BY_USER -eq 1 ]]; then printf '\n  %sStopped by you.%s %s\n' "$C_Y" "$C_N" "$(primary_note)"
-  else printf '\n  %sStopped.%s %s\n' "$C_R" "$C_N" "$(primary_note)"; fi
+  if [[ $STOPPED_BY_USER -eq 1 ]]; then printf '\n  %sStopped by you.%s  %s\n' "$C_Y" "$C_N" "$(primary_note)"
+  else printf '\n  %sStopped.%s  %s\n' "$C_R" "$C_N" "$(primary_note)"; fi
   local rs=${RESUME_STEP:-$CUR_STEP}
   [[ "$rs" == *.x ]] && rs="${rs%.x}"
   if [[ -n "${UNDO_STEP:-}" ]]; then
@@ -184,19 +205,20 @@ fatal() {
     if [[ ${UNDO_N_DONE:-0} -gt 0 ]] && declare -F record >/dev/null; then
       NOW="partly undone with --undo"; STEP_TITLE[$UNDO_STEP]=${STEP_TITLE[$UNDO_STEP]:-step}; record "$UNDO_STEP" UNDONE
     fi
-    printf '  Undo stopped. What is left:  %s --show-changes %s\n' "$SELF" "$UNDO_STEP"
+    printf '  The undo stopped part-way. To see what is left:\n      %s --show-changes %s\n' "$SELF" "$UNDO_STEP"
   elif [[ -n "$DETACHED_JOB" ]]; then
-    printf '  %s. Do NOT start it again by hand.\n' "$DETACHED_JOB"
-    printf '  See it:  %s --status     When it has ended, run  %s  (it records the result and goes on).\n' "$SELF" "$SELF"
+    printf '  %s. Do NOT start it again by hand.\n' "${DETACHED_JOB^}"
+    printf '  To see it:          %s --status\n' "$SELF"
+    printf '  When it has ended:  %s   (records the result and continues)\n' "$SELF"
   elif [[ ${NEXT_PRINTED:-0} -eq 1 ]]; then :
   elif [[ -n "$rs" && "$rs" != 1.* && "$rs" != *.* ]]; then
-    printf '  Continue later:  %s --from %s\n' "$SELF" "$rs"
+    printf '  To continue later:   %s --from %s\n' "$SELF" "$rs"
   elif [[ -n "$rs" && "$rs" != 1.* ]]; then
-    printf '  Continue later from this step:  %s --from %s\n  Manual commands:  %s --help-step %s\n' "$SELF" "$rs" "$SELF" "$rs"
+    printf '  To continue later:   %s --from %s\n  To do it by hand:    %s --help-step %s\n' "$SELF" "$rs" "$SELF" "$rs"
   elif [[ -n "$rs" ]]; then
-    printf '  Manual commands:  %s --help-step %s\n' "$SELF" "$rs"
+    printf '  To do it by hand:    %s --help-step %s\n' "$SELF" "$rs"
   fi
-  [[ -n "$LOG_FILE" ]] && printf '  Log: %s\n' "$LOG_FILE"
+  [[ -n "$LOG_FILE" ]] && printf '  Log:                 %s\n' "$LOG_FILE"
   declare -F write_last_run >/dev/null && write_last_run "stopped"
   exit 1
 }
@@ -213,7 +235,8 @@ on_signal() {
     [[ "$MODE" == "run" && -n "${JOB_STEP:-}" && "$JOB_STEP" =~ ^[0-9]+\.[0-9]+$ ]] && declare -F record >/dev/null \
       && { NOW="$JOB_TITLE still running (session $JOB_PID)"; STEP_TITLE[$JOB_STEP]=${STEP_TITLE[$JOB_STEP]:-$(step_title_of "$JOB_STEP" 2>/dev/null)}; record "$JOB_STEP" RUNNING; }
   fi
-  fatal "Stopped by signal $1 (terminal closed or kill). A long job (installer, root script, RMAN) keeps running by itself; run the script again later."
+  fatal "The terminal was closed, or the script was stopped (signal $1).
+A running installer, root script or RMAN copy goes on by itself. Run the script again later."
 }
 
 cleanup() {
@@ -239,21 +262,17 @@ trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
 # Prompts  (typing h at any question shows the manual commands of the step)
 #------------------------------------------------------------------------------
 ask() {
-  # $1 = question. Result in ANSWER.
+  # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
   while true; do
-    if [[ "$1" == *"[h] help"* || -z "$CUR_STEP" ]]; then
-      printf '      %s> %s%s ' "$C_C" "$1" "$C_N"
-    else
-      printf '      %s> %s%s %s(h = help)%s ' "$C_C" "$1" "$C_N" "$C_D" "$C_N"
-    fi
+    printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
-      printf '\n'; fatal "No input available for the question: $1
-             Run the script in an interactive terminal (for example: ssh -t root@$(hostname -s 2>/dev/null))."
+      printf '\n'; fatal "No answer could be read for: $1
+This script asks questions. Run it in an interactive terminal, for example:  ssh -t root@$(hostname -s 2>/dev/null)"
     fi
     _log ASK "$1  -> $ANSWER"
     case "${ANSWER,,}" in
       h|"?"|help) if [[ -n "$CUR_STEP" ]]; then show_help "$CUR_STEP" || true
-                  else say "There is no help for this question. The options of the script: $SELF --help"; fi ;;
+                  else say "No help for this question. All options:  $SELF --help"; fi ;;
       *) return 0 ;;
     esac
   done
@@ -261,12 +280,12 @@ ask() {
 
 ask_default() {
   # $1 question, $2 default. Result in ANSWER (default when Enter).
-  ask "$1 [$2]:"
+  ask "$1 [$2]"
   [[ -n "$ANSWER" ]] || ANSWER=$2
 }
 
 confirm() {
-  ask "$1 [y/N]"
+  ask "$1  [y] Yes   [N] No"
   [[ "${ANSWER,,}" == "y" || "${ANSWER,,}" == "yes" ]]
 }
 
@@ -275,13 +294,13 @@ confirm_word() {
   # (DUPLICATE, IGNORE) is accepted in any case; a device name must be typed exactly. Three tries.
   local n a
   for n in 1 2 3; do
-    ask "$1  Type $2 to continue (n = no):"
+    ask "$1  Type $2 to continue, or n to stop"
     a=${ANSWER//[[:space:]]/}
     [[ "$a" == "$2" ]] && return 0
     [[ "$2" =~ ^[A-Z]+$ && "${a^^}" == "$2" ]] && return 0
     [[ "${a,,}" == "n" || "${a,,}" == "no" ]] && return 1
     # an Enter by mistake does not stop an important step: it asks again
-    if [[ -z "$a" ]]; then [[ $n -lt 3 ]] && say "Nothing typed. Type $2, or n to stop."; continue; fi
+    if [[ -z "$a" ]]; then [[ $n -lt 3 ]] && say "Nothing was typed. Type $2, or n to stop."; continue; fi
     if [[ $n -lt 3 ]]; then
       if [[ "$2" =~ ^[A-Z]+$ ]]; then say "You typed \"$a\". Type $2 (capital or small letters), or n to stop."
       else say "You typed \"$a\". Type exactly $2, or n to stop."; fi
@@ -292,8 +311,8 @@ confirm_word() {
 
 ask_secret() {
   # $1 prompt. Result in SECRET.
-  printf '      %s> %s%s ' "$C_C" "$1" "$C_N"
-  IFS= read -rs SECRET < "$PROMPT_IN" || fatal "No input for: $1 (run the script in an interactive terminal, for example ssh -t)"
+  printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
+  IFS= read -rs SECRET < "$PROMPT_IN" || fatal "No answer could be read for: $1  (run the script in an interactive terminal, for example ssh -t)"
   printf '\n'
   _log ASK "$1  -> (hidden)"
 }
@@ -386,7 +405,7 @@ job_alive() {
     if [[ -n "$JOB_OUT" && -f "$JOB_OUT.rc" ]]; then
       JOB_PID=""; job_finish_late        # it ended before the reboot: its result counts (the old pid means nothing now)
     else
-      _log JOB "the job '$JOB_TITLE' was stopped by a reboot"; say "The job '$JOB_TITLE' of an earlier run was stopped by a reboot (output: $JOB_OUT)."
+      _log JOB "the job '$JOB_TITLE' was stopped by a reboot"; say "The job '$JOB_TITLE' of an earlier run was stopped by a reboot. Output: $JOB_OUT"
       job_remove_keep
     fi
     rm -f -- "$JOB_FILE"; JOB_PID=""; JOB_KEEP=""; return 1
@@ -396,7 +415,7 @@ job_alive() {
     [[ -n "$JOB_OUT" && -f "$JOB_OUT.rc" ]] || return 0
     if [[ "$JOB_LEFT_WARNED" != "$JOB_PID" ]]; then
       JOB_LEFT_WARNED=$JOB_PID
-      warn "The job '$JOB_TITLE' has ended; programs it started are still running: $(pgrep -s "$JOB_PID" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
+      warn "The job '$JOB_TITLE' has ended, but programs it started still run: $(pgrep -s "$JOB_PID" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
     fi
   fi
   [[ "$MODE" == "run" ]] && job_finish_late
@@ -424,7 +443,7 @@ job_finish_late() {
   # a new file (rename): programs that still write keep writing to the old one, which is then gone
   if [[ -n "$SYS_PW$ASM_PW" ]]; then ( umask 077; mask_pw < "$JOB_OUT" > "$JOB_OUT.m" ) && mv -f -- "$JOB_OUT.m" "$JOB_OUT"; rm -f -- "$JOB_OUT.m"; fi
   chmod 640 "$JOB_OUT" 2>/dev/null
-  say "The job '$JOB_TITLE' has ended (exit code ${rc:-unknown}). Its output: $JOB_OUT"
+  say "The job '$JOB_TITLE' has ended with exit code ${rc:-unknown}. Output: $JOB_OUT"
   # the passwords may not be known yet (the job is finished before step 1.5): mask again later
   [[ -z "$SYS_PW$ASM_PW" ]] && { install -d -m 700 "$STATE_DIR"; printf '%s\n' "$JOB_OUT" >> "$STATE_DIR/unmasked"; chmod 600 "$STATE_DIR/unmasked"; chmod 600 "$JOB_OUT" 2>/dev/null; }
   # the step that started the job records what the job did (journal lines carry that step)
@@ -433,14 +452,15 @@ job_finish_late() {
   case "$JOB_TITLE" in
     "RMAN duplicate")
       if grep -q 'Finished Duplicate Db' "$JOB_OUT" && ! grep -qE '^RMAN-0(3002|3009|3015)' "$JOB_OUT" && declare -F dup_success_record >/dev/null; then
-        dup_success_record; say "The RMAN duplicate had finished: recorded."; jok=1
+        dup_success_record; say "The RMAN copy had finished. Its result is recorded."; jok=1
       else
         jok=0; install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
-        say "The RMAN duplicate did NOT finish ($(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')). Step 7.2 of a normal run shows the clean-up of THIS server."
+        say "The RMAN copy did NOT finish: $(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')"
+        say "Step 7.2 of a normal run shows how to clean up this server."
       fi ;;
     "Grid installer"*|"Grid configuration tools"*|"Database installer"*)
       if [[ "$rc" == "0" || "$rc" == "6" ]] && declare -F installer_done_record >/dev/null; then
-        installer_done_record "$JOB_TITLE"; say "'$JOB_TITLE' had finished without error: recorded."
+        installer_done_record "$JOB_TITLE"; say "'$JOB_TITLE' had finished without error. Its result is recorded."
       fi ;;
     "root script $GRID_HOME/root.sh")
       if [[ "$rc" == "0" ]]; then
@@ -472,7 +492,8 @@ job_finish_late() {
 DETACHED_JOB=""
 job_detach_question() {
   # Ctrl+C while a long job runs: the job goes on in any case; the script either keeps watching or stops
-  ask_choice "[w] keep watching   [d] leave it running and stop the script (run it again later: it waits for the job)" "wd"
+  say "The job goes on in any case. A later run of the script waits for it."
+  ask_choice "[w] Keep watching   [d] Leave it running and stop the script" "wd"
   [[ "$ANSWER" == "d" ]] || return 0
   [[ -n "$TAIL_PID" ]] && { pkill -P "$TAIL_PID" 2>/dev/null; kill "$TAIL_PID" 2>/dev/null; wait "$TAIL_PID" 2>/dev/null; TAIL_PID=""; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
@@ -496,7 +517,7 @@ run_long() {
     *)      pre=(env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C LC_ALL=C) ;;
   esac
   rm -f -- "$out" "$out.rc" "$out.pid"
-  ( umask 077; : > "$out" ) || { bad "Cannot write $out"; return 1; }
+  ( umask 077; : > "$out" ) || { bad "Cannot write $out."; return 1; }
   # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
   setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid"; f=$1; k=$2; sp=$3; shift 3
@@ -507,15 +528,17 @@ run_long() {
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
   num "$jpid" || jpid=$bg
   printf '%s|%s|%s|%s|%s|%s\n' "$jpid" "$title" "$out" "$JOB_KEEP" "$(boot_id)" "${CUR_STEP:-}" > "$JOB_FILE" \
-    || warn "Cannot write $JOB_FILE: if this run stops, the next run will not know that $title is still running"
+    || warn "Cannot write $JOB_FILE.
+If this run stops, the next run will not know that $title is still running."
   JOB_PID=$jpid; JOB_TITLE=$title; JOB_OUT=$out; JOB_STEP=${CUR_STEP:-}
   _log JOB "start pid=$jpid $title -> $out"
   say "$title is running (process $jpid). Output: $out"
   if [[ $LONG_ADVICE_SHOWN -eq 0 ]]; then
     LONG_ADVICE_SHOWN=1
-    say "It runs in its own session $jpid: a closed terminal does not stop it; the next run of the script waits for it."
-    say "Ctrl+C asks whether to keep watching or to leave it running (the job itself goes on)."
-    say "To stop the job itself: pkill -s $jpid   (a stopped installer or root script leaves a half-configured home)"
+    say "It runs in its own session. A closed terminal does not stop it, and the next run waits for it."
+    say "Ctrl+C asks if you want to keep watching. The job itself goes on in any case."
+    say "To stop the job itself:  pkill -s $jpid"
+    [[ "${title:-}" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
   fi
   RL_INT=0; trap 'RL_INT=1' INT
   # the output is shown by a background pipeline; waiting for it can be interrupted by HUP/TERM at once
@@ -536,9 +559,9 @@ run_long() {
       hb=$((hb + 1))
       if [[ "$title" == "RMAN duplicate"* ]]; then
         # progress of the copy: datafiles RMAN has finished so far
-        say "... $title still running after $(( (SECONDS - t0) / 60 )) minutes: $(grep -cE 'restoring datafile|datafile copy complete|copying datafile' "$out" 2>/dev/null) datafile line(s) done so far (output: $out)"
+        say "$title still running after $(( (SECONDS - t0) / 60 )) minutes. Datafile lines done: $(grep -cE 'restoring datafile|datafile copy complete|copying datafile' "$out" 2>/dev/null)"
       else
-        say "... $title still running after $(( (SECONDS - t0) / 60 )) minutes (output: $(du -h -- "$out" 2>/dev/null | cut -f1) in $out)"
+        say "$title still running after $(( (SECONDS - t0) / 60 )) minutes. Output so far: $(du -h -- "$out" 2>/dev/null | cut -f1)"
       fi
     fi
   done
@@ -547,23 +570,23 @@ run_long() {
   # the wrapper may have been killed while its command goes on: wait for the whole job
   n=0
   while job_running "$jpid"; do
-    [[ $n -eq 0 ]] && say "Waiting for the rest of the job (session $jpid) to end ..."
+    [[ $n -eq 0 ]] && say "Waiting for the rest of the job (session $jpid) to end."
     n=$((n + 1)); sleep 2
     if [[ $RL_INT -eq 1 ]]; then RL_INT=0; printf '\n'; job_detach_question "$title" "$jpid" "$out"; fi
     # the command has ended and only programs it started still run: do not wait for them
     if [[ -f "$out.rc" && $n -ge 30 ]]; then
-      warn "$title has ended; programs it started keep running: $(pgrep -s "$jpid" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
+      warn "$title has ended, but programs it started still run: $(pgrep -s "$jpid" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
       break
     fi
     if (( n % 300 == 0 )); then
-      say "Programs of the job are still running after $((n * 2 / 60)) minutes: $(pgrep -s "$jpid" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
-      ask_choice "[k] keep waiting   [c] continue without them (they keep running)" "kc"
+      say "Programs of the job still run after $((n * 2 / 60)) minutes: $(pgrep -s "$jpid" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
+      ask_choice "[k] Keep waiting   [c] Continue without them (they keep running)" "kc"
       [[ "$ANSWER" == "c" ]] && break
     fi
   done
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
   local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc" "$JOB_FILE"; JOB_PID=""
-  num "$rc" || { rc=1; bad "$title was stopped before it finished"; }
+  num "$rc" || { rc=1; bad "$title was stopped before it finished."; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
   JOB_KEEP=""
   # the output file may contain the passwords only if a tool printed them; mask it to be sure
@@ -585,13 +608,13 @@ backup_file() {
   [[ -e "$b" || -L "$b" ]] && return 0
   if [[ -n "$u" && "$u" != "root" ]]; then runuser -u "$u" -- cp -p -- "$f" "$b" || return 1
   else cp -p --remove-destination -- "$f" "$b" || return 1; fi
-  say "backup: $b"
+  say "Backup: $b"
 }
 append_as() {
   # $1 user (empty or root = root), $2 file; stdin = text to add at the end (a missing final newline is added first)
   local u=${1:-root} f=$2 txt before=0 after=0 lead=0
   txt=$(cat)
-  [[ -L "$f" ]] && { bad "$f is a symbolic link; not changed"; return 1; }
+  [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
   if [[ -s "$f" && -n "$(tail -c 1 -- "$f")" ]]; then txt=$'\n'"$txt"; lead=1; fi
   [[ -f "$f" ]] && before=$(stat -c '%s' -- "$f")
   if [[ "$u" != "root" ]]; then printf '%s\n' "$txt" | runuser -u "$u" -- tee -a -- "$f" > /dev/null || return 1
@@ -603,8 +626,9 @@ append_as() {
 write_as() {
   # $1 user, $2 file, $3 mode; stdin = the whole new content (written as that user)
   local u=$1 f=$2 m=$3 existed=0
-  [[ -L "$f" ]] && { bad "$f is a symbolic link; not changed"; return 1; }
+  [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
   [[ -e "$f" ]] && existed=1
+
   if [[ "$u" == "root" ]]; then
     local t; t=$(mktemp "$(dirname "$f")/.dgtmp.XXXXXX") || return 1
     cat > "$t" && chmod "$m" "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; return 1; }
@@ -638,7 +662,8 @@ lsnr_sw_ok() { users_ok && [[ -x "$(lsnr_home)/bin/lsnrctl" ]]; }
 human_min() {
   # minutes -> "45 minutes" / "6 hours" / "2.5 days"
   local m=${1:-0}
-  if [[ $m -lt 120 ]]; then printf '%s minutes' "$m"
+  if [[ $m -eq 1 ]]; then printf '1 minute'
+  elif [[ $m -lt 120 ]]; then printf '%s minutes' "$m"
   elif [[ $m -lt 2880 ]]; then printf '%s hours' "$(( (m + 30) / 60 ))"
   else printf '%s.%s days' "$(( m / 1440 ))" "$(( (m % 1440) * 10 / 1440 ))"; fi
 }

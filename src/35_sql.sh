@@ -26,7 +26,7 @@ sql_standby_tns() {
 
 sql_primary_tns() {
   # PRIMARY through the TNS alias that RMAN will use. READ-ONLY.
-  readonly_guard "$1" || fatal "SAFETY STOP: refused statement for primary: $1"
+  readonly_guard "$1" || fatal "Safety stop: this statement is not read-only, so it was NOT sent to the primary: $1"
   _sql_exec "connect sys/\"$SYS_PW\"@$PRIMARY_TNS as sysdba" "$1" "PRIMARY via $PRIMARY_TNS (read-only): ${1:0:150}" as_oracle "$DB_HOME"
 }
 

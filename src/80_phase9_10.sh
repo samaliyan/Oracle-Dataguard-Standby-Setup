@@ -7,7 +7,7 @@ need_built() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 1; }
   detect_built
   if [[ $STANDBY_BUILT -eq 1 && "$LSTATE" == "IDLE" && "${CUR_STEP%%.*}" == "10" ]]; then
-    NOW="The standby instance is not running (step 9.2): $(use_grid && printf 'srvctl start database -db %s' "$STANDBY_UNIQUE" || printf 'startup mount')  as $ORACLE_USER; also check:  systemctl status $(unit_name 2>/dev/null)"
+    NOW="The standby instance is not running (step 9.2)."$'\n'"Start it as $ORACLE_USER:  $(use_grid && printf 'srvctl start database -db %s' "$STANDBY_UNIQUE" || printf 'startup mount')"$'\n'"Also check:  systemctl status $(unit_name 2>/dev/null)"
     return 1
   fi
   [[ $STANDBY_BUILT -eq 1 ]] && return 0
@@ -16,27 +16,27 @@ need_built() {
 }
 adg_note() {
   # an OPEN standby with apply running is Active Data Guard (a separate license)
-  [[ "$1" == OPEN* ]] && warn "The standby is OPEN. Opening a physical standby while redo is applied needs the Active Data Guard license; this script only mounts it."
+  [[ "$1" == OPEN* ]] && warn "The standby is OPEN."$'\n'"An open standby with redo apply needs the Active Data Guard license."$'\n'"This script only mounts it."
   return 0
 }
 
 # ---- 9.1 ----
 srv_dgs() { asm_dgs | paste -sd, -; }
 c_9_1() {
-  use_grid || { NOW="Not needed (no Oracle Restart on this server; see step 9.7 for start at boot)"; return 0; }
+  use_grid || { NOW="Not needed: no Oracle Restart on this server. Step 9.7 sets up the start at boot."; return 0; }
   need_built || return 2
   local srv="$DB_HOME/bin/srvctl" spf; spf=$(spfile_path)
-  [[ -f "$spf" ]] || { NOW="spfile not found: $spf"; return 2; }
+  [[ -f "$spf" ]] || { NOW="The spfile is missing: $spf"; return 2; }
   local add="srvctl add database -db $STANDBY_UNIQUE -oraclehome $DB_HOME -spfile $spf -pwfile $(pw_dest) -role PHYSICAL_STANDBY -startoption MOUNT -dbname $DB_NAME -instance $STANDBY_SID -diskgroup $(srv_dgs)${PRIMARY_DOMAIN:+ -domain $PRIMARY_DOMAIN}"
   if run_logged "srvctl config database" as_oracle "$srv" config database -db "$STANDBY_UNIQUE"; then
     local cfg=$RUN_OUT bad_items=""
     grep -qiE "^spfile:[[:space:]]*${spf}[[:space:]]*\$" <<< "$cfg" || bad_items+=" spfile"
     grep -qiE "^Database role:[[:space:]]*PHYSICAL_STANDBY" <<< "$cfg" || bad_items+=" role"
     grep -qiE "^(Database instance|Instance)( name)?:[[:space:]]*${STANDBY_SID}[[:space:]]*\$" <<< "$cfg" || bad_items+=" instance"
-    if [[ -z "$bad_items" ]]; then NOW="Registered: spfile $spf, role PHYSICAL_STANDBY, instance $STANDBY_SID"; return 0; fi
-    NOW="Registered, but wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance)' <<< "$cfg")"
+    if [[ -z "$bad_items" ]]; then NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"; return 0; fi
+    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance)' <<< "$cfg")"
     REG_MODE=re
-    PLAN="On THIS server only, as $ORACLE_USER:
+    PLAN="As $ORACLE_USER, on this server only:
 srvctl stop database -db $STANDBY_UNIQUE
 srvctl remove database -db $STANDBY_UNIQUE -noprompt
 $add"
@@ -46,7 +46,7 @@ $add"
   NOW="$STANDBY_UNIQUE is not registered in Oracle Restart"
   PLAN="As $ORACLE_USER:
 $add"
-  USING="-instance must be exactly $STANDBY_SID (otherwise: 'Connected to an idle instance')"
+  USING="-instance must be exactly $STANDBY_SID, or sqlplus shows 'Connected to an idle instance'"
   return 1
 }
 srv_add() {
@@ -74,8 +74,8 @@ c_9_2() {
     local_state
     case "$LSTATE" in
       MOUNTED|OPEN) adg_note "$LSTATE"; NOW="Instance $STANDBY_SID is $LSTATE (no Oracle Restart on this server)"; return 0 ;;
-      IDLE) NOW="The standby instance is not running"; PLAN="sqlplus / as sysdba  ->  startup mount   (as $ORACLE_USER)"; return 1 ;;
-      STARTED) NOW="The instance is in NOMOUNT (started with the first pfile)"; PLAN="sqlplus / as sysdba  ->  shutdown immediate ; startup mount   (as $ORACLE_USER, with the spfile)"; return 1 ;;
+      IDLE) NOW="The standby instance is not running"; PLAN="As $ORACLE_USER:  sqlplus / as sysdba  ->  startup mount"; return 1 ;;
+      STARTED) NOW="The instance is in NOMOUNT (started with the first pfile)"; PLAN="As $ORACLE_USER, on this server (standby instance $STANDBY_SID only):"$'\n'"  sqlplus / as sysdba  ->  shutdown immediate ; startup mount"$'\n'"The new start uses the spfile"; return 1 ;;
       *) NOW="Instance state: $LSTATE ($(ora_errors "$SQL_OUT"))"; return 2 ;;
     esac
   fi
@@ -85,34 +85,34 @@ c_9_2() {
   if sql_local "select i.instance_name||'|'||i.status||'|'||d.database_role from v\$instance i, v\$database d;"; then
     local iname ist irole; IFS='|' read -r iname ist irole <<< "$(first_line)"
     if [[ $srv_on -eq 1 && "$iname" == "$STANDBY_SID" && "$irole" == "PHYSICAL STANDBY" && ( "$ist" == "MOUNTED" || "$ist" == "OPEN" ) ]]; then
-      adg_note "$ist"; NOW="srvctl: running; instance $iname $ist $irole"; return 0
+      adg_note "$ist"; NOW="Running under Oracle Restart: instance $iname, $ist, $irole"; return 0
     fi
     if [[ $srv_on -eq 0 ]]; then
       NOW="Instance $iname is $ist, but it was started by RMAN, not by Oracle Restart"
-      PLAN="As $ORACLE_USER (THIS server):
+      PLAN="As $ORACLE_USER, on this server (standby instance $STANDBY_SID only):
 sqlplus / as sysdba  ->  shutdown immediate
 srvctl start database -db $STANDBY_UNIQUE"
       return 1
     fi
-    NOW="Unexpected: instance=$iname status=$ist role=$irole"; return 2
+    NOW="Unexpected state: instance $iname, status $ist, role $irole"; return 2
   fi
   if [[ $srv_on -eq 1 ]] && grep -qE 'ORA-01034|idle instance' <<< "$SQL_OUT"; then
-    NOW="srvctl says running, but ORACLE_SID=$STANDBY_SID is idle: the registration uses another instance name (step 9.1)"
+    NOW="srvctl says the database is running, but ORACLE_SID=$STANDBY_SID is idle."$'\n'"The registration uses another instance name (step 9.1)"
     return 2
   fi
   NOW="The standby instance is not running"
-  PLAN="srvctl start database -db $STANDBY_UNIQUE   (as $ORACLE_USER)"
+  PLAN="As $ORACLE_USER:  srvctl start database -db $STANDBY_UNIQUE"
   return 1
 }
 d_9_2() {
   if ! use_grid; then
     [[ "$LSTATE" == "STARTED" ]] && { sql_local_long "shutdown immediate" || true; }
-    sql_local_long "startup mount" || { bad "startup mount failed ($(ora_errors "$SQL_OUT"))"; return 1; }
+    sql_local_long "startup mount" || { bad "Startup mount failed ($(ora_errors "$SQL_OUT"))"; return 1; }
     journal INSTANCE "$STANDBY_SID" "startup mount (standby)"; return 0
   fi
   local_state
   if [[ "$LSTATE" != "IDLE" && "$LSTATE" != "NOSW" ]]; then
-    say "Stopping the instance started by RMAN (this server only)"
+    say "Stopping the instance that RMAN started on this server"
     sql_local_long "shutdown immediate" || true
   fi
   run_logged "srvctl start" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" start database -db "$STANDBY_UNIQUE" || { bad "srvctl start failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
@@ -128,9 +128,9 @@ c_9_3() {
   NOW=$SRL_INFO
   [[ $rc -eq 0 ]] && return 0
   SRL_SQL="alter system set standby_file_management=manual scope=memory;"$'\n'"$SRL_STMTS"$'\n'"alter system set standby_file_management=auto scope=memory;"
-  PLAN="On THIS server, sqlplus / as sysdba (apply is stopped first if running):
+  PLAN="On this server, in sqlplus / as sysdba (apply is stopped first if it runs):
 $SRL_SQL"
-  USING="same size as the online logs of primary; one more than the online groups, per thread"
+  USING="Same size as the online logs of the primary"$'\n'"Per thread: one group more than the online groups"
   return 1
 }
 d_9_3() {
@@ -147,8 +147,8 @@ d_9_3() {
     new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
     [[ -n "$new" ]] && journal SRL "$STANDBY_SID" "$new"
     SQL_OUT=$eo
-    bad "Adding standby redo logs failed ($(ora_errors "$SQL_OUT"))"
-    grep -q 'ORA-01378' <<< "$SQL_OUT" && printf 'ORA-01378: the online logs of the primary use 4K blocks; the disk group / file system here must have a 4K sector size.\n' | hint
+    bad "Cannot add the standby redo logs ($(ora_errors "$SQL_OUT"))"
+    grep -q 'ORA-01378' <<< "$SQL_OUT" && printf 'ORA-01378: the online logs of the primary use 4K blocks.\nThe disk group or file system here must have a 4K sector size.\n' | hint
     return 1
   fi
   sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
@@ -193,18 +193,20 @@ c_9_8() {
   local tok=1; arch_in_fra || arch_timer_ok || tok=0
   if [[ $ARCH_POLICY_OK -eq 1 && $tok -eq 1 ]]; then
     NOW="RMAN archivelog deletion policy: $v"
-    arch_in_fra && NOW+=" (the recovery area deletes applied logs when it needs space)" || NOW+=$'\n'"$(arch_timer) deletes applied logs older than one day in $ARCH_LOC every night"
+    arch_in_fra && NOW+=$'\n'"The recovery area deletes applied logs when it needs space." || NOW+=$'\n'"$(arch_timer) deletes applied logs older than one day in $ARCH_LOC every night"
     return 0
   fi
   NOW=""
-  [[ $ARCH_POLICY_OK -eq 1 ]] || NOW="RMAN archivelog deletion policy of the standby: ${v/#-/not set}$([[ "$v" != "-" ]] && printf ' (copied from the primary with its control file)'). It does not delete applied logs here: the archived logs fill the disk and redo transport stops (ORA-19809 / ORA-00257)."
-  [[ $tok -eq 1 ]] || NOW+="${NOW:+$'\n'}The archive destination is not the recovery area ($ARCH_LOC): Oracle deletes nothing there by itself."
+  [[ $ARCH_POLICY_OK -eq 1 ]] || NOW="RMAN archivelog deletion policy of the standby: ${v/#-/not set}$([[ "$v" != "-" ]] && printf ', copied from the primary with the control file')."$'\n'"Without the right policy, applied logs are not deleted here."$'\n'"The disk fills up and redo transport stops (ORA-19809, ORA-00257)."
+  [[ $tok -eq 1 ]] || NOW+="${NOW:+$'\n'}The archive destination $ARCH_LOC is not the recovery area. Oracle deletes nothing there by itself."
   PLAN=""
-  [[ $ARCH_POLICY_OK -eq 1 ]] || PLAN="As $ORACLE_USER on THIS server:  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;"
-  [[ $tok -eq 1 ]] || PLAN+="${PLAN:+$'\n'}A daily systemd timer $(arch_timer) (04:30) runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';   (logs not applied yet are kept)"
-  USING="For the PRIMARY nothing is changed. Its own policy belongs to its backups: check it there with  rman target /  ->  show archivelog deletion policy;
-Only if the primary is backed up by RMAN, a policy such as TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DEVICE TYPE <the device of its backups: DISK or SBT>
-keeps logs until this standby has them. Never set it on a primary that RMAN does not back up (its logs would never be deleted)."
+  [[ $ARCH_POLICY_OK -eq 1 ]] || PLAN="As $ORACLE_USER on this server:"$'\n'"  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;"
+  [[ $tok -eq 1 ]] || PLAN+="${PLAN:+$'\n'}Add a daily systemd timer $(arch_timer) at 04:30."$'\n'"It runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';"$'\n'"Logs that are not applied yet are kept."
+  USING="Nothing is changed on the primary. Its own policy belongs to its backups.
+To see it there:  rman target /  ->  show archivelog deletion policy;
+If RMAN backs up the primary, this policy there keeps logs until the standby has them:
+  TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DEVICE TYPE <DISK or SBT>
+NEVER set it on a primary that RMAN does not back up: its logs would never be deleted."
   return 1
 }
 d_9_8() {
@@ -215,7 +217,7 @@ d_9_8() {
     printf 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;\nexit\n' | as_oracle timeout 300 "$DB_HOME/bin/rman" target / > "$t" 2>&1 || lrc=1
     RUN_OUT=$(cat "$t"); rm -f -- "$t"
     printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman configure"
-    [[ $lrc -eq 0 ]] || { bad "rman failed ($(ora_errors "$RUN_OUT"))"; return 1; }
+    [[ $lrc -eq 0 ]] || { bad "RMAN failed ($(ora_errors "$RUN_OUT"))"; return 1; }
     journal RMANCFG "$STANDBY_SID" "old=${old// /~}"
   fi
   if ! arch_in_fra && ! arch_timer_ok; then
@@ -240,22 +242,22 @@ systemctl start $(arch_timer)" || return 1
 c_9_4() {
   need_built || return 2
   if mrp_running; then
-    NOW="MRP (apply) is running"
+    NOW="Redo apply (MRP) is running"
     # real-time apply needs standby redo logs that the standby can use; without them redo is applied from archived logs only
     if sql_local "select nvl(max(recovery_mode),'-') from v\$archive_dest_status where recovery_mode like 'MANAGED%';" && [[ "$(first_line)" != "-" && "$(first_line)" != *"REAL TIME"* ]]; then
-      warn "Redo is applied from archived logs only (recovery_mode = $(first_line)), not in real time. Usually the standby redo logs cannot be used: step 9.3, and in the alert log: ORA-19527, ORA-15046, ORA-15173, 'No standby redo logfiles'."
+      warn "Redo is applied from archived logs only, not in real time (recovery_mode = $(first_line))."$'\n'"Usually the standby redo logs cannot be used. Check step 9.3, and look in the alert log for:"$'\n'"ORA-19527, ORA-15046, ORA-15173, 'No standby redo logfiles'."
     fi
     return 0
   fi
-  NOW="MRP (apply) is not running"
-  PLAN="alter database recover managed standby database disconnect from session;   (THIS server)"
+  NOW="Redo apply (MRP) is not running"
+  PLAN="On this server:  alter database recover managed standby database disconnect from session;"
   return 1
 }
 d_9_4() {
   if ! sql_local "alter database recover managed standby database disconnect from session;"; then
-    bad "Cannot start apply ($(ora_errors "$SQL_OUT"))"
+    bad "Cannot start redo apply ($(ora_errors "$SQL_OUT"))"
     grep -q 'ORA-01153' <<< "$SQL_OUT" && printf 'ORA-01153: another recovery session is active (an old MRP or a manual recover). Cancel it first:\n  alter database recover managed standby database cancel;\n' | hint
-    grep -q 'ORA-01154' <<< "$SQL_OUT" && printf 'ORA-01154: the database is OPEN or being opened; a physical standby is mounted, not opened, by this script.\n' | hint
+    grep -q 'ORA-01154' <<< "$SQL_OUT" && printf 'ORA-01154: the database is OPEN or opening. This script only mounts a physical standby.\n' | hint
     return 1
   fi
   journal MRP "$STANDBY_SID" "redo apply started"
@@ -266,15 +268,15 @@ d_9_4() {
 c_9_5() {
   need_built || return 2
   need_ssh || return 2
-  find_dest || { NOW="Cannot read the log_archive_dest parameters on primary"; return 2; }
+  find_dest || { NOW="Cannot read the log_archive_dest parameters on the primary"; return 2; }
   local d=$DEST_N
   p_param "log_archive_dest_$d" || { NOW="Query failed"; return 2; }
   if ! has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}"; then
-    NOW="log_archive_dest_$d on primary does not point to the standby ($PVAL)"
+    NOW="log_archive_dest_$d on the primary does not point to this standby: $PVAL"
     PLAN="alter system set log_archive_dest_$d='service=$STANDBY_TNS async valid_for=(online_logfiles,primary_role) db_unique_name=$STANDBY_UNIQUE' scope=both;
 alter system set log_archive_dest_state_$d=enable scope=both;
 alter system switch logfile;"
-    PLAN_UNDO="alter system set log_archive_dest_state_$d=defer scope=both;   (stops shipping to this standby)"
+    PLAN_UNDO="alter system set log_archive_dest_state_$d=defer scope=both;   (stops redo transport to this standby)"
     return 1
   fi
   prim_sql "select upper(value) from v\$parameter where name='log_archive_dest_state_$d';" || { NOW="Query failed"; return 2; }
@@ -282,16 +284,16 @@ alter system switch logfile;"
   # ORA- inside the error column would look like a failed query, so it is masked in SQL and restored here
   prim_sql "select status||'|'||nvl(replace(error,'ORA-','ORA_'),'-') from v\$archive_dest where dest_id=$d;" || { NOW="Query failed"; return 2; }
   local s e; IFS='|' read -r s e <<< "$(first_line)"; e=${e//ORA_/ORA-}
-  if [[ "$st" == "ENABLE" && "$s" == "VALID" && "$e" == "-" ]]; then NOW="Primary dest_$d is ENABLE and VALID, no error"; return 0; fi
-  NOW="Primary log_archive_dest_state_$d=$st, dest_$d status=$s error=$e"
+  if [[ "$st" == "ENABLE" && "$s" == "VALID" && "$e" == "-" ]]; then NOW="On the primary, dest_$d is ENABLE and VALID, with no error"; return 0; fi
+  NOW="On the primary: log_archive_dest_state_$d=$st, dest_$d status $s, $([[ "$e" == "-" ]] && printf 'no error' || printf 'error %s' "$e")"
   PLAN="alter system set log_archive_dest_state_$d=enable scope=both;
 alter system switch logfile;"
-  PLAN_UNDO="alter system set log_archive_dest_state_$d=defer scope=both;   (stops shipping to this standby)"
+  PLAN_UNDO="alter system set log_archive_dest_state_$d=defer scope=both;   (stops redo transport to this standby)"
   if [[ "$e" != "-" ]]; then
     case "$e" in
-      *16191*|*1017*) PLAN+=$'\n'"-- error: password files differ (step 6.1)" ;;
-      *12154*) PLAN+=$'\n'"-- error: alias $STANDBY_TNS missing in primary tnsnames.ora (step 4.9)" ;;
-      *12514*|*12541*) PLAN+=$'\n'"-- error: standby listener (phase 5)" ;;
+      *16191*|*1017*) PLAN+=$'\n'"-- Cause: the password files differ (step 6.1)" ;;
+      *12154*) PLAN+=$'\n'"-- Cause: alias $STANDBY_TNS is missing in tnsnames.ora on the primary (step 4.9)" ;;
+      *12514*|*12541*) PLAN+=$'\n'"-- Cause: the listener of the standby (phase 5)" ;;
     esac
   fi
   return 1
@@ -303,15 +305,15 @@ c_9_6() {
   find_dest >/dev/null 2>&1 || true
   local n=0
   while true; do
-    rfs_running && { NOW="RFS is receiving redo from primary"; return 0; }
+    rfs_running && { NOW="RFS is receiving redo from the primary"; return 0; }
     n=$((n + 1)); [[ $n -ge 6 || "$MODE" == "check" ]] && break
-    say "waiting for RFS ... ($n/6)"; sleep 10
+    say "Waiting for RFS ($n of 6)"; sleep 10
   done
-  NOW="No RFS process on standby yet"
+  NOW="No RFS process on this server yet"
   PLAN="Check step 9.5, then the alert logs:
   standby: ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${STANDBY_UNIQUE,,}/$STANDBY_SID/trace/alert_$STANDBY_SID.log
   primary: ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${PRIMARY_UNIQUE,,}/$PRIMARY_SID/trace/alert_$PRIMARY_SID.log
-  primary: alert log of $PRIMARY_SID (look for ORA- near LOG_ARCHIVE_DEST_${DEST_N:-2})"
+In the alert log of the primary, look for ORA- errors near LOG_ARCHIVE_DEST_${DEST_N:-2}"
   return 1
 }
 
@@ -361,25 +363,25 @@ dropin_text() {
   else printf '[Unit]\nAfter=systemd-udev-settle.service\nWants=systemd-udev-settle.service\n'; fi
 }
 c_9_7() {
-  command -v systemctl >/dev/null 2>&1 || { NOW="systemd not found; start the standby by hand after a reboot"; return 2; }
+  command -v systemctl >/dev/null 2>&1 || { NOW="systemd is not found. Start the standby by hand after each reboot."; return 2; }
   need_built || return 2
   local u sc okd=1; u="/etc/systemd/system/$(unit_name)"; sc=$(start_script)
   need_udev_dropin && [[ "$(cat "$(udev_dropin)" 2>/dev/null)" != "$(dropin_text)" ]] && okd=0
   if [[ -f "$u" && "$(cat "$u")" == "$(unit_text)" && -f "$sc" && "$(cat "$sc")" == "$(script_text)" && $okd -eq 1 ]] && systemctl is-enabled --quiet "$(unit_name)" 2>/dev/null && ! systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
-    if use_grid; then NOW="$(unit_name) is enabled (starts apply after Oracle Restart has mounted the standby)"
-    else NOW="$(unit_name) is enabled (listener + startup mount + apply at boot, clean stop at shutdown)"; fi
+    if use_grid; then NOW="$(unit_name) is enabled."$'\n'"It starts apply after Oracle Restart mounts the standby."
+    else NOW="$(unit_name) is enabled."$'\n'"At boot: listener, startup mount, apply. At shutdown: a clean stop."; fi
     return 0
   fi
   if systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
-    NOW="$(unit_name) is in the failed state: $(systemctl status "$(unit_name)" --no-pager -l 2>&1 | grep -E 'Active:|ORA-|TNS-|error' | head -n 3 | tr '\n' ' ')"
-  elif use_grid; then NOW="After a reboot Oracle Restart mounts the standby, but nothing starts apply (MRP)"
+    NOW="$(unit_name) has failed: $(systemctl status "$(unit_name)" --no-pager -l 2>&1 | grep -E 'Active:|ORA-|TNS-|error' | head -n 3 | tr '\n' ' ')"
+  elif use_grid; then NOW="After a reboot, Oracle Restart mounts the standby, but nothing starts redo apply (MRP)"
   else NOW="Nothing starts the listener and the standby after a reboot (no Oracle Restart here)"; fi
-  if use_grid; then PLAN="Create $sc (root-owned; runs as $ORACLE_USER: waits for MOUNT, starts apply)"
-  else PLAN="Create $sc (root-owned; runs as $ORACLE_USER: lsnrctl start, startup mount, start apply; at shutdown: shutdown immediate)"; fi
-  PLAN+=$'\n'"Create $u (with the Oracle limits: nofile, nproc, stack, memlock) and enable it"
-  need_udev_dropin && PLAN+=$'\n'"Create $(udev_dropin): Oracle Restart starts after the ASM disks are there"
-  PLAN+=$'\n'"Start the unit once now (it does not change a running standby), so it is stopped cleanly at the next shutdown"
-  USING="MOUNT only: opening a standby read-only while apply runs needs the Active Data Guard license"
+  if use_grid; then PLAN="Create this script, owned by root. It runs as $ORACLE_USER, waits for MOUNT and starts apply:"$'\n'"  $sc"
+  else PLAN="Create this script, owned by root. It runs as $ORACLE_USER:"$'\n'"  $sc"$'\n'"  at boot: lsnrctl start, startup mount, start apply"$'\n'"  at shutdown: shutdown immediate"; fi
+  PLAN+=$'\n'"Create and enable this systemd unit:"$'\n'"  $u"$'\n'"It sets the Oracle limits (nofile, nproc, stack, memlock)."
+  need_udev_dropin && PLAN+=$'\n'"Create this drop-in, so Oracle Restart starts after the ASM disks are ready:"$'\n'"  $(udev_dropin)"
+  PLAN+=$'\n'"Start the unit once now, so the next shutdown stops the standby cleanly."$'\n'"This does not change the running standby."
+  USING="The standby is only mounted."$'\n'"Opening it read-only while apply runs needs the Active Data Guard license."
   return 1
 }
 d_9_7() {
@@ -401,19 +403,19 @@ d_9_7() {
   run_cmds <<< "systemctl daemon-reload
 systemctl enable $(unit_name)" || return 1
   journal UNIT "$(unit_name)" "enabled (start at boot)"
-  run_cmds <<< "systemctl start $(unit_name)" || { bad "The unit did not start: systemctl status $(unit_name)"; systemctl status "$(unit_name)" --no-pager -l 2>&1 | tail -n 8 | hint; return 1; }
+  run_cmds <<< "systemctl start $(unit_name)" || { bad "The unit did not start. Check:  systemctl status $(unit_name)"; systemctl status "$(unit_name)" --no-pager -l 2>&1 | tail -n 8 | hint; return 1; }
 }
 
 phase_9() {
-  phase_header 9 "Register, start apply, start shipping"
+  phase_header 9 "Start redo apply and transport"
   run_step 9.1 auto    "Registration in Oracle Restart (srvctl)" c_9_1 d_9_1
   run_step 9.2 auto    "Standby instance running (MOUNT)" c_9_2 d_9_2
   run_step 9.3 auto    "Standby redo logs on this server" c_9_3 d_9_3
-  run_step 9.4 auto    "Apply (MRP)" c_9_4 d_9_4
-  run_step 9.5 primary "Redo shipping from primary" c_9_5
+  run_step 9.4 auto    "Redo apply (MRP)" c_9_4 d_9_4
+  run_step 9.5 primary "Redo transport from the primary" c_9_5
   run_step 9.6 check   "Redo arrives on this server (RFS)" c_9_6
   run_step 9.7 auto    "Start at boot (mount and apply)" c_9_7 d_9_7
-  run_step 9.8 auto    "Archived logs on the standby (deletion)" c_9_8 d_9_8
+  run_step 9.8 auto    "Clean-up of archived logs on the standby" c_9_8 d_9_8
 }
 
 #------------------------------------------------------------------------------
@@ -432,14 +434,15 @@ c_10_1() {
     sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
     IFS='|' read -r tl al <<< "$(first_line)"
     tls=$(lag_seconds "$tl"); als=$(lag_seconds "$al")
-    if [[ $tls -ge 0 && $tls -le 60 && $als -ge 0 && $als -le 60 ]]; then NOW="transport lag $tl, apply lag $al"; return 0; fi
+    if [[ $tls -ge 0 && $tls -le 60 && $als -ge 0 && $als -le 60 ]]; then NOW="Transport lag $tl, apply lag $al"; return 0; fi
     tries=$((tries + 1)); [[ $tries -ge 12 || "$MODE" == "check" ]] && break
-    say "transport lag=$tl apply lag=$al ... waiting 10s ($tries/12)"; sleep 10
+    say "Transport lag $tl, apply lag $al. Waiting 10 seconds ($tries of 12)"; sleep 10
   done
-  NOW="transport lag '$tl', apply lag '$al'"
-  PLAN="Empty values right after setup are normal for a few minutes.
-On primary (as $ORACLE_USER, sqlplus / as sysdba) you can force a log:  alter system switch logfile;
-then answer r"
+  NOW="The lag is too high or not known yet: transport '$tl', apply '$al'"
+  PLAN="Empty values are normal for a few minutes after the setup.
+To force a log switch, on the primary as $ORACLE_USER in sqlplus / as sysdba:
+  alter system switch logfile;
+Then answer r."
   return 1
 }
 c_10_2() {
@@ -449,43 +452,43 @@ c_10_2() {
   [[ "$(first_line)" -eq 0 ]] && { NOW="No archive gap"; return 0; }
   sql_local "select thread#||' '||low_sequence#||'-'||high_sequence# from v\$archive_gap;" || true
   NOW="Archive gap: $SQL_OUT"
-  PLAN="fal_server normally fetches missing logs within minutes. If it stays:
+  PLAN="fal_server usually fetches the missing logs within minutes. If the gap stays, check:
   grep -iE 'FAL|gap|ORA-' ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${STANDBY_UNIQUE,,}/$STANDBY_SID/trace/alert_$STANDBY_SID.log | tail -30"
   return 1
 }
 c_10_3() {
   need_built || return 2
   need_ssh || return 2
-  prim_sql "select nvl(max(sequence#),0) from v\$archived_log where standby_dest='NO' and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read primary"; return 2; }
+  prim_sql "select nvl(max(sequence#),0) from v\$archived_log where standby_dest='NO' and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read the primary"; return 2; }
   local pmax smax; pmax=$(first_line)
-  sql_local "select nvl(max(sequence#),0) from v\$archived_log where applied in ('YES','IN-MEMORY') and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read standby"; return 2; }
+  sql_local "select nvl(max(sequence#),0) from v\$archived_log where applied in ('YES','IN-MEMORY') and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read the standby"; return 2; }
   smax=$(first_line)
   num "$pmax" && num "$smax" || { NOW="Unexpected answer (primary '$pmax', standby '$smax')"; return 2; }
-  if [[ "$smax" -ge $((pmax - 1)) ]]; then NOW="Primary last archived $pmax, standby applied $smax"; return 0; fi
-  NOW="Primary last archived $pmax, standby applied only $smax"
-  PLAN="Wait a few minutes (apply catches up), then answer r"
+  if [[ "$smax" -ge $((pmax - 1)) ]]; then NOW="Last log archived on the primary: $pmax. Applied on the standby: $smax"; return 0; fi
+  NOW="Last log archived on the primary: $pmax. Applied on the standby: only $smax"
+  PLAN="Wait a few minutes for apply to catch up, then answer r."
   return 1
 }
 c_10_4() {
   need_built || return 2
   if mrp_running; then
-    NOW="MRP is running"
+    NOW="Redo apply (MRP) is running"
     # real-time apply uses a standby log that receives the redo; errors of the last day are shown
     if sql_local "select count(*) from v\$standby_log where status='ACTIVE';" && [[ "$(first_line)" == "0" ]]; then
-      warn "No standby redo log is in use (none ACTIVE): redo arrives only as archived logs, the lag grows by whole log files. Check step 9.3 and the alert log (ORA-19527, ORA-15046)."
+      warn "No standby redo log is in use (none is ACTIVE)."$'\n'"Redo arrives only as archived logs, so the lag grows by whole log files."$'\n'"Check step 9.3 and the alert log (ORA-19527, ORA-15046)."
     fi
     if sql_local "select count(*) from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1;" && num "$(first_line)" && [[ "$(first_line)" != "0" ]]; then
-      warn "$(first_line) Data Guard error message(s) in the last 24 hours on this standby:  select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
+      warn "$(first_line) Data Guard error message(s) on this standby in the last 24 hours. To see them:"$'\n'"select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
     fi
     return 0
   fi
-  NOW="MRP is not running"; PLAN="Step 9.4:  alter database recover managed standby database disconnect from session;"; return 1
+  NOW="Redo apply (MRP) is not running"; PLAN="Start it (step 9.4), on this server:"$'\n'"  alter database recover managed standby database disconnect from session;"; return 1
 }
 
 phase_10() {
-  phase_header 10 "Verify synchronization"
+  phase_header 10 "Health check"
   run_step 10.1 check "Transport and apply lag" c_10_1
   run_step 10.2 check "No archive gap" c_10_2
-  run_step 10.3 check "Last sequence: primary vs standby" c_10_3
-  run_step 10.4 check "Apply process running" c_10_4
+  run_step 10.3 check "Last log: primary and standby" c_10_3
+  run_step 10.4 check "Redo apply is running" c_10_4
 }

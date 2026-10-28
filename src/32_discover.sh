@@ -85,7 +85,7 @@ read_arch_params() {
 pick_from_list() {
   # $1 prompt, $2 count -> ANSWER = 1..count; q stops the script. No default: the order of ps means nothing.
   while true; do
-    ask "$1 (q = stop):"
+    ask "$1  (q to stop)"
     [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
     [[ "$ANSWER" =~ ^[0-9]{1,3}$ ]] && (( 10#$ANSWER >= 1 && 10#$ANSWER <= $2 )) && { ANSWER=$((10#$ANSWER)); return 0; }
     say "Please type a number from 1 to $2, or q."
@@ -95,26 +95,28 @@ pick_from_list() {
 discover_primary() {
   local l
   DISC_NOTES=()
-  [[ "$PRIMARY_SSH_USER" != "root" ]] || fatal "Use the Oracle software owner (for example oracle) for ssh, not root: --user oracle"
+  [[ "$PRIMARY_SSH_USER" != "root" ]] || fatal "Do not use root for ssh. Use the Oracle software owner, for example:  --user oracle"
   # ---- host
-  prim_probe host || { bad "Cannot run commands on primary"; return 1; }
+  prim_probe host || { bad "Cannot run commands on the primary."; return 1; }
   PRIMARY_HOST=$(sed -n '1p' <<< "$RUN_OUT" | tr -d '[:space:]')
-  v_name "$PRIMARY_HOST" || { bad "Unexpected host name from primary: $PRIMARY_HOST"; return 1; }
+  v_name "$PRIMARY_HOST" || { bad "The primary returned an unexpected host name: $PRIMARY_HOST"; return 1; }
   local ls; ls=$(hostname -s 2>/dev/null || hostname)
   if [[ "${PRIMARY_HOST,,}" == "${ls,,}" ]]; then
-    fatal "The primary has the same host name ($PRIMARY_HOST) as this server. Data Guard needs two different host names.
-             If this IS the primary: run the script on the standby server.
-             If this server is a copy (clone) of the primary: give it its own name first, for example
-               hostnamectl set-hostname <new name>      and fix /etc/hosts, then run the script again."
+    fatal "The primary has the same host name as this server: $PRIMARY_HOST. Data Guard needs two names.
+If this server is the primary, run the script on the standby server instead.
+If this server is a clone of the primary, give it its own name first:
+  hostnamectl set-hostname <new name>
+Then fix /etc/hosts and run the script again."
   fi
   ok "Primary host: $PRIMARY_HOST"
   if prim_probe now && num "$(head -n 1 <<< "$RUN_OUT")"; then
     PRIM_CLOCK_OFFSET=$(( $(head -n 1 <<< "$RUN_OUT") - $(date +%s) ))
-    [[ ${PRIM_CLOCK_OFFSET#-} -gt 300 ]] && DISC_NOTES+=("The clocks differ by $PRIM_CLOCK_OFFSET seconds (primary minus this server). Fix time synchronization (step 2.10 here, chronyd on primary).")
+    [[ ${PRIM_CLOCK_OFFSET#-} -gt 300 ]] && DISC_NOTES+=("The clock of the primary is $PRIM_CLOCK_OFFSET seconds off from this server.
+Fix the time synchronization: step 2.10 here, chronyd on the primary.")
   fi
 
   # ---- running instances and listeners
-  prim_probe ps || { bad "Cannot list processes on primary"; return 1; }
+  prim_probe ps || { bad "Cannot list the processes on the primary."; return 1; }
   PS_OUT=$RUN_OUT
   local -a pm=()
   ASM_PMON_PID=""
@@ -130,8 +132,8 @@ discover_primary() {
   prim_probe oratab && oratab=$RUN_OUT
 
   if [[ ${#pm[@]} -eq 0 ]]; then
-    bad "No running database instance (ora_pmon_<SID>) on primary."
-    printf 'The primary database must be running (OPEN) for this script.\nStart it on primary as oracle:  sqlplus / as sysdba   ->  startup\n' | hint
+    bad "No database instance is running on the primary (no ora_pmon_<SID> process)."
+    printf 'The primary database must be open for this script.\nStart it on the primary as oracle:\n  sqlplus / as sysdba\n  startup\n' | hint
     return 1
   fi
   local pick=1 i saved_sid=$PRIMARY_SID
@@ -140,12 +142,13 @@ discover_primary() {
     # the database chosen in an earlier run is used again (--settings or a new primary IP start over)
     if [[ -n "$saved_sid" && $REVIEW_SETTINGS -eq 0 ]]; then
       for i in "${!pm[@]}"; do [[ "${pm[$i]%%:*}" == "$saved_sid" ]] && pick=$((i + 1)); done
-      [[ -n "$pick" ]] && ok "Database $saved_sid (chosen in an earlier run; to choose another one: $SELF --settings)"
+      [[ -n "$pick" ]] && ok "Database $saved_sid, chosen in an earlier run
+To choose another one:  $SELF --settings"
     fi
     if [[ -z "$pick" ]]; then
-      say "Running databases on primary (SID, OS user):"
-      for i in "${!pm[@]}"; do say "  $((i + 1))) ${pm[$i]%%:*}   (user ${pm[$i]##*:})"; done
-      pick_from_list "Number of the database that gets the standby (1-${#pm[@]})" "${#pm[@]}"
+      say "Running databases on the primary:"
+      for i in "${!pm[@]}"; do say "  $((i + 1))) ${pm[$i]%%:*}   user ${pm[$i]##*:}"; done
+      pick_from_list "Number of the database for the standby, 1 to ${#pm[@]}" "${#pm[@]}"
       pick=$ANSWER
     fi
   fi
@@ -161,8 +164,9 @@ discover_primary() {
   run_home=$(home_of_pid "$DB_PMON_PID" || true)
   if [[ -n "$run_home" ]] && home_ok "$run_home" "$pmon_user"; then
     DB_HOME=$run_home
-    if [[ -z "$tab_home" ]]; then DISC_NOTES+=("/etc/oratab on primary has no line for $PRIMARY_SID (add: $PRIMARY_SID:$DB_HOME:N)")
-    elif [[ "$tab_home" != "$run_home" ]]; then DISC_NOTES+=("/etc/oratab on primary says $tab_home for $PRIMARY_SID, but the database runs from $run_home"); fi
+    if [[ -z "$tab_home" ]]; then DISC_NOTES+=("/etc/oratab on the primary has no line for $PRIMARY_SID. Suggested line:  $PRIMARY_SID:$DB_HOME:N")
+    elif [[ "$tab_home" != "$run_home" ]]; then DISC_NOTES+=("/etc/oratab on the primary says $tab_home for $PRIMARY_SID,
+but the database runs from $run_home."); fi
   elif [[ -n "$tab_home" ]] && home_ok "$tab_home" "$pmon_user"; then
     DB_HOME=$tab_home
   else
@@ -173,19 +177,22 @@ discover_primary() {
     else
       for ih in $(inventory_homes); do home_ok "$ih" "$pmon_user" && { DB_HOME=$ih; break; }; done
     fi
-    [[ -n "$DB_HOME" ]] && DISC_NOTES+=("/etc/oratab on primary has no usable line for $PRIMARY_SID; its home $DB_HOME was found in the process environment / inventory (add to oratab: $PRIMARY_SID:$DB_HOME:N)")
+    [[ -n "$DB_HOME" ]] && DISC_NOTES+=("/etc/oratab on the primary has no usable line for $PRIMARY_SID. Its home was found another way.
+Suggested oratab line:  $PRIMARY_SID:$DB_HOME:N")
   fi
   if [[ -z "$DB_HOME" ]]; then
-    warn "The Oracle home of $PRIMARY_SID could not be found (no usable /etc/oratab line, process not readable, not in the inventory)."
+    warn "The Oracle home of $PRIMARY_SID was not found.
+It is not in /etc/oratab or the inventory, and the process cannot be read."
+    say "Example of a home:  /u01/app/oracle/product/19.0.0/dbhome_1"
     while true; do
-      ask "Full path of the database ORACLE_HOME on primary (for example /u01/app/oracle/product/19.0.0/dbhome_1), or q to stop:"
+      ask "Full path of the database ORACLE_HOME on the primary (q to stop)"
       [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
       ANSWER=${ANSWER%/}
       if home_ok "$ANSWER" "$pmon_user"; then DB_HOME=$ANSWER; break; fi
-      say "$ANSWER/bin/oracle does not exist on primary, or does not belong to $pmon_user (the user of the running instance)."
+      say "$ANSWER/bin/oracle is not on the primary, or it does not belong to $pmon_user (the owner of the instance)."
     done
   fi
-  ok "Database: ORACLE_SID=$PRIMARY_SID  home=$DB_HOME"
+  ok "Instance: ORACLE_SID=$PRIMARY_SID  home=$DB_HOME"
 
   # ---- environment of the running database (true TNS_ADMIN); readable only as the DB owner
   PRIMARY_TNS_ADMIN=""
@@ -196,12 +203,13 @@ discover_primary() {
 
   # ---- edition: Data Guard needs Enterprise Edition (checked here, before anything is installed)
   prim_sql "select banner from v\$version where banner like 'Oracle%';" \
-    || { bad "Cannot query the database on primary ($(ora_errors "$SQL_OUT"))"; printf 'The ssh user %s must be able to run:  sqlplus / as sysdba   (member of the dba group).\n' "$PRIMARY_SSH_USER" | hint; return 1; }
+    || { bad "Cannot query the database on the primary: $(ora_errors "$SQL_OUT")"; printf 'The ssh user %s must be able to run  sqlplus / as sysdba  (it must be in the dba group).\n' "$PRIMARY_SSH_USER" | hint; return 1; }
   local ban; ban=$(first_line)
   if [[ "$ban" == *"Enterprise Edition"* ]]; then DB_EDITION=EE
   elif [[ "$ban" == *"Standard Edition"* ]]; then DB_EDITION=SE2
-  else DB_EDITION=EE; DISC_NOTES+=("Edition not recognised in '$ban'; assuming Enterprise Edition"); fi
-  [[ "$DB_EDITION" == "EE" ]] || fatal "The primary is Standard Edition ($ban). Data Guard needs Enterprise Edition. This script cannot build a standby for it."
+  else DB_EDITION=EE; DISC_NOTES+=("The edition in '$ban' is not known. Enterprise Edition is assumed."); fi
+  [[ "$DB_EDITION" == "EE" ]] || fatal "The primary is Standard Edition: $ban
+Data Guard needs Enterprise Edition, so this script cannot build a standby for it."
 
   # ---- Grid home (only if there is Grid/ASM)
   GRID_HOME=$(awk -F: '$1 ~ /^\+ASM[0-9]*$/ {print $2; exit}' <<< "$(sed 's/#.*//' <<< "$oratab")")
@@ -222,12 +230,12 @@ discover_primary() {
   if [[ -n "$GRID_HOME" ]] && prim_probe owner "$GRID_HOME/bin/oracle"; then GRID_USER=$(awk '{print $1; exit}' <<< "$RUN_OUT"); fi
   v_name "$ORACLE_USER" || ORACLE_USER=oracle
   v_name "$GRID_USER" || GRID_USER=$ORACLE_USER
-  prim_probe ids "$ORACLE_USER" "$GRID_USER" || { bad "Cannot read user ids on primary"; return 1; }
+  prim_probe ids "$ORACLE_USER" "$GRID_USER" || { bad "Cannot read the user ids on the primary."; return 1; }
   parse_id_line "$(grep -m1 "^uid=[0-9]*($ORACLE_USER)" <<< "$RUN_OUT")"
   ORACLE_UID=$PID_UID; INSTALL_GROUP=$PID_PGROUP; local og=$PID_GROUPS
   parse_id_line "$(grep -m1 "^uid=[0-9]*($GRID_USER)" <<< "$RUN_OUT")"
   GRID_UID=$PID_UID; GRID_PGROUP=$PID_PGROUP; local gg=$PID_GROUPS
-  num "$ORACLE_UID" && num "$GRID_UID" && [[ -n "$INSTALL_GROUP" ]] || { bad "Cannot parse 'id' output from primary"; return 1; }
+  num "$ORACLE_UID" && num "$GRID_UID" && [[ -n "$INSTALL_GROUP" ]] || { bad "Cannot understand the output of 'id' on the primary."; return 1; }
   # Only Oracle OS groups are copied (not wheel, docker, LDAP groups and so on)
   local ora_re="^(${INSTALL_GROUP}|${GRID_PGROUP}|oinstall|dba|oper|backupdba|dgdba|kmdba|racdba|asmadmin|asmdba|asmoper):"
   og=$(tr ',' '\n' <<< "$og" | grep -E "$ora_re" | paste -sd, -)
@@ -242,7 +250,7 @@ discover_primary() {
   ORACLE_BASE=""; GRID_BASE=""
   prim_probe orabase "$DB_HOME" && ORACLE_BASE=$(grep -m1 -E '^/' <<< "$RUN_OUT")
   ORACLE_BASE=${ORACLE_BASE%/}
-  v_path "$ORACLE_BASE" || { bad "Cannot read ORACLE_BASE of $DB_HOME (orabase)"; return 1; }
+  v_path "$ORACLE_BASE" || { bad "Cannot read the ORACLE_BASE of $DB_HOME (orabase failed)."; return 1; }
   if [[ -n "$GRID_HOME" ]]; then
     prim_probe orabase "$GRID_HOME" && GRID_BASE=$(grep -m1 -E '^/' <<< "$RUN_OUT")
     GRID_BASE=${GRID_BASE%/}
@@ -257,25 +265,27 @@ discover_primary() {
 
   # ---- database facts (version-neutral SQL, works on 12.1 and newer)
   prim_sql "select d.name||'|'||d.db_unique_name||'|'||d.database_role||'|'||d.cdb||'|'||i.version||'|'||nvl((select value from v\$parameter where name='db_domain'),'-')||'|'||nvl((select upper(value) from v\$parameter where name='cluster_database'),'FALSE')||'|'||d.open_mode from v\$database d, v\$instance i;" \
-    || { bad "Cannot query the database on primary ($(ora_errors "$SQL_OUT"))"; printf 'The ssh user %s must be able to run:  sqlplus / as sysdba   (member of the dba group).\n' "$PRIMARY_SSH_USER" | hint; return 1; }
+    || { bad "Cannot query the database on the primary: $(ora_errors "$SQL_OUT")"; printf 'The ssh user %s must be able to run  sqlplus / as sysdba  (it must be in the dba group).\n' "$PRIMARY_SSH_USER" | hint; return 1; }
   local role ver dom rac omode
   IFS='|' read -r DB_NAME PRIMARY_UNIQUE role PRIMARY_CDB ver dom rac omode <<< "$(first_line)"
-  [[ "$role" == "PRIMARY" ]] || fatal "Database $PRIMARY_SID on $PRIMARY_HOST has role '$role', not PRIMARY. Stopping."
-  [[ "$rac" != "TRUE" ]] || fatal "The primary is a RAC database (cluster_database=TRUE). This script builds a single-instance standby of a single-instance primary only."
-  v_name "$DB_NAME" && v_name "$PRIMARY_UNIQUE" || { bad "Unexpected database name from primary: $DB_NAME / $PRIMARY_UNIQUE"; return 1; }
+  [[ "$role" == "PRIMARY" ]] || fatal "Database $PRIMARY_SID on $PRIMARY_HOST has the role $role, not PRIMARY.
+Run the script against the primary database."
+  [[ "$rac" != "TRUE" ]] || fatal "The primary is a RAC database (cluster_database=TRUE).
+This script supports only a single-instance primary."
+  v_name "$DB_NAME" && v_name "$PRIMARY_UNIQUE" || { bad "The primary returned an unexpected database name: $DB_NAME, $PRIMARY_UNIQUE"; return 1; }
   [[ "$dom" == "-" ]] && dom=""; [[ -z "$dom" ]] || v_name "$dom" || dom=""; PRIMARY_DOMAIN=$dom
-  DB_MAJOR=${ver%%.*}; num "$DB_MAJOR" || { bad "Unexpected version: $ver"; return 1; }
-  [[ $DB_MAJOR -ge 12 ]] || fatal "Primary version is $ver. This script supports 12.1 and newer."
+  DB_MAJOR=${ver%%.*}; num "$DB_MAJOR" || { bad "The primary returned an unexpected version: $ver"; return 1; }
+  [[ $DB_MAJOR -ge 12 ]] || fatal "The primary runs Oracle $ver. This script supports 12.1 and newer."
   PRIMARY_VERSION=$ver
   if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select version_full from v\$instance;"; then PRIMARY_VERSION=$(first_line); fi
   v_name "$PRIMARY_VERSION" || PRIMARY_VERSION=$ver
-  [[ "$omode" == READ\ WRITE* ]] || warn "Primary open mode is '$omode' (expected READ WRITE)."
+  [[ "$omode" == READ\ WRITE* ]] || warn "The primary is open as $omode, not READ WRITE."
 
   # ---- storage: every place with database files (also the standby redo logs) and how much is there
   local c="case when name like '+%' then upper(regexp_substr(name,'^[+][^/]+')) else substr(name,1,instr(name,'/',-1)-1) end"
   local cm="case when f.member like '+%' then upper(regexp_substr(f.member,'^[+][^/]+')) else substr(f.member,1,instr(f.member,'/',-1)-1) end"
   prim_sql "select loc||':'||round(sum(b)/1048576) from (select $c loc, bytes b from v\$datafile union all select $c, bytes from v\$tempfile union all select $cm, l.bytes from v\$logfile f, v\$log l where f.group#=l.group# union all select $cm, s.bytes from v\$logfile f, v\$standby_log s where f.group#=s.group# union all select $c, block_size*file_size_blks from v\$controlfile) group by loc;" \
-    || { bad "Cannot read the database file locations ($(ora_errors "$SQL_OUT"))"; return 1; }
+    || { bad "Cannot read the locations of the database files: $(ora_errors "$SQL_OUT")"; return 1; }
   LOCS=$(grep -E '^[+/][A-Za-z0-9_./-]*:[0-9]+$' <<< "$SQL_OUT" | paste -sd, -)
   [[ -n "$LOCS" ]] || { bad "Unexpected answer for the file locations: $(head -n 3 <<< "$SQL_OUT")"; return 1; }
   PRIMARY_DB_MB=$(loc_list | awk -F: '{s+=$2} END {print s+0}')
@@ -285,14 +295,14 @@ discover_primary() {
   num "$PRIMARY_REDO_BS" || PRIMARY_REDO_BS=512
 
   # ---- recovery area, archive destination, folders used by the instance
-  read_arch_params || { bad "Cannot read parameters on primary"; return 1; }
+  read_arch_params || { bad "Cannot read the parameters of the primary database."; return 1; }
 
   # ---- ASM or file system
   DATA_DG=""
   if [[ -n "$(asm_dgs)" ]]; then
     USE_GRID=yes
-    [[ -n "$GRID_HOME" ]] || { bad "The primary uses ASM ($(asm_dgs | paste -sd' ' -)) but its Grid home was not found."; return 1; }
-    [[ -n "$GRID_BASE" ]] || { bad "Cannot read ORACLE_BASE of $GRID_HOME (orabase)"; return 1; }
+    [[ -n "$GRID_HOME" ]] || { bad "The primary uses ASM ($(asm_dgs | paste -sd' ' -)), but its Grid home was not found."; return 1; }
+    [[ -n "$GRID_BASE" ]] || { bad "Cannot read the ORACLE_BASE of $GRID_HOME (orabase failed)."; return 1; }
     if [[ "$CFD" == +* ]]; then DATA_DG=$(norm_loc "$CFD"); DATA_DG=${DATA_DG#+}
     else DATA_DG=$(loc_list | grep '^+' | sort -t: -k2,2nr | head -n 1 | cut -d: -f1); DATA_DG=${DATA_DG#+}; fi
     # only the recovery area / archive destination in ASM: Grid is installed with that disk group
@@ -307,15 +317,18 @@ discover_primary() {
     fi
     if [[ -z "$GRID_REL" ]]; then
       GRID_REL=$(want_rel db)
-      DISC_NOTES+=("The Grid release could not be read on primary ($GRID_HOME/inventory/ContentsXML/comps.xml); assuming $GRID_REL like the database")
+      DISC_NOTES+=("The Grid release of the primary could not be read from $GRID_HOME/inventory/ContentsXML/comps.xml.
+Grid $GRID_REL is assumed, the same as the database.")
     fi
   else
     USE_GRID=no; GRID_REL=""
     # no ASM on the standby: no Grid; the listener runs from the database home
     GRID_HOME=""; GRID_BASE=""; GRID_USER=$ORACLE_USER; GRID_UID=$ORACLE_UID; GRID_PGROUP=$INSTALL_GROUP; GRID_GROUPS=""
   fi
-  ok "Database: $DB_NAME / $PRIMARY_UNIQUE, PRIMARY, CDB=$PRIMARY_CDB, $PRIMARY_VERSION, $(human_mb "$PRIMARY_DB_MB")"
-  ok "Storage: $(tr ',' ' ' <<< "$LOCS")${FRA_LOC:+, recovery area $FRA_LOC}"
+  ok "Database: $DB_NAME, unique name $PRIMARY_UNIQUE, $PRIMARY_VERSION, CDB $PRIMARY_CDB, $(human_mb "$PRIMARY_DB_MB")"
+  local sl="" l; for l in $(tr ',' ' ' <<< "$LOCS"); do sl+="${sl:+, }${l%:*} ($(human_mb "${l##*:}"))"; done
+  ok "Storage: database files in $sl${FRA_LOC:+
+Recovery area: $FRA_LOC}"
 
   # ---- listener: the running tnslsnr that offers this database's service.
   #      Only a tnslsnr that runs as an Oracle owner from a program of that owner is asked.
@@ -342,16 +355,19 @@ discover_primary() {
     p=$(norm "$RUN_OUT" | grep -oE '\(PROTOCOL=TCP\)\(HOST=[^)]*\)\(PORT=[0-9]+\)' | head -n 1 | grep -oE '[0-9]+\)$' | tr -d ')')
     LISTENER_NAME=$ln; PRIMARY_LISTENER_HOME=$lh; PRIMARY_SERVICE=$svc; num "$p" && PORT=$p; found=1; break
   done < <(awk '{ for (i = 3; i <= NF; i++) if ($i ~ /\/bin\/tnslsnr$/) { h=$i; sub(/\/bin\/tnslsnr$/, "", h); print $1, $2, h, $(i+1); break } }' <<< "$PS_OUT")
-  if [[ $found -eq 1 ]]; then ok "Listener $LISTENER_NAME ($PRIMARY_LISTENER_HOME) on port $PORT, service $PRIMARY_SERVICE"
+  if [[ $found -eq 1 ]]; then ok "Listener $LISTENER_NAME on port $PORT, service $PRIMARY_SERVICE
+Listener home: $PRIMARY_LISTENER_HOME"
   else
     LSNR_ASSUMED=1
     # values the admin corrected in the settings of an earlier run are kept
     if [[ -n "$sv_port" && -n "$sv_ln" && -n "$sv_svc" && ( "$sv_port" != "1521" || "$sv_ln" != "LISTENER" || "$sv_svc" != "$want" ) ]]; then
       PORT=$sv_port; LISTENER_NAME=$sv_ln; PRIMARY_SERVICE=$sv_svc; [[ -n "$sv_lh" ]] && PRIMARY_LISTENER_HOME=$sv_lh
-      warn "No running listener on primary offers the service $want. Using your settings: $LISTENER_NAME, port $PORT, service $PRIMARY_SERVICE."
+      warn "No running listener on the primary offers the service $want.
+Using your settings: $LISTENER_NAME, port $PORT, service $PRIMARY_SERVICE."
     else
-      warn "No running listener on primary offers the service $want. Assuming LISTENER, port $PORT, service $want."
-      say "If that is wrong, correct PORT / LISTENER_NAME / PRIMARY_SERVICE in the settings (step 1.4 shows them: choose e; later:  $SELF --settings)."
+      warn "No running listener on the primary offers the service $want.
+Assuming LISTENER, port $PORT, service $want."
+      say "If that is wrong, correct it in step 1.4 (choose e), or later with  $SELF --settings"
     fi
   fi
 
@@ -363,7 +379,9 @@ discover_primary() {
   if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name in ('wallet_root','tde_configuration');"; then
     local wn wv
     while IFS='|' read -r wn wv; do
-      case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { DISC_NOTES+=("wallet_root on primary is '$WALLET_ROOT' (not a folder; the TDE wallet is copied by hand, step 6.3)"); WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
+      case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { DISC_NOTES+=("wallet_root on the primary is '$WALLET_ROOT', which is not a folder.
+Copy the TDE wallet by hand in step 6.3.");WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
+
     done <<< "$SQL_OUT"
   fi
 

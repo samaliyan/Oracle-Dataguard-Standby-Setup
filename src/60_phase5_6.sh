@@ -39,7 +39,7 @@ port_owner_pid() {
   ss -ltnp "( sport = :$1 )" 2>/dev/null | grep -oE 'users:\(\("[^"]*",(pid=)?[0-9]+' | head -n 1 | grep -oE '[0-9]+$'
 }
 c_5_1() {
-  lsnr_sw_ok || { NOW="The software for the listener is not installed (phase 3)"; return 2; }
+  lsnr_sw_ok || { NOW="The listener software is not installed yet (phase 3)"; return 2; }
   local st=0 f; f=$(lsnr_file)
   # on a server that already runs something else: port $PORT must be free or ours
   local opid oexe; opid=$(port_owner_pid "$PORT")
@@ -47,57 +47,63 @@ c_5_1() {
     oexe=$(readlink "/proc/$opid/exe" 2>/dev/null); oexe=${oexe% (deleted)}
     # both paths resolved (a home under a symbolic link is still our listener)
     if [[ "$(readlink -f -- "$oexe" 2>/dev/null || printf '%s' "$oexe")" != "$(readlink -f -- "$(lsnr_home)/bin/tnslsnr" 2>/dev/null || printf '%s' "$(lsnr_home)/bin/tnslsnr")" ]]; then
-      NOW="Port $PORT on this server is already used by $oexe (pid $opid), not by the listener of $(lsnr_home)"
+      NOW="Port $PORT on this server is used by another program: $oexe (pid $opid)"
       KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-      PLAN="Another listener (or program) owns port $PORT. The standby listener must be the one in $(lsnr_home) on this port
-(the primary and the copy use port $PORT). Stop the other one, or move it to another port, then answer r:
+      PLAN="-- The standby listener of $(lsnr_home) must use port $PORT.
+-- The primary and the RMAN copy connect to it there.
+-- Stop the other program or move it to another port, then answer r. To see what it is:
   ps -fp $opid
   ss -ltnp '( sport = :$PORT )'"
       return 1
     fi
   fi
   static_entry_state || st=$?
-  if [[ $st -eq 0 ]] && { use_grid || lsnr_has_desc; }; then NOW="Static entry for $STANDBY_SID with ORACLE_HOME=$DB_HOME in $f"; return 0; fi
-  USING="SID $STANDBY_SID, service $STANDBY_SERVICE, DATABASE home $DB_HOME (never the Grid home)"
+  if [[ $st -eq 0 ]] && { use_grid || lsnr_has_desc; }; then NOW="listener.ora has the static entry for $STANDBY_SID with the database home."; return 0; fi
+  USING="SID $STANDBY_SID, service $STANDBY_SERVICE
+ORACLE_HOME (database home, not Grid):
+  $DB_HOME"
   L51_MODE=""
   if ! use_grid && ! lsnr_has_desc; then
     if [[ $st -eq 1 ]] && ! lsnr_has_sidlist; then
       # no Grid: the listener lives in the database home and must be defined completely
       L51_MODE=both
-      NOW="No listener defined in $f (there is no Grid on this server)"
-      PLAN="Write to $f (backup kept, owner $ORACLE_USER):
+      NOW="No listener is defined in listener.ora. There is no Grid on this server."$'\n'"  $f"
+      PLAN="Write this to listener.ora (owner $ORACLE_USER; a backup is kept):
 $(lsnr_desc_block)
 $(static_block)"
       return 1
     fi
     if [[ $st -eq 0 ]]; then
       L51_MODE=desc
-      NOW="$f has the static entry, but no address for the listener $SB_LSNR"
-      PLAN="Add to $f (backup kept):
+      NOW="listener.ora has the static entry, but no address for the listener $SB_LSNR:"$'\n'"  $f"
+      PLAN="Add this to listener.ora (a backup is kept):
 $(lsnr_desc_block)"
       return 1
     fi
   fi
   if [[ $st -eq 1 ]] && ! lsnr_has_sidlist; then
     L51_MODE=static
-    NOW="No static entry in $f"
-    PLAN="Append to $f (backup kept, owner $(lsnr_user)):
+    NOW="listener.ora has no static entry for $STANDBY_SID:"$'\n'"  $f"
+    PLAN="Add this to listener.ora (owner $(lsnr_user); a backup is kept):
 $(static_block)"
     return 1
   fi
-  KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  edit $f"
+  KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
-    NOW="The static entry for $STANDBY_SID has ANOTHER ORACLE_HOME (this gives ORA-01017 through the listener)"
+    NOW="The static entry for $STANDBY_SID has a different ORACLE_HOME."$'\n'"Logins through the listener would fail with ORA-01017."
+    NOW+=$'\n'"The script only adds new entries; it does not change an existing one."$'\n'"Please correct this entry by hand."
   else
-    NOW="$f already has a SID_LIST_$SB_LSNR block without $STANDBY_SID; the script does not edit inside it"
+    NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID."$'\n'"The script does not edit inside an existing block, so please add the entry by hand."
   fi
-  PLAN="Inside SID_LIST_$SB_LSNR / (SID_LIST = ... ) there must be exactly this SID_DESC:
+  PLAN="-- Edit this file:
+--   $f
+-- Inside SID_LIST_$SB_LSNR, the (SID_LIST = ...) must contain exactly this SID_DESC:
     (SID_DESC =
       (GLOBAL_DBNAME = $STANDBY_SERVICE)
       (SID_NAME = $STANDBY_SID)
       (ORACLE_HOME = $DB_HOME)
     )"
-  ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"and the listener address:"$'\n'"$(lsnr_desc_block)"
+  ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
   return 1
 }
 d_5_1() {
@@ -116,28 +122,30 @@ d_5_1() {
 # ---- 5.2 ----
 L52_START=0
 c_5_2() {
-  lsnr_sw_ok || { NOW="The software for the listener is not installed (phase 3)"; return 2; }
-  static_entry_state || { NOW="Static entry is not correct (step 5.1)"; return 2; }
+  lsnr_sw_ok || { NOW="The listener software is not installed yet (phase 3)"; return 2; }
+  static_entry_state || { NOW="The static entry is not correct yet (step 5.1)"; return 2; }
   L52_START=0
   if ! run_logged "lsnrctl status" as_lsnr timeout 60 "$(lsnr_home)/bin/lsnrctl" status "$SB_LSNR"; then
-    if use_grid; then NOW="Listener $SB_LSNR is not running (Oracle Restart resource, step 3.9)"; return 2; fi
+    if use_grid; then NOW="Listener $SB_LSNR is not running. It is an Oracle Restart resource, set up in step 3.9."; return 2; fi
     L52_START=1
     NOW="Listener $SB_LSNR is not running"
-    PLAN="lsnrctl start $SB_LSNR   (as $ORACLE_USER, from $DB_HOME)"
+    PLAN="Start it:  lsnrctl start $SB_LSNR   (as $ORACLE_USER, from $DB_HOME)"
     return 1
   fi
   if ! grep -q "(PROTOCOL=TCP)(HOST=[^)]*)(PORT=$PORT)" <<< "$(norm "$RUN_OUT")"; then
-    NOW="Listener $SB_LSNR does not listen on port $PORT (the primary uses $PORT)"
-    KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  edit $(lsnr_file)"
-    PLAN="Set (PORT = $PORT) in the $SB_LSNR address of $(lsnr_file), then:
+    NOW="Listener $SB_LSNR does not listen on port $PORT, the port the primary uses"
+    KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
+    PLAN="-- Edit this file:
+--   $(lsnr_file)
+-- Set (PORT = $PORT) in the $SB_LSNR address, then restart the listener:
 $(lsnr_home)/bin/lsnrctl stop $SB_LSNR ; $(lsnr_home)/bin/lsnrctl start $SB_LSNR"
     use_grid && { MANUAL_HOW="$GRID_USER  ->  shell"; PLAN="srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
 srvctl stop listener -listener $SB_LSNR ; srvctl start listener -listener $SB_LSNR"; }
     return 1
   fi
-  if grep -qF "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT"; then NOW="Listener shows: Instance \"$STANDBY_SID\", status UNKNOWN (port $PORT)"; return 0; fi
-  NOW="Listener does not show the static instance $STANDBY_SID yet"
-  PLAN="lsnrctl reload $SB_LSNR   (as $(lsnr_user); running connections are not affected)"
+  if grep -qF "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT"; then NOW="The listener shows Instance \"$STANDBY_SID\", status UNKNOWN (port $PORT)"; return 0; fi
+  NOW="The listener does not show the static instance $STANDBY_SID yet"
+  PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
   return 1
 }
 d_5_2() {
@@ -151,15 +159,17 @@ d_5_2() {
 T_ALIAS=""; T_HOST=""; T_SVC=""
 tns_alias_present() { local f; f=$(tns_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*$1[[:space:]]*=" "$f"; }
 c_tns() {
-  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
-  rw_home_ok || { NOW="Oracle home is read-only (step 3.8)"; return 2; }
+  db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
+  rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
   local f; f=$(tns_file)
-  USING="host $T_HOST, port $PORT, service $T_SVC"
+  USING="Host $T_HOST, port $PORT, service $T_SVC"
   if tns_alias_present "$T_ALIAS" && run_logged "tnsping $T_ALIAS" as_oracle timeout 60 "$DB_HOME/bin/tnsping" "$T_ALIAS" 1 && grep -q '^OK' <<< "$RUN_OUT"; then
-    if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then NOW="tnsping $T_ALIAS OK ($T_HOST:$PORT/$T_SVC, UR=A)"; return 0; fi
-    NOW="Alias $T_ALIAS exists but is different: $TNS_WHY"
-    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  edit $f"
-    PLAN="The entry must be:
+    if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then NOW="tnsping $T_ALIAS works ($T_HOST:$PORT/$T_SVC, UR=A)"; return 0; fi
+    NOW="The alias $T_ALIAS exists but is different: $TNS_WHY"
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
+    PLAN="-- Edit this file:
+--   $f
+-- The entry must be:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     return 1
   fi
@@ -167,19 +177,21 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     case "$(tnsping_class "$RUN_OUT")" in
       NOLISTENER)
         if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then
-          NOW="Alias $T_ALIAS is right ($T_HOST:$PORT/$T_SVC), but nothing answers there yet: $(grep -oE 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1) (the listener on $T_HOST is not running)"
-          [[ "$T_HOST" == "$STANDBY_HOST" ]] && { NOW+=" (step 5.2)"; return 2; }
-          NOW+=" - check the listener on the primary ($LISTENER_NAME, port $PORT)"; return 2
+          NOW="The alias $T_ALIAS is right, but nothing answers at $T_HOST:$PORT yet: $(grep -oE 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
+          [[ "$T_HOST" == "$STANDBY_HOST" ]] && { NOW+=$'\n'"The listener on this server is not running (step 5.2)"; return 2; }
+          NOW+=$'\n'"The listener on $T_HOST is not running. Check $LISTENER_NAME on the primary (port $PORT)."; return 2
         fi ;;
     esac
-    NOW="Alias $T_ALIAS is in $f but tnsping fails: $(grep -E 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
-    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  edit $f"
-    PLAN="Fix the entry (check brackets and the host name):
+    NOW="The alias $T_ALIAS is in tnsnames.ora, but tnsping fails: $(grep -E 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
+    PLAN="-- Edit this file:
+--   $f
+-- Fix the entry. Check the brackets and the host name:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     return 1
   fi
-  NOW="Alias $T_ALIAS is not in $f"
-  PLAN="Append to $f (backup kept):
+  NOW="The alias $T_ALIAS is missing from tnsnames.ora:"$'\n'"  $f"
+  PLAN="Add this to tnsnames.ora (a backup is kept):
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
   return 1
 }
@@ -193,11 +205,11 @@ c_5_3() { T_ALIAS=$PRIMARY_TNS; T_HOST=$PRIMARY_HOST; T_SVC=$PRIMARY_SERVICE; c_
 c_5_4() { T_ALIAS=$STANDBY_TNS; T_HOST=$STANDBY_HOST; T_SVC=$STANDBY_SERVICE; c_tns; }
 
 phase_5() {
-  phase_header 5 "Network files on this server (listener.ora, tnsnames.ora)"
+  phase_header 5 "Listener and tnsnames.ora"
   run_step 5.1 auto "Static listener entry for $STANDBY_SID" c_5_1 d_5_1
   run_step 5.2 auto "Listener shows the static entry" c_5_2 d_5_2
-  run_step 5.3 auto "tnsnames.ora: $PRIMARY_TNS (primary)" c_5_3 d_tns
-  run_step 5.4 auto "tnsnames.ora: $STANDBY_TNS (standby)" c_5_4 d_tns
+  run_step 5.3 auto "tnsnames.ora entry for the primary ($PRIMARY_TNS)" c_5_3 d_tns
+  run_step 5.4 auto "tnsnames.ora entry for the standby ($STANDBY_TNS)" c_5_4 d_tns
 }
 
 #------------------------------------------------------------------------------
@@ -220,10 +232,10 @@ pwfile_ok() {
 
 PW_SRC=""
 c_6_1() {
-  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
-  rw_home_ok || { NOW="Oracle home is read-only (step 3.8)"; return 2; }
+  db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
+  rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
   local d; d=$(pw_dest)
-  if pwfile_ok; then NOW="$d exists, owner $ORACLE_USER (compared with primary by the login test 7.4)"; return 0; fi
+  if pwfile_ok; then NOW="The password file is in place, owner $ORACLE_USER."$'\n'"  $d"$'\n'"The login test of step 7.4 compares it with the primary."; return 0; fi
   need_ssh || return 2
   # 12.2+: v$passwordfile_info has file_name and format; 12.1: file_name only; else the file in dbs
   local pfile=""
@@ -232,22 +244,23 @@ c_6_1() {
   fi
   if [[ -z "$pfile" || "$pfile" == "-" ]]; then
     if prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && [[ "$(head -n 1 <<< "$RUN_OUT")" == "YES" ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
-    else NOW="The primary password file could not be found (v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist). On primary as $ORACLE_USER:  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
+    else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
   fi
-  [[ "$pfile" =~ ^[+/][A-Za-z0-9_./+-]+$ ]] || { NOW="Primary password file path is unusual: '$pfile'"; return 2; }
-  if [[ -f "$d" ]]; then NOW="$d exists but owner, mode or format is wrong"; else NOW="$d does not exist"; fi
+  [[ "$pfile" =~ ^[+/][A-Za-z0-9_./+-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
+  if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
     if prim_probe statx "$t"; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
       if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#${tmode: -1} & 2 )) -ne 0 ]]; then
-        NOW+=$'\n'"$t on primary is not a file of $GRID_USER/$ORACLE_USER (owner $towner, type $ttype, mode $tmode); it is not used"
+        NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
+        NOW+=$'\n'"It must be a regular file of $GRID_USER or $ORACLE_USER that others cannot write."
         KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
         PLAN="rm -f $t
 asmcmd pwcopy '$pfile' $t
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
-        PLAN_UNDO="rm -f $t   (step 6.2 asks for it after the copy)"
+        PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
         return 1
       fi
       # the age is measured with the clock of the primary
@@ -255,49 +268,53 @@ chmod 640 $t"
     fi
     if [[ -n "$tage" && $tage -gt 86400 ]]; then
       # a copy older than a day (from an earlier attempt) may be from before a sys password change
-      NOW+=$'\n'"An OLD copy $t (owner $towner, $((tage / 3600)) hours older than this run) is on primary; it is not used"
+      NOW+=$'\n'"An old copy $t is on the primary (owner $towner, $((tage / 3600)) hours older than this run)."
+      NOW+=$'\n'"It is not used: the sys password may have changed since then."
       KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
       PLAN="rm -f $t
 asmcmd pwcopy '$pfile' $t
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
-        PLAN_UNDO="rm -f $t   (step 6.2 asks for it after the copy)"
+        PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
       return 1
     fi
-    [[ -n "$tage" && $tage -gt 0 ]] && NOW+=$'\n'"(the copy $t on primary is $((tage / 60)) minutes old: made for this setup, it is used)"
+    [[ -n "$tage" ]] && NOW="The copy $t is ready on the primary$([[ $tage -ge 60 ]] && printf ' (%s minutes old)' "$((tage / 60))")."$'\n'"$NOW"
     if [[ -n "$tage" ]]; then
       PW_SRC=$t
-      PLAN="Copy $t from primary (scp over the open connection, checked with md5sum)
-install it as $d  (owner $ORACLE_USER:$INSTALL_GROUP, mode 640)"
-      [[ -f "$d" ]] && PLAN+=$'\n'"the old file is kept as $d.bak_$RUN_ID"
-      USING="copy made on primary during this run (owner $towner) from $pfile"
+      PLAN="Copy $t from the primary (scp, checked with md5sum)
+Install it here (owner $ORACLE_USER:$INSTALL_GROUP, mode 640):
+  $d"
+      [[ -f "$d" ]] && PLAN+=$'\n'"Keep the old file as ${d##*/}.bak_$RUN_ID (same folder)"
+      USING="Fresh copy of $pfile on the primary (owner $towner)"
       return 1
     fi
-    NOW+=$'\n'"The primary password file is inside ASM: $pfile"
+    NOW+=$'\n'"The primary password file is in ASM: $pfile"
     KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
     PLAN="asmcmd pwcopy '$pfile' $t
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
-        PLAN_UNDO="rm -f $t   (step 6.2 asks for it after the copy)"
-    USING="the script then copies $t (step 6.2 reminds you to delete it)"
+        PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
+    USING="After you run the commands below, the script copies the file to this server."$'\n'"Step 6.2 then asks you to delete it on the primary."
     return 1
   fi
   PW_SRC=$pfile
-  PLAN="Copy $pfile from primary (scp over the open connection, checked with md5sum)
-install it as $d  (owner $ORACLE_USER:$INSTALL_GROUP, mode 640)"
-  [[ -f "$d" ]] && PLAN+=$'\n'"the old file is kept as $d.bak_$RUN_ID"
+  PLAN="Copy the password file from the primary (scp, checked with md5sum):
+  $pfile
+Install it here (owner $ORACLE_USER:$INSTALL_GROUP, mode 640):
+  $d"
+  [[ -f "$d" ]] && PLAN+=$'\n'"Keep the old file as ${d##*/}.bak_$RUN_ID (same folder)"
   return 1
 }
 fetch_primary_file() {
   # $1 file on primary, $2 private local copy. 0 only when the copy is byte-identical (md5).
   local src=$1 tmp=$2 rmd lmd
   rm -f -- "$tmp"
-  prim_scp "$src" "$tmp" || { bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"; printf 'The ssh user %s must be able to read %s on primary.\n' "$PRIMARY_SSH_USER" "$src" | hint; return 1; }
-  [[ -s "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || { bad "The copied file $src is empty"; return 1; }
-  prim_probe md5 "$src" || { bad "Cannot compute md5sum of $src on primary; the copy is not used"; return 1; }
+  prim_scp "$src" "$tmp" || { bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"; printf 'The ssh user %s must be able to read %s on the primary.\n' "$PRIMARY_SSH_USER" "$src" | hint; return 1; }
+  [[ -s "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || { bad "The copy of $src is empty"; return 1; }
+  prim_probe md5 "$src" || { bad "Cannot get the md5sum of $src on the primary. The copy is not used."; return 1; }
   rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT"); lmd=$(md5sum "$tmp" | awk '{print $1}')
-  [[ "$rmd" =~ ^[0-9a-f]{32}$ && "$rmd" == "$lmd" ]] || { bad "The copied file differs from $src on primary (md5 $lmd vs $rmd)"; return 1; }
-  say "md5 checked: same as $src on primary"
+  [[ "$rmd" =~ ^[0-9a-f]{32}$ && "$rmd" == "$lmd" ]] || { bad "The copy differs from $src on the primary (md5 here $lmd, there $rmd)"; return 1; }
+  say "Checksum (md5) is the same as the file on the primary."
 }
 d_6_1() {
   local d tmp; d=$(pw_dest)
@@ -309,7 +326,7 @@ d_6_1() {
   install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 640 "$tmp" "$d" || { bad "Cannot install $d"; return 1; }
   rm -f "$tmp"
   journal_file_written "$d" "$existed"
-  DONE_MSG="Installed $d (copy of the primary password file)"
+  DONE_MSG="The primary password file is installed here:"$'\n'"  $d"
 }
 
 # ---- 6.2 temporary copy on primary ----
@@ -317,9 +334,9 @@ c_6_2() {
   need_ssh || return 2
   local t; t=$(pw_tmp_remote)
   PRIMARY_HOW_STEP="$GRID_USER (or root)  ->  shell"
-  if ! prim_probe owner "$t"; then NOW="No temporary password file copy on primary"; return 0; fi
-  pwfile_ok || { NOW="Password file not installed yet (step 6.1); keep $t for now"; return 2; }
-  NOW="Temporary copy $t is still on primary"
+  if ! prim_probe owner "$t"; then NOW="No temporary password file copy on the primary"; return 0; fi
+  pwfile_ok || { NOW="Keep $t for now: the password file is not installed yet (step 6.1)"; return 2; }
+  NOW="The temporary copy $t is still on the primary"
   PLAN="rm -f $t"
   return 1
 }
@@ -335,7 +352,7 @@ tde_local_autologin() { awk -F'|' 'toupper($4) ~ /LOCAL/' <<< "$TDE_INFO" | grep
 orapki_plan() {
   # creates cwallet.sso next to ewallet.p12 on THIS server; orapki asks for the keystore password itself
   printf 'ORACLE_HOME=%s %s/bin/orapki wallet create -wallet %s %s\n' "$DB_HOME" "$DB_HOME" "$1" "$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')"
-  printf '# orapki asks for the keystore password; it writes %s/cwallet.sso here; the primary is not changed. Then answer r.' "$1"
+  printf '# orapki asks for the keystore password and writes %s/cwallet.sso here.\n# The primary is not changed. Then answer r.' "$1"
 }
 tde_autologin_missing() {
   # 0 when the primary uses a file keystore and this server has no auto-login file for it (ORA-28365 later)
@@ -348,25 +365,25 @@ tde_autologin_missing() {
 }
 sqlnet_has_wallet() { local f; f=$(sqlnet_file); [[ -f "$f" ]] && norm "$(sed 's/#.*//' "$f")" | grep -qF "(DIRECTORY=${1^^})"; }
 c_6_3() {
-  [[ -n "$TDE_INFO" ]] || { NOW="No TDE wallet in use on primary"; return 0; }
+  [[ -n "$TDE_INFO" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   if awk -F'|' 'toupper($1)!="FILE" && toupper($3)!="NOT_AVAILABLE"' <<< "$TDE_INFO" | grep -q .; then
-    NOW="Primary uses a TDE keystore that is not a file (HSM / OKV):"$'\n'"$TDE_INFO"
-    PLAN="Configure the same keystore for $STANDBY_UNIQUE on this server as described by your HSM/OKV vendor."
+    NOW="The primary uses a TDE keystore that is not a file (HSM or OKV):"$'\n'"$TDE_INFO"
+    PLAN="Set up the same keystore for $STANDBY_UNIQUE on this server, as your HSM or OKV vendor describes."
     return 2
   fi
   local -a dirs=(); local d f; mapfile -t dirs < <(tde_dirs)
-  [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="No TDE wallet in use on primary"; return 0; }
+  [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   # 18c+: the password for "IDENTIFIED BY EXTERNAL STORE" is in WALLET_ROOT/tde_seps
   [[ -n "$WALLET_ROOT" ]] && need_ssh && prim_probe lsdir "$WALLET_ROOT/tde_seps" && grep -qx 'cwallet.sso' <<< "$RUN_OUT" && dirs+=("$WALLET_ROOT/tde_seps")
-  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
+  db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   for d in "${dirs[@]}"; do
-    [[ "$d" == /* ]] && v_path "$d" || { NOW="The TDE wallet is at $d (inside ASM or unusual path)"; PLAN="Copy the wallet files by hand to the same location for the standby (asmcmd cp ...)."; return 2; }
+    [[ "$d" == /* ]] && v_path "$d" || { NOW="The TDE wallet is at $d, in ASM or at an unusual path"; PLAN="Copy the wallet files by hand to the same location for the standby, for example with asmcmd cp."; return 2; }
   done
   need_ssh || return 2
   TDE_DIRS=("${dirs[@]}"); TDE_TODO=()
   local miss="" diff="" have=""
   for d in "${dirs[@]}"; do
-    prim_probe lsdir "$d" || { NOW="Cannot list the wallet folder $d on primary (the ssh user must be able to read it)"; return 2; }
+    prim_probe lsdir "$d" || { NOW="Cannot list the wallet folder $d on the primary. The ssh user must be able to read it."; return 2; }
     local found=0
     while IFS= read -r f; do
       [[ "$f" =~ ^(ewallet\.p12|cwallet\.sso)$ ]] || continue
@@ -377,17 +394,19 @@ c_6_3() {
       if prim_probe md5 "$d/$f" && [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" == "$(md5sum "$d/$f" | awk '{print $1}')" ]]; then have+=" $d/$f"
       else diff+=" $d/$f"; TDE_TODO+=("$d/$f"); fi
     done <<< "$RUN_OUT"
-    [[ $found -eq 1 ]] || { NOW="No ewallet.p12 / cwallet.sso in $d on primary"; return 2; }
+    [[ $found -eq 1 ]] || { NOW="No ewallet.p12 or cwallet.sso in $d on the primary"; return 2; }
   done
   # without WALLET_ROOT (12c, or 18c-21c set up the old way) the standby finds the wallet only through sqlnet.ora
   TDE_SQLNET=0
   if [[ -z "$WALLET_ROOT" ]]; then
-    [[ $DB_MAJOR -ge 23 ]] && { NOW="The primary ($PRIMARY_VERSION) uses TDE without WALLET_ROOT; set WALLET_ROOT on the primary first"; return 2; }
+    [[ $DB_MAJOR -ge 23 ]] && { NOW="The primary ($PRIMARY_VERSION) uses TDE without WALLET_ROOT. Set WALLET_ROOT on the primary first."; return 2; }
     if ! sqlnet_has_wallet "${dirs[0]}"; then
       if [[ -f "$(sqlnet_file)" ]] && grep -qiE '^[[:space:]]*ENCRYPTION_WALLET_LOCATION' "$(sqlnet_file)"; then
-        NOW="$(sqlnet_file) already has an ENCRYPTION_WALLET_LOCATION that is not ${dirs[0]}"
-        KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  edit $(sqlnet_file)"
-        PLAN="Change it to:
+        NOW="sqlnet.ora has an ENCRYPTION_WALLET_LOCATION that is not ${dirs[0]}:"$'\n'"  $(sqlnet_file)"
+        KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
+        PLAN="-- Edit this file:
+--   $(sqlnet_file)
+-- Change the ENCRYPTION_WALLET_LOCATION line to:
 ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"
         return 1
       fi
@@ -397,28 +416,28 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   TDE_NO_AUTOLOGIN=0; [[ "$have$miss$diff" == *"cwallet.sso"* ]] || TDE_NO_AUTOLOGIN=1
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 && -f "${dirs[0]}/cwallet.sso" ]]; then TDE_NO_AUTOLOGIN=0; fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 ]]; then
-    NOW="TDE wallet copied, but there is no auto-login keystore (cwallet.sso) here: the copy and the apply would stop (ORA-28365)"
-    tde_local_autologin && NOW+=$'\n'"(the primary uses a LOCAL auto-login wallet, which opens only on the primary host: it is made again here)"
-    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER (THIS server)"
+    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here."$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
+    tde_local_autologin && NOW+=$'\n'"The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is made again here."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"
     PLAN=$(orapki_plan "${dirs[0]}")
     return 1
   fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
-    NOW="TDE wallet is the same as on primary:$have"
-    [[ -n "$WALLET_ROOT" ]] && NOW+=$'\n'"(wallet_root=$WALLET_ROOT comes to the standby with the spfile)" || NOW+=$'\n'"($(sqlnet_file) points to ${dirs[0]})"
+    NOW="The TDE wallet is the same as on the primary:$have"
+    [[ -n "$WALLET_ROOT" ]] && NOW+=$'\n'"wallet_root=$WALLET_ROOT comes to the standby with the spfile." || NOW+=$'\n'"The wallet location ${dirs[0]} is set in:"$'\n'"  $(sqlnet_file)"
     return 0
   fi
   NOW="The primary uses TDE.${miss:+ Missing here:$miss}${diff:+ Different here:$diff}"
-  [[ $TDE_SQLNET -eq 1 ]] && NOW+=$'\n'"$(sqlnet_file) does not point to the wallet ${dirs[0]}"
+  [[ $TDE_SQLNET -eq 1 ]] && NOW+=$'\n'"sqlnet.ora does not point to the wallet ${dirs[0]}:"$'\n'"  $(sqlnet_file)"
   PLAN=""
-  [[ ${#TDE_TODO[@]} -gt 0 ]] && PLAN="Copy from primary (scp, checked with md5sum) to the same path here, owner $ORACLE_USER:$INSTALL_GROUP, mode 600 (old files kept as .bak_$RUN_ID):"$'\n'"$(printf '  %s\n' "${TDE_TODO[@]}")"$'\n'
-  [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add to $(sqlnet_file) (backup kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
+  [[ ${#TDE_TODO[@]} -gt 0 ]] && PLAN="Copy these files from the primary to the same path here (scp, checked with md5sum):"$'\n'"$(printf '  %s\n' "${TDE_TODO[@]}")"$'\n'"Owner $ORACLE_USER:$INSTALL_GROUP, mode 600. Old files are kept as .bak_$RUN_ID."$'\n'
+  [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add this to sqlnet.ora (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
   TDE_NO_AUTOLOGIN=0
   if [[ " ${have} ${TDE_TODO[*]+"${TDE_TODO[*]}"} " != *"cwallet.sso"* ]]; then
     TDE_NO_AUTOLOGIN=1
-    if tde_local_autologin; then PLAN+="The primary uses a LOCAL auto-login wallet (it opens only on the primary host): it is not copied."$'\n'
-    else PLAN+="NO AUTO-LOGIN KEYSTORE (cwallet.sso) on the primary: the copy and the redo apply on the standby would stop with ORA-28365."$'\n'; fi
-    PLAN+="After the copy this step shows the orapki command that makes cwallet.sso on THIS server (no instance needed)."$'\n'
+    if tde_local_autologin; then PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
+    else PLAN+="The primary has no auto-login keystore (cwallet.sso)."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'; fi
+    PLAN+="After the copy, this step shows the orapki command that makes cwallet.sso on this server."$'\n'
   fi
   PLAN=${PLAN%$'\n'}
   return 1
@@ -434,20 +453,20 @@ d_6_3() {
     local existed=0; [[ -e "$f" ]] && existed=1
     backup_file "$f" "$ORACLE_USER" || return 1
     install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 600 "$tmp" "$f" || return 1
-    rm -f "$tmp"; say "installed $f"; journal_file_written "$f" "$existed"
+    rm -f "$tmp"; say "Installed $f"; journal_file_written "$f" "$existed"
   done
   if [[ $TDE_SQLNET -eq 1 ]]; then
     local s; s=$(sqlnet_file)
     backup_file "$s" "$ORACLE_USER" || return 1
     printf '# Added by dg_standby_setup.sh %s (TDE wallet of the standby)\nENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = %s)))\n' "$RUN_ID" "${TDE_DIRS[0]}" \
       | append_as "$ORACLE_USER" "$s" || return 1
-    say "added ENCRYPTION_WALLET_LOCATION to $s"
+    say "Added ENCRYPTION_WALLET_LOCATION to $s"
   fi
 }
 
 phase_6() {
-  phase_header 6 "Password file and TDE wallet (same as primary)"
+  phase_header 6 "Password file and TDE wallet"
   run_step 6.1 auto    "Password file orapw$STANDBY_SID" c_6_1 d_6_1
-  run_step 6.2 primary "Remove the temporary copy on primary" c_6_2
-  run_step 6.3 auto    "TDE wallet (only if the primary uses encryption)" c_6_3 d_6_3
+  run_step 6.2 primary "Remove the temporary copy on the primary" c_6_2
+  run_step 6.3 auto    "TDE wallet (only if the primary uses TDE)" c_6_3 d_6_3
 }

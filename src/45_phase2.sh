@@ -9,7 +9,7 @@ run_cmds() {
   while IFS= read -r c || [[ -n "$c" ]]; do
     [[ -z "$c" ]] && continue
     if ! run_logged "$c" bash -c "$c"; then bad "Failed: $c"; printf '%s\n' "$RUN_OUT" | tail -n 5 | hint; return 1; fi
-    say "ran: $c"
+    [[ "$PLAN" == *"$c"* ]] || say "Ran: $c"      # a command the Plan already shows is not repeated
   done
   return 0
 }
@@ -25,27 +25,27 @@ c_2_1() {
     if [[ -z "$cur" ]]; then
       local other; other=$(getent group "$gid" | cut -d: -f1)
       if [[ -n "$other" ]]; then
-        diff+="gid $gid (needed for $name) is already used here by group $other"$'\n'
+        diff+="Group id $gid is needed for $name, but group $other uses it here"$'\n'
         fix+="groupmod -g <a free gid> $other"$'\n'"groupadd -g $gid $name"$'\n'
       else miss+="groupadd -g $gid $name"$'\n'; fi
     elif [[ "$cur" != "$gid" ]]; then
-      diff+="group $name has gid $cur here, $gid on primary"$'\n'
+      diff+="Group $name has id $cur here and $gid on the primary"$'\n'
       fix+="groupmod -g $gid $name"$'\n'
     fi
   done
   if [[ -n "$diff" ]]; then
     NOW="${diff%$'\n'}"
-    MANUAL_HOW="root  ->  shell (only while no Oracle software is installed here)"
+    MANUAL_HOW="root  ->  shell Do this only while no Oracle software is installed here."
     PLAN="${fix%$'\n'}
-(the gids must be the same on both servers for ASM and the password file to work;
- files that belong to the old gid keep it: find / -xdev -gid <old gid> lists them)"
+-- The group ids must be the same on both servers, for ASM and the password file.
+-- Files of the old id keep it. To list them: find / -xdev -gid <old gid>"
     return 2
   fi
-  if [[ -z "$miss" ]]; then NOW="All ${#_ge[@]} groups exist with the same ids as primary"; return 0; fi
+  if [[ -z "$miss" ]]; then NOW="All ${#_ge[@]} groups exist with the same ids as on the primary"; return 0; fi
   G_TODO=${miss%$'\n'}
   NOW="Missing groups: $(grep -oE '[^ ]+$' <<< "$G_TODO" | paste -sd' ' -)"
   PLAN="$G_TODO"
-  USING="group names and ids read from primary"
+  USING="Group names and ids from the primary"
   return 1
 }
 d_2_1() {
@@ -61,7 +61,7 @@ d_2_1() {
 # ---- 2.2 users ----
 U_TODO=""
 c_2_2() {
-  local spec name uid pg supp g miss_g todo="" err="" fix=""
+  local spec name uid pg supp g miss_g todo="" err="" fix="" why=""
   local -a specs=("$ORACLE_USER|$ORACLE_UID|$INSTALL_GROUP|$ORACLE_GROUPS")
   single_owner || specs+=("$GRID_USER|$GRID_UID|$GRID_PGROUP|$GRID_GROUPS")
   for spec in "${specs[@]}"; do
@@ -69,34 +69,34 @@ c_2_2() {
     if ! id "$name" >/dev/null 2>&1; then
       local other; other=$(getent passwd "$uid" | cut -d: -f1)
       if [[ -n "$other" ]]; then
-        err+="uid $uid (needed for $name) is already used here by user $other"$'\n'
+        err+="User id $uid is needed for $name, but user $other uses it here"$'\n'
         fix+="usermod -u <a free uid> $other"$'\n'; continue
       fi
-      todo+="useradd -m -s /bin/bash -u $uid -g $pg${supp:+ -G $supp} $name"$'\n'; continue
+      todo+="useradd -m -s /bin/bash -u $uid -g $pg${supp:+ -G $supp} $name"$'\n'; why+="$name does not exist yet"$'\n'; continue
     fi
-    [[ "$(id -u "$name")" == "$uid" ]] || { err+="user $name has uid $(id -u "$name") here, $uid on primary"$'\n'; fix+="usermod -u $uid $name"$'\n'; continue; }
-    [[ "$(id -gn "$name")" == "$pg" ]] || todo+="usermod -g $pg $name"$'\n'
+    [[ "$(id -u "$name")" == "$uid" ]] || { err+="User $name has id $(id -u "$name") here and $uid on the primary"$'\n'; fix+="usermod -u $uid $name"$'\n'; continue; }
+    [[ "$(id -gn "$name")" == "$pg" ]] || { todo+="usermod -g $pg $name"$'\n'; why+="$name has another primary group than on the primary ($pg)"$'\n'; }
     miss_g=""
     IFS=',' read -ra _gl <<< "$supp"
     for g in "${_gl[@]}"; do [[ -n "$g" ]] && ! in_group "$name" "$g" && miss_g+="$g,"; done
-    [[ -n "$miss_g" ]] && todo+="usermod -a -G ${miss_g%,} $name"$'\n'
+    [[ -n "$miss_g" ]] && { todo+="usermod -a -G ${miss_g%,} $name"$'\n'; why+="$name is missing groups it has on the primary: $(sed 's/,$//; s/,/, /g' <<< "$miss_g")"$'\n'; }
   done
   if [[ -n "$err" ]]; then
     NOW="${err%$'\n'}"
-    MANUAL_HOW="root  ->  shell (only while no Oracle software is installed here)"
+    MANUAL_HOW="root  ->  shell Do this only while no Oracle software is installed here."
     PLAN="${fix%$'\n'}
-(files of the old uid keep it: find / -xdev -uid <old uid> lists them)"
+-- Files of the old id keep it. To list them: find / -xdev -uid <old uid>"
     return 2
   fi
   if [[ -z "$todo" ]]; then
-    if single_owner; then NOW="$ORACLE_USER ($ORACLE_UID) exists with the same groups as primary"
-    else NOW="$ORACLE_USER ($ORACLE_UID) and $GRID_USER ($GRID_UID) exist with the same groups as primary"; fi
+    if single_owner; then NOW="$ORACLE_USER ($ORACLE_UID) exists with the same groups as on the primary"
+    else NOW="$ORACLE_USER ($ORACLE_UID) and $GRID_USER ($GRID_UID) exist with the same groups as on the primary"; fi
     return 0
   fi
   U_TODO=${todo%$'\n'}
-  NOW="Users are missing or miss some groups"
+  NOW="${why%$'\n'}"
   PLAN="$U_TODO"
-  USING="uid, primary group and groups of each user on primary"
+  USING="Id, primary group and other groups of each user, from the primary"
   return 1
 }
 d_2_2() {
@@ -106,7 +106,7 @@ d_2_2() {
     [[ "$c" =~ ^useradd\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal USER "${BASH_REMATCH[1]}" "$c"
     [[ "$c" =~ ^usermod\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal USERMOD "${BASH_REMATCH[1]}" "$c"
   done <<< "$U_TODO"
-  say "Passwords are not needed by this script (set them with passwd if you want to log in as these users)."
+  return 0
 }
 
 # ---- 2.3 packages ----
@@ -128,33 +128,34 @@ need_pkgs() {
 }
 P_MISS=()
 c_2_3() {
-  command -v rpm >/dev/null 2>&1 || { NOW="rpm not found: this server is not Oracle Linux / RHEL"; return 2; }
+  command -v rpm >/dev/null 2>&1 || { NOW="rpm is not found. This server is not Oracle Linux or RHEL."; return 2; }
   local p; P_MISS=()
   while IFS= read -r p; do rpm -q "$p" >/dev/null 2>&1 || P_MISS+=("$p"); done < <(need_pkgs)
   if [[ ${#P_MISS[@]} -eq 0 ]]; then NOW="Required packages are installed"; return 0; fi
   NOW="Missing packages: ${P_MISS[*]}"
-  PLAN="$PKG install -y <package>   (one package at a time, so one that is not found does not stop the others):
-  ${P_MISS[*]}
-($(preinstall_pkg) sets kernel parameters and limits for the user oracle; it does not change existing users)"
-  USING="Oracle Linux $OS_MAJOR, database $DB_MAJOR"
+  PLAN="Install with $PKG, one package at a time:
+  ${P_MISS[*]}"
+  USING="Oracle Linux $OS_MAJOR, database $DB_MAJOR
+$(preinstall_pkg) sets kernel parameters and limits for the user oracle.
+It does not change existing users."
   return 1
 }
 d_2_3() {
   local p failed=()
   for p in "${P_MISS[@]}"; do
-    if run_logged "$PKG install -y $p" "$PKG" install -y "$p" && rpm -q "$p" >/dev/null 2>&1; then say "installed: $p"; journal PKG "$p"
+    if run_logged "$PKG install -y $p" "$PKG" install -y "$p" && rpm -q "$p" >/dev/null 2>&1; then say "Installed: $p"; journal PKG "$p"
     else failed+=("$p"); bad "Not installed: $p ($(grep -iE 'no package|unable to find|error' <<< "$RUN_OUT" | head -n 1))"; fi
   done
   [[ ${#failed[@]} -eq 0 ]] && return 0
   local repo
   case "$OS_MAJOR" in 7) repo="ol7_latest ol7_addons" ;; 8) repo="ol8_baseos_latest ol8_appstream ol8_addons" ;; *) repo="ol${OS_MAJOR}_baseos_latest ol${OS_MAJOR}_appstream ol${OS_MAJOR}_addons" ;; esac
   {
-    printf 'Usually a repository is not enabled, or there is no internet / local repository.\n'
-    printf 'Check:   %s repolist      (needed: %s)\n' "$PKG" "$repo"
+    printf 'Usually a repository is not enabled, or there is no internet or local repository.\n'
+    printf 'Check:   %s repolist   (needed: %s)\n' "$PKG" "$repo"
     if [[ "$PKG" == "yum" ]]; then printf 'Enable:  yum-config-manager --enable <repo>\n'; else printf 'Enable:  dnf config-manager --set-enabled <repo>\n'; fi
-    printf 'Not every preinstall package exists for every Oracle Linux release (for example 12c on OL8 or OL9).\n'
-    [[ " ${failed[*]} " == *" oracleasm-support "* ]] && printf 'Without oracleasm-support the ASM disks can use udev rules instead: skip this step, then step 2.12 offers udev.\n'
-    printf 'Then install them yourself and answer r:  %s install -y %s\n' "$PKG" "${failed[*]}"
+    printf 'Some preinstall packages do not exist for every release, for example 12c on OL8 or OL9.\n'
+    [[ " ${failed[*]} " == *" oracleasm-support "* ]] && printf 'Without oracleasm-support, the ASM disks can use udev rules instead.\nTo do that, skip this step. Step 2.12 then offers udev.\n'
+    printf 'Then install them yourself and answer r:\n  %s install -y %s\n' "$PKG" "${failed[*]}"
   } | hint
   return 1
 }
@@ -175,13 +176,15 @@ c_2_4() {
     [[ -n "$u" ]] || continue
     grep -qsE "^[[:space:]]*$u[[:space:]]+hard[[:space:]]+nofile" /etc/security/limits.d/*.conf /etc/security/limits.conf 2>/dev/null || miss+=("$u")
   done < <(limit_users)
-  if [[ -z "$(limit_users)" ]]; then NOW="Not needed (the only Oracle owner is oracle; $(preinstall_pkg) sets its limits)"; return 0; fi
-  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits exist for: $(limit_users | paste -sd' ' -)"; return 0; fi
+  if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
+  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits are set for: $(limit_users | paste -sd' ' -)"; return 0; fi
   LIM_TODO=("${miss[@]}")
-  NOW="No limits for: ${miss[*]} (the preinstall package sets them only for the user named oracle)"
-  PLAN="Write $LIMITS_FILE: nofile 1024/65536, nproc 16384, stack 10240/32768, memlock unlimited for ${miss[*]}"
+  NOW="No limits are set for: ${miss[*]}
+The preinstall package sets limits only for the user named oracle."
+  PLAN="Add limits for ${miss[*]} to $LIMITS_FILE:
+nofile 1024/65536, nproc 16384, stack 10240/32768, memlock unlimited"
   [[ "$ORACLE_USER" != "oracle" ]] && ! id oracle >/dev/null 2>&1 && \
-    PLAN+=$'\n'"Note: the preinstall package may create a user named oracle (uid 54321); it is not used by this standby."
+    PLAN+=$'\n'"The preinstall package may create a user named oracle (uid 54321). This standby does not use it."
   return 1
 }
 d_2_4() {
@@ -205,18 +208,18 @@ make_dir() {
   local -a parts=()
   case "$path" in /etc/ORACLE|/etc/ORACLE/*) ;;   # Oracle's default wallet location
     /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/tmp)
-    bad "Refused to create or change the system folder $path"; return 1 ;; esac
+    bad "$path is a system folder. It is not created or changed."; return 1 ;; esac
   IFS='/' read -ra parts <<< "${path#/}"
   for comp in "${parts[@]}"; do
     [[ -n "$comp" ]] || continue
     p+="/$comp"
     if [[ -L "$p" ]]; then
       local lo; lo=$(stat -c '%U' "$p")
-      [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo; not used"; return 1; }
+      [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo. It is not used."; return 1; }
     fi
-    if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "created $p"; journal DIR "$p" "owner $owner"; fi
+    if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
   done
-  [[ -L "$path" ]] && { bad "$path is a symbolic link; its owner is not changed"; return 0; }
+  [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
   if [[ -z "$(ls -A "$path" 2>/dev/null)" ]]; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
 }
 dir_specs() {
@@ -227,20 +230,21 @@ existing_parent() { local p=$1; while [[ ! -e "$p" && "$p" != "/" ]]; do p=$(dir
 mnt_of() { df --output=target -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1; }
 free_mb_of() { local f; f=$(df -m --output=avail -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1 | tr -d ' '); num "$f" && printf '%s' "$f" || printf '0'; }
 c_2_5() {
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   local d own miss="" wrong="" fixw=""
   while IFS=: read -r d own; do
-    if [[ ! -d "$d" ]]; then miss+="$d ($own)"$'\n'; continue; fi
+    if [[ ! -d "$d" ]]; then miss+="  $d  (owner $own)"$'\n'; continue; fi
     local cur; cur=$(stat -c '%U' "$d")
     if [[ "$cur" != "$own" && ! ( "$cur" == "root" && "$d" == "$GRID_HOME" ) ]]; then
-      if [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then miss+="$d (owner $cur -> $own)"$'\n'
-      else wrong+="$d is owned by $cur (expected $own) and is not empty"$'\n'; fixw+="chown $own:$INSTALL_GROUP $d"$'\n'; fi
+      if [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
+      else wrong+="$d is not empty and belongs to $cur, not $own"$'\n'; fixw+="chown $own:$INSTALL_GROUP $d"$'\n'; fi
     fi
   done < <(dir_specs)
   if [[ -n "$wrong" ]]; then
     NOW="${wrong%$'\n'}"
-    MANUAL_HOW="root  ->  shell (only if these files belong to this standby setup)"
-    PLAN="Check what is in the folder first (ls -la). If it is right to change the owner:
+    MANUAL_HOW="root  ->  shell Only if these files belong to this standby setup."
+    PLAN="-- First check what is in the folder (ls -la).
+-- Change the owner only if that is right:
 ${fixw%$'\n'}"
     return 2
   fi
@@ -249,15 +253,15 @@ ${fixw%$'\n'}"
   for h in "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"}; do
     [[ -n "$(ls -A "$h" 2>/dev/null)" ]] && continue
     use_grid || [[ "$h" != "$GRID_HOME" ]] || continue
-    [[ $(free_mb_of "$h") -ge 15360 ]] || short+="$(mnt_of "$h") has $(human_mb "$(free_mb_of "$h")") free for $h (needs about 15 GB); "
+    [[ $(free_mb_of "$h") -ge 15360 ]] || short+="$(mnt_of "$h") has $(human_mb "$(free_mb_of "$h")") free for $h. It needs about 15 GB."$'\n'
   done
-  [[ -n "$short" ]] && warn "Little space for the software: $short"
-  if [[ -z "$miss" ]]; then NOW="Folders exist with correct owners"; return 0; fi
-  NOW="Missing folders or wrong owner on empty folders"
-  PLAN="Create (owner, group $INSTALL_GROUP, mode 775):
+  [[ -n "$short" ]] && warn "Little free space for the software:"$'\n'"${short%$'\n'}"
+  if [[ -z "$miss" ]]; then NOW="The folders exist and have the right owners"; return 0; fi
+  NOW="Some folders are missing, or an empty folder has the wrong owner"
+  PLAN="Create these folders, or set their owner (group $INSTALL_GROUP, mode 775):
 ${miss%$'\n'}
-Owners of existing non-empty folders are never changed"
-  USING="same paths as on primary"
+Folders that are not empty keep their owner."
+  USING="Same paths as on the primary"
   return 1
 }
 d_2_5() { local d own; while IFS=: read -r d own; do make_dir "$d" "$own" || return 1; done < <(dir_specs); }
@@ -274,32 +278,33 @@ c_2_6() {
       if [[ "$want" =~ ^[0-9.]+$ ]]; then
         local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(hostname 2>/dev/null) && [[ "$fq" == *.* && "${fq%%.*}" == "$h" ]] || fq=""
         todo+="$want    ${fq:+$fq }$h"$'\n'
-      else NOW="$h does not resolve and no IP is known"; return 2; fi
+      else NOW="$h does not resolve, and its IP address is not known"; return 2; fi
     elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" && "$ip" != 127.* ]]; then
-      wrong+="$h resolves to $ip here, expected $want"$'\n'
+      wrong+="$h resolves to $ip here, but should be $want"$'\n'
     fi
   done
   local sip; sip=$(v4_of "$STANDBY_HOST")
   if [[ "$sip" == 127.* ]]; then
     # the Grid listener would listen only on loopback; primary could not reach it
-    NOW="$STANDBY_HOST resolves to $sip (loopback) on this server"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  edit /etc/hosts"
-    PLAN="In /etc/hosts remove $STANDBY_HOST from the 127.x line and add:
+    NOW="$STANDBY_HOST resolves to $sip (loopback) on this server
+The primary could not reach the listener here."
+    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
+    PLAN="-- In /etc/hosts, remove $STANDBY_HOST from the 127.x line, then add this line:
 $STANDBY_IP    $STANDBY_HOST"
     return 1
   fi
   if [[ -n "$wrong" ]]; then
     NOW="${wrong%$'\n'}"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  edit /etc/hosts (or the DNS entry)"
-    PLAN="Make the names resolve to the right addresses, for example in /etc/hosts:
+    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
+    PLAN="-- Make the names resolve to these addresses, in DNS or in /etc/hosts:
 $PRIMARY_IP    $PRIMARY_HOST
 $STANDBY_IP    $STANDBY_HOST"
     return 1
   fi
-  if [[ -z "$todo" ]]; then NOW="$PRIMARY_HOST -> $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST -> $sip"; return 0; fi
+  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $sip"; return 0; fi
   H_TODO=${todo%$'\n'}
-  NOW="Host names do not resolve on this server"
-  PLAN="Add to /etc/hosts (a backup copy is kept):
+  NOW="The host names do not resolve on this server"
+  PLAN="Add these lines to /etc/hosts (a backup is kept):
 $H_TODO"
   return 1
 }
@@ -316,15 +321,15 @@ c_2_7() {
   need_ssh || return 2
   if prim_probe hosts "$STANDBY_HOST" && [[ -n "$(awk '{print $1; exit}' <<< "$RUN_OUT")" ]]; then
     local pip; pip=$(awk '{print $1; exit}' <<< "$RUN_OUT")
-    if [[ "$pip" == "$STANDBY_IP" ]]; then NOW="Primary resolves $STANDBY_HOST -> $pip"; return 0; fi
-    NOW="Primary resolves $STANDBY_HOST -> $pip, but this server is $STANDBY_IP"
-    PRIMARY_HOW_STEP="root  ->  edit /etc/hosts (or DNS)"
-    PLAN="Change the line for $STANDBY_HOST in /etc/hosts on primary to:
+    if [[ "$pip" == "$STANDBY_IP" ]]; then NOW="The primary resolves $STANDBY_HOST to $pip"; return 0; fi
+    NOW="The primary resolves $STANDBY_HOST to $pip, but this server is $STANDBY_IP"
+    PRIMARY_HOW_STEP="root  ->  shell"
+    PLAN="-- In /etc/hosts on the primary (or in DNS), change the line for $STANDBY_HOST to:
 $STANDBY_IP    $STANDBY_HOST"
     PLAN_UNDO="put back the line '$pip    $STANDBY_HOST' in /etc/hosts on the primary"
     return 1
   fi
-  NOW="Primary does not resolve $STANDBY_HOST"
+  NOW="The primary does not resolve $STANDBY_HOST"
   PRIMARY_HOW_STEP="root  ->  shell"
   PLAN="echo '$STANDBY_IP    $STANDBY_HOST' >> /etc/hosts"
   PLAN_UNDO="remove the line '$STANDBY_IP    $STANDBY_HOST' from /etc/hosts on the primary"
@@ -334,11 +339,12 @@ $STANDBY_IP    $STANDBY_HOST"
 # ---- 2.8 network to primary listener ----
 c_2_8() {
   if timeout 5 bash -c "exec 3<>/dev/tcp/$PRIMARY_IP/$PORT" 2>/dev/null; then NOW="$PRIMARY_IP:$PORT is reachable"; return 0; fi
-  NOW="Cannot open TCP $PRIMARY_IP:$PORT (a firewall on the primary or in the network between the servers)"
-  KIND_NOW=primary; PRIMARY_HOW_STEP="root  ->  shell (only if the primary runs firewalld; else ask the network team)"
+  NOW="Cannot connect to $PRIMARY_IP:$PORT
+A firewall on the primary, or in the network, blocks it."
+  KIND_NOW=primary; PRIMARY_HOW_STEP="root  ->  shell Only if the primary runs firewalld. Otherwise ask the network team."
   # added only when it is not open yet, and without a reload (a reload would drop rules the primary admin added at runtime)
   PLAN="firewall-cmd --query-port=$PORT/tcp || { firewall-cmd --add-port=$PORT/tcp ; firewall-cmd --permanent --add-port=$PORT/tcp ; }
-# if the port was open already, the block is in the network between the servers: ask the network team"
+# If the port was already open, the network blocks it: ask the network team."
   PLAN_UNDO="only if the port was NOT open before (else clients of the primary lose it): firewall-cmd --remove-port=$PORT/tcp ; firewall-cmd --permanent --remove-port=$PORT/tcp"
   return 1
 }
@@ -371,11 +377,11 @@ d_2_9() {
 # ---- 2.10 time ----
 c_2_10() {
   if systemctl is-active --quiet chronyd 2>/dev/null; then
-    if grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)"; then NOW="chronyd is running, clock in sync"; else NOW="chronyd is running (sync not confirmed yet)"; fi
+    if grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)"; then NOW="chronyd is running and the clock is in sync"; else NOW="chronyd is running; the sync is not confirmed yet"; fi
     return 0
   fi
-  if systemctl is-active --quiet ntpd 2>/dev/null; then NOW="ntpd is running (time synchronization)"; return 0; fi
-  NOW="No time synchronization is running (chronyd or ntpd)"
+  if systemctl is-active --quiet ntpd 2>/dev/null; then NOW="ntpd is running"; return 0; fi
+  NOW="No time sync is running (neither chronyd nor ntpd)"
   PLAN="systemctl enable --now chronyd"
   return 1
 }
@@ -393,38 +399,43 @@ profile_specs() {
 }
 profile_block() { printf '# Added by dg_standby_setup.sh (Data Guard standby %s)\nexport ORACLE_BASE=%s\nexport ORACLE_HOME=%s\nexport ORACLE_SID=%s\nexport PATH=$ORACLE_HOME/bin:$PATH\n' "$STANDBY_UNIQUE" "$2" "$3" "$4"; }
 c_2_11() {
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   local entry usr base home sid cur csid chome cbase todo=() report="" okl="" over=""
   while IFS= read -r entry; do
     IFS='|' read -r usr base home sid <<< "$entry"
     cur=$(login_env "$usr"); IFS='|' read -r csid chome cbase <<< "$cur"
-    if [[ "$csid" == "$sid" && "${chome%/}" == "$home" && "${cbase%/}" == "$base" ]]; then okl+="$usr -> $sid  "; continue; fi
+    if [[ "$csid" == "$sid" && "${chome%/}" == "$home" && "${cbase%/}" == "$base" ]]; then okl+="${okl:+, }$usr ($sid)"; continue; fi
     local prof; prof="$(home_of "$usr")/.bash_profile"
     if [[ -f "$prof" ]] && grep -qxF "export ORACLE_SID=$sid" "$prof" && grep -qxF "export ORACLE_HOME=$home" "$prof" && grep -qF "dg_standby_setup.sh" "$prof"; then
-      over+="$usr: the lines are in $prof, but after login the values are ORACLE_SID=${csid:-<not set>} ORACLE_HOME=${chome:-<not set>}"$'\n'
+      over+="$usr: the lines are in $prof, but after login the values are:"$'\n'"  ORACLE_SID=${csid:-<not set>}  ORACLE_HOME=${chome:-<not set>}"$'\n'
       continue
     fi
     todo+=("$entry")
-    report+="$usr now has: ORACLE_SID=${csid:-<not set>} ORACLE_HOME=${chome:-<not set>} ORACLE_BASE=${cbase:-<not set>}"$'\n'
+    report+="$usr now has: ORACLE_SID=${csid:-<not set>}  ORACLE_HOME=${chome:-<not set>}  ORACLE_BASE=${cbase:-<not set>}"$'\n'
   done < <(profile_specs)
   if [[ -n "$over" ]]; then
     NOW="${over%$'\n'}"
-    KIND_NOW=manual; MANUAL_HOW="the user  ->  edit the login files"
-    PLAN="Something that runs after ~/.bash_profile sets other values (often ~/.bashrc or /etc/profile.d/*.sh):
+    KIND_NOW=manual; MANUAL_HOW="the Oracle user  ->  shell"
+    PLAN="-- A file read after ~/.bash_profile sets other values, often ~/.bashrc or /etc/profile.d/*.sh.
+-- To find the lines:
 grep -n 'ORACLE_' ~/.bashrc /etc/profile.d/*.sh
-Remove or correct those lines, then answer r."
+-- Remove or correct them, then answer r."
     return 1
   fi
-  if [[ ${#todo[@]} -eq 0 ]]; then NOW="Profiles correct: $okl"; return 0; fi
+  if [[ ${#todo[@]} -eq 0 ]]; then NOW="Environment is correct: $okl"; return 0; fi
   PROF_TODO=("${todo[@]}")
   NOW="${report%$'\n'}"
-  PLAN="Append to ~/.bash_profile of each user (backup kept; old lines stay, the new lines win):"
+  PLAN="Add these settings to ~/.bash_profile of each user (a backup is kept):"
   local others; others=$(grep -vE '^\s*(#|$|\+ASM)' /etc/oratab 2>/dev/null | cut -d: -f1 | grep -vx -- "$STANDBY_SID" | paste -sd' ' -)
-  [[ -n "$others" ]] && USING="NOTE: /etc/oratab lists other databases on this server ($others): the default ORACLE_SID of $ORACLE_USER becomes $STANDBY_SID"
+  [[ -n "$others" ]] && USING="/etc/oratab lists other databases here: $others
+After this, the default ORACLE_SID of $ORACLE_USER is $STANDBY_SID."
   for entry in "${todo[@]}"; do
     IFS='|' read -r usr base home sid <<< "$entry"
-    PLAN+=$'\n'"  $usr:  ORACLE_BASE=$base  ORACLE_HOME=$home  ORACLE_SID=$sid  PATH=\$ORACLE_HOME/bin:\$PATH"
+    PLAN+=$'\n'"  $usr:"
+    PLAN+=$'\n'"    ORACLE_BASE=$base"$'\n'"    ORACLE_HOME=$home"
+    PLAN+=$'\n'"    ORACLE_SID=$sid"$'\n'"    PATH=\$ORACLE_HOME/bin:\$PATH"
   done
+  PLAN+=$'\n'"Existing lines stay; the new lines come last, so they win."
   return 1
 }
 d_2_11() {
@@ -432,7 +443,7 @@ d_2_11() {
   for entry in "${PROF_TODO[@]}"; do
     IFS='|' read -r usr base home sid <<< "$entry"
     prof="$(home_of "$usr")/.bash_profile"
-    [[ -L "$prof" ]] && { bad "$prof is a symbolic link; not changed"; return 1; }
+    [[ -L "$prof" ]] && { bad "$prof is a symbolic link. It is not changed."; return 1; }
     backup_file "$prof" "$usr" || return 1
     profile_block "$usr" "$base" "$home" "$sid" | append_as "$usr" "$prof" || { bad "Cannot write $prof"; return 1; }
     profile_block "$usr" "$base" "$home" "$sid" | log_block "added to $prof"
@@ -456,15 +467,16 @@ c_2_12() {
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
   local m; m=$(asm_method); A212_MODE=""
   if [[ "$m" == "udev" ]]; then
-    NOW="ASM disks use udev rules ($UDEV_RULES, devices in /dev/oraasm; no ASMLib on this kernel)"
-    if [[ "$ASM_METHOD" != "udev" && "$MODE" == "run" ]]; then ASM_METHOD=udev; save_settings; journal SETTING ASM_METHOD "ASM_METHOD=udev"; NOW+=" - saved"; fi
+    NOW="ASM disks use udev rules, with devices in /dev/oraasm
+Rules file: $UDEV_RULES"
+    if [[ "$ASM_METHOD" != "udev" && "$MODE" == "run" ]]; then ASM_METHOD=udev; save_settings; journal SETTING ASM_METHOD "ASM_METHOD=udev"; NOW+=$'\n'"This choice is saved in the settings."; fi
     return 0
   fi
   if ! command -v oracleasm >/dev/null 2>&1; then
-    if [[ -n "$(asm_labels_all)" ]]; then NOW="oracleasm is not installed, but ASM disks were made with it before (step 2.3)"; return 2; fi
+    if [[ -n "$(asm_labels_all)" ]]; then NOW="oracleasm is not installed, but earlier ASM disks were made with it (step 2.3)"; return 2; fi
     NOW="ASMLib (oracleasm-support) is not installed"
-    PLAN="Use udev rules for the ASM disks instead of ASMLib (works on every kernel)
-(or install oracleasm-support in step 2.3 and answer s here, then run the script again)"
+    PLAN="Use udev rules for the ASM disks instead of ASMLib. They work on every kernel.
+To use ASMLib instead: answer s, install oracleasm-support (step 2.3), then run the script again."
     A212_MODE=to_udev
     return 1
   fi
@@ -475,8 +487,16 @@ c_2_12() {
   fi
   [[ $(grep -c ': yes' <<< "$st") -ge 2 ]] || need+="oracleasm init"$'\n'
   systemctl is-enabled --quiet oracleasm 2>/dev/null || need+="systemctl enable oracleasm"$'\n'
-  if [[ -z "$need" && "$ASM_METHOD" == "asmlib" ]]; then NOW="ASMLib configured for $GRID_USER:$ag, loaded, and started at boot"; return 0; fi
-  NOW="ASMLib (oracleasm) is not configured, not loaded or not started at boot"
+  if [[ -z "$need" && "$ASM_METHOD" == "asmlib" ]]; then NOW="ASMLib is configured for $GRID_USER:$ag, loaded, and starts at boot"; return 0; fi
+  if [[ "$need" == "systemctl enable oracleasm"$'\n' ]]; then NOW="ASMLib is configured and loaded, but does not start at boot"
+  elif [[ -z "$need" ]]; then NOW="ASMLib is configured and loaded, but not yet chosen for the ASM disks"
+  else
+    local nl=""
+    [[ "$need" == *"oracleasm configure"* ]] && nl+="${nl:+; }not configured for $GRID_USER:$ag"
+    [[ "$need" == *"oracleasm init"* ]] && nl+="${nl:+; }not loaded"
+    [[ "$need" == *"systemctl enable"* ]] && nl+="${nl:+; }does not start at boot"
+    NOW="ASMLib (oracleasm): $nl"
+  fi
   PLAN="${need%$'\n'}"
   [[ -n "$PLAN" ]] || PLAN="Use ASMLib for the ASM disks"
   A212_MODE=asmlib
@@ -592,36 +612,55 @@ free_disks() {
 A213_FOREIGN=""
 c_2_13() {
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
-  [[ "$(asm_method)" == "udev" ]] || command -v oracleasm >/dev/null 2>&1 || { NOW="oracleasm not installed (step 2.12)"; return 2; }
-  local dg have="" miss="" short="" l foreign="" min hv
+  [[ "$(asm_method)" == "udev" ]] || command -v oracleasm >/dev/null 2>&1 || { NOW="oracleasm is not installed (step 2.12)"; return 2; }
+  local dg have="" miss="" short="" l foreign="" min hv ready="" x fl xm
   for dg in $(asm_dgs); do
-    l=$(asm_foreign "$dg"); [[ -n "$l" ]] && foreign+="+$dg: $(paste -sd' ' - <<< "$l")"$'\n'
+    ready+=" +$dg"
+    l=$(asm_foreign "$dg")
+    if [[ -n "$l" ]]; then
+      fl=""; for x in $l; do xm=$(label_mb "$x"); fl+="${fl:+, }$x$([[ $xm -gt 0 ]] && printf ' (%s)' "$(human_mb "$xm")")"; done
+      foreign+="  +$dg: $fl"$'\n'
+    fi
     min=$(dg_min_mb "$dg"); hv=$(dg_have_mb "$dg")
     if [[ -z "$(asm_labels "$dg")" ]]; then miss+=" +$dg"
-    elif [[ $hv -lt $min ]]; then short+=" +$dg"; have+="+$dg: $(asm_labels "$dg" | paste -sd' ' -) ($(human_mb "$hv"), needs $(human_mb "$min"))   "
-    else have+="+$dg: $(asm_labels "$dg" | paste -sd' ' -) ($(human_mb "$hv"))   "; fi
+    elif [[ $hv -lt $min ]]; then short+=" +$dg"; have+="  +$dg: $(asm_labels "$dg" | paste -sd' ' -)  ($(human_mb "$hv"), needs $(human_mb "$min"))"$'\n'
+    else have+="  +$dg: $(asm_labels "$dg" | paste -sd' ' -)  ($(human_mb "$hv"))"$'\n'; fi
   done
   A213_FOREIGN=${foreign%$'\n'}
-  if [[ -z "$miss$short$foreign" ]]; then NOW="ASM disks: $have"; return 0; fi
-  NOW=""
-  [[ -n "$have" ]] && NOW+="ASM disks: $have"$'\n'
-  [[ -n "$miss" ]] && NOW+="No ASM disks yet for:$miss"$'\n'
-  [[ -n "$short" ]] && NOW+="Too small:$short (more disks are added)"$'\n'
-  [[ -n "$foreign" ]] && NOW+="ASM disks that this script did not make (you are asked whether to use them):"$'\n'"$A213_FOREIGN"$'\n'
-  NOW=${NOW%$'\n'}
+  if [[ -z "$miss$short$foreign" ]]; then NOW="ASM disks are ready for:$ready"$'\n'"${have%$'\n'}"; return 0; fi
   local fd; fd=$(free_disks)
-  PLAN="You choose EMPTY disks (one or more) for each disk group; the list is below
-Each chosen disk: parted mklabel gpt + one partition, then"
-  if [[ "$(asm_method)" == "asmlib" ]]; then PLAN+=" oracleasm createdisk <DG>_1, <DG>_2 ..."
-  else PLAN+=" a udev rule (partition UUID) -> /dev/oraasm/<DG>_1, owner $GRID_USER:$(asm_owner_group), mode 0660"; fi
-  PLAN+=$'\n'"All chosen disks are checked first; you type each disk name to confirm; disks with any data are refused"
-  USING="Size needed (database files of primary + 10%; recovery area: what a standby needs, see step 8.1):"
+  NOW=""
+  if [[ -n "$miss" ]]; then
+    local -a mw=(); read -ra mw <<< "$miss"
+    local ml=${mw[${#mw[@]}-1]}
+    [[ ${#mw[@]} -gt 1 ]] && ml="$(printf '%s, ' "${mw[@]:0:${#mw[@]}-1}")"; [[ ${#mw[@]} -gt 1 ]] && ml="${ml%, } and ${mw[${#mw[@]}-1]}"
+    NOW+="No disks are assigned yet to $ml."$'\n'
+  fi
+  [[ -n "$short" ]] && NOW+="Too small, more disks are added for:$short"$'\n'
+  [[ -n "$foreign" ]] && NOW+="Existing ASM disks found (not created by this script):"$'\n'"$A213_FOREIGN"$'\n'
+  [[ -n "$have" ]] && NOW+="ASM disks:"$'\n'"$have"
+  [[ -n "$foreign" && -z "$fd" ]] && NOW+="No empty disk was found, so no disk will be partitioned."
+  NOW=${NOW%$'\n'}
+  PLAN=""
+  [[ -n "$foreign" ]] && PLAN="Ask you, for each disk group, whether to use its existing ASM disks."
+  if [[ -n "$fd" || -z "$foreign" ]]; then
+    [[ -n "$foreign" ]] && PLAN+=$'\n'"Then, for each disk group that still needs disks:"
+    PLAN+=$'\n'"Choose one or more empty disks for each disk group (list below)
+Each chosen disk gets a GPT label and one partition"
+    if [[ "$(asm_method)" == "asmlib" ]]; then PLAN+=$'\n'"Then: oracleasm createdisk <DG>_1, <DG>_2 ..."
+    else PLAN+=$'\n'"Then a udev rule makes /dev/oraasm/<DG>_1, owner $GRID_USER:$(asm_owner_group), mode 0660"; fi
+    PLAN+=$'\n'"All chosen disks are checked first. Disks with any data are refused."
+    PLAN+=$'\n'"You type each disk name to confirm it."
+  fi
+  PLAN=${PLAN#$'\n'}
+  USING="Size needed (database files of the primary + 10%, plus the recovery area):"
   for dg in $(asm_dgs); do USING+=$'\n'"  +$dg  at least $(human_mb "$(dg_min_mb "$dg")")"; done
   if [[ -n "$fd" ]]; then
     USING+=$'\n'"Empty disks found:"
     while read -r l; do USING+=$'\n'"  ${l%% *}  $(human_mb "${l##* }")"; done <<< "$fd"
   else
-    USING+=$'\n'"No empty disk found on this server (multipath devices are not offered: see --help-step 2.13)"
+    [[ -n "$foreign" ]] || USING+=$'\n'"No empty disk was found on this server."
+    USING+=$'\n'"Multipath devices are not offered; see --help-step 2.13"
   fi
   return 1
 }
@@ -639,7 +678,7 @@ make_asm_disk() {
   # $1 label, $2 disk (already validated and confirmed)
   local label=$1 disk=$2 part
   part=$(part_name "$disk")
-  disk_is_free "$disk" || { bad "$disk cannot be used any more: $DISK_WHY. Nothing was erased."; return 1; }
+  disk_is_free "$disk" || { bad "$disk can no longer be used: $DISK_WHY. Nothing was erased."; return 1; }
   journal PART "$disk" "GPT with one partition for ASM disk $label"
   run_cmds <<< "parted -s $disk mklabel gpt mkpart primary 1MiB 100%
 partprobe $disk" || return 1
@@ -651,14 +690,14 @@ partprobe $disk" || return 1
   if [[ "$(asm_method)" == "asmlib" ]]; then
     if ! run_cmds <<< "oracleasm createdisk $label $part
 oracleasm scandisks"; then
-      printf 'The disk now has an empty GPT partition (no data on it). To try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
+      printf 'The disk now has an empty GPT partition, with no data on it.\nTo try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
       return 1
     fi
   else
     local uuid; uuid=$(udev_uuid "$part")
     if ! [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
       bad "Cannot read the partition UUID of $part"
-      printf 'The disk now has an empty GPT partition (no data on it). To try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
+      printf 'The disk now has an empty GPT partition, with no data on it.\nTo try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
       return 1
     fi
     install -d -m 755 "$(dirname "$UDEV_RULES")" || return 1
@@ -674,12 +713,12 @@ udevadm trigger --action=change --sysname-match=${part#/dev/}
 udevadm settle" || return 1
     n=0; until [[ -e "/dev/oraasm/$label" ]]; do n=$((n + 1)); [[ $n -gt 10 ]] && break; sleep 1; done
     local perm; perm=$(stat -L -c '%U:%G:%a' "/dev/oraasm/$label" 2>/dev/null)
-    [[ "$perm" == "$GRID_USER:$(asm_owner_group):660" ]] || { bad "/dev/oraasm/$label has owner/mode '$perm', expected $GRID_USER:$(asm_owner_group):660"; return 1; }
+    [[ "$perm" == "$GRID_USER:$(asm_owner_group):660" ]] || { bad "/dev/oraasm/$label has owner and mode '$perm', but needs $GRID_USER:$(asm_owner_group):660"; return 1; }
   fi
-  asm_label_exists "$label" || { bad "ASM disk $label is not visible after it was created"; return 1; }
+  asm_label_exists "$label" || { bad "ASM disk $label was created, but it is not visible"; return 1; }
   record_label "$label" "$part"
   journal ASMLABEL "$label" "on $part"
-  say "ASM disk $label created on $part"
+  say "Created ASM disk $label on $part"
 }
 
 next_label() {
@@ -708,20 +747,22 @@ d_2_13() {
       # a disk that already belongs to a disk group is used only when THIS server's ASM has that group
       # mounted (a disk of the primary, seen here through a shared SAN, must never be taken)
       g=$(asm_header_group "$i")
-      if [[ "$g" == "?" ]]; then refused+=" $i(device not found)"
-      elif [[ -n "$g" ]] && ! asm_group_mounted_here "$g"; then refused+=" $i(member of disk group $g, not mounted here)"; reflab+=" $i"
+      if [[ "$g" == "?" ]]; then refused+=$'\n'"  $i: device not found"
+      elif [[ -n "$g" ]] && ! asm_group_mounted_here "$g"; then refused+=$'\n'"  $i: in disk group $g, which is not mounted here"; reflab+=" $i"
       else ok_l+=" $i"; fi
     done <<< "$l"
     if [[ -n "$refused" ]]; then
-      warn "Not used:$refused. Such disks may belong to another server (for example the primary)."
+      warn "These existing ASM disks are not used:$refused"$'\n'"They may belong to another server, for example the primary."
       install -d -m 700 "$STATE_DIR"; for i in $reflab; do printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
     fi
     [[ -n "$ok_l" ]] || continue
-    if confirm "Use the existing ASM disk(s)$ok_l for +$dg on this standby? (only if nothing else uses them)"; then
+    say "Answer y only if no other database uses$ok_l."
+    if confirm "Use the existing ASM disks$ok_l for +$dg"; then
       for i in $ok_l; do record_label "$i" "$(label_device "$i")"; done
     else
       for i in $ok_l; do install -d -m 700 "$STATE_DIR"; printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
-      say "Not used:$ok_l (remembered). New disks are chosen for +$dg instead."
+      say "Not used:$ok_l. This answer is remembered."
+      say "New disks are chosen for +$dg instead."
     fi
   done
   # 2) new disks for every disk group that has none or too little space
@@ -731,9 +772,9 @@ d_2_13() {
     min=$(dg_min_mb "$dg"); have=$(dg_have_mb "$dg")
     [[ -n "$(asm_labels "$dg")" && $have -ge $min ]] && continue
     local need_more=$(( min - have ))
-    [[ ${#disks[@]} -gt 0 ]] || { bad "No empty disk on this server for +$dg. Add disks (h shows the manual way). Nothing was erased."; return 1; }
-    if [[ $have -gt 0 ]]; then say "Disk group +$dg needs at least $min MB; its disks have $have MB. Empty disks:"
-    else say "Disk group +$dg needs at least $min MB. Empty disks:"; fi
+    [[ ${#disks[@]} -gt 0 ]] || { bad "No empty disk on this server for +$dg. Nothing was erased."$'\n'"Add disks to this server, then try again."; return 1; }
+    if [[ $have -gt 0 ]]; then say "+$dg needs at least $(human_mb "$min"). Its disks have $(human_mb "$have"). Empty disks:"
+    else say "+$dg needs at least $(human_mb "$min"). Empty disks:"; fi
     def=""
     for i in "${!disks[@]}"; do
       if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")   (chosen)"
@@ -743,11 +784,11 @@ d_2_13() {
     local left=0
     for i in "${!disks[@]}"; do [[ "$used" == *" ${disks[$i]%% *} "* ]] || left=$((left + ${disks[$i]##* })); done
     if [[ $left -lt $need_more ]]; then
-      bad "The empty disks left have $left MB together; +$dg needs $need_more MB more. Add disks to this server. Nothing was erased."
+      bad "The empty disks left have $(human_mb "$left") in total, but +$dg needs $(human_mb "$need_more") more."$'\n'"Add disks to this server. Nothing was erased."
       return 1
     fi
     while true; do
-      ask_default "Disk numbers for +$dg (one or more, separated by spaces; q = stop, nothing is erased)" "$def"
+      ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""
       local -a picks=(); read -ra picks <<< "$ANSWER"
@@ -759,7 +800,7 @@ d_2_13() {
         nums+="$n "; total=$((total + ${disks[$((n - 1))]##* }))
       done
       [[ "$pick" == "bad" || "$nums" == " " ]] && continue
-      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB; +$dg needs $need_more MB more. Choose more or bigger disks."; continue; fi
+      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB, but +$dg needs $need_more MB more. Choose more or bigger disks."; continue; fi
       break
     done
     for n in $nums; do
@@ -778,14 +819,14 @@ d_2_13() {
     local sb="/sys/block/$(basename "$(readlink -f "$d")")/queue" pbs lbs
     pbs=$(cat "$sb/physical_block_size" 2>/dev/null); lbs=$(cat "$sb/logical_block_size" 2>/dev/null)
     if [[ "${PRIMARY_REDO_BS:-512}" == "4096" ]]; then
-      [[ -n "$pbs" && "$pbs" -lt 4096 ]] && { bad "The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors: the standby logs could not be created (ORA-01378). Use disks with 4K sectors. Nothing was erased."; return 1; }
+      [[ -n "$pbs" && "$pbs" -lt 4096 ]] && { bad "The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors."$'\n'"The standby logs could not be created (ORA-01378). Use disks with 4K sectors."$'\n'"Nothing was erased."; return 1; }
     else
-      [[ -n "$lbs" && "$lbs" -ge 4096 ]] && { bad "$d is a 4K-native disk (4096-byte logical sectors), but the redo logs of the primary use 512-byte blocks: the standby and online logs could not be created (ORA-01378). Use disks with 512-byte (or 512e) sectors. Nothing was erased."; return 1; }
+      [[ -n "$lbs" && "$lbs" -ge 4096 ]] && { bad "$d is a 4K-native disk, but the redo logs of the primary use 512-byte blocks."$'\n'"The standby and online logs could not be created (ORA-01378)."$'\n'"Use disks with 512-byte or 512e sectors. Nothing was erased."; return 1; }
     fi
   done
   for p in "${sel[@]}"; do
     d=${p#*|}
-    confirm_word "ALL DATA on $d ($(lsblk -dn -o SIZE "$d" | tr -d ' ')) will be erased for ASM disk ${p%%|*}." "$d" \
+    confirm_word "ALL data on $d ($(lsblk -dn -o SIZE "$d" | tr -d ' ')) will be erased to make ASM disk ${p%%|*}." "$d" \
       || { say "Not confirmed. Nothing was erased."; return 3; }
   done
   for p in "${sel[@]}"; do make_asm_disk "${p%%|*}" "${p#*|}" || return 1; done
@@ -804,46 +845,47 @@ fs_need_lines() {
 FS_TODO=()
 c_2_14() {
   [[ -n "$(fs_dirs)" ]] || { NOW="Not needed (all database files are in ASM)"; return 0; }
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   local d mb mnt free used missing=() short="" report="" notmine=""
   declare -A need_by_mnt=() free_by_mnt=()
   while IFS='|' read -r d mb; do
-    mnt=$(mnt_of "$d"); [[ -n "$mnt" ]] || { NOW="Cannot read the free space for $d (df)"; return 2; }
+    mnt=$(mnt_of "$d"); [[ -n "$mnt" ]] || { NOW="Cannot read the free space of $d (df failed)"; return 2; }
     free=$(free_mb_of "$d")
     # files that are already there (an earlier duplicate) already use their space
     used=0; [[ -d "$d" ]] && used=$(du -smx -- "$d" 2>/dev/null | awk '{print $1+0}'); num "$used" || used=0
     mb=$(( mb > used ? mb - used : 0 ))
     need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + mb ))
     free_by_mnt[$mnt]=$free
-    if [[ -d "$d" && "$(stat -c %U "$d")" == "$ORACLE_USER" ]]; then report+="$d exists ($mnt)"$'\n'
+    if [[ -d "$d" && "$(stat -c %U "$d")" == "$ORACLE_USER" ]]; then report+="$d exists (on $mnt)"$'\n'
     elif [[ -d "$d" && -n "$(ls -A "$d" 2>/dev/null)" ]]; then notmine+="$d is owned by $(stat -c %U "$d") and is not empty"$'\n'
-    else missing+=("$d"); report+="$d missing ($mnt)"$'\n'; fi
+    else missing+=("$d"); report+="$d is missing (on $mnt)"$'\n'; fi
   done < <(fs_need_lines)
   if [[ -n "$notmine" ]]; then
-    NOW="${notmine%$'\n'}"; MANUAL_HOW="root  ->  shell (check the files first: ls -la)"
+    NOW="${notmine%$'\n'}"; MANUAL_HOW="root  ->  shell Check the files first (ls -la)."
     PLAN="$(while IFS= read -r d; do [[ -n "$d" ]] && printf 'chown %s:%s %s\n' "$ORACLE_USER" "$INSTALL_GROUP" "${d%% is owned*}"; done <<< "$notmine")"
     return 2
   fi
   for mnt in "${!need_by_mnt[@]}"; do
     local want=$(( ${need_by_mnt[$mnt]} * 11 / 10 ))
-    [[ ${free_by_mnt[$mnt]} -ge $want ]] || short+="file system $mnt has $(human_mb "${free_by_mnt[$mnt]}") free, needs about $(human_mb "$want")"$'\n'
+    [[ ${free_by_mnt[$mnt]} -ge $want ]] || short+="File system $mnt has $(human_mb "${free_by_mnt[$mnt]}") free, but needs about $(human_mb "$want")"$'\n'
   done
   if [[ -n "$short" ]]; then
     NOW="${report}${short%$'\n'}"
     MANUAL_HOW="root  ->  shell"
-    PLAN="Give the database folders enough space, for example a new disk as a new file system:
-lsblk                                   (find an EMPTY disk; below it is called /dev/<empty disk>)
+    PLAN="-- Give the database folders enough space, for example a new disk with a new file system.
+-- Find an empty disk. Below it is called /dev/<empty disk>.
+lsblk
 mkfs.xfs /dev/<empty disk>
 mkdir -p <mount point, for example $(fs_dirs | head -n 1 | cut -d/ -f1-2)>
 echo \"UUID=\$(blkid -s UUID -o value /dev/<empty disk>)  <mount point>  xfs  defaults  0 0\" >> /etc/fstab
 mount <mount point>
-Then answer r (paths must stay the same as on primary)."
+-- Then answer r. The paths must stay the same as on the primary."
     return 2
   fi
   if [[ ${#missing[@]} -eq 0 ]]; then NOW="${report%$'\n'}"; return 0; fi
   FS_TODO=("${missing[@]}")
   NOW="${report%$'\n'}"
-  PLAN="Create (owner $ORACLE_USER:$INSTALL_GROUP, mode 775, same paths as primary):"
+  PLAN="Create these folders (owner $ORACLE_USER:$INSTALL_GROUP, mode 775):"
   for d in "${missing[@]}"; do PLAN+=$'\n'"  $d"; done
   return 1
 }
@@ -891,7 +933,7 @@ storage_not_shared() {
   # rc 0 = not shared, 1 = shared, 2 = not proven. A folder found shared outranks one that is not proven.
   local d m fst ans lid pid lsrc psrc luuid net lids wcom key ok why plan np=0 info2="" plan2=""
   STORAGE_SHARED=""; STORAGE_INFO=""; STORAGE_PLAN=""
-  read_primary_mounts || { STORAGE_INFO="Cannot read the file systems mounted on primary (findmnt/lsblk over ssh)"; return 2; }
+  read_primary_mounts || { STORAGE_INFO="Cannot read the file systems mounted on the primary (findmnt and lsblk over ssh)"; return 2; }
   for d in $(fs_dirs); do
     ok=0; why=""; plan=""; key=""
     [[ -d "$d" ]] || { [[ -z "$info2" ]] && info2="Folder $d does not exist yet (step 2.14)"; np=1; continue; }
@@ -904,10 +946,10 @@ storage_not_shared() {
     lids=""; [[ "$lsrc" == /dev/* ]] && lids=$(lsblk -nsP -o TYPE,WWN,SERIAL "$lsrc" 2>/dev/null | disk_ids)
     # the primary, same path
     ans=""; prim_probe canlook "$d" && ans=$(head -n 1 <<< "$RUN_OUT")
-    [[ "$ans" == "YES" || "$ans" == "NO" ]] || { [[ -z "$info2" ]] && info2="Cannot test $d on primary (no answer over ssh)"; np=1; continue; }
+    [[ "$ans" == "YES" || "$ans" == "NO" ]] || { [[ -z "$info2" ]] && info2="Cannot test $d on the primary (no answer over ssh)"; np=1; continue; }
     pid=""; prim_probe fsid "$d" && pid=$(head -n 1 <<< "$RUN_OUT"); psrc=${pid%% *}; psrc=${psrc%%\[*}
     # 1) a network file system mounted from the same source on both servers
-    if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, the same source $lsrc on both servers) "; continue; fi
+    if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, same source $lsrc on both servers) "; continue; fi
     # 2) a test file written here (as the database owner) must not be visible on the primary
     if [[ "$ans" == "YES" ]]; then
       m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$"
@@ -917,44 +959,44 @@ storage_not_shared() {
       ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
       if [[ "$ans" == "NO" && $net -eq 1 && "$STORAGE_NET_DONE" != *" $d|$lsrc "* ]]; then
         # a network file system client may cache folder contents for up to a minute: ask again after that (once per run)
-        say "  $d is $fst: testing again in 65 seconds (the primary may cache the folder contents) ..."
+        say "$d is $fst. Testing again in 65 seconds, as the primary may cache the folder contents ..."
         sleep 65
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
       rm -f -- "$m"
       case "$ans" in
-        YES) STORAGE_SHARED+="$d ($fst, the test file is seen on primary) "; continue ;;
+        YES) STORAGE_SHARED+="$d ($fst, the test file is seen on the primary) "; continue ;;
         NO)  ans=SEEN_NO ;;
-        *)   [[ -z "$info2" ]] && info2="Cannot test $d on primary (no answer over ssh)"; np=1; continue ;;
+        *)   [[ -z "$info2" ]] && info2="Cannot test $d on the primary (no answer over ssh)"; np=1; continue ;;
       esac
     fi
     # 3) the same file system UUID as a file system of the primary (at any path)
     if [[ -n "$luuid" ]] && grep -qxF -- "${luuid^^}" <<< "$P_MNT_UUIDS"; then
       wcom=$(comm -12 <(grep '^W:' <<< "$lids") <(primary_ids_of_uuid "$luuid" | grep '^W:') | sed 's/^W://' | paste -sd' ' -)
-      if [[ -n "$wcom" ]]; then STORAGE_SHARED+="$d (file system $luuid on the same disk $wcom as on primary) "; continue; fi
+      if [[ -n "$wcom" ]]; then STORAGE_SHARED+="$d (file system $luuid on the same disk $wcom as on the primary) "; continue; fi
       key=$luuid
-      why="$d has the same file system UUID ($luuid) as a file system of the primary. This is a copy of the primary's disk, or the SAME disk mounted on both servers (the disk ids do not prove which)."
+      why="$d has the same file system UUID ($luuid) as a file system of the primary."$'\n'"It is a copy of the primary's disk, or the same disk mounted on both servers."
     elif [[ -n "$lids" ]] && wcom=$(comm -12 <(grep '^W:' <<< "$lids") <(primary_ids_all | grep '^W:') | sed 's/^W://' | paste -sd' ' -) && [[ -n "$wcom" ]]; then
       # 4) a disk of this folder is a disk under a file system of the primary (another partition, or a copied disk id)
       key="disks:$(paste -sd, - <<< "$lids")"
-      why="A disk of $d (WWN $wcom) is also a disk under a file system of the primary: another partition of the same disk, or a virtual disk copied with its id."
+      why="A disk of $d (WWN $wcom) is also under a file system of the primary."$'\n'"It is another partition of the same disk, or a virtual disk copied with its id."
     elif [[ $net -eq 1 ]]; then
       # 5) network file system: only the test file can prove it
-      if [[ "$ans" == "SEEN_NO" ]]; then ok=1; STORAGE_INFO+="$d: $fst, test file not visible on primary after 65 seconds ($lsrc here, ${psrc:-?} there)"$'\n'
+      if [[ "$ans" == "SEEN_NO" ]]; then ok=1; STORAGE_INFO+="$d: $fst, the test file is not seen on the primary after 65 seconds ($lsrc here, ${psrc:-?} there)"$'\n'
       else
-        why="$d ($fst): the primary user $PRIMARY_SSH_USER cannot look into this folder there, so the test file cannot be used. It cannot be proven that this is not the storage of the primary."
-        plan="For $d: run the script again with the owner of the database files on primary:
+        why="$d ($fst): the user $PRIMARY_SSH_USER cannot read this folder on the primary, so the test file cannot be used."$'\n'"It cannot be proven that this is not the storage of the primary."
+        plan="-- For $d: run the script again with the owner of the database files on the primary:
 $SELF --user $ORACLE_USER"
       fi
     elif [[ -n "$luuid" && $P_MNT_COMPLETE -eq 1 ]]; then
       # 6) the primary shows every file system it mounts, and this one is not among them
-      ok=1; STORAGE_INFO+="$d: ${fst:-?}, file system $luuid is not mounted on primary$([[ "$ans" == "SEEN_NO" ]] && printf '; test file not visible there')"$'\n'
+      ok=1; STORAGE_INFO+="$d: ${fst:-?}, file system $luuid is not mounted on the primary$([[ "$ans" == "SEEN_NO" ]] && printf '; the test file is not seen there')"$'\n'
     else
       if [[ -n "$luuid" ]]; then key=$luuid; elif [[ -n "$lids" ]]; then key="disks:$(paste -sd, - <<< "$lids")"; else key="device:$lsrc"; fi
-      if [[ -z "$luuid" ]]; then why="$d: the file system UUID of THIS server could not be read."
-      else why="$d: the primary does not show the UUID of every file system it mounts (user $PRIMARY_SSH_USER may not read them)."; fi
-      why+=" It cannot be proven that this is not the storage of the primary."
+      if [[ -z "$luuid" ]]; then why="$d: the file system UUID on this server cannot be read."
+      else why="$d: the primary does not show the UUID of every file system it mounts."$'\n'"The user $PRIMARY_SSH_USER may not be allowed to read them."; fi
+      why+=$'\n'"It cannot be proven that this is not the storage of the primary."
     fi
     [[ $ok -eq 1 ]] && continue
     # not proven: a confirmation for exactly this disk counts
@@ -962,14 +1004,16 @@ $SELF --user $ORACLE_USER"
       STORAGE_INFO+="$d: ${fst:-?}, you confirmed it is a separate disk of this server ($key)"$'\n'; continue
     fi
     if [[ -n "$key" ]]; then
-      plan="For $d: do NOT change or format anything until you know which disk it is. Compare the disks on both servers:
-here:            lsblk -s -o NAME,TYPE,WWN,SERIAL,SIZE \$(findmnt -n -o SOURCE --target $d)
-on the primary:  lsblk -o NAME,TYPE,WWN,SERIAL,SIZE,MOUNTPOINT
-(look in the storage or virtualization console whether it is the same volume)${plan:+
+      plan="-- $d: do NOT change or format anything until you know which disk this is.
+-- Compare the disks on both servers. On this server:
+lsblk -s -o NAME,TYPE,WWN,SERIAL,SIZE \$(findmnt -n -o SOURCE --target $d)
+-- On the primary:
+lsblk -o NAME,TYPE,WWN,SERIAL,SIZE,MOUNTPOINT
+-- Or check in the storage or virtualization console whether it is the same volume.${plan:+
 $plan}
-Only if it is a separate disk of this server:
+-- Only if it is a separate disk of this server:
 echo '$key' >> $(storage_clone_file)
-then answer r."
+-- Then answer r."
     fi
     [[ -z "$info2" ]] && { info2=$why; plan2=$plan; }
     np=1
@@ -980,23 +1024,25 @@ then answer r."
   return 0
 }
 c_2_15() {
-  [[ -n "$(fs_dirs)" ]] || { NOW="Not needed (no database folders; new ASM disks must be empty, existing ones are checked in step 2.13)"; return 0; }
-  [[ "$(marker_kind 2>/dev/null)" == "duplicate" ]] && { NOW="The copy already ran; the storage was proven before it started"; return 0; }
-  if [[ "$MODE" == "check" ]]; then NOW="Tested only in a normal run (it writes a small test file)"; return 2; fi
+  [[ -n "$(fs_dirs)" ]] || { NOW="Not needed: there are no database folders. ASM disks are checked in step 2.13."; return 0; }
+  [[ "$(marker_kind 2>/dev/null)" == "duplicate" ]] && { NOW="The RMAN copy already ran. The storage was checked before it started."; return 0; }
+  if [[ "$MODE" == "check" ]]; then NOW="Tested only in a normal run, because it writes a small test file"; return 2; fi
   need_ssh || return 2
   local rc=0; storage_not_shared || rc=$?
   if [[ $rc -eq 2 ]]; then NOW=$STORAGE_INFO; [[ -n "$STORAGE_PLAN" ]] && PLAN=$STORAGE_PLAN; return 2; fi
-  if [[ $rc -eq 0 ]]; then NOW="Each database folder is storage of this server only:"$'\n'"$STORAGE_INFO"; return 0; fi
-  NOW="DANGER: these folders are the SAME storage as on the primary: $STORAGE_SHARED"$'\n'"The duplicate would overwrite the files of the primary database."
-  KIND_NOW=manual; MANUAL_HOW="root  ->  storage"
-  PLAN="Give this server its own storage for these paths (not the NFS export or SAN volume of the primary),
-mount it at the same path, then answer r. The duplicate (step 8.2) is refused until this is fixed."
+  if [[ $rc -eq 0 ]]; then NOW="Each database folder is on storage of this server only:"$'\n'"$STORAGE_INFO"; return 0; fi
+  NOW="DANGER: these folders are the SAME storage as on the primary: $STORAGE_SHARED"$'\n'"The RMAN copy would overwrite the files of the primary database."
+  KIND_NOW=manual; MANUAL_HOW="root  ->  storage and mount"
+  PLAN="-- Give this server its own storage for these paths.
+-- Do not use the NFS export or SAN volume of the primary.
+-- Mount it at the same path, then answer r.
+-- The RMAN copy (step 8.2) is refused until this is fixed."
   :
   return 1
 }
 
 phase_2() {
-  phase_header 2 "This server: groups, users, packages, folders, network, storage"
+  phase_header 2 "Prepare this server"
   run_step 2.1  auto    "Groups (same names and ids as primary)" c_2_1 d_2_1
   run_step 2.2  auto    "Users (same ids as primary)" c_2_2 d_2_2
   run_step 2.3  auto    "Required packages" c_2_3 d_2_3

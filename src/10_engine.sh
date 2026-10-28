@@ -45,10 +45,23 @@ step_in_range() {
 }
 
 phase_header() {
-  printf '\n%s==============================================================================%s\n' "$C_B" "$C_N"
-  printf '%s PHASE %s  |  %s%s\n' "$C_B" "$1" "$2" "$C_N"
-  printf '%s==============================================================================%s\n' "$C_B" "$C_N"
+  local t="Phase $1 of 10 $S_DOT ${PHASE_TITLES[$1]:-$2}" w   # one name per phase, the same everywhere
+  w=$((66 - ${#t})); [[ $w -lt 2 ]] && w=2
+  printf '\n\n  %s%s %s %s%s\n' "$C_B" "$(rule 2 "$S_HR2")" "$t" "$(rule $w "$S_HR2")" "$C_N"
   _log PHASE "$1  $2"
+}
+# words shown for the result codes kept in the progress file
+result_label() {
+  case "$1" in
+    OK) printf 'ok' ;; DONE) printf 'done' ;; DONE_BY_YOU) printf 'done by you' ;; SKIPPED) printf 'skipped' ;;
+    SKIPPED_OPTIONAL) printf 'skipped (optional)' ;; FAILED_SKIPPED) printf 'failed, skipped' ;; FAILED) printf 'failed' ;;
+    WAITS) printf 'waiting' ;; RUNNING) printf 'running' ;; TODO) printf 'to do' ;; PROBLEM) printf 'problem' ;;
+    UNDONE) printf 'undone' ;; NOT_FINISHED) printf 'stopped here' ;; *) printf '%s' "$1" ;;
+  esac
+}
+result_color() {
+  case "$1" in OK|DONE|DONE_BY_YOU) printf '%s' "$C_G" ;; SKIPPED_OPTIONAL|WAITS) printf '%s' "$C_D" ;; RUNNING) printf '%s' "$C_C" ;;
+    TODO) printf '%s' "$C_M" ;; SKIPPED|UNDONE) printf '%s' "$C_Y" ;; *) printf '%s' "$C_R" ;; esac
 }
 
 ok_lines() {
@@ -56,7 +69,7 @@ ok_lines() {
   local l first=${1%%$'\n'*} rest=""
   [[ "$1" == *$'\n'* ]] && rest=${1#*$'\n'}
   ok "$first"
-  [[ -n "$rest" ]] && while IFS= read -r l; do [[ -n "$l" ]] && say "       $l"; done <<< "$rest"
+  [[ -n "$rest" ]] && while IFS= read -r l; do [[ -n "$l" ]] && say "$l"; done <<< "$rest"
   return 0
 }
 
@@ -82,7 +95,7 @@ load_progress() {
   while IFS='|' read -r id r t run why; do [[ "$id" =~ ^[0-9]+\.[0-9]+$ ]] && { LAST_RESULT[$id]=$r; LAST_WHEN[$id]=$t; LAST_REASON[$id]=$why; }; done < "$PROGRESS_FILE"
   return 0
 }
-PHASE_TITLES=("" "Connect and read the primary" "This server (OS, users, disks, folders)" "Oracle software on this server" "Primary readiness (commands for the primary)" "Listener and tnsnames" "Password file and TDE wallet" "Standby instance (NOMOUNT) and login tests" "RMAN duplicate (the copy)" "Register, apply, shipping, start at boot" "Daily check (lag, gap, apply)")
+PHASE_TITLES=("" "Connect to the primary" "Prepare this server" "Install the Oracle software" "Prepare the primary" "Listener and tnsnames.ora" "Password file and TDE wallet" "Start the empty instance (NOMOUNT)" "Copy the database (RMAN)" "Start redo apply and transport" "Health check")
 phase_done_result() {
   # overall result of a phase from the progress file: DONE | PARTLY | OPEN | - (never ran)
   local p=$1 i n=0 ok=0 bad=0
@@ -99,49 +112,50 @@ phase_done_result() {
 print_progress_board() {
   # where the earlier runs got to: one line per phase, then the steps that are not done
   load_progress
-  local p r col i open="" first=""
-  printf '\n  %sWhere you are%s (results of earlier runs on this server)\n' "$C_W" "$C_N"
+  local p r col i open="" first="" word
+  printf '\n  %sProgress%s\n' "$C_W" "$C_N"
   for p in 1 2 3 4 5 6 7 8 9 10; do
     r=$(phase_done_result "$p")
-    case "$r" in DONE) col=$C_G ;; OPEN) col=$C_Y ;; PARTLY) col=$C_C ;; *) col=$C_D ;; esac
-    printf '  %sphase %2s  %-7s%s %s\n' "$col" "$p" "$r" "$C_N" "${PHASE_TITLES[$p]}"
+    case "$r" in DONE) col=$C_G; word="done" ;; OPEN) col=$C_Y; word="needs attention" ;; PARTLY) col=$C_C; word="in progress" ;; *) col=$C_D; word="not started" ;; esac
+    printf '    %2s  %-28s %s%s%s\n' "$p" "${PHASE_TITLES[$p]}" "$col" "$word" "$C_N"
   done
   local nopen=0
   for i in "${HELP_IDS[@]}"; do
     case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|"") ;;
       *) nopen=$((nopen + 1))
          if [[ $nopen -le 8 ]]; then
-           open+="$(printf '    %-5s %-15s %s  (%s)' "$i" "${LAST_RESULT[$i]}" "$(step_title_of "$i" 2>/dev/null | cut -c1-40)" "${LAST_WHEN[$i]:0:16}")"$'\n'
-           [[ -n "${LAST_REASON[$i]:-}" ]] && open+="          ${LAST_REASON[$i]:0:100}"$'\n'
+           open+="$(printf '      %-5s %s%-16s%s %s' "$i" "$(result_color "${LAST_RESULT[$i]}")" "$(result_label "${LAST_RESULT[$i]}")" "$C_N" "$(step_title_of "$i" 2>/dev/null | cut -c1-44)")"$'\n'
+           [[ -n "${LAST_REASON[$i]:-}" ]] && open+="            ${C_D}${LAST_REASON[$i]:0:100}${C_N}"$'\n'
          fi
          [[ -n "$first" || "$i" == 1.* ]] || first=$i ;;
     esac
   done
-  [[ $nopen -gt 8 ]] && open+="    ... and $((nopen - 8)) more"$'\n'
+  [[ $nopen -gt 8 ]] && open+="      ... and $((nopen - 8)) more"$'\n'
   if [[ -s "$LASTRUN_FILE" ]]; then
     local lr; lr=$(cat "$LASTRUN_FILE" 2>/dev/null)
-    printf '  Last run: %s\n' "$lr"
+    printf '\n  Last run:  %s\n' "$lr"
   fi
   # a long job that still runs by itself (read-only look: pid and boot of the job file)
   if [[ -n "$JOB_FILE" && -s "$JOB_FILE" ]]; then
     local jp jt jo jk jb js
     IFS='|' read -r jp jt jo jk jb js < "$JOB_FILE" || true
     if [[ "$jb" == "$(boot_id)" ]] && job_running "$jp"; then
-      printf '  %sRunning now: %s (session %s, started in step %s; output %s, %s)%s\n' "$C_C" "$jt" "$jp" "${js:-?}" "$jo" "$(du -h -- "$jo" 2>/dev/null | cut -f1)" "$C_N"
-      printf '  Do not start it again by hand. When it has ended, run the script: it records the result.\n'
+      printf '\n  %sRunning now:%s %s  (step %s, session %s)\n' "$C_C" "$C_N" "$jt" "${js:-?}" "$jp"
+      printf '  Output: %s (%s). Do NOT start it again by hand. When it has ended, run the script.\n' "$jo" "$(du -h -- "$jo" 2>/dev/null | cut -f1)"
     else
-      printf '  %sThe long job %s (step %s) has ended%s. Run the script to record its result.%s\n' "$C_Y" "$jt" "${js:-?}" "$( [[ -f "$jo.rc" ]] && printf ' (exit code %s)' "$(cat "$jo.rc" 2>/dev/null)")" "$C_N"
+      printf '\n  %s%s (step %s) has ended%s.%s Run the script to record the result.\n' "$C_Y" "$jt" "${js:-?}" "$( [[ -f "$jo.rc" ]] && printf ', exit code %s' "$(cat "$jo.rc" 2>/dev/null)")" "$C_N"
     fi
   fi
   if [[ -n "$open" ]]; then
-    printf '  Steps of earlier runs that are not done:\n%s' "$open"
-    [[ -n "$first" ]] && printf '  (a normal run checks every step again; to start at the first one:  %s --from %s)\n' "$SELF" "$first"
+    printf '\n  Steps not done yet:\n%s' "$open"
+    [[ -n "$first" ]] && printf '  %sA normal run checks every step again. To start at the first open step:  %s --from %s%s\n' "$C_D" "$SELF" "$first" "$C_N"
   elif [[ ! -s "$PROGRESS_FILE" ]]; then
-    printf '  First run on this server. You will be asked: the primary IP and its Oracle OS user, the ssh password,\n'
-    printf '  the sys password (step 1.5); with ASM also the disks (2.13) and a new ASM password (3.2); DUPLICATE (8.2).\n'
+    printf '\n  Nothing is set up yet. You will be asked for:\n'
+    printf '    - the primary IP address, its Oracle OS user and its ssh password\n'
+    printf '    - the sys password (step 1.5)\n'
+    printf '    - with ASM: the disks to use (step 2.13) and a new ASM password (step 3.2)\n'
+    printf '    - the word DUPLICATE before the copy starts (step 8.2)\n'
   fi
-  printf '  Legend: DONE = every step OK   OPEN = a step is not done   PARTLY = some steps done   - = never ran\n'
-  [[ -n "$open" ]] && printf '  Step results: UNDONE = taken back with --undo   RUNNING = its long job ran by itself   WAITS = an earlier step was not done\n                TODO / PROBLEM = from a --check run   SKIPPED / FAILED_SKIPPED = you went on without it\n'
   return 0
 }
 step_ok_anywhere() {
@@ -196,7 +210,7 @@ is_optional() { [[ "$OPTIONAL_STEPS" == *" $1 "* ]]; }
 skip_record() {
   # (phase 1: the waiters ask once anyway, for example to type the sys password with [p])
   [[ "$1" == 1.* ]] || AUTO_WAIT["step $1"]=1
-  if is_optional "$1"; then say "Skipped (optional step; the standby works without it)."; record "$1" SKIPPED_OPTIONAL
+  if is_optional "$1"; then say "Skipped. This step is optional: the standby works without it."; record "$1" SKIPPED_OPTIONAL
   else warn "$2"; record "$1" SKIPPED; fi
 }
 
@@ -210,22 +224,40 @@ waits_for() {
 
 how_by_hand() {
   # After a failure: the manual commands of this step, so the user can finish it by hand
-  if no_skip "$1"; then say "How to do this step by hand (then answer r to check again):"
-  else say "How to do this step by hand (then answer r to check again, or s to go on):"; fi
+  if no_skip "$1"; then say "To do this step by hand (then answer r to check again):"
+  else say "To do this step by hand (then answer r to check again, or s to go on):"; fi
   show_help "$1" || true
 }
 
 print_commands() {
-  # $1 where, $2 run as, stdin = commands
-  local where=$1 how=$2 line cmds
+  # $1 where, $2 run as ("user  ->  env ; program" or a user name), stdin = commands.
+  # The commands have no frame at the start of the line, so they can be copied as they are.
+  local where=$1 how=$2 line cmds who prep="" note="" t
   cmds=$(cat)
-  printf '      %s+-- %s%s\n' "$C_M" "$where" "$C_N"
-  printf '      %s|   run as: %s%s\n' "$C_M" "$how" "$C_N"
-  printf '      %s|%s\n' "$C_M" "$C_N"
+  who=${how%%  ->  *}
+  [[ "$how" == *"  ->  "* ]] && prep=${how#*  ->  }
+  # the environment lines are commands too; anything else after the arrow is a note (shell, edit /etc/hosts, ...)
+  if [[ -n "$prep" && "$prep" != export* ]]; then note=${prep#shell}; note=${note# }; prep=""; fi
+  case "$where" in
+    "ON PRIMARY ("*") - you run it") where="Run on the PRIMARY ${where#ON PRIMARY }"; where=${where% - you run it} ;;
+    "ON THIS SERVER ("*") - you do it") where="Run on this server ${where#ON THIS SERVER }"; where=${where% - you do it} ;;
+  esac
+  t="$where, as $who"
+  local w=$((64 - ${#t})); [[ $w -lt 2 ]] && w=2
+  printf '\n    %s%s %s %s%s\n' "$C_M" "$(rule 2)" "$t" "$(rule $w)" "$C_N"
+  # remarks in a shell box are shell comments (# ...), in an SQL or RMAN box they stay "-- ..."
+  local shellbox=1; [[ "$how" == *sqlplus* || "$how" == *rman* ]] && shellbox=0
+  [[ -n "$note" ]] && printf '      %s%s%s\n' "$C_D" "$note" "$C_N"
+  if [[ -n "$prep" ]]; then
+    while IFS= read -r line; do line=${line# }; [[ -n "$line" ]] && printf '      %s\n' "$line"; done <<< "${prep// ; /$'\n'}"
+    printf '\n'
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '      %s|%s   %s\n' "$C_M" "$C_N" "$line"
+    if [[ "$line" == "-- "* ]]; then [[ $shellbox -eq 1 ]] && line="# ${line#-- }"; printf '      %s%s%s\n' "$C_D" "$line" "$C_N"
+    elif [[ "$line" == "#"* ]]; then printf '      %s%s%s\n' "$C_D" "$line" "$C_N"
+    else printf '      %s\n' "$line"; fi
   done <<< "$cmds"
-  printf '      %s+--------------------------------------------------------------%s\n' "$C_M" "$C_N"
+  printf '    %s%s%s\n\n' "$C_M" "$(rule 70)" "$C_N"
   printf '%s\n' "$cmds" | log_block "commands for: $where ($how)"
   if [[ -n "$ACTIONS_FILE" ]]; then
     { printf '\n# ===== %s | step %s | %s | run as: %s\n' "$(ts)" "$CUR_STEP" "$where" "$how"; printf '%s\n' "$cmds"; } | mask_pw >> "$ACTIONS_FILE"
@@ -246,7 +278,7 @@ ask_choice() {
     ask "$1"
     ANSWER=${ANSWER,,}; ANSWER=${ANSWER//[[:space:]]/}
     [[ -n "$ANSWER" && ${#ANSWER} -eq 1 && "$2" == *"$ANSWER"* ]] && return 0
-    say "Please answer one of: $(sed 's/./& /g' <<< "$2")"
+    say "Please type one of: $(sed 's/./& /g' <<< "$2")"
   done
 }
 
@@ -266,25 +298,25 @@ job_wait_step() {
 job_wait_loop() {
   local tp
   while job_alive; do
-    wait_msg "A long job is still running: $JOB_TITLE (session $JOB_PID)."
-    say "Its output: $JOB_OUT"
-    say "Its programs: $(pgrep -s "$JOB_PID" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
-    say "(To stop it: pkill -s $JOB_PID  - an installer or root script stopped half-way leaves a half-configured home.)"
+    wait_msg "Still running: $JOB_TITLE (session $JOB_PID)"
+    say "Output:    $JOB_OUT"
+    say "Programs:  $(pgrep -s "$JOB_PID" -l 2>/dev/null | head -n 5 | awk '{print $2}' | tr '\n' ' ')"
+    say "${C_D}To stop it: pkill -s $JOB_PID  (an installer stopped half-way leaves a broken home)${C_N}"
     if [[ "$MODE" == "check" ]]; then
       # the steps the job works on (and all after them) cannot be judged while it runs: their clean-up plans would hit the job
       case "$JOB_TITLE" in "RMAN duplicate"*) JOB_BUSY_PHASE=7 ;; *) JOB_BUSY_PHASE=3 ;; esac
       JOB_BUSY_TEXT="'$JOB_TITLE' is still running (session $JOB_PID): checked after it has ended"
-      say "Check mode: phase $JOB_BUSY_PHASE and later are not judged until the job has ended (they show WAITS)."
+      say "Check mode: phase $JOB_BUSY_PHASE and later are checked after the job has ended (shown as waiting)."
       return 0
     fi
     local main_prog
     main_prog=$(pgrep -s "$JOB_PID" -l 2>/dev/null | awk '{print $2}' | grep -E '^(rman|java|perl|unzip|runInstaller|gridSetup|root\.sh|sqlplus|opatch|opatchauto|oracle|setup)' | sort -u | paste -sd' ' -)
     if kill -0 "$JOB_PID" 2>/dev/null || [[ -n "$main_prog" ]]; then
-      [[ -n "$main_prog" ]] && say "The job itself is still working ($main_prog)."
-      ask_choice "[w] watch it until it ends (Ctrl+C stops watching)   [r] check again   [q] quit (it keeps running)" "wrq"
+      [[ -n "$main_prog" ]] && say "It is still working ($main_prog)."
+      ask_choice "[w] Watch until it ends (Ctrl+C stops watching)   [r] Check again   [q] Quit (it keeps running)" "wrq"
     else
       # the leader of the job is gone, other programs of its session remain
-      ask_choice "[w] watch it until it ends (Ctrl+C stops watching)   [r] check again   [c] continue without it   [q] quit (it keeps running)" "wrcq"
+      ask_choice "[w] Watch until it ends (Ctrl+C stops watching)   [r] Check again   [c] Continue without it   [q] Quit (it keeps running)" "wrcq"
     fi
     case "$ANSWER" in
       w) WATCH_STOP=0; trap 'WATCH_STOP=1' INT
@@ -293,12 +325,12 @@ job_wait_loop() {
          while [[ $WATCH_STOP -eq 0 ]] && job_running "$JOB_PID" && [[ ! -f "$JOB_OUT.rc" ]]; do sleep 2; done
          sleep 1; pkill -P "$tp" 2>/dev/null; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; TAIL_PID=""
          trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT ;;
-      c) if confirm_word "Continue without the job '$JOB_TITLE'?" "CONTINUE"; then
+      c) if confirm_word "Continue without '$JOB_TITLE'?" "CONTINUE"; then
            _log JOB "user continues without the job $JOB_TITLE (session $JOB_PID)"
            job_finish_late; rm -f -- "$JOB_FILE"; JOB_PID=""; JOB_KEEP=""; return 0
          fi ;;
       q) DETACHED_JOB="'$JOB_TITLE' keeps running (session $JOB_PID, output $JOB_OUT)"; CUR_STEP=${JOB_STEP:-$CUR_STEP}
-         user_stop "Stopped by you (the job keeps running; run the script again when it has finished)" ;;
+         user_stop "Stopped by you. The job keeps running; run the script again when it has finished." ;;
     esac
   done
 }
@@ -307,10 +339,9 @@ run_step() {
   local id=$1 kind0=$2 kind=$2 title=$3 checkfn=$4 dofn=${5:-}
   step_in_range "$id" || return 0
   STEP_ORDER+=("$id"); STEP_TITLE[$id]=$title; CUR_STEP=$id
-  printf '\n  %s[%s]%s %s%s%s\n' "$C_B" "$id" "$C_N" "$C_W" "$title" "$C_N"
+  printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "$id" "$C_N" "$C_W" "$title" "$C_N"
   _log STEP "[$id] $title"
   local rc drc acted=0 helped=0 opts w
-  is_optional "$id" && say "(optional step: needed for switchover, not for the standby itself)"
   # (phase 4 needs nothing of this server: it is judged also while a job runs)
   if [[ -n "$JOB_BUSY_PHASE" && "${id%%.*}" -ge "$JOB_BUSY_PHASE" && "${id%%.*}" != 4 ]]; then
     NOW=$JOB_BUSY_TEXT
@@ -323,7 +354,7 @@ run_step() {
     if [[ $rc -eq 0 ]]; then
       local pend; pend=$(primary_pending_get "$id")
       if [[ $acted -eq 1 || -n "$pend" ]]; then
-        ok_lines "Done (by you). ${NOW}"; record "$id" DONE_BY_YOU
+        ok_lines "Done by you. ${NOW}"; record "$id" DONE_BY_YOU
         # the commands printed for the primary (in this run or an earlier one) are done now: journal them with their undo
         if [[ -n "$pend" ]]; then
           [[ "$pend" == "-" ]] && pend="(nothing to take back; see --help-step $id)"
@@ -346,35 +377,35 @@ run_step() {
       fi
       if [[ "$MODE" == "check" ]]; then
         if [[ "$NOW" == *"only in a normal run"* ]]; then wait_msg "$NOW"; record "$id" WAITS
-        elif [[ -n "$w" ]]; then wait_msg "Can be checked only after $w: $NOW"; record "$id" WAITS
-        else bad "Problem: ${NOW:-unknown}"; [[ -n "$PLAN" ]] && printf '%s\n' "$PLAN" | block "Fix:"; record "$id" PROBLEM; fi
+        elif [[ -n "$w" ]]; then wait_msg "Checked after $w is done. $NOW"; record "$id" WAITS
+        else bad "${NOW:-Problem (no details)}"; [[ -n "$PLAN" && "$PLAN" != "$NOW" ]] && printf '%s\n' "$PLAN" | block "Fix:"; record "$id" PROBLEM; fi
         return 0
       fi
       # the earlier step (or phase) was not done in this run and you went on: the waiters do not ask again
       if [[ -n "$w" && -n "${AUTO_WAIT[$w]:-}" ]]; then
-        wait_msg "Waits for $w (not done in this run): $NOW"; record "$id" WAITS; AUTO_WAIT["step $id"]=1; return 0
+        wait_msg "Waiting for $w, which was not done in this run. $NOW"; record "$id" WAITS; AUTO_WAIT["step $id"]=1; return 0
       fi
       if [[ -n "$w" ]]; then
-        bad "Cannot continue yet: $NOW"
-        if [[ $NEED_SYS -eq 1 ]]; then say "The sys password is needed here: answer p to type it now."
-        elif [[ "$w" == step* && "$wid" == 1.* ]]; then say "Step $wid can only be done by the script: answer q and run the script again."
-        elif [[ "$w" == step* && -n "${STEP_RESULT[$wid]:-}" ]]; then say "Step $wid ended as ${STEP_RESULT[$wid]} in this run. Do it first (--help-step $wid shows how), then answer r; or s to go on without it."
-        elif [[ "$w" == step* ]] && ! step_in_range "$wid"; then say "Step $wid is not done yet and is not part of this run: answer q, then run  $SELF --from $wid   (or without --from)"
-        elif [[ "$w" == step* ]]; then say "Step $wid has to be done first (--help-step $wid shows how). Then answer r; or s to go on without it."
-        else say "Phase $wid is not done: answer s to go on (the other steps that need it then wait without asking), or q and run  $SELF --from $wid"; fi
+        bad "Not possible yet. $NOW"
+        if [[ $NEED_SYS -eq 1 ]]; then say "This step needs the sys password. Answer p to type it now."
+        elif [[ "$w" == step* && "$wid" == 1.* ]]; then say "Only the script can do step $wid. Answer q and run the script again."
+        elif [[ "$w" == step* && -n "${STEP_RESULT[$wid]:-}" ]]; then say "Step $wid is not done in this run (result: $(result_label "${STEP_RESULT[$wid]}")). Do it first, then answer r. Or answer s to go on without it."
+        elif [[ "$w" == step* ]] && ! step_in_range "$wid"; then say "Step $wid is not done and is not part of this run. Answer q, then run:  $SELF --from $wid"
+        elif [[ "$w" == step* ]]; then say "Step $wid must be done first. Then answer r. Or answer s to go on without it."
+        else say "Phase $wid is not done. Answer s to go on (steps that need it will wait), or q and run:  $SELF --from $wid"; fi
       else
-        bad "Cannot continue automatically: ${NOW:-unknown}"
-        if [[ -n "$PLAN" ]]; then printf '%s\n' "$PLAN" | print_commands "${MANUAL_WHERE:-ON THIS SERVER ($(hostname -s)) - you do it}" "${MANUAL_HOW:-root}"
+        bad "This cannot be done automatically. ${NOW:-}"
+        if [[ -n "$PLAN" ]]; then printf '%s\n' "$PLAN" | print_commands "${MANUAL_WHERE:-Run on this server ($(hostname -s))}" "${MANUAL_HOW:-root}"
         elif [[ $helped -eq 0 ]]; then how_by_hand "$id"; helped=1; fi
       fi
-      opts="[r] check again   [s] skip (I do it myself)   [h] help   [q] quit"; local allowed="rshq"
-      no_skip "$id" && { opts="[r] check again   [h] help   [q] quit"; allowed="rhq"; }
-      if [[ $NEED_SYS -eq 1 ]]; then opts="[p] type the sys password now   $opts"; allowed+="p"; fi
+      opts="[r] Check again   [s] Skip   [h] Help   [q] Quit"; local allowed="rshq"
+      no_skip "$id" && { opts="[r] Check again   [h] Help   [q] Quit"; allowed="rhq"; }
+      if [[ $NEED_SYS -eq 1 ]]; then opts="[p] Type the sys password   $opts"; allowed+="p"; fi
       ask_choice "$opts" "$allowed"
       case "$ANSWER" in
         p) if d_1_5; then record 1.5 DONE; fi; continue ;;
         s) [[ -n "$w" ]] && AUTO_WAIT[$w]=1
-           skip_record "$id" "Skipped by you. Make sure it is done before the steps that need it."; return 0 ;;
+           skip_record "$id" "Skipped. Do it before the steps that need it."; return 0 ;;
         q) [[ -n "$w" && -z "$RESUME_STEP" ]] && RESUME_STEP=$wid
            user_stop "Stopped by you" ;;
         h) show_help "$id" || true; continue ;;
@@ -382,31 +413,33 @@ run_step() {
       esac
     fi
     # rc 1: something must be done
+    is_optional "$id" && say "${C_D}Optional: needed only for switchover and the broker, not to build the standby.${C_N}"
     [[ -n "$NOW" ]] && printf '%s\n' "$NOW" | block "Now:"
     if [[ "$kind" == "primary" || "$kind" == "manual" ]]; then
       local where how
-      if [[ "$kind" == "primary" ]]; then where="ON PRIMARY ($PRIMARY_HOST) - you run it"; how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
-      else where=${MANUAL_WHERE:-"ON THIS SERVER ($(hostname -s)) - you do it"}; how=${MANUAL_HOW:-root}; fi
+      if [[ "$kind" == "primary" ]]; then where="Run on the PRIMARY ($PRIMARY_HOST)"; how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
+      else where=${MANUAL_WHERE:-"Run on this server ($(hostname -s))"}; how=${MANUAL_HOW:-root}; fi
       [[ -n "$USING" ]] && printf '%s\n' "$USING" | block "Using:"
       [[ "$kind" == "primary" ]] && primary_pending_add "$id" "$PLAN_UNDO"
-      { printf '%s\n' "$PLAN"; [[ -n "$PLAN_UNDO" ]] && printf -- '-- undo (if ever needed): %s\n' "$PLAN_UNDO"; } | print_commands "$where" "$how"
-      if [[ "$MODE" == "check" ]]; then todo "Needed (check mode)"; record "$id" TODO; return 0; fi
-      [[ $PRIMARY_BOX_NOTE -eq 0 ]] && { PRIMARY_BOX_NOTE=1; say "(Every command shown for the primary is also collected in $ACTIONS_FILE)"; }
-      ask_choice "[r] I did it, check again   [s] skip (I do it later)   [h] help   [q] quit" "rshq"
+      { printf '%s\n' "$PLAN"; [[ -n "$PLAN_UNDO" ]] && printf -- '-- Undo, if ever needed: %s\n' "$PLAN_UNDO"; } | print_commands "$where" "$how"
+      if [[ "$MODE" == "check" ]]; then todo "To do in a normal run"; record "$id" TODO; return 0; fi
+      [[ $PRIMARY_BOX_NOTE -eq 0 ]] && { PRIMARY_BOX_NOTE=1; say "${C_D}All commands for you are also saved in:${C_N}"; say "${C_D}  $ACTIONS_FILE${C_N}"; }
+      if is_optional "$id"; then ask_choice "[r] Done, check it   [s] Skip (optional)   [h] Help   [q] Quit" "rshq"
+      else ask_choice "[r] Done, check it   [s] Skip for now   [h] Help   [q] Quit" "rshq"; fi
       case "$ANSWER" in
-        s) skip_record "$id" "Skipped by you."; return 0 ;;
+        s) skip_record "$id" "Skipped."; return 0 ;;
         q) user_stop "Stopped by you" ;;
         h) show_help "$id" || true; continue ;;
-        r) acted=1; say "Checking again ..."; continue ;;
+        r) acted=1; continue ;;
       esac
     fi
     if [[ "$kind" == "check" ]]; then
       [[ -n "$PLAN" ]] && printf '%s\n' "$PLAN" | block "Fix:"
-      if [[ "$MODE" == "check" ]]; then bad "Problem found (see Fix above)"; record "$id" PROBLEM; return 0; fi
+      if [[ "$MODE" == "check" ]]; then bad "Problem found. See Fix above."; record "$id" PROBLEM; return 0; fi
       [[ $helped -eq 0 && -z "$PLAN" ]] && { how_by_hand "$id"; helped=1; }
-      ask_choice "[r] check again   [s] skip (I do it myself)   [h] help   [q] quit" "rshq"
+      ask_choice "[r] Check again   [s] Skip   [h] Help   [q] Quit" "rshq"
       case "$ANSWER" in
-        s) skip_record "$id" "Skipped by you."; return 0 ;;
+        s) skip_record "$id" "Skipped."; return 0 ;;
         q) user_stop "Stopped by you" ;;
         h) show_help "$id" || true; continue ;;
         *) continue ;;
@@ -415,12 +448,12 @@ run_step() {
     # kind auto (or ask: the do function asks its own question)
     printf '%s\n' "$PLAN" | block "Plan:"
     [[ -n "$USING" ]] && printf '%s\n' "$USING" | block "Using:"
-    if [[ "$MODE" == "check" ]]; then todo "Would do the plan above (check mode)"; record "$id" TODO; return 0; fi
+    if [[ "$MODE" == "check" ]]; then todo "To do in a normal run"; record "$id" TODO; return 0; fi
     if [[ "$kind" != "ask" ]]; then
-      ask_choice "[y] do it   [s] skip (I do it myself)   [h] help   [q] quit" "yshq"
+      ask_choice "[y] Yes, do it   [s] Skip   [h] Help   [q] Quit" "yshq"
       case "$ANSWER" in
         y) ;;
-        s) skip_record "$id" "Skipped by you. Type h at any question (or --help-step $id) to see the commands."; return 0 ;;
+        s) skip_record "$id" "Skipped. To do it by hand:  $SELF --help-step $id"; return 0 ;;
         q) user_stop "Stopped by you" ;;
         h) show_help "$id" || true; continue ;;
       esac
@@ -428,7 +461,7 @@ run_step() {
     _log DO "[$id] start"
     JOURNAL_STEP_ENTRIES=0
     drc=0; "$dofn" || drc=$?
-    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started (your answer). Run the step again later: $SELF --from $id"; return 0; fi
+    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $SELF --from $id"; return 0; fi
     if [[ $drc -eq 0 ]]; then
       NOW=""; "$checkfn"; rc=$?
       if [[ $rc -eq 0 ]]; then
@@ -443,27 +476,27 @@ run_step() {
       fi
       if [[ $rc -eq 1 && "$KIND_NOW" == "manual" ]]; then
         # the action did its part; one more thing must be done by hand (shown next, then checked)
-        say "Done so far. One more thing has to be done by hand:"; acted=1; continue
+        say "Done so far. One more thing must be done by hand:"; acted=1; continue
       fi
-      bad "The action ran, but the check still fails: ${NOW:-unknown}"
+      bad "The action ran, but the check still fails. ${NOW:-}"
     else
-      bad "The action did not complete."
+      bad "The action did not finish."
     fi
     if [[ $DO_FAIL_STOP_ONLY -eq 1 ]]; then
       # a retry here would build on what the failed action left: the clean-up is in an earlier step
       DO_FAIL_STOP_ONLY=0
       record "$id" FAILED
-      say "It cannot go on from here: the next run shows the clean-up of THIS server first (step 7.2)."
-      while true; do ask_choice "[h] help   [q] quit" "hq"; [[ "$ANSWER" == "q" ]] && break; show_help "$id" || true; done
+      say "The script cannot go on from here. The next run first shows how to clean up this server (step 7.2)."
+      while true; do ask_choice "[h] Help   [q] Quit" "hq"; [[ "$ANSWER" == "q" ]] && break; show_help "$id" || true; done
       user_stop "Stopped after the failed step $id"
     fi
     [[ $helped -eq 0 ]] && { how_by_hand "$id"; helped=1; }
-    opts="[r] try again   [s] skip (I fix it myself)   [h] help   [q] quit"; local allowed2="rshq"
-    no_skip "$id" && { opts="[r] try again   [h] help   [q] quit"; allowed2="rhq"; }
-    [[ "$id" == "1.2" ]] && { opts="[r] try again   [i] another IP address or user   [h] help   [q] quit"; allowed2="rihq"; }
+    opts="[r] Try again   [s] Skip   [h] Help   [q] Quit"; local allowed2="rshq"
+    no_skip "$id" && { opts="[r] Try again   [h] Help   [q] Quit"; allowed2="rhq"; }
+    [[ "$id" == "1.2" ]] && { opts="[r] Try again   [i] Other IP address or user   [h] Help   [q] Quit"; allowed2="rihq"; }
     ask_choice "$opts" "$allowed2"
     case "$ANSWER" in
-      s) warn "Skipped by you after an error."; record "$id" FAILED_SKIPPED; [[ "$id" == 1.* ]] || AUTO_WAIT["step $id"]=1; return 0 ;;
+      s) warn "Skipped after an error."; record "$id" FAILED_SKIPPED; [[ "$id" == 1.* ]] || AUTO_WAIT["step $id"]=1; return 0 ;;
       q) user_stop "Stopped by you" ;;
       h) show_help "$id" || true; continue ;;
       i) reenter_primary; continue ;;
@@ -474,60 +507,63 @@ run_step() {
 
 summary() {
   local id r col n_ok=0 n_opt=0 n_done=0 n_skip=0 n_bad=0 n_todo=0 n_wait=0 n_prob=0 first_bad=""
-  printf '\n%s================================ SUMMARY ================================%s\n' "$C_B" "$C_N"
+  local t="Summary"
+  printf '\n\n  %s%s %s %s%s\n' "$C_B" "$(rule 2 "$S_HR2")" "$t" "$(rule $((66 - ${#t})) "$S_HR2")" "$C_N"
+  printf '  %sok = was already correct   done = done by the script   done by you = you did it, the script checked it%s\n\n' "$C_D" "$C_N"
   for id in "${STEP_ORDER[@]}"; do
     r=${STEP_RESULT[$id]:-"NOT_FINISHED"}
     case "$r" in
-      OK) col=$C_G; n_ok=$((n_ok + 1)) ;;
-      SKIPPED_OPTIONAL) col=$C_D; n_opt=$((n_opt + 1)) ;;
-      DONE|DONE_BY_YOU) col=$C_G; n_done=$((n_done + 1)) ;;
-      SKIPPED) col=$C_Y; n_skip=$((n_skip + 1)) ;;
-      TODO) col=$C_M; n_todo=$((n_todo + 1)) ;;
-      WAITS) col=$C_D; n_wait=$((n_wait + 1)) ;;
-      RUNNING) col=$C_C; n_wait=$((n_wait + 1)) ;;
-      PROBLEM) col=$C_R; n_prob=$((n_prob + 1)) ;;
-      *) col=$C_R; n_bad=$((n_bad + 1)) ;;
+      OK) n_ok=$((n_ok + 1)) ;;
+      SKIPPED_OPTIONAL) n_opt=$((n_opt + 1)) ;;
+      DONE|DONE_BY_YOU) n_done=$((n_done + 1)) ;;
+      SKIPPED) n_skip=$((n_skip + 1)) ;;
+      TODO) n_todo=$((n_todo + 1)) ;;
+      WAITS|RUNNING) n_wait=$((n_wait + 1)) ;;
+      PROBLEM) n_prob=$((n_prob + 1)) ;;
+      *) n_bad=$((n_bad + 1)) ;;
     esac
-    printf '  %-6s %s%-15s%s %s\n' "$id" "$col" "$r" "$C_N" "${STEP_TITLE[$id]}"
+    col=$(result_color "$r")
+    printf '    %-5s %s%-18s%s %s\n' "$id" "$col" "$(result_label "$r")" "$C_N" "${STEP_TITLE[$id]}"
     case "$r" in
       OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|TODO) ;;
-      *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '         %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:110}" "$C_N"
+      *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '          %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:100}" "$C_N"
          [[ -n "$first_bad" ]] || first_bad=$id ;;
     esac
     _log SUM "$id $r ${STEP_TITLE[$id]}"
   done
   local el=$(( $(date +%s) - RUN_START ))
+  printf '\n'
   if [[ "$MODE" == "check" ]]; then
-    printf '\n  already correct: %s   to do: %s   waits for earlier steps: %s   problems: %s   warnings: %s   (%d min)\n' "$n_ok" "$n_todo" "$n_wait" "$((n_prob + n_bad))" "$WARN_COUNT" "$((el / 60))"
-    printf '  Check mode changed nothing, so on a new server most steps are TODO or WAITS. That is normal.\n'
-    printf '  TODO     = a normal run does it (or shows you the commands for the primary)\n'
-    printf '  WAITS    = can be checked only after an earlier step is done (for example no users yet)\n'
-    printf '  PROBLEM  = must be fixed: see the Fix / Problem lines of that step above\n'
+    printf '  %s ok, %s to do, %s waiting, %s problems, %s warnings\n' "$n_ok" "$n_todo" "$n_wait" "$((n_prob + n_bad))" "$WARN_COUNT"
+    printf '  %sCheck mode changes nothing, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
+    printf '  Only "problem" steps need your attention: see the Fix lines above.%s\n' "$C_N"
   else
-    printf '\n  already correct: %s   done now: %s   skipped: %s   optional skipped: %s   not OK: %s   warnings: %s   (%d min)\n' \
-      "$n_ok" "$n_done" "$n_skip" "$n_opt" "$((n_bad + n_todo + n_wait + n_prob))" "$WARN_COUNT" "$((el / 60))"
-    printf '  OK = was already correct   DONE = done now   DONE_BY_YOU = you did it, checked   SKIPPED = you skipped it\n'
-    printf '  FAILED_SKIPPED = the action failed and you skipped it   NOT_FINISHED = the run stopped in this step\n'
-    [[ $n_opt -gt 0 ]] && printf '  SKIPPED_OPTIONAL = an optional step you skipped (the standby works without it)\n'
-    [[ " ${STEP_RESULT[*]+${STEP_RESULT[*]}} " == *" FAILED "* ]] && printf '  FAILED = the action failed; what to do next is in the Next line\n'
-    [[ $n_wait -gt 0 ]] && printf '  WAITS = needs a step that was not done in this run; checked again in the next run   RUNNING = its long job goes on by itself\n'
+    printf '  %s already ok, %s done in this run, %s skipped, %s not ok, %s warnings%s\n' \
+      "$n_ok" "$n_done" "$((n_skip + n_opt))" "$((n_bad + n_todo + n_wait + n_prob))" "$WARN_COUNT" "$( [[ $el -ge 60 ]] && printf '   (run time %s)' "$(human_min $((el / 60)))")"
+    [[ $n_wait -gt 0 ]] && printf '  %s"waiting" steps need a step that was not done in this run. They are checked again next time.%s\n' "$C_D" "$C_N"
   fi
   if [[ ${#WARN_LIST[@]} -gt 0 ]]; then
-    printf '  Warnings:\n'; local x; for x in "${WARN_LIST[@]}"; do printf '    - %s\n' "$x"; done
+    printf '\n  Warnings:\n'; local x xl xf
+    for x in "${WARN_LIST[@]}"; do
+      xf=1
+      while IFS= read -r xl || [[ -n "$xl" ]]; do
+        if [[ $xf -eq 1 ]]; then printf '    %s%s%s %s\n' "$C_Y" "$S_WARN" "$C_N" "$xl"; xf=0; else [[ -n "$xl" ]] && printf '      %s\n' "$xl"; fi
+      done <<< "$x"
+    done
   fi
   declare -F journal_run_summary >/dev/null && journal_run_summary
-  printf '  Log: %s\n' "$LOG_FILE"
-  [[ -s "$ACTIONS_FILE" ]] && printf '  Commands shown for primary/manual work: %s\n' "$ACTIONS_FILE"
+  printf '\n  Log:        %s\n' "$LOG_FILE"
+  [[ -s "$ACTIONS_FILE" ]] && printf '  Commands:   %s\n' "$ACTIONS_FILE"
   printf '  %s\n' "$(primary_note)"
   if [[ "$MODE" == "check" ]]; then
-    [[ $((n_todo + n_prob + n_bad)) -gt 0 ]] && printf '  Next: fix the PROBLEM steps (if any), then run the script without --check:  %s\n' "$SELF"
+    [[ $((n_todo + n_prob + n_bad)) -gt 0 ]] && printf '\n  %sNext:%s fix the "problem" steps (if any), then run without --check:  %s\n' "$C_W" "$C_N" "$SELF"
   else
     local nc; nc=$(next_cmd)
     if [[ -n "$nc" ]]; then
       NEXT_PRINTED=1
-      if [[ "$nc" == *" --from "*.* ]]; then printf '  Next: continue with  %s   (--help-step %s shows the manual commands)\n' "$nc" "${nc##* }"
-      elif [[ "$nc" == "$SELF" ]]; then printf '  Next: run  %s   (it checks every step; the steps already done pass quickly)\n' "$nc"
-      else printf '  Next: continue with  %s\n' "$nc"; fi
+      if [[ "$nc" == *" --from "*.* ]]; then printf '\n  %sNext:%s  %s\n         %sTo do step %s by hand:  %s --help-step %s%s\n' "$C_W" "$C_N" "$nc" "$C_D" "${nc##* }" "$SELF" "${nc##* }" "$C_N"
+      elif [[ "$nc" == "$SELF" ]]; then printf '\n  %sNext:%s  %s\n         %sEvery step is checked again; finished steps pass quickly.%s\n' "$C_W" "$C_N" "$nc" "$C_D" "$C_N"
+      else printf '\n  %sNext:%s  %s\n' "$C_W" "$C_N" "$nc"; fi
     fi
   fi
   return 0
@@ -579,28 +615,38 @@ batch_primary_steps() {
     [[ "$id" == "4.1" ]] && in41=1; [[ "$id" == "4.7" ]] && in47=1
     n=$((n + 1))
     [[ -n "$how" ]] || how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
-    all+="-- [$id] ${STEP_TITLE_HINT[$id]:-}"$'\n'"$PLAN"$'\n'"${PLAN_UNDO:+-- undo (if ever needed): $PLAN_UNDO}"$'\n\n'
+    all+="-- Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$PLAN"$'\n'"${PLAN_UNDO:+-- Undo, if ever needed: $PLAN_UNDO}"$'\n\n'
   done
   CUR_STEP=""
   exec {BATCH_TTY}>&-; BATCH_TTY=""
   # warnings of the quiet checks are shown here (the steps do not repeat them)
-  local wi; for ((wi = wbefore; wi < ${#WARN_LIST[@]}; wi++)); do printf '      %s[WARN]%s %s\n' "$C_Y" "$C_N" "${WARN_LIST[$wi]#\[*\] }"; done
+  local wi wl wf
+  for ((wi = wbefore; wi < ${#WARN_LIST[@]}; wi++)); do
+    wf=1
+    while IFS= read -r wl || [[ -n "$wl" ]]; do
+      if [[ $wf -eq 1 ]]; then printf '    %s%s %s%s\n' "$C_Y" "$S_WARN" "$wl" "$C_N"; wf=0; else [[ -n "$wl" ]] && printf '      %s%s%s\n' "$C_Y" "$wl" "$C_N"; fi
+    done <<< "${WARN_LIST[$wi]#\[*\] }"
+  done
   [[ $n -ge 2 ]] || return 0
-  printf '\n  %s%s steps of this phase need commands on the primary (SQL, unless a line says SHELL). All of them together:%s\n' "$C_W" "$n" "$C_N"
-  say "(Run them in this order. Each step is checked again afterwards; a step that is not done asks again by itself."
-  say " The file changes on the primary (steps 4.9 to 4.11, if needed) come after this box, one by one.)"
-  CUR_STEP="${1%%.*}.x"
-  printf '%s' "${all%$'\n\n'}" | print_commands "ON PRIMARY ($PRIMARY_HOST) - you run it" "$how"
-  CUR_STEP=""
-  PRIMARY_BOX_NOTE=1; say "(The same commands are in $ACTIONS_FILE)"
-  if [[ $in41 -eq 1 && $in47 -eq 1 ]]; then
-    if grep -q 'create spfile from memory' <<< "$all"; then say "(4.1 first, with its restart: the scope=spfile lines of the other steps work only when the primary runs from the spfile.)"
-    else say "(4.1 and 4.7 both need a restart of the primary: run the 4.7 line before the shutdown of 4.1, then one restart covers both.)"; fi
+  printf '\n  %s%s steps need commands on the primary. They are shown together below, in order.%s\n' "$C_W" "$n" "$C_N"
+  if grep -q '^shutdown immediate' <<< "$all"; then
+    printf '\n    %s%s Step 4.1 restarts the primary database (shutdown immediate, startup mount).%s\n' "$C_Y" "$S_WARN" "$C_N"
+    printf '      %sPlan a short downtime, or choose [o] and run the steps one at a time.%s\n\n' "$C_Y" "$C_N"
   fi
-  ask_choice "[r] I did them, check every step   [o] one step at a time instead   [q] quit" "roq"
+  say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
+  say "Afterwards the script checks every step again."
+  say "Changes to files on the primary (steps 4.9 to 4.11, if needed) follow one by one."
+  CUR_STEP="${1%%.*}.x"
+  printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
+  CUR_STEP=""
+  PRIMARY_BOX_NOTE=1; say "${C_D}The same commands are saved in $ACTIONS_FILE${C_N}"
+  if [[ $in41 -eq 1 && $in47 -eq 1 ]]; then
+    if grep -q 'create spfile from memory' <<< "$all"; then say "Run step 4.1 first, with its restart. The scope=spfile lines of the other steps need the spfile."
+    else say "Steps 4.1 and 4.7 both need a restart of the primary. Run the 4.7 line before the shutdown of 4.1: then one restart covers both."; fi
+  fi
+  ask_choice "[r] Done, check all steps   [o] Show the steps one at a time   [q] Quit" "roq"
   case "$ANSWER" in
     q) [[ $PHASE4_FIRST -eq 0 && -z "$ONLY_PHASE" ]] && RESUME_STEP=$1; user_stop "Stopped by you" ;;
-    r) say "Checking the steps one by one ..." ;;
   esac
   return 0
 }

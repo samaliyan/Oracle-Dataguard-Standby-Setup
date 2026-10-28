@@ -33,7 +33,7 @@ prim_probe() {
   local a
   for a in "$@"; do
     [[ "$a" == "/" && ( "$p" == lsdir || "$p" == canlook ) ]] && continue
-    [[ "$a" != -* ]] && { v_name "$a" || v_path "$a"; } || fatal "SAFETY STOP: invalid value for primary probe $p: $a"
+    [[ "$a" != -* ]] && { v_name "$a" || v_path "$a"; } || fatal "Safety stop: invalid value for the primary check $p: $a"
   done
   case "$p" in
     host)        cmd='hostname -s; hostname -f' ;;
@@ -41,8 +41,8 @@ prim_probe() {
     orainst)     cmd='cat /etc/oraInst.loc' ;;
     olr)         cmd='cat /etc/oracle/olr.loc' ;;
     ps)          cmd='ps -eo pid,user:32,args' ;;
-    exe)         num "$1" || fatal "SAFETY STOP: bad pid $1"; cmd="readlink /proc/$1/exe" ;;
-    environ)     num "$1" || fatal "SAFETY STOP: bad pid $1"
+    exe)         num "$1" || fatal "Safety stop: invalid process id $1"; cmd="readlink /proc/$1/exe" ;;
+    environ)     num "$1" || fatal "Safety stop: invalid process id $1"
                  cmd="tr '\\0' '\\n' < /proc/$1/environ | grep -E '^(ORACLE_HOME|ORACLE_SID|ORACLE_BASE|TNS_ADMIN)='" ;;
     ids)         cmd="id $1; id $2" ;;
     owner)       cmd="stat -c '%U %G' $1" ;;
@@ -64,7 +64,7 @@ prim_probe() {
     invxml)      cmd="cat $1/ContentsXML/inventory.xml" ;;
     tnsping)     cmd="env ORACLE_HOME=$1 TNS_ADMIN=$2 $1/bin/tnsping $3 1" ;;
     hosts)       cmd="getent ahostsv4 $1" ;;
-    *) fatal "SAFETY STOP: unknown primary probe $p" ;;
+    *) fatal "Safety stop: unknown primary check $p" ;;
   esac
   # commands that read files or devices end on the primary itself after 120 s (a hung NFS path must not leave
   # a stuck process there for every probe)
@@ -76,7 +76,8 @@ prim_probe() {
   # a stuck remote command (a hung NFS path, a wedged listener) must not stop the script for ever
   out=$(prim_ssh "echo $PROBE_MARK; $cmd" < /dev/null 2>"$err") || rc=$?
   PROBE_TIMED_OUT=0; PROBE_ERR=""
-  [[ $rc -eq 124 ]] && { printf 'no answer from the primary within %s s (%s)\n' "$PROBE_TIMEOUT" "$p" >> "$err"; PROBE_TIMED_OUT=1; warn "The primary did not answer in time ($p; limit 120 s on the primary, $PROBE_TIMEOUT s here); the result of this check is unknown."; }
+  [[ $rc -eq 124 ]] && { printf 'no answer from the primary within %s s (%s)\n' "$PROBE_TIMEOUT" "$p" >> "$err"; PROBE_TIMED_OUT=1; warn "The primary did not answer in time ($p). The result of this check is unknown.
+Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
   { printf '%s\n' "$out"; printf -- '--- stderr ---\n'; cat "$err"; printf '(exit code %s)\n' "$rc"; } | log_block "PRIMARY probe $p: $cmd"
   PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
   rm -f "$err"
@@ -90,7 +91,7 @@ PROBE_TIMED_OUT=0; PROBE_ERR=""
 prim_scp() {
   # Copy ONE file FROM primary to this server over the existing connection (read-only on primary).
   local src=$1 dst=$2
-  v_path "$src" || fatal "SAFETY STOP: invalid remote path $src"
+  v_path "$src" || fatal "Safety stop: invalid path on the primary: $src"
   run_logged "scp from primary: $src -> $dst" timeout --foreground 600 scp -q -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes "$PRIMARY_SSH_USER@$PRIMARY_IP:$src" "$dst" < /dev/null && return 0
   local rc=$?
   # OL9 scp uses the SFTP protocol; a primary without the sftp subsystem needs the old protocol (-O)
@@ -149,7 +150,7 @@ _prim_sqlplus() {
   # $1 connect line, $2 query (already guarded), $3 title. Runs sqlplus ON PRIMARY over ssh.
   local out rc=0
   v_name "$PRIMARY_SID" && v_path "$DB_HOME" && { [[ -z "$PRIMARY_TNS_ADMIN" ]] || v_path "$PRIMARY_TNS_ADMIN"; } && num "$SQL_TIMEOUT" \
-    || fatal "SAFETY STOP: invalid primary SID/home/TNS_ADMIN"
+    || fatal "Safety stop: invalid SID, home or TNS_ADMIN of the primary"
   # TWO_TASK / LOCAL in the profile of the primary user would send "connect / as sysdba" over the network
   out=$(printf 'set define off\n%s\n%s\nprompt %s\n%s\nexit\n' "$1" "$SQL_HEADER" "$SQL_MARK" "$2" \
         | PROBE_TIMEOUT=$((SQL_TIMEOUT + 30)) prim_ssh "env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME=$DB_HOME ORACLE_SID=$PRIMARY_SID TNS_ADMIN=${PRIMARY_TNS_ADMIN:-$DB_HOME/network/admin} timeout $SQL_TIMEOUT $DB_HOME/bin/sqlplus -S /nolog" 2>&1) || rc=$?
@@ -162,15 +163,15 @@ _prim_sqlplus() {
 prim_sql() {
   # READ-ONLY query on primary (OS authentication of the primary oracle user).
   local q=$1
-  readonly_guard "$q" || { _log SAFETY "Blocked: $q"; fatal "SAFETY STOP: refused to send a non read-only statement to primary: $q"; }
+  readonly_guard "$q" || { _log SAFETY "Blocked: $q"; fatal "Safety stop: this statement is not read-only, so it was NOT sent to the primary: $q"; }
   _prim_sqlplus "connect / as sysdba" "$q" "PRIMARY (read-only): ${q:0:150}"
 }
 
 prim_sql_as_sys() {
   # READ-ONLY query on primary, logging in as sys through the network ($1 = target).
   local target=$1 q=$2
-  readonly_guard "$q" || fatal "SAFETY STOP: refused statement: $q"
-  [[ "$target" =~ ^(//[A-Za-z0-9_.-]+:[0-9]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+)$ ]] || fatal "SAFETY STOP: invalid target $target"
+  readonly_guard "$q" || fatal "Safety stop: this statement is not read-only, so it was NOT sent to the primary: $q"
+  [[ "$target" =~ ^(//[A-Za-z0-9_.-]+:[0-9]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+)$ ]] || fatal "Safety stop: invalid connect target $target"
   _prim_sqlplus "connect sys/\"$SYS_PW\"@$target as sysdba" "$q" "PRIMARY sqlplus as sys@$target (read-only): ${q:0:120}"
 }
 
@@ -180,41 +181,42 @@ ssh_diagnose() {
   local u=$PRIMARY_SSH_USER ip=$PRIMARY_IP
   case "$e" in
     *"Permission denied"*)
-      print_commands "ON PRIMARY ($ip) - check" "root  ->  shell" <<EOF
-# The password of $u was refused (wrong password), or password login is off.
+      print_commands "Check on the PRIMARY ($ip)" "root  ->  shell" <<EOF
+# The password of $u was refused, or password login is turned off.
 grep -iE '^[[:space:]]*(PasswordAuthentication|PermitRootLogin|AllowUsers|DenyUsers)' /etc/ssh/sshd_config
-# PasswordAuthentication must be yes; if you change it:
+# PasswordAuthentication must be yes. After a change:
 systemctl restart sshd
-# unlock / set the password if needed:
+# To unlock the user or set its password:
 passwd $u
 EOF
       ;;
     *"Connection refused"*)
-      print_commands "ON PRIMARY ($ip) - check" "root  ->  shell" <<EOF
-# Nothing listens on port 22: sshd is stopped
+      print_commands "Check on the PRIMARY ($ip)" "root  ->  shell" <<EOF
+# Nothing listens on port 22: sshd is stopped.
 systemctl enable --now sshd
 systemctl status sshd
 EOF
       ;;
     *"timed out"*|*"No route to host"*|*"Network is unreachable"*)
-      print_commands "ON PRIMARY ($ip) - check" "root  ->  shell" <<EOF
-# The network or a firewall blocks port 22 between the servers
+      print_commands "Check on the PRIMARY ($ip)" "root  ->  shell" <<EOF
+# The network or a firewall blocks port 22 between the servers.
 firewall-cmd --list-services
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
 EOF
       ;;
     *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
-      print_commands "ON THIS SERVER ($(hostname -s)) - you do it" "root  ->  shell" <<EOF
-# The saved host key of $ip is old (the primary was reinstalled?). Remove it, then try again:
+      print_commands "Run on this server ($(hostname -s))" "root  ->  shell" <<EOF
+# The saved host key of $ip is old, for example after a reinstall. Remove it and try again:
 ssh-keygen -R $ip
 ssh $u@$ip hostname
 EOF
       ;;
     *"Could not resolve hostname"*)
-      say "The name $ip cannot be resolved here; start the script with the IP address:  $SELF --primary <IP>" ;;
+      say "The name $ip cannot be resolved here. Start the script with the IP address:"
+      say "  $SELF --primary <IP>" ;;
     *)
-      print_commands "ON THIS SERVER ($(hostname -s)) - test" "root  ->  shell" <<EOF
+      print_commands "Test on this server ($(hostname -s))" "root  ->  shell" <<EOF
 ssh -v $u@$ip hostname
 EOF
       ;;
@@ -229,7 +231,7 @@ open_ssh() {
   rm -f -- "$SSH_CTL"
   local elog="$STATE_DIR/ssh_error.log"
   : > "$elog"; chmod 600 "$elog"
-  say "ssh will ask the password of user $PRIMARY_SSH_USER on $PRIMARY_IP (it goes to ssh only)."
+  say "Type the password of $PRIMARY_SSH_USER on $PRIMARY_IP when ssh asks. Only ssh sees it."
   say "If ssh asks to accept the host key of the primary, answer yes."
   # Only options that every OpenSSH since 6.7 knows (Oracle Linux 7 has 7.4, OL8 has 8.0).
   # -E: ssh writes its own error messages to a file, so they can be shown and logged.
@@ -238,13 +240,14 @@ open_ssh() {
          -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < "$PROMPT_IN" 9>&-; then
     SSH_OPEN=1
   else
-    bad "ssh connection to $PRIMARY_SSH_USER@$PRIMARY_IP failed"
+    bad "The ssh connection to $PRIMARY_SSH_USER@$PRIMARY_IP failed."
     if [[ -s "$elog" ]]; then printf 'ssh said:\n'; sed 's/^/  /' "$elog"; fi | hint
     ssh_diagnose "$elog"
     log_block "ssh error output" < "$elog"
     return 1
   fi
-  ssh_alive || { bad "ssh connection is not usable"; sed 's/^/  /' "$elog" | hint; return 1; }
-  DONE_MSG="Connected to $PRIMARY_SSH_USER@$PRIMARY_IP (one connection, reused by all read-only checks)"
+  ssh_alive || { bad "The ssh connection is not usable."; sed 's/^/  /' "$elog" | hint; return 1; }
+  DONE_MSG="Connected to $PRIMARY_SSH_USER@$PRIMARY_IP."
+
 }
 

@@ -137,13 +137,16 @@ media_is_staged() { local k; k=$(media_kind "${1%%,*}"); [[ "$k" == *_staged ]];
 # ---- 3.1 installer files ----
 F_GRID=""; F_DB=""
 c_3_1() {
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   local need_g=0 need_d=0
   if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; fi
   db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1
-  if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Software is already unpacked/installed; installer files not needed"; return 0; fi
+  if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
   if { [[ $need_g -eq 0 ]] || media_ok "$GRID_MEDIA"; } && { [[ $need_d -eq 0 ]] || media_ok "$DB_MEDIA"; }; then
-    NOW="Installer files:${GRID_MEDIA:+ Grid=$GRID_MEDIA}${DB_MEDIA:+ DB=$DB_MEDIA}"; return 0
+    NOW="Installer files are known"
+    [[ -n "$GRID_MEDIA" ]] && NOW+=$'\n'"Grid:      $GRID_MEDIA"
+    [[ -n "$DB_MEDIA" ]] && NOW+=$'\n'"Database:  $DB_MEDIA"
+    return 0
   fi
   scan_media
   F_GRID=""; F_DB=""
@@ -154,44 +157,50 @@ c_3_1() {
   [[ "$F_GRID" == MISSING:* ]] && { miss2+=" ${F_GRID#MISSING:}"; F_GRID=""; }
   [[ "$F_DB" == MISSING:* ]] && { miss2+=" ${F_DB#MISSING:}"; F_DB=""; }
   if [[ -n "$miss2" ]]; then
-    NOW="The second file of the installer is missing:$miss2 (it must be in the same folder as the first one)"
-    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="Copy$miss2 next to the first file (owner root, chmod 644), then answer r."
+    NOW="The second installer file is missing:$miss2"$'\n'"It must be in the same folder as the first file."
+    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 next to the first file (owner root, mode 644). Then answer r."
     return 1
   fi
   if [[ ( $need_g -eq 1 && -z "$F_GRID" ) || ( $need_d -eq 1 && -z "$F_DB" ) ]]; then
-    NOW="No installer files found in ${ZIP_DIRS[*]} for:$([[ $need_g -eq 1 && -z "$F_GRID" ]] && printf ' Grid %s' "$(want_rel grid)")$([[ $need_d -eq 1 && -z "$F_DB" ]] && printf ' database %s' "$(want_rel)")"
-    [[ -n "$MEDIA_REFUSED" ]] && NOW+=$'\n'"Not used (owner is not root/$ORACLE_USER/$GRID_USER, or others can change the file):"$'\n'"${MEDIA_REFUSED%$'\n'}"
-    KIND_NOW=manual; MANUAL_HOW="see each line"; MANUAL_WHERE="PRIMARY ($PRIMARY_HOST) and THIS SERVER ($(hostname -s)) - you do it"
+    NOW="No installer files found for:$([[ $need_g -eq 1 && -z "$F_GRID" ]] && printf ' Grid %s' "$(want_rel grid)")$([[ $need_d -eq 1 && -z "$F_DB" ]] && printf ' database %s' "$(want_rel)")"
+    NOW+=$'\n'"Searched in: ${ZIP_DIRS[*]}"
+    [[ -n "$MEDIA_REFUSED" ]] && NOW+=$'\n'"Not used, because of their owner or mode:"$'\n'"${MEDIA_REFUSED%$'\n'}"
+    KIND_NOW=manual; MANUAL_HOW="the user named on each line"; MANUAL_WHERE="Run on the PRIMARY ($PRIMARY_HOST) and on this server ($(hostname -s))"
     local wg=""; [[ $need_g -eq 1 ]] && wg=" and grid"
-    PLAN="Copy the files to /stage on this server (owner root, chmod 644), then answer r. Either:"
+    PLAN="-- Copy the files to /stage on this server (owner root, mode 644). Then answer r."
     if [[ $DB_MAJOR -ge 18 ]]; then
-      PLAN+=$'\n'"A) a GOLD IMAGE of the primary home (same patches). ON PRIMARY:"
+      PLAN+=$'\n'"-- Use one of these:"
+      PLAN+=$'\n'"-- A) A gold image of the primary home, with the same patches. On the primary:"
       [[ $need_d -eq 1 ]] && PLAN+=$'\n'"     as $ORACLE_USER:  mkdir -p /tmp/gold && $DB_HOME/runInstaller -silent -createGoldImage -destinationLocation /tmp/gold"
       [[ $need_g -eq 1 ]] && PLAN+=$'\n'"     as $GRID_USER:  mkdir -p /tmp/gold && $GRID_HOME/gridSetup.sh -silent -createGoldImage -destinationLocation /tmp/gold"
-      PLAN+=$'\n'"   then ON THIS SERVER as root:  mkdir -p /stage && scp $PRIMARY_SSH_USER@$PRIMARY_IP:/tmp/gold/*.zip /stage/ && chmod 644 /stage/*.zip"
-      PLAN+=$'\n'"B) the base installation files of version $DB_MAJOR (then step 3.11 asks for the same patches as primary):"
+      PLAN+=$'\n'"   Then on this server, as root:  mkdir -p /stage && scp $PRIMARY_SSH_USER@$PRIMARY_IP:/tmp/gold/*.zip /stage/ && chmod 644 /stage/*.zip"
+      PLAN+=$'\n'"-- B) The base installation files of release $DB_MAJOR."
+      PLAN+=$'\n'"--    Step 3.11 then asks you to apply the same patches as on the primary."
     else
-      PLAN+=$'\n'"the base installation files of version $(want_rel) (then step 3.11 asks for the same patches as primary):"
+      PLAN+=$'\n'"-- The base installation files of release $(want_rel)."
+      PLAN+=$'\n'"-- Step 3.11 then asks you to apply the same patches as on the primary."
     fi
     [[ $need_d -eq 1 ]] && PLAN+=$'\n'"     database: $(base_media_name db "$(want_rel)")"
     [[ $need_g -eq 1 ]] && PLAN+=$'\n'"     grid:     $(base_media_name grid "$(want_rel grid)")"
     return 1
   fi
-  NOW="Found installer files"
-  PLAN="Use these files:"
-  [[ $need_g -eq 1 ]] && PLAN+=$'\n'"  Grid: $(media_desc "$F_GRID")"
-  [[ $need_d -eq 1 ]] && PLAN+=$'\n'"  DB:   $(media_desc "$F_DB")"
-  PLAN+=$'\n'"and save them in $SETTINGS_FILE"
-  USING="files with another version than $(want_rel) in their name are ignored; a gold image must come from the primary"
+  NOW="Installer files found"
+  PLAN="Use these installer files:"
+  [[ $need_g -eq 1 ]] && PLAN+=$'\n'"  Grid:      $(media_desc "$F_GRID")"
+  [[ $need_d -eq 1 ]] && PLAN+=$'\n'"  Database:  $(media_desc "$F_DB")"
+  PLAN+=$'\n'"Save them in $SETTINGS_FILE"
+  USING="Files of another release than $(want_rel) are ignored."$'\n'"A gold image must come from the primary."
   # base media + a patched primary: say it now, not after two hours of installing
   local pp; pp=$(primary_patches "$DB_HOME" 2>/dev/null | head -n 3 | paste -sd' ' -)
   if [[ -n "$pp" && -z "$RU_DIR" ]] && media_is_gold "${F_DB:-${F_GRID:-}}"; then :   # gold image: same patches
   elif [[ -n "$pp" && -z "$RU_DIR" ]]; then
-    USING+=$'\n'"NOTE: the primary has patches ($pp ...). These are base files: after the installation step 3.11 asks you to apply"
-    USING+=$'\n'"the same patches by hand (opatchauto, about an hour). Faster: unzip the Release Update of the primary here now,"
-    USING+=$'\n'"set RU_DIR and OPATCH_ZIP in the settings (q, then $SELF --settings, e) and the installer applies it."
+    USING+=$'\n'"The primary has patches ($pp ...). These base files do not have them."
+    USING+=$'\n'"Step 3.11 then asks you to apply them by hand (opatchauto, about an hour)."
+    USING+=$'\n'"Faster: unzip the primary's Release Update on this server now and set RU_DIR"
+    USING+=$'\n'"and OPATCH_ZIP in the settings. The installer then applies it."
+    USING+=$'\n'"To do that: answer q, run $SELF --settings and choose e."
   fi
-  [[ -n "$MEDIA_REFUSED" ]] && USING+=$'\n'"not used (owner or mode): ${MEDIA_REFUSED//$'\n'/ }"
+  [[ -n "$MEDIA_REFUSED" ]] && USING+=$'\n'"Not used, because of owner or mode: ${MEDIA_REFUSED//$'\n'/ }"
   return 1
 }
 base_media_name() {
@@ -248,7 +257,7 @@ make_rsp() {
   # $1 template, $2 owner. Copies the template into a private file (RSP).
   local tpl=$1 name; name=$(basename "$tpl")
   RSP_TEMPLATE=$tpl
-  [[ -f "$tpl" ]] || { bad "Response file template not found in the media: $tpl"; return 1; }
+  [[ -f "$tpl" ]] || { bad "The response file template is not in the media: $tpl"; return 1; }
   secure_rsp "$name" || return 1
   ( umask 077; set -C; cat "$tpl" > "$RSP" ) || return 1
   RSP_MISSING=""
@@ -263,10 +272,12 @@ rsp_review() {
   # after setting the keys: log them (passwords masked) and stop if a needed key is missing
   grep -vE '^[[:space:]]*(#|$)' "$RSP" | log_block "response file $RSP (template from the media)"
   local dup; dup=$(grep -vE '^[[:space:]]*(#|$)' "$RSP" | cut -d= -f1 | tr -d ' ' | sort | uniq -d | paste -sd' ' -)
-  [[ -n "$dup" ]] && { bad "The response file has a key twice ($dup): the installer would read the last one. Check the template $RSP_TEMPLATE (each key once, as an uncommented key= line)."; return 1; }
+  [[ -n "$dup" ]] && { bad "The response file has a key twice: $dup
+The installer would read only the last one. Fix the template so that each key
+is in it once, as an uncommented key= line: $RSP_TEMPLATE"; return 1; }
   if [[ -n "$RSP_MISSING" ]]; then
-    bad "The response file template of this media does not have these settings:$RSP_MISSING"
-    printf 'This media is newer or older than the script expects. Install this software yourself\n(h shows the installer choices), or add the missing keys as uncommented key= lines to the template\n%s and run the step again.\n' "$RSP_TEMPLATE" | hint
+    bad "The response file template of this media lacks these keys:$RSP_MISSING"
+    printf 'This media is newer or older than the script expects. Either install this software\nyourself (h shows the installer choices), or add the missing keys to the template\nas uncommented key= lines and run the step again. The template:\n  %s\n' "$RSP_TEMPLATE" | hint
     return 1
   fi
 }
@@ -279,19 +290,20 @@ ask_asm_password() {
   local tries=0 p1
   while [[ $tries -lt 3 ]]; do
     tries=$((tries + 1))
-    if [[ -n "$ENV_ASM_PW" ]]; then SECRET=$ENV_ASM_PW; ENV_ASM_PW=""; say "Using DG_ASM_PASSWORD from environment"
+    if [[ -n "$ENV_ASM_PW" ]]; then SECRET=$ENV_ASM_PW; ENV_ASM_PW=""; say "Using the ASM password from DG_ASM_PASSWORD."
     else
-      ask_secret "New password for ASM SYS/ASMSNMP on this server (8-30 chars, upper, lower, digit; not shown while typing):"
+      ask_secret "New ASM password for SYS and ASMSNMP (8-30 characters, upper and lower case, a digit)"
       p1=$SECRET
-      ask_secret "Repeat:"
-      [[ "$p1" == "$SECRET" ]] || { SECRET=""; bad "Passwords do not match. Please type them again."; continue; }
+      ask_secret "Type it again"
+      [[ "$p1" == "$SECRET" ]] || { SECRET=""; bad "The two passwords are not the same. Type them again."; continue; }
     fi
     p1=$SECRET; SECRET=""
     if [[ ${#p1} -lt 8 || ${#p1} -gt 30 || ! "$p1" =~ [A-Z] || ! "$p1" =~ [a-z] || ! "$p1" =~ [0-9] || "$p1" =~ [[:space:]\"\'@/\\\&\$\`] ]]; then
-      bad "Password must be 8-30 chars with upper, lower and a digit, without space, quote, @ / & \$ \` or backslash"; continue
+      bad "The password needs 8-30 characters, upper and lower case letters and a digit.
+It must not contain a space, a quote, @ / & \$ \` or a backslash."; continue
     fi
     ASM_PW=$p1
-    ok "ASM password received (kept only in memory and in a temporary response file)"
+    ok "ASM password set. It is kept only in memory and in a temporary response file."
     mask_pending
     return 0
   done
@@ -306,13 +318,13 @@ run_installer() {
   INS08101_RETRIED=0
   local who=oracle; [[ "$runner" == "as_grid" ]] && who=grid
   local out; out="$LOG_DIR/$(tr -c 'A-Za-z0-9\n' '_' <<< "$title" | tr -s '_' | tr -d '\n')_$RUN_ID.log"
-  say "$title (silent). This takes several minutes."
+  say "Starting the $title. It runs silently and takes several minutes."
   local rc=0 keep=$JOB_KEEP
   run_long "$title" "$out" "" "$who" "$@" < /dev/null || rc=$?
-  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && warn "$title finished with warnings (see $out)"; installer_done_record "$title"; return 0; fi
+  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && warn "$title finished with warnings. Output: $out"; installer_done_record "$title"; return 0; fi
   bad "$title failed (exit code $rc)"
   grep -E 'INS-[0-9]+|PRVF-|PRVG-|PRCZ-|\[FATAL\]|\[WARNING\]|SEVERE' <<< "$RUN_OUT" | head -n 15 | hint
-  grep -oE '(/[A-Za-z0-9_./-]+/(logs|cfgtoollogs)/[A-Za-z0-9_./-]+\.log)' <<< "$RUN_OUT" | sort -u | head -n 3 | sed 's/^/installer log: /' | hint
+  grep -oE '(/[A-Za-z0-9_./-]+/(logs|cfgtoollogs)/[A-Za-z0-9_./-]+\.log)' <<< "$RUN_OUT" | sort -u | head -n 3 | sed 's/^/Installer log: /' | hint
   # the retries below never apply a Release Update a second time (the failed try may have applied it already)
   local -a args=("$@"); local home; home=$([[ "$who" == "grid" ]] && printf '%s' "$GRID_HOME" || printf '%s' "$DB_HOME")
   if ru_applied "$home"; then
@@ -321,13 +333,14 @@ run_installer() {
       if [[ "${args[$i]}" == "-applyRU" || "${args[$i]}" == "-applyPSU" ]]; then i=$((i + 2)); continue; fi
       a2+=("${args[$i]}"); i=$((i + 1))
     done
-    args=("${a2[@]}"); say "The Release Update is already in $home: a retry does not apply it again."
+    args=("${a2[@]}"); say "The Release Update is already in $home. A retry does not apply it again."
   fi
   if grep -q 'INS-08101' <<< "$RUN_OUT"; then
     local did; did=$([[ ${OS_MAJOR:-0} -ge 9 ]] && printf 'OL8' || printf 'OEL7.8')
     if [[ "${INS08101_RETRIED:-0}" -eq 0 ]] && [[ " ${ORA_ENV[*]} ${GRID_ENV[*]} " != *" CV_ASSUME_DISTID=$did "* ]]; then
       INS08101_RETRIED=1
-      say "INS-08101: this installer does not know Oracle Linux $OS_MAJOR. Trying again with CV_ASSUME_DISTID=$did (the usual workaround)."
+      say "INS-08101: this installer does not know Oracle Linux $OS_MAJOR."
+      say "Trying again with CV_ASSUME_DISTID=$did, the usual workaround."
       local -a saved_o=("${ORA_ENV[@]}") saved_g=("${GRID_ENV[@]}")
       ORA_ENV+=("CV_ASSUME_DISTID=$did"); GRID_ENV+=("CV_ASSUME_DISTID=$did")
       rc=0; JOB_KEEP=$keep
@@ -340,19 +353,19 @@ run_installer() {
         install -d -m 700 "$STATE_DIR"; printf '%s\n' "$did" > "$STATE_DIR/distid"; chmod 600 "$STATE_DIR/distid"
         _log INFO "CV_ASSUME_DISTID=$did kept (saved in $STATE_DIR/distid)"
       fi
-      if [[ $rc -eq 0 || $rc -eq 6 ]]; then warn "$title finished with CV_ASSUME_DISTID=$did"; installer_done_record "$title"; return 0; fi
+      if [[ $rc -eq 0 || $rc -eq 6 ]]; then warn "$title finished, with CV_ASSUME_DISTID=$did."; installer_done_record "$title"; return 0; fi
       bad "$title failed again (exit code $rc)"; grep -E 'INS-[0-9]+|\[FATAL\]|SEVERE' <<< "$RUN_OUT" | head -n 10 | hint
     fi
-    printf 'INS-08101: this installer does not know this Oracle Linux release. Use a newer Release Update:\nunzip it on this server, set RU_DIR=<folder> and OPATCH_ZIP in the settings (%s --settings, choose e),\nthen run the script again.\n' "$SELF" | hint
+    printf 'INS-08101: this installer does not know this Oracle Linux release.\nUse a newer Release Update: unzip it on this server, then set RU_DIR=<folder>\nand OPATCH_ZIP in the settings:\n  %s --settings   (choose e)\nThen run the script again.\n' "$SELF" | hint
   fi
   if [[ -n "$ign" ]] && grep -qE 'INS-13013|INS-13014|INS-13016|PRVF-|PRVG-' <<< "$RUN_OUT"; then
-    printf 'Some prerequisite checks failed (lines above). Fix them if you can.\n' | hint
-    if confirm_word "Retry and IGNORE the prerequisite failures?" "IGNORE"; then
+    printf 'Some prerequisite checks failed (see the lines above). Fix them if you can.\n' | hint
+    if confirm_word "Retry and ignore the failed prerequisite checks" "IGNORE"; then
       rc=0
       JOB_KEEP=$keep
       ru_applied "$home" && { local -a a3=(); local j=0; while [[ $j -lt ${#args[@]} ]]; do if [[ "${args[$j]}" == "-applyRU" || "${args[$j]}" == "-applyPSU" ]]; then j=$((j + 2)); continue; fi; a3+=("${args[$j]}"); j=$((j + 1)); done; args=("${a3[@]}"); }
       run_long "$title (ignore prereq)" "${out%.log}_2.log" "" "$who" "${args[@]}" "$ign" < /dev/null || rc=$?
-      if [[ $rc -eq 0 || $rc -eq 6 ]]; then warn "$title finished with ignored prerequisites"; installer_done_record "$title"; return 0; fi
+      if [[ $rc -eq 0 || $rc -eq 6 ]]; then warn "$title finished. Failed prerequisite checks were ignored."; installer_done_record "$title"; return 0; fi
       bad "$title failed again (exit code $rc)"
       grep -E 'INS-[0-9]+|\[FATAL\]|SEVERE' <<< "$RUN_OUT" | head -n 10 | hint
     fi
@@ -382,10 +395,10 @@ installer_done_record() {
 }
 run_root_script() {
   # root scripts get no input: their questions (local bin folder, TFA) take the default answer
-  [[ -x "$1" ]] || { bad "Not found: $1"; return 1; }
+  [[ -x "$1" ]] || { bad "Root script not found: $1"; return 1; }
   local out; out="$LOG_DIR/root_$(basename "$(dirname "$1")")_$(basename "$1" .sh)_$RUN_ID.log"
-  if run_long "root script $1" "$out" "" root "$1" < /dev/null; then say "$1 completed"; return 0; fi
-  bad "$1 failed"; printf '%s\n' "$RUN_OUT" | tail -n 15 | hint
+  if run_long "root script $1" "$out" "" root "$1" < /dev/null; then say "$1 finished without error."; return 0; fi
+  bad "$1 failed. The last lines of its output:"; printf '%s\n' "$RUN_OUT" | tail -n 15 | hint
   return 1
 }
 ru_args() {
@@ -394,32 +407,34 @@ ru_args() {
   [[ -n "$RU_DIR" && -d "$RU_DIR" ]] || return 0
   # a home that already has the Release Update (an earlier try applied it) does not get it again
   local h; [[ "${1:-}" == "grid" ]] && h=$GRID_HOME || h=$DB_HOME
-  if ru_applied "$h"; then say "The Release Update is already in $h: it is not applied again." >&2; return 0; fi
+  if ru_applied "$h"; then say "The Release Update is already in $h. It is not applied again." >&2; return 0; fi
   if [[ "${1:-}" == "grid" && "$(want_rel grid)" == "12.2" ]]; then printf '%s\n' -applyPSU "$RU_DIR"
   else printf '%s\n' -applyRU "$RU_DIR"; fi
 }
 new_opatch() {
   # $1 home, $2 runner, $3 owner: the Release Update needs a newer OPatch than the base media has
   [[ -n "$RU_DIR" ]] || return 0
-  [[ -n "$OPATCH_ZIP" && -f "$OPATCH_ZIP" ]] || { bad "RU_DIR is set but OPATCH_ZIP (the newest OPatch, p6880880) is not: set it with  $SELF --settings  (choose e)"; return 1; }
-  media_trusted "$OPATCH_ZIP" || { bad "$OPATCH_ZIP may not be used (owner or mode)"; return 1; }
+  [[ -n "$OPATCH_ZIP" && -f "$OPATCH_ZIP" ]] || { bad "RU_DIR is set, but OPATCH_ZIP is not. It must name the newest OPatch zip (p6880880).
+Set it with:  $SELF --settings   (choose e)"; return 1; }
+  media_trusted "$OPATCH_ZIP" || { bad "$OPATCH_ZIP is not used: its owner or mode is not safe.
+The owner must be root, $ORACLE_USER or $GRID_USER, and only the owner may change it."; return 1; }
 
   # the old OPatch is kept next to it (no rm -rf of a part of a home)
   # the OPatch of the zip already in place (an earlier try): nothing to do
   local want_v have_v
   want_v=$(unzip -p "$OPATCH_ZIP" OPatch/version.txt 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)
   have_v=$(grep -oE '[0-9]+(\.[0-9]+)+' "$1/OPatch/version.txt" 2>/dev/null | head -n 1)
-  if [[ -n "$want_v" && -n "$have_v" ]] && ! ver_lt "$have_v" "$want_v"; then say "$1/OPatch is already version $have_v (the zip has $want_v)"; return 0; fi
-  say "Replacing $1/OPatch with $OPATCH_ZIP (needed by the Release Update)"
+  if [[ -n "$want_v" && -n "$have_v" ]] && ! ver_lt "$have_v" "$want_v"; then say "$1/OPatch is already version $have_v. The zip has $want_v: nothing to do."; return 0; fi
+  say "Replacing $1/OPatch with the one in $OPATCH_ZIP. The Release Update needs it."
   if [[ -e "$1/OPatch" && -e "$1/OPatch.bak_$RUN_ID" ]]; then
     # a retry in this run: the original is kept already; the half copy goes
-    run_logged "remove the OPatch of the failed try" "$2" rm -rf -- "$1/OPatch" || { bad "Cannot remove $1/OPatch"; return 1; }
+    run_logged "remove the OPatch of the failed try" "$2" rm -rf -- "$1/OPatch" || { bad "Cannot remove $1/OPatch."; return 1; }
   elif [[ -e "$1/OPatch" ]]; then
-    run_logged "keep old OPatch" "$2" mv -T -- "$1/OPatch" "$1/OPatch.bak_$RUN_ID" || { bad "Cannot move $1/OPatch aside"; return 1; }
+    run_logged "keep old OPatch" "$2" mv -T -- "$1/OPatch" "$1/OPatch.bak_$RUN_ID" || { bad "Cannot move $1/OPatch aside."; return 1; }
     journal OPATCH "$1/OPatch" "old=$1/OPatch.bak_$RUN_ID"
   fi
-  run_logged "unzip OPatch" "$2" unzip -q -o "$OPATCH_ZIP" -d "$1" || { bad "unzip of OPatch failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-  [[ -x "$1/OPatch/opatch" ]] || { bad "$1/OPatch/opatch missing after unzip (wrong file?)"; return 1; }
+  run_logged "unzip OPatch" "$2" unzip -q -o "$OPATCH_ZIP" -d "$1" || { bad "The unzip of OPatch failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+  [[ -x "$1/OPatch/opatch" ]] || { bad "$1/OPatch/opatch is missing after the unzip. Is OPATCH_ZIP the right file?"; return 1; }
 }
 
 unzip_marker() { printf '%s/unzip_failed' "$STATE_DIR"; }
@@ -445,15 +460,17 @@ unzip_failed_check() {
     hit=0; [[ -z "$dest" ]] && hit=1
     for f in "$@"; do [[ "$dest" == "$f" ]] && hit=1; done
     [[ $hit -eq 1 ]] || continue
-    list+="  '$t' into ${dest:-(folder not recorded: the home or stage folder of that file)} (output $o)"$'\n'
+    list+="  '$t' into ${dest:-the home or stage folder of that file} (output $o)"$'\n'
     rmcmd+="grep -vF -- '|${o}|' '$(unzip_marker)' > '$(unzip_marker).n'; mv -f '$(unzip_marker).n' '$(unzip_marker)'"$'\n'
   done < "$(unzip_marker)"
   [[ -n "$list" ]] || return 0
-  NOW="An earlier unzip did not finish; this folder is incomplete:"$'\n'"${list%$'\n'}"
+  NOW="An earlier unzip did not finish. Its folder is incomplete:"$'\n'"${list%$'\n'}"
   MANUAL_HOW="root  ->  shell"
-  PLAN="Empty ONLY the folder named above (check that nothing is installed there: it must not be in $INVENTORY_DIR/ContentsXML/inventory.xml), then remove its line(s):
+  PLAN="-- Empty the folder named above, and nothing else. First check that nothing is
+-- installed there: it must not be listed in $INVENTORY_DIR/ContentsXML/inventory.xml.
+-- Then remove its line from the list of failed unzips:
 ${rmcmd%$'\n'}
-and answer r (the files are unpacked again)"
+-- Then answer r. The files are unpacked again."
   return 1
 }
 stage_dir() { printf '%s/dg_stage_%s' "$(dirname "$INVENTORY_DIR")" "$1"; }   # for staged (12.x) media
@@ -463,16 +480,16 @@ unpack_media() {
   [[ -d "$dest" ]] || make_dir "$dest" "$owner" || return 1
   IFS=',' read -ra _uz <<< "$files"
   for f in "${_uz[@]}"; do
-    media_trusted "$f" || { bad "$f may not be used (owner or mode changed)"; return 1; }
-    runuser -u "$owner" -- test -r "$f" || { bad "$owner cannot read $f (chmod 644 it)"; return 1; }
+    media_trusted "$f" || { bad "$f is not used: its owner or mode has changed."; return 1; }
+    runuser -u "$owner" -- test -r "$f" || { bad "$owner cannot read $f. Fix it with:  chmod 644 $f"; return 1; }
     local who=oracle; [[ "$runner" == "as_grid" ]] && who=grid
     local uo="$LOG_DIR/unzip_$(basename "$f" .zip)_$RUN_ID.log"
     # the marker is written first and removed only when the unzip worked: any other end leaves it
     install -d -m 700 "$STATE_DIR"
     printf '%s|%s|%s\n' "unzip $(basename "$f")" "$uo" "$dest" >> "$(unzip_marker)" && chmod 600 "$(unzip_marker)" \
-      || { bad "Cannot write $(unzip_marker) (disk full?); the unzip is not started"; return 1; }
+      || { bad "Cannot write $(unzip_marker). Is the disk full? The unzip was not started."; return 1; }
     run_long "unzip $(basename "$f")" "$uo" "" "$who" unzip -q -o "$f" -d "$dest" < /dev/null \
-      || { bad "unzip failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+      || { bad "The unzip failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     unzip_marker_clear "$uo"
     journal UNZIP "$dest" "from $(basename "$f")"
   done
@@ -510,12 +527,16 @@ grid_state() {
 half_installed_plan() {
   # $1 home, $2 owner, $3 the success record: an installer that registered the home but did not finish
   # (relink error, killed), or a home installed by hand before this script ran
-  NOW="$1 is in the inventory, but this script has no record that its installer finished (or its programs are missing)"
+  NOW="$1 is in the Oracle inventory, but the script cannot confirm the installation."$'\n'"There is no record that its installer finished, or its programs are missing."
   KIND_NOW=manual; MANUAL_HOW="$2  ->  shell"
-  PLAN="If YOU installed this home and the installer finished without error (check the newest log under $INVENTORY_DIR/logs):
-  as root:  touch $3      then answer r
-If the installer failed or was stopped: fix the cause, remove the half home and answer r (it is installed again):
-  $1/deinstall/deinstall     (if that fails: as root  rm -rf $1/*  and remove the HOME line of $1 from $INVENTORY_DIR/ContentsXML/inventory.xml)"
+  PLAN="-- Case 1: you installed this home yourself, and the installer finished without error
+-- (see the newest log in $INVENTORY_DIR/logs). Record that, as root, then answer r:
+touch $3
+-- Case 2: the installer failed or was stopped. Fix the cause, remove the half-installed
+-- home, then answer r. The home is then installed again:
+$1/deinstall/deinstall
+-- If deinstall fails, as root:  rm -rf $1/*
+-- and remove the HOME line of $1 from $INVENTORY_DIR/ContentsXML/inventory.xml"
 }
 grid_installer() {
   # prints the installer path for the current media (image: in the home; staged: in the stage folder)
@@ -559,32 +580,34 @@ write_grid_rsp() {
 # ---- 3.2 Grid software ----
 c_3_2() {
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   grid_state
   case "$GSTATE" in
     DONE|ASM_DOWN|HAS_DOWN|NEED_CONFIGTOOLS|NEED_ROOT) NOW="Grid software is installed in $GRID_HOME"; return 0 ;;
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     HALF_INSTALLED) half_installed_plan "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done"; return 1 ;;
   esac
-  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disk for +$DATA_DG yet (step 2.13)"; return 2; }
+  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 2; }
   unzip_failed_check "$GRID_HOME" "$(stage_dir grid)" || return 2
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$GRID_MEDIA" || { NOW="Grid installer files are not known (step 3.1)"; return 2; }
+    media_ok "$GRID_MEDIA" || { NOW="The Grid installer files are not known yet (step 3.1)"; return 2; }
     if ! media_is_staged "$GRID_MEDIA"; then
-      [[ -z "$(ls -A "$GRID_HOME" 2>/dev/null)" ]] || { NOW="$GRID_HOME is not empty but has no gridSetup.sh"; return 2; }
+      [[ -z "$(ls -A "$GRID_HOME" 2>/dev/null)" ]] || { NOW="$GRID_HOME is not empty, but it has no gridSetup.sh"; return 2; }
     fi
   fi
-  NOW="Grid Infrastructure is not installed"
+  NOW="Grid is not installed yet"
   PLAN=""
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
-    if media_is_staged "$GRID_MEDIA"; then PLAN="unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid) (as $GRID_USER)"$'\n'
-    else PLAN="unzip $GRID_MEDIA into $GRID_HOME (as $GRID_USER)"$'\n'; fi
+    if media_is_staged "$GRID_MEDIA"; then PLAN="Unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid), as $GRID_USER"$'\n'
+    else PLAN="Unzip $GRID_MEDIA into $GRID_HOME, as $GRID_USER"$'\n'; fi
   fi
-  PLAN+="Grid installer, silent, Oracle Restart (single server), as $GRID_USER${RU_DIR:+, applying the Release Update in $RU_DIR}
-  disk group +$DATA_DG, EXTERNAL redundancy, disks $(asm_labels "$DATA_DG" | paste -sd' ' -)
-  Grid home $GRID_HOME, base $GRID_BASE, inventory $INVENTORY_DIR
-You will be asked a NEW password for ASM SYS/ASMSNMP (local to this server)"
-  USING="same paths and disk group name as primary; response file from the template in the media"
+  PLAN+="Install Grid silently as $GRID_USER: Oracle Restart for a single server${RU_DIR:+,}
+${RU_DIR:+  with the Release Update in $RU_DIR}
+  Disk group +$DATA_DG, external redundancy, disks $(asm_labels "$DATA_DG" | paste -sd' ' -)
+  Grid home $GRID_HOME, base $GRID_BASE
+  Inventory $INVENTORY_DIR
+Ask you for a new ASM password for SYS and ASMSNMP (used only on this server)"
+  USING="Same paths and disk group name as the primary."$'\n'"The response file is made from the template in the media."
   return 1
 }
 d_3_2() {
@@ -592,7 +615,7 @@ d_3_2() {
     if media_is_staged "$GRID_MEDIA"; then unpack_media "$GRID_MEDIA" "$(stage_dir grid)" as_grid "$GRID_USER" || return 1
     else
       unpack_media "$GRID_MEDIA" "$GRID_HOME" as_grid "$GRID_USER" || return 1
-      [[ -x "$GRID_HOME/gridSetup.sh" ]] || { bad "gridSetup.sh not found after unzip (wrong file?)"; return 1; }
+      [[ -x "$GRID_HOME/gridSetup.sh" ]] || { bad "gridSetup.sh is missing after the unzip. Is GRID_MEDIA the right file?"; return 1; }
     fi
   fi
   [[ -x "$GRID_HOME/gridSetup.sh" ]] && { new_opatch "$GRID_HOME" as_grid "$GRID_USER" || return 1; }
@@ -618,34 +641,35 @@ c_3_3() {
   case "$GSTATE" in
     DONE|ASM_DOWN|NEED_CONFIGTOOLS)
       [[ "$MODE" == "run" ]] && { install -d -m 700 "$STATE_DIR"; : > "$(GRID_ROOT_DONE_FILE)"; }
-      NOW="Grid root scripts have run (Oracle Restart is configured and running)"; return 0 ;;
+      NOW="The Grid root scripts have run. Oracle Restart is configured and running."; return 0 ;;
     HAS_DOWN)
-      if [[ -f "$(GRID_ROOT_DONE_FILE)" ]]; then NOW="Grid root scripts have run (Oracle High Availability Services is started in step 3.4)"; return 0; fi
-      NOW="Oracle Restart is configured (olr.loc exists) but Oracle High Availability Services does not run: root.sh may have failed"
+      if [[ -f "$(GRID_ROOT_DONE_FILE)" ]]; then NOW="The Grid root scripts have run. High Availability Services is started in step 3.4."; return 0; fi
+      NOW="Oracle Restart is configured (olr.loc exists), but High Availability Services is not running."$'\n'"root.sh may have failed."
       KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
       PLAN="$GRID_HOME/bin/crsctl start has
-If that fails, look at $GRID_HOME/cfgtoollogs/crsconfig/roothas_*.log, then undo and run root.sh again:
+-- If that fails, read $GRID_HOME/cfgtoollogs/crsconfig/roothas_*.log.
+-- Then undo the configuration and run root.sh again:
 $GRID_HOME/crs/install/roothas.sh -deconfig -force
 $GRID_HOME/root.sh"
       return 1 ;;
     NEED_ROOT) ;;
-    *) NOW="Grid software is not installed (step 3.2)"; return 2 ;;
+    *) NOW="Grid is not installed yet (step 3.2)"; return 2 ;;
   esac
   # 12.1 Oracle Restart on Oracle Linux 7 (systemd) starts ohasd only with patch 18370031 (also inside a later PSU)
   if [[ "$(want_rel grid)" == "12.1" && "$OS_MAJOR" == "7" && ! -d "$GRID_HOME/inventory/oneoffs/18370031" ]] \
      && ! grep -qs '18370031' "$GRID_HOME"/inventory/oneoffs/*/etc/config/inventory.xml; then
-    NOW="12.1 Grid on Oracle Linux 7: patch 18370031 must be applied BEFORE root.sh (otherwise ohasd does not start under systemd)"
+    NOW="12.1 Grid on Oracle Linux 7 needs patch 18370031 before root.sh."$'\n'"Without it, ohasd does not start under systemd."
     KIND_NOW=manual; MANUAL_HOW="$GRID_USER  ->  shell"
-    PLAN="download patch 18370031 (My Oracle Support), unzip it, then:
+    PLAN="-- Download patch 18370031 from My Oracle Support and unzip it. Then:
 $GRID_HOME/OPatch/opatch napply -oh $GRID_HOME -local <folder>/18370031
-Then answer r (root.sh runs after it)."
+-- Then answer r. root.sh runs after that."
     return 1
   fi
-  NOW="Grid is installed, root scripts not run yet"
+  NOW="Grid is installed. Its root scripts have not run yet."
   local invd; invd=$(inventory_dir)
   PLAN=""
-  [[ -x "$invd/orainstRoot.sh" ]] && PLAN="$invd/orainstRoot.sh"$'\n'
-  PLAN+="$GRID_HOME/root.sh   (configures Oracle Restart on this server; its questions take the default answer)"
+  [[ -x "$invd/orainstRoot.sh" ]] && PLAN="Run $invd/orainstRoot.sh"$'\n'
+  PLAN+="Run $GRID_HOME/root.sh. It configures Oracle Restart on this server."$'\n'"Its questions get the default answers."
   return 1
 }
 d_3_3() {
@@ -663,14 +687,15 @@ c_3_4() {
   case "$GSTATE" in
     DONE) NOW="Oracle Restart is running and ASM is ONLINE"; return 0 ;;
     NEED_CONFIGTOOLS)
-      NOW="Oracle Restart is running, ASM is not configured yet"
-      if [[ -x "$GRID_HOME/gridSetup.sh" ]]; then PLAN="gridSetup.sh -executeConfigTools -silent (as $GRID_USER): creates ASM, +$DATA_DG and the listener"
-      else PLAN="$GRID_HOME/cfgtoollogs/configToolAllCommands (12.1, as $GRID_USER): creates ASM, +$DATA_DG and the listener"; fi
-      [[ -n "$ASM_PW" ]] || PLAN+=$'\n'"You will be asked the password for ASM (SYS/ASMSNMP): the one typed in step 3.2 (it was not used yet), or a new one" ;;
-    HAS_DOWN) NOW="Oracle High Availability Services is stopped"; PLAN="$GRID_HOME/bin/crsctl start has   (as root)" ;;
-    ASM_DOWN) NOW="ASM is not ONLINE"; PLAN="crsctl start res ora.asm   (as $GRID_USER)" ;;
+      NOW="Oracle Restart is running. ASM is not configured yet."
+      if [[ -x "$GRID_HOME/gridSetup.sh" ]]; then PLAN="Run gridSetup.sh -executeConfigTools -silent as $GRID_USER"
+      else PLAN="Run $GRID_HOME/cfgtoollogs/configToolAllCommands as $GRID_USER (12.1)"; fi
+      PLAN+=$'\n'"It creates ASM, +$DATA_DG and the listener."
+      [[ -n "$ASM_PW" ]] || PLAN+=$'\n'"Ask you for the ASM password for SYS and ASMSNMP: the one from step 3.2"$'\n'"(it was not used yet), or a new one" ;;
+    HAS_DOWN) NOW="High Availability Services is stopped"; PLAN="Start it as root:  $GRID_HOME/bin/crsctl start has" ;;
+    ASM_DOWN) NOW="ASM is not ONLINE"; PLAN="Start it as $GRID_USER:  crsctl start res ora.asm" ;;
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
-    *) NOW="Grid root scripts did not run yet (step 3.3)"; return 2 ;;
+    *) NOW="The Grid root scripts have not run yet (step 3.3)"; return 2 ;;
   esac
   return 1
 }
@@ -697,7 +722,7 @@ d_3_4() {
       return $crc ;;
     HAS_DOWN)
       run_logged "crsctl start has" timeout 300 "$GRID_HOME/bin/crsctl" start has || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-      local n=0; say "waiting for ASM to come ONLINE ..."
+      local n=0; say "Waiting for ASM to come online ..."
       until grid_state; [[ "$GSTATE" == "DONE" || $n -ge 12 ]]; do sleep 5; n=$((n + 1)); done ;;
     ASM_DOWN) run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; } ;;
   esac
@@ -713,8 +738,8 @@ dg_field() {
 DG_TODO=""
 c_3_5() {
   use_grid || { NOW="Not needed (no ASM)"; return 0; }
-  grid_sw_ok || { NOW="Grid is not installed (step 3.2)"; return 2; }
-  dg_list || { NOW="Cannot query ASM ($(ora_errors "$SQL_OUT")) (step 3.4)"; return 2; }
+  grid_sw_ok || { NOW="Grid is not installed yet (step 3.2)"; return 2; }
+  dg_list || { NOW="Cannot query ASM: $(ora_errors "$SQL_OUT") (step 3.4)"; return 2; }
   local list=$SQL_OUT ca="" cr=""
   dg_field "$DATA_DG"
   if [[ "$DG_S" == "MOUNTED" || "$DG_S" == "CONNECTED" ]]; then
@@ -722,23 +747,24 @@ c_3_5() {
       && IFS='|' read -r ca cr <<< "$(first_line)"
   elif [[ -z "$DG_S" ]]; then
     # the Grid configuration created ASM but not +DATA (it stopped half-way): created here like the others
-    warn "+$DATA_DG does not exist although ASM runs (the Grid configuration did not finish it); it is created now with the default attributes"
+    warn "+$DATA_DG does not exist, although ASM is running. The Grid configuration did not
+finish it. This step creates it, with default attributes."
   fi
   SQL_OUT=$list
   local dg info="" todo="" disks
   DG_TODO=""
   for dg in $(asm_dgs); do
     dg_field "$dg"
-    if [[ "$DG_S" == "MOUNTED" || "$DG_S" == "CONNECTED" ]]; then info+="+$dg $DG_S, free $DG_F MB of $DG_T MB"$'\n'; continue; fi
+    if [[ "$DG_S" == "MOUNTED" || "$DG_S" == "CONNECTED" ]]; then info+="+$dg $DG_S, $(human_mb "$DG_F") free of $(human_mb "$DG_T")"$'\n'; continue; fi
     if [[ -n "$DG_S" ]]; then
-      NOW="Disk group +$dg exists here but is $DG_S"
+      NOW="Disk group +$dg exists here, but it is $DG_S"
       KIND_NOW=manual; MANUAL_HOW="$GRID_USER  ->  export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM ; \$ORACLE_HOME/bin/sqlplus / as sysasm"
-      PLAN="Mount it only if all its disks belong to THIS standby (never a disk of the primary):
+      PLAN="-- Mount it only if all its disks belong to this server. NEVER use a disk of the primary.
 select path, header_status, name from v\$asm_disk;
 alter diskgroup $dg mount;"
       return 1
     fi
-    [[ -n "$(asm_labels "$dg")" ]] || { NOW="No ASM disk for +$dg yet (step 2.13)"; return 2; }
+    [[ -n "$(asm_labels "$dg")" ]] || { NOW="No ASM disks for +$dg yet (step 2.13)"; return 2; }
     disks=$(asm_labels "$dg" | sed "s#^#'$(asm_disk_dir)/#; s#\$#'#" | paste -sd, -)
     local c="create diskgroup $dg external redundancy disk $disks" attrs=""
     local ca2=$ca cr2=$cr
@@ -756,10 +782,10 @@ alter diskgroup $dg mount;"
   done
   DG_TODO=${DG_TODO%$'\n'}
   if [[ -z "$DG_TODO" ]]; then NOW="${info%$'\n'}"; return 0; fi
-  NOW="Disk groups to create or mount:$todo"
+  NOW="Disk groups to create:$todo"
   PLAN="As $GRID_USER:  export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM ; \$ORACLE_HOME/bin/sqlplus / as sysasm
 $DG_TODO"
-  USING="same disk group names as primary; attributes compatible.asm/rdbms as +$DATA_DG"
+  USING="Same disk group names as the primary."$'\n'"compatible.asm and compatible.rdbms are the same as in +$DATA_DG."
   return 1
 }
 d_3_5() {
@@ -767,9 +793,9 @@ d_3_5() {
   while IFS= read -r s; do
     [[ -n "$s" ]] || continue
     if ! sql_asm "$s"; then
-      bad "Failed ($(ora_errors "$SQL_OUT")): $s"
+      bad "This failed ($(ora_errors "$SQL_OUT")):"$'\n'"$s"
       if grep -qE 'ORA-15018|ORA-15030|ORA-15033' <<< "$SQL_OUT"; then
-        printf 'A disk already has an ASM header (an earlier try that was interrupted). Only for disks made by this\nscript (%s) the statement may be repeated with FORCE:\n  %s\n' "$(asm_disks_file)" "$(sed -E "s/'((\/|ORCL:)[^']*)'/'\1' force/g" <<< "$s")" | hint
+        printf 'A disk already has an ASM header, probably from an interrupted earlier try.\nOnly if the disks were made by this script (%s), repeat the statement with FORCE:\n  %s\n' "$(asm_disks_file)" "$(sed -E "s/'((\/|ORCL:)[^']*)'/'\1' force/g" <<< "$s")" | hint
       fi
       return 1
     fi
@@ -831,35 +857,36 @@ primary_edition() {
   local b; b=$(first_line)
   if [[ "$b" == *"Enterprise Edition"* ]]; then DB_EDITION=EE
   elif [[ "$b" == *"Standard Edition"* ]]; then DB_EDITION=SE2
-  else DB_EDITION=EE; warn "Edition not recognised in '$b'; using Enterprise Edition"; fi
+  else DB_EDITION=EE; warn "Edition not recognised in '$b'. Using Enterprise Edition."; fi
   [[ "$DB_EDITION" == "EE" ]] || fatal "The primary is Standard Edition ($b). Data Guard needs Enterprise Edition. This script cannot build a standby for it."
 }
 
 # ---- 3.6 DB software ----
 c_3_6() {
-  users_ok || { NOW="Users do not exist yet (step 2.2)"; return 2; }
+  users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   db_state
   case "$DSTATE" in
     DONE|NEED_ROOT) NOW="Database software is installed in $DB_HOME"; return 0 ;;
     HALF_INSTALLED) half_installed_plan "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done"; return 1 ;;
   esac
-  primary_edition || { NOW="Cannot read the primary edition"; return 2; }
+  primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
   unzip_failed_check "$DB_HOME" "$(stage_dir db)" || return 2
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$DB_MEDIA" || { NOW="Database installer files are not known (step 3.1)"; return 2; }
+    media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 2; }
     if ! media_is_staged "$DB_MEDIA"; then
-      [[ -z "$(ls -A "$DB_HOME" 2>/dev/null)" ]] || { NOW="$DB_HOME is not empty but has no runInstaller"; return 2; }
+      [[ -z "$(ls -A "$DB_HOME" 2>/dev/null)" ]] || { NOW="$DB_HOME is not empty, but it has no runInstaller"; return 2; }
     fi
   fi
-  NOW="Database software is not installed"
+  NOW="Database software is not installed yet"
   PLAN=""
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
-    if media_is_staged "$DB_MEDIA"; then PLAN="unzip ${DB_MEDIA//,/ + } into $(stage_dir db) (as $ORACLE_USER)"$'\n'
-    else PLAN="unzip $DB_MEDIA into $DB_HOME (as $ORACLE_USER)"$'\n'; fi
+    if media_is_staged "$DB_MEDIA"; then PLAN="Unzip ${DB_MEDIA//,/ + } into $(stage_dir db), as $ORACLE_USER"$'\n'
+    else PLAN="Unzip $DB_MEDIA into $DB_HOME, as $ORACLE_USER"$'\n'; fi
   fi
-  PLAN+="runInstaller, silent, Software Only, Enterprise Edition (as $ORACLE_USER)${RU_DIR:+, applying the Release Update in $RU_DIR}
-  home $DB_HOME, base $ORACLE_BASE, OS groups as on primary"
-  USING="same home and base as primary; response file from the template in the media"
+  PLAN+="Install the database software silently as $ORACLE_USER: Software Only, Enterprise Edition${RU_DIR:+,}
+${RU_DIR:+  with the Release Update in $RU_DIR}
+  Home $DB_HOME, base $ORACLE_BASE, OS groups as on the primary"
+  USING="Same home and base as the primary."$'\n'"The response file is made from the template in the media."
   return 1
 }
 d_3_6() {
@@ -868,7 +895,7 @@ d_3_6() {
     if media_is_staged "$DB_MEDIA"; then unpack_media "$DB_MEDIA" "$(stage_dir db)" as_oracle "$ORACLE_USER" || return 1
     else
       unpack_media "$DB_MEDIA" "$DB_HOME" as_oracle "$ORACLE_USER" || return 1
-      [[ -x "$DB_HOME/runInstaller" ]] || { bad "runInstaller not found after unzip (wrong file?)"; return 1; }
+      [[ -x "$DB_HOME/runInstaller" ]] || { bad "runInstaller is missing after the unzip. Is DB_MEDIA the right file?"; return 1; }
     fi
   fi
   local inst irc=0; inst=$(db_installer)
@@ -894,36 +921,36 @@ c_3_7() {
   case "$DSTATE" in
     DONE) NOW="root.sh of the database home has run"; return 0 ;;
     NEED_ROOT)
-      NOW="Database software installed, root.sh not run yet"
-      PLAN=""; [[ -x "$(inventory_dir)/orainstRoot.sh" && ! -f /etc/oraInst.loc ]] && PLAN="$(inventory_dir)/orainstRoot.sh"$'\n'
-      PLAN+="$DB_HOME/root.sh   (its questions take the default answer)"; return 1 ;;
+      NOW="The database software is installed. Its root.sh has not run yet."
+      PLAN=""; [[ -x "$(inventory_dir)/orainstRoot.sh" && ! -f /etc/oraInst.loc ]] && PLAN="Run $(inventory_dir)/orainstRoot.sh"$'\n'
+      PLAN+="Run $DB_HOME/root.sh. Its questions get the default answers."; return 1 ;;
     HALF_INSTALLED) NOW="The database installer did not finish (step 3.6)"; return 2 ;;
-    *) NOW="Database software is not installed (step 3.6)"; return 2 ;;
+    *) NOW="Database software is not installed yet (step 3.6)"; return 2 ;;
   esac
 }
 d_3_7() {
   if [[ ! -f /etc/oraInst.loc && -x "$(inventory_dir)/orainstRoot.sh" ]]; then run_root_script "$(inventory_dir)/orainstRoot.sh" || return 1; fi
   run_root_script "$DB_HOME/root.sh" || return 1
   journal ROOTSH "$DB_HOME" "root.sh of the database home (/usr/local/bin/oraenv, coraenv, dbhome; /etc/oratab)"
-  local s; for s in db grid; do [[ -d "$(stage_dir $s)" ]] && say "The unpacked installer in $(stage_dir $s) can be removed now (rm -rf)."; done
+  local s; for s in db grid; do [[ -d "$(stage_dir $s)" ]] && say "You can now remove the unpacked installer in $(stage_dir $s) (rm -rf)."; done
   return 0
 }
 
 # ---- 3.8 read/write home (18c and newer) ----
 OBH=""
 c_3_8() {
-  db_sw_ok || { NOW="Database software is not installed (step 3.6)"; return 2; }
+  db_sw_ok || { NOW="Database software is not installed yet (step 3.6)"; return 2; }
   [[ -x "$DB_HOME/bin/orabasehome" ]] || { NOW="Not needed (read-only homes exist only from 18c)"; return 0; }
   run_logged "orabasehome" as_oracle "$DB_HOME/bin/orabasehome" || { NOW="Cannot run $DB_HOME/bin/orabasehome"; return 2; }
   OBH=$(printf '%s\n' "$RUN_OUT" | grep -E '^/' | head -n 1); OBH=${OBH%/}
-  if [[ "$OBH" == "$DB_HOME" ]]; then NOW="Read/write Oracle home (orabasehome = $DB_HOME)"; return 0; fi
-  NOW="Oracle home is READ-ONLY (orabasehome = $OBH)"
+  if [[ "$OBH" == "$DB_HOME" ]]; then NOW="The Oracle home is read/write (orabasehome prints the home itself)"; return 0; fi
+  NOW="The Oracle home is read-only. orabasehome prints:"$'\n'"  $OBH"
   if [[ -n "$(ls -A "$ORACLE_BASE/dbs" 2>/dev/null)" ]] || pgrep -f "^ora_pmon_" >/dev/null 2>&1; then
-    NOW+=$'\n'"A database already uses this home (files in $ORACLE_BASE/dbs or a running instance); the script will not convert it"
+    NOW+=$'\n'"A database already uses it: there are files in $ORACLE_BASE/dbs, or an instance runs."$'\n'"The script does not change such a home."
     return 2
   fi
-  PLAN="roohctl -disable   (as $ORACLE_USER; new home without any database)
-so spfile, password file and tnsnames.ora are inside $DB_HOME"
+  PLAN="Run roohctl -disable as $ORACLE_USER. The home is new and has no database yet."
+  PLAN+=$'\n'"Then the spfile, password file and tnsnames.ora are kept inside $DB_HOME."
   return 1
 }
 d_3_8() { journal ROOHCTL "$DB_HOME"; run_logged "roohctl -disable" as_oracle "$DB_HOME/bin/roohctl" -disable || { bad "roohctl failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }; }
@@ -938,8 +965,8 @@ rw_home_ok() {
 # ---- 3.9 resources (Grid) ----
 RES_TODO=""
 c_3_9() {
-  use_grid || { NOW="Not needed (no Grid; the listener is set up in phase 5)"; return 0; }
-  grid_sw_ok || { NOW="Grid is not installed (step 3.2)"; return 2; }
+  use_grid || { NOW="Not needed without Grid. The listener is set up in phase 5."; return 0; }
+  grid_sw_ok || { NOW="Grid is not installed yet (step 3.2)"; return 2; }
   local r off=() miss=() on=() dg
   local -a res=(ora.asm "ora.$SB_LSNR.lsnr")
   for dg in $(asm_dgs); do res+=("ora.${dg^^}.dg"); done
@@ -949,7 +976,7 @@ c_3_9() {
     elif grep -q 'STATE=ONLINE' <<< "$RUN_OUT"; then on+=("$r")
     else off+=("$r"); fi
   done
-  if [[ ${#off[@]} -eq 0 && ${#miss[@]} -eq 0 ]]; then NOW="ONLINE: ${on[*]}"; return 0; fi
+  if [[ ${#off[@]} -eq 0 && ${#miss[@]} -eq 0 ]]; then NOW="All ONLINE: ${on[*]}"; return 0; fi
   RES_TODO=""
   for r in "${miss[@]+"${miss[@]}"}"; do
     if [[ "$r" == "ora.$SB_LSNR.lsnr" ]]; then
@@ -960,8 +987,8 @@ c_3_9() {
   done
   for r in "${off[@]+"${off[@]}"}"; do RES_TODO+="crsctl start res $r"$'\n'; done
   RES_TODO=${RES_TODO%$'\n'}
-  NOW="Not ONLINE: ${off[*]+"${off[*]}"} ${miss[*]+"${miss[*]}"}"
-  PLAN="As $GRID_USER:
+  NOW="Not ONLINE yet: ${off[*]+"${off[*]}"} ${miss[*]+"${miss[*]}"}"
+  PLAN="Run as $GRID_USER:
 $RES_TODO"
   return 1
 }
@@ -971,21 +998,21 @@ d_3_9() {
     [[ -z "$c" ]] && continue
     local -a w=(); read -ra w <<< "$c"
     run_logged "$c" as_grid timeout 300 "$GRID_HOME/bin/${w[0]}" "${w[@]:1}" || { bad "$c failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-    say "ran: $c"
+    say "Ran: $c"
     [[ "$c" == "srvctl add listener"* ]] && journal LSNRRES "$SB_LSNR" "srvctl add listener"
   done <<< "$RES_TODO"
 }
 
 # ---- 3.10 listener port equal to primary (Grid listener) ----
 c_3_10() {
-  use_grid || { NOW="Not needed here (the database-home listener is created with port $PORT in phase 5)"; return 0; }
-  grid_sw_ok || { NOW="Grid is not installed (step 3.2)"; return 2; }
+  use_grid || { NOW="Not needed without Grid. Phase 5 creates the listener with port $PORT."; return 0; }
+  grid_sw_ok || { NOW="Grid is not installed yet (step 3.2)"; return 2; }
   run_logged "lsnrctl status" as_grid timeout 60 "$GRID_HOME/bin/lsnrctl" status "$SB_LSNR" || { NOW="Listener $SB_LSNR is not running (step 3.9)"; return 2; }
-  if grep -q "(PROTOCOL=TCP)(HOST=[^)]*)(PORT=$PORT)" <<< "$(norm "$RUN_OUT")"; then NOW="Listener $SB_LSNR listens on port $PORT (same as primary)"; return 0; fi
+  if grep -q "(PROTOCOL=TCP)(HOST=[^)]*)(PORT=$PORT)" <<< "$(norm "$RUN_OUT")"; then NOW="Listener $SB_LSNR uses port $PORT, the same as the primary"; return 0; fi
   local cur; cur=$(norm "$RUN_OUT" | grep -oE '\(PROTOCOL=TCP\)\(HOST=[^)]*\)\(PORT=[0-9]+\)' | head -n 1 | grep -oE '[0-9]+\)$' | tr -d ')')
   L310_CUR=$cur
-  NOW="Listener listens on port ${cur:-?}, primary uses $PORT"
-  PLAN="As $GRID_USER:
+  NOW="Listener $SB_LSNR uses port ${cur:-?}. The primary uses $PORT."
+  PLAN="Run as $GRID_USER:
 srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
 srvctl stop listener -listener $SB_LSNR
 srvctl start listener -listener $SB_LSNR"
@@ -1020,24 +1047,25 @@ local_release() {
   grep -oE 'Release [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
 }
 c_3_11() {
-  db_sw_ok || { NOW="Database software is not installed (step 3.6)"; return 2; }
+  db_sw_ok || { NOW="Database software is not installed yet (step 3.6)"; return 2; }
   need_ssh || return 2
-  primary_edition || { NOW="Cannot read the primary edition"; return 2; }
+  primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
   local rel want h pp lp missing extra report="" bad_rel=""
   rel=$(local_release || true); want=$(want_rel)
   if [[ -n "$rel" ]]; then
-    if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$want" ]] || bad_rel="installed release $rel, primary is $want"
-    else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="installed release $rel, primary is $DB_MAJOR"; fi
+    if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$want" ]] || bad_rel="release $rel here, release $want on the primary"
+    else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="release $rel here, release $DB_MAJOR on the primary"; fi
   fi
   if [[ -n "$bad_rel" ]]; then
     NOW="The database software here is another release: $bad_rel"
     KIND_NOW=manual; MANUAL_HOW="root"
-    PLAN="Remove this installation and install release $want (steps 3.1, 3.6): the standby must have the same release as the primary."
+    PLAN="-- Remove this installation and install release $want (steps 3.1 and 3.6).
+-- The standby must have the same release as the primary."
     return 1
   fi
   for h in "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"}; do
     use_grid || [[ "$h" != "$GRID_HOME" ]] || continue
-    pp=$(primary_patches "$h") || { NOW="Cannot read $h/inventory on primary (the ssh user must be able to read it)"; return 2; }
+    pp=$(primary_patches "$h") || { NOW="Cannot read $h/inventory on the primary. The ssh user must be able to read it."; return 2; }
     lp=$(local_patches "$h")
     missing=$(comm -23 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | paste -sd' ' -)
     extra=$(comm -13 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | paste -sd' ' -)
@@ -1045,27 +1073,36 @@ c_3_11() {
       report+="$h:${missing:+ missing here: $missing}${extra:+  only here: $extra}"$'\n'
     fi
   done
-  if [[ -z "$report" ]]; then NOW="Same patches as primary ($(local_patches "$DB_HOME" | wc -l) in $DB_HOME${GRID_HOME:+ and the Grid home}), release ${rel:-$want}, Enterprise Edition"; return 0; fi
-  NOW="The homes here do not have the same patches as primary:"$'\n'"${report%$'\n'}"
-  KIND_NOW=manual; MANUAL_HOW="root / $ORACLE_USER  ->  OPatch"
-  PLAN="Apply the same patches as primary to the homes on this server:
-  1) on primary, as the owner of the home, see the list:   <home>/OPatch/opatch lspatches
-  2) put the newest OPatch (patch 6880880) into $DB_HOME${GRID_HOME:+ and $GRID_HOME}"
-  if use_grid; then
-    PLAN+=$'\n'"  3) Release Update, as root:   $GRID_HOME/OPatch/opatchauto apply <RU folder> -oh $GRID_HOME ; $DB_HOME/OPatch/opatchauto apply <RU folder> -oh $DB_HOME"
-  else
-    PLAN+=$'\n'"  3) Release Update, as $ORACLE_USER:   cd <RU folder> ; $DB_HOME/OPatch/opatch apply"
+  if [[ -z "$report" ]]; then
+    local np; np=$(local_patches "$DB_HOME" | wc -l)
+    NOW="Same release and patches as the primary: release ${PRIMARY_VERSION:-${rel:-$want}}, Enterprise Edition"$'\n'"$np $([[ $np -eq 1 ]] && printf 'patch' || printf 'patches') in the database home${GRID_HOME:+; the Grid home matches too}"
+    return 0
   fi
-  PLAN+=$'\n'"  4) one-off patches, as $ORACLE_USER:   cd <patch folder> ; $DB_HOME/OPatch/opatch apply"
-  [[ $DB_MAJOR -ge 18 ]] && PLAN+=$'\n'"Easier: install from a gold image of the primary home (see step 3.1)."
+  NOW="The homes here do not have the same patches as the primary:"$'\n'"${report%$'\n'}"
+  KIND_NOW=manual; MANUAL_HOW="root or $ORACLE_USER  ->  each step names the user"
+  PLAN="-- Apply the primary's patches to the homes on this server.
+-- 1) On the primary, as the owner of each home, list its patches:
+<home>/OPatch/opatch lspatches
+-- 2) Put the newest OPatch (patch 6880880) into $DB_HOME${GRID_HOME:+ and $GRID_HOME}."
+  if use_grid; then
+    PLAN+=$'\n'"-- 3) Apply the Release Update, as root:"
+    PLAN+=$'\n'"$GRID_HOME/OPatch/opatchauto apply <RU folder> -oh $GRID_HOME ; $DB_HOME/OPatch/opatchauto apply <RU folder> -oh $DB_HOME"
+  else
+    PLAN+=$'\n'"-- 3) Apply the Release Update, as $ORACLE_USER:"
+    PLAN+=$'\n'"cd <RU folder> ; $DB_HOME/OPatch/opatch apply"
+  fi
+  PLAN+=$'\n'"-- 4) Apply the one-off patches, as $ORACLE_USER:"
+  PLAN+=$'\n'"cd <patch folder> ; $DB_HOME/OPatch/opatch apply"
+  [[ $DB_MAJOR -ge 18 ]] && PLAN+=$'\n'"-- Easier: install from a gold image of the primary home, as shown in step 3.1."
   if use_grid && ! single_owner; then
-    PLAN+=$'\n'"After opatch on the database home (role separation), as root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"
+    PLAN+=$'\n'"-- After opatch on the database home (role separation), as root:"
+    PLAN+=$'\n'"$GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"
   fi
   return 1
 }
 
 phase_3() {
-  phase_header 3 "Oracle software on this server"
+  phase_header 3 "Install the Oracle software"
   build_envs_if_possible
   run_step 3.1  auto  "Installer files" c_3_1 d_3_1
   run_step 3.2  auto  "Grid Infrastructure software (Oracle Restart)" c_3_2 d_3_2

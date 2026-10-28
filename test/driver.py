@@ -76,7 +76,7 @@ def fix_local(text):
         os.system(f"chgrp asmadmin {env['db_home']}/bin/oracle")
 
 def cur_step(full):
-    m = re.findall(r"\n  \[(\d+\.\d+)\] ", full)
+    m = re.findall(r"\n  Step (\d+\.\d+)  ", full)
     return m[-1] if m else ""
 
 def main():
@@ -107,67 +107,70 @@ def main():
             if E("DG_TEST_HUP_ON_JOB") and not hup_sent and re.search(E("DG_TEST_HUP_ON_JOB") + r" is running \(process \d+\)", full):
                 import signal
                 time.sleep(1); os.killpg(pid, signal.SIGHUP); hup_sent = True
-        bt = re.sub(r"\s*\(h = help\)\s*$", "", buf).rstrip()
-        is_prompt = bool(buf) and buf.endswith(" ") and (bt.endswith((":", "quit", "]", "running)", "job)")) or buf.rstrip().endswith("(h = help)"))
+        # a question: a line "    ? text >" (or the UTF-8 mark), or a password prompt of ssh
+        last = buf.rsplit("\n", 1)[-1]
+        q = re.match(r"^\s*\? (.*?)\s*[>\u203a]\s$", last)
+        bt = q.group(1).rstrip() if q else buf.rstrip()
+        is_prompt = bool(buf) and buf.endswith(" ") and (q is not None or bt.endswith("'s password:"))
         if not is_prompt:
             if time.time() > deadline: print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break
             continue
         step = cur_step(full)
         if answered > int(E("DG_TEST_MAXPROMPTS", "400")):
             print("\nDRIVER TOO MANY PROMPTS"); os.kill(pid, 9); break
-        if "> " in bt:
+        if q:
             if step in lst("DG_TEST_CTRLC_AT") and step not in ctrlc:
                 ctrlc.add(step); send("<CTRL-C>"); continue
-            if step in lst("DG_TEST_HELP_AT") and step not in helped and ("(h = help)" in buf or "[h] help" in buf):
+            if step in lst("DG_TEST_HELP_AT") and step not in helped and "[h] Help" in bt:
                 helped.add(step); send("h"); continue
         if bt.endswith("'s password:"): send(E("DG_TEST_OSPW", "Oracle_os1")); continue
-        if bt.endswith("IP address (or host name) of the PRIMARY server:"): send(E("DG_TEST_IP", "127.0.0.2")); continue
-        if "OS user on primary for ssh" in bt or "OS user on primary that owns the database" in bt: send(E("DG_TEST_SSHUSER", "")); continue
-        if "[w] keep watching   [d] detach" in bt or "[w] keep watching   [d] leave it running" in bt: send("w"); continue
-        if "[4] do phase 4 (primary) first   [c] continue in order" in bt: send(E("DG_TEST_P4FIRST", "c")); continue
-        if "[r] I did them, check every step   [o] one step at a time" in bt:
+        if bt.startswith("IP address or host name of the primary"): send(E("DG_TEST_IP", "127.0.0.2")); continue
+        if bt.startswith("OS user for ssh on the primary"): send(E("DG_TEST_SSHUSER", "")); continue
+        if "[w] Keep watching   [d] Leave it running" in bt: send("w"); continue
+        if "[4] Do phase 4 (primary) first   [c] Continue in order" in bt: send(E("DG_TEST_P4FIRST", "c")); continue
+        if "[r] Done, check all steps   [o] Show the steps one at a time" in bt:
             if E("DG_TEST_BATCH", "o") == "r": fix_primary(ctx)
             send(E("DG_TEST_BATCH", "o")); continue
-        if "[y] undo it   [s] skip   [q] quit" in bt: send(E("DG_TEST_UNDO", "y")); continue
-        if bt.endswith("Undo anyway (the later change is lost)? [y/N]") or bt.endswith("Cut the file at that point anyway? [y/N]"): send("y"); continue
-        if bt.endswith("Mark it as done by you? [y/N]"): send(E("DG_TEST_UNDO_MARK", "n")); continue
-        if bt.endswith("sys password (same on primary and standby):") or bt.endswith("sys password of the primary database (not shown while typing):"):
+        if "[y] Undo it   [s] Skip   [q] Quit" in bt: send(E("DG_TEST_UNDO", "y")); continue
+        if bt.startswith("Undo it anyway and lose the later change") or bt.startswith("Cut the file at that point anyway"): send("y"); continue
+        if bt.startswith("Mark it as undone by you"): send(E("DG_TEST_UNDO_MARK", "n")); continue
+        if bt.startswith("sys password"):
             pw_asked[0] += 1
             if pw_asked[0] == 1 and E("DG_TEST_PW1"): send(E("DG_TEST_PW1")); continue
             send(E("DG_TEST_PW", "Welcome_123")); continue
-        if re.search(r"New password for ASM SYS/ASMSNMP.*:$", bt): send(E("DG_TEST_ASMPW", "Asm_Pass123")); continue
-        if bt.endswith("> Repeat:"): send(E("DG_TEST_ASMPW2", E("DG_TEST_ASMPW", "Asm_Pass123"))); continue
+        if bt.startswith("New ASM password for SYS and ASMSNMP"): send(E("DG_TEST_ASMPW", "Asm_Pass123")); continue
+        if bt == "Type it again": send(E("DG_TEST_ASMPW2", E("DG_TEST_ASMPW", "Asm_Pass123"))); continue
         if "Number of the database" in bt: send(E("DG_TEST_DBPICK", "1")); continue
-        if "Full path of the database ORACLE_HOME on primary" in bt: send(E("DG_TEST_HOMEPATH", "")); continue
-        if re.search(r"Disk numbers for \+\S+ \(one or more, separated by spaces; q = stop, nothing is erased\) \[\d+\]:$", bt):
+        if "Full path of the database ORACLE_HOME on the primary" in bt: send(E("DG_TEST_HOMEPATH", "")); continue
+        if re.search(r"Disk numbers for \+\S+, separated by spaces \(q = stop, nothing is erased\) \[\d+\]$", bt):
             send(disk_picks.pop(0) if disk_picks else ""); continue
-        m = re.search(r"Type (\S+) to continue(?: \((?:or n to stop|n = no)\))?:$", bt)
+        m = re.search(r"Type (\S+) to continue, or n to stop$", bt)
         if m:
             w = m.group(1)
             if w == "DUPLICATE": w = E("DG_TEST_DUP", w)
             elif w == "IGNORE": w = E("DG_TEST_IGNORE", w)
             elif w.startswith("/dev/"): w = E("DG_TEST_DISKWORD", w)
             send(w); continue
-        if "[w] watch it until it ends" in bt: send("w"); continue
-        if "[p] type the sys password now" in bt and step in lst("DG_TEST_PSYS"): send("p"); continue
-        if bt.endswith("[a] accept these settings   [e] edit them in an editor   [q] quit"):
+        if "[w] Watch until it ends" in bt: send("w"); continue
+        if "[p] Type the sys password" in bt and step in lst("DG_TEST_PSYS"): send("p"); continue
+        if bt.endswith("[a] Accept   [e] Edit   [h] Help   [q] Quit"):
             send(settings_answers.pop(0) if settings_answers else "a"); continue
-        if "[y] do it   [s] skip" in bt and bt.endswith("quit"):
+        if "[y] Yes, do it   [s] Skip" in bt and bt.endswith("Quit"):
             if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
             send("s" if step in lst("DG_TEST_SKIP") else "y"); continue
-        if "[r] I did it, check again" in bt and bt.endswith("quit"):
+        if "[r] Done, check it" in bt and bt.endswith("Quit"):
             if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
             retries[step] = retries.get(step, 0) + 1
             if step in lst("DG_TEST_NOFIX") or retries[step] > 2: send("s"); continue
-            if "ON PRIMARY" in ctx: fix_primary(ctx)
+            if "Run on the PRIMARY" in ctx: fix_primary(ctx)
             else: fix_local(ctx)
             send("r"); continue
-        if ("[r] check again" in bt or "[r] try again" in bt) and bt.endswith("quit"):
+        if ("[r] Check again" in bt or "[r] Try again" in bt) and bt.endswith("Quit"):
             retries[step] = retries.get(step, 0) + 1
             if step in lst("DG_TEST_RETRY") and retries[step] <= 2: send("r"); continue
             send("s" if "[s]" in bt else "q"); continue
-        if bt.endswith("[h] help   [q] quit") and "[r]" not in bt and "[y]" not in bt and "[s]" not in bt: send("q"); continue
-        if bt.endswith("[y/N]"): send(E("DG_TEST_YN", "y")); continue
+        if bt.endswith("[h] Help   [q] Quit") and "[r]" not in bt and "[y]" not in bt and "[s]" not in bt: send("q"); continue
+        if bt.endswith("[y] Yes   [N] No"): send(E("DG_TEST_YN", "y")); continue
         if time.time() > deadline:
             print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break
     _, status = os.waitpid(pid, 0)
