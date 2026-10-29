@@ -66,7 +66,7 @@ db_payload() {   # $1 dir
 grid_payload() { # $1 dir
   local d=$1 p
   mkdir -p "$d/bin" "$d/OPatch" "$d/network/admin" "$d/cfgtoollogs"
-  for p in crsctl lsnrctl sqlplus srvctl; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
+  for p in crsctl lsnrctl sqlplus srvctl asmcmd setasmgidwrap; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
   cp "$TD/mock_oracle.py" "$d/OPatch/opatch"; printf 'mock\n' > "$d/bin/oracle"
   mkdir -p "$d/inventory/oneoffs/35643107"
   cp "$TD/zipsrc/root.sh" "$d/root.sh"; touch "$d/network/admin/README"

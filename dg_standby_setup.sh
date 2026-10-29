@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.1"
+readonly SCRIPT_VERSION="5.3"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -244,7 +244,8 @@ cleanup() {
   for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
     [[ -n "$f" ]] || continue
     # a response file of a job that still runs is removed by the job itself when it ends
-    [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && continue
+    # (once the job's command has ended, its .rc file exists: the response file is no longer needed and goes now)
+    [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && [[ ! -f "${JOB_OUT:-/nonexistent}.rc" ]] && continue
     rm -f -- "$f"
     [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
@@ -646,6 +647,8 @@ first_line() {
   printf '%s' "$l"
 }
 
+# empty, or only the lost+found folder that a new file system has at its top (a fresh mount point counts as empty)
+dir_empty() { [[ -z "$(ls -A -- "$1" 2>/dev/null | grep -vx 'lost+found')" ]]; }
 norm() { printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'; }
 ora_errors() {
   # the first error with its text (so the admin sees what it means), then the other codes
@@ -1300,6 +1303,8 @@ batch_primary_steps() {
   for id in "$@"; do
     step_in_range "$id" || continue
     cf="c_${id//./_}"; declare -F "$cf" >/dev/null || continue
+    # a lost connection is opened again here, on the screen (the checks below run quietly)
+    need_ssh || break
     NOW=""; PLAN=""; PLAN_UNDO=""; USING=""; KIND_NOW=""; PRIMARY_HOW_STEP=""; NEED_SYS=0; CUR_STEP=$id
     "$cf" >/dev/null 2>"$BATCH_ERR"; rc=$?
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"
@@ -1544,7 +1549,7 @@ change_word() {
     SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
     LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|SRL|MRP) printf 'database' ;;
-    SRVCTL|SRVCTL_OLD) printf 'restart' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
+    SRVCTL|SRVCTL_OLD) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
 journal_run_summary() {
@@ -1623,7 +1628,7 @@ _srl_drop() {
   for g in $1; do
     num "$g" || continue
     grep -q "^$g|" <<< "$have" || { say "Group $g is already gone."; continue; }
-    if grep -q "^$g|ACTIVE" <<< "$have"; then
+    if grep -qE "^$g\|(ACTIVE|CURRENT|CLEARING)" <<< "$have"; then
       bad "Group $g is in use: redo from the primary is written into it.
 Stop the redo transport first (the undo of step 9.5). On the primary:
   alter system set log_archive_dest_state_<N of step 4.4>=defer scope=both;
@@ -1689,7 +1694,8 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
       { head -c "$off" -- "$obj"; [[ $keep_nl -eq 1 ]] && printf '\n'; tail -c +$((off + len + 1)) -- "$obj"; } > "$tmp" || { rm -f -- "$tmp"; return 1; }
       if [[ "$u" == "root" ]]; then cat "$tmp" > "$obj" || { rm -f -- "$tmp"; return 1; }
-      else chmod 644 "$tmp"; runuser -u "$u" -- cp -- "$tmp" "$obj" || { rm -f -- "$tmp"; return 1; }; fi
+      # root reads the private temp copy; the owner writes its own file (the copy is never made readable for others)
+      else runuser -u "$u" -- sh -c 'cat > "$1"' sh "$obj" < "$tmp" || { rm -f -- "$tmp"; return 1; }; fi
       rm -f -- "$tmp"
       if [[ $off -eq 0 && ! -s "$obj" ]]; then rm -f -- "$obj"; say "Removed $obj. It held only the added block."
       else say "Removed the block that was added to $obj."; fi
@@ -1873,6 +1879,7 @@ PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_M
 # may be empty
 readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP "
 # values the user may change (everything else is read from the primary at every run)
+readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
 readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
@@ -1896,7 +1903,14 @@ valid_value() {
     opt_name)  [[ -z "$v" || ( "$v" =~ ^[A-Za-z0-9_.-]+$ && "$v" != -* ) ]] ;;
     dbname)    [[ "$v" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ;;
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
-    ip)        [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$v" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] ;;
+    ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
+                 # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
+                 [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+                   && (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 ))
+               else
+                 # a host name: letters, digits, dots and dashes, at least one letter, no empty label
+                 [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$v" =~ [A-Za-z] && "$v" != *..* ]]
+               fi ;;
     num)       [[ "$v" =~ ^[0-9]{1,9}$ ]] ;;
     port)      [[ "$v" =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )) ;;
     list)      [[ "$v" =~ ^[A-Za-z0-9_.,:+-]*$ ]] ;;
@@ -1939,8 +1953,11 @@ load_settings() {
     spec=""
     for t in $SETTING_SPECS; do [[ "${t%%:*}" == "$key" ]] && spec=${t#*:}; done
     if [[ -z "$spec" ]]; then DROPPED_KEYS+=" $key"; continue; fi
+    # values that are derived again when empty (the settings file says so for a new standby name)
+    if [[ -z "$val" && "$DERIVED_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
     if ! valid_value "$spec" "$val"; then
-      if is_standby_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
+      # a typo in a value you may edit is an error; it is never ignored silently
+      if is_standby_key "$key" || assumed_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
       continue        # a primary value is read again from the primary anyway
     fi
     printf -v "$key" '%s' "$val"
@@ -2043,7 +2060,7 @@ validate_settings() {
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
   [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qFw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
   [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "STANDBY_UNIQUE must differ from the db_unique_name of the primary."; bad_n=1; }
@@ -2197,7 +2214,7 @@ SETTINGS_ACCEPTED=0
 SYS_VERIFIED=0
 PRIMARY_TNS_ADMIN=""
 
-v_name() { [[ "$1" =~ ^[A-Za-z0-9_.+-]+$ ]]; }
+v_name() { [[ "$1" =~ ^[A-Za-z0-9_.+-]+$ && "$1" != -* ]]; }
 v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ ]]; }
 
 ssh_alive() {
@@ -2936,7 +2953,9 @@ c_1_6() {
   [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] || { NOW="Operating system version unknown; not checked"; return 0; }
   local v=$PRIMARY_VERSION why="" r w
   # the database release, and the Grid release when there is Grid (Grid may be newer)
-  for r in "$(want_rel)" ${GRID_REL:+"$GRID_REL"}; do
+  local -a rels=("$(want_rel)")
+  [[ -n "$GRID_REL" && "$GRID_REL" != "${rels[0]}" ]] && rels+=("$GRID_REL")    # the same release is checked once
+  for r in "${rels[@]}"; do
     w=""
     case "$r" in
       12.1) [[ $OS_MAJOR -ge 8 ]] && w="12.1 is certified on Oracle Linux 7 only."
@@ -2960,7 +2979,7 @@ c_1_6() {
 }
 
 c_1_2() {
-  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qFw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
     fatal "$PRIMARY_IP is an address of this server, but you gave it as the primary.
 Run the script on the standby server."
   fi
@@ -3046,7 +3065,7 @@ d_1_4() {
         # check the edited file first (a typo must not stop the script)
         local -A keep=(); local line
         while IFS= read -r line; do [[ -n "$line" ]] && keep[${line%%=*}]=${line#*=}; done <<< "$snap"
-        local save_vals=""; for k in $STANDBY_KEYS; do save_vals+="$k=${!k}"$'\n'; done
+        local save_vals=""; for k in $STANDBY_KEYS PORT LISTENER_NAME PRIMARY_SERVICE; do save_vals+="$k=${!k}"$'\n'; done
         if ! load_settings soft; then
           bad "The edited file has an error: $LOAD_ERR"; say "Your edits are still in $SETTINGS_FILE."
           while IFS= read -r line; do [[ -n "$line" ]] && printf -v "${line%%=*}" '%s' "${line#*=}"; done <<< "$save_vals"
@@ -3243,7 +3262,7 @@ d_2_1() {
   local c; while IFS= read -r c; do
     [[ -n "$c" ]] || continue
     run_cmds <<< "$c" || return 1
-    [[ "$c" =~ ^groupadd\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal GROUP "${BASH_REMATCH[1]}" "gid ${c#groupadd -g }"
+    [[ "$c" =~ ^groupadd\ -g\ ([0-9]+)\ ([A-Za-z0-9_.-]+)$ ]] && journal GROUP "${BASH_REMATCH[2]}" "gid ${BASH_REMATCH[1]}"
   done <<< "$G_TODO"
   return 0
 }
@@ -3251,7 +3270,11 @@ d_2_1() {
 # ---- 2.2 users ----
 U_TODO=""
 c_2_2() {
-  local spec name uid pg supp g miss_g todo="" err="" fix="" why=""
+  local spec name uid pg supp g miss_g todo="" err="" fix="" why="" ge
+  # the users need their groups: without them useradd fails
+  for ge in ${GROUP_GIDS//,/ }; do
+    getent group "${ge%%:*}" >/dev/null 2>&1 || { NOW="The group ${ge%%:*} does not exist yet (step 2.1)"; return 2; }
+  done
   local -a specs=("$ORACLE_USER|$ORACLE_UID|$INSTALL_GROUP|$ORACLE_GROUPS")
   single_owner || specs+=("$GRID_USER|$GRID_UID|$GRID_PGROUP|$GRID_GROUPS")
   for spec in "${specs[@]}"; do
@@ -3410,7 +3433,7 @@ make_dir() {
     if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
-  if [[ -z "$(ls -A "$path" 2>/dev/null)" ]]; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
+  if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
 }
 dir_specs() {
   if use_grid; then printf '%s\n' "$GRID_BASE:$GRID_USER" "$GRID_HOME:$GRID_USER"; fi
@@ -3426,7 +3449,7 @@ c_2_5() {
     if [[ ! -d "$d" ]]; then miss+="  $d  (owner $own)"$'\n'; continue; fi
     local cur; cur=$(stat -c '%U' "$d")
     if [[ "$cur" != "$own" && ! ( "$cur" == "root" && "$d" == "$GRID_HOME" ) ]]; then
-      if [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
+      if dir_empty "$d"; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
       else wrong+="$d is not empty and belongs to $cur, not $own"$'\n'; fixw+="chown $own:$INSTALL_GROUP $d"$'\n'; fi
     fi
   done < <(dir_specs)
@@ -3441,7 +3464,7 @@ ${fixw%$'\n'}"
   # an empty home needs room for the software (about 15 GB each)
   local short="" h
   for h in "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"}; do
-    [[ -n "$(ls -A "$h" 2>/dev/null)" ]] && continue
+    dir_empty "$h" || continue
     use_grid || [[ "$h" != "$GRID_HOME" ]] || continue
     [[ $(free_mb_of "$h") -ge 15360 ]] || short+="$(mnt_of "$h") has $(human_mb "$(free_mb_of "$h")") free for $h. It needs about 15 GB."$'\n'
   done
@@ -3457,52 +3480,81 @@ Folders that are not empty keep their owner."
 d_2_5() { local d own; while IFS=: read -r d own; do make_dir "$d" "$own" || return 1; done < <(dir_specs); }
 
 # ---- 2.6 /etc/hosts on standby ----
-H_TODO=""
+# The script fixes /etc/hosts itself (a backup is kept, --undo puts it back):
+#   a name that does not resolve gets a line; a name on a 127.x line or on a wrong address is taken off
+#   that line and gets its own correct line (lines of other names are never changed).
+H_TODO=""; H_FIX=""
 v4_of() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'; }
+host_fq() {   # the full name of this server when it is <short name>.<domain>
+  local fq; fq=$(hostname 2>/dev/null)
+  [[ "$fq" == *.* && "${fq%%.*}" == "$STANDBY_HOST" ]] && printf '%s' "$fq"
+}
 c_2_6() {
-  local todo="" h ip want wrong=""
+  local todo="" fix="" h ip want why=""
+  H_TODO=""; H_FIX=""
   for h in "$PRIMARY_HOST|$PRIMARY_IP" "$STANDBY_HOST|$STANDBY_IP"; do
     IFS='|' read -r h want <<< "$h"
     ip=$(v4_of "$h")
+    local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
     if [[ -z "$ip" ]]; then
-      if [[ "$want" =~ ^[0-9.]+$ ]]; then
-        local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(hostname 2>/dev/null) && [[ "$fq" == *.* && "${fq%%.*}" == "$h" ]] || fq=""
-        todo+="$want    ${fq:+$fq }$h"$'\n'
-      else NOW="$h does not resolve, and its IP address is not known"; return 2; fi
-    elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" && "$ip" != 127.* ]]; then
-      wrong+="$h resolves to $ip here, but should be $want"$'\n'
+      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known"; return 2; }
+      todo+="$want    ${fq:+$fq }$h"$'\n'
+    elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" ]]; then
+      if [[ "$ip" == 127.* ]]; then why+="$h resolves to $ip (loopback). The primary could not reach this server's listener."$'\n'
+      else why+="$h resolves to $ip here, but it is $want"$'\n'; fi
+      fix+="$h|$want"$'\n'; todo+="$want    ${fq:+$fq }$h"$'\n'
     fi
   done
-  local sip; sip=$(v4_of "$STANDBY_HOST")
-  if [[ "$sip" == 127.* ]]; then
-    # the Grid listener would listen only on loopback; primary could not reach it
-    NOW="$STANDBY_HOST resolves to $sip (loopback) on this server
-The primary could not reach the listener here."
+  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $(v4_of "$STANDBY_HOST")"; return 0; fi
+  H_TODO=${todo%$'\n'}; H_FIX=${fix%$'\n'}
+  if [[ -L /etc/hosts ]]; then
+    NOW="${why:-The host names do not resolve on this server}"$'\n'"/etc/hosts is a symbolic link, so the script does not change it."
     KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- In /etc/hosts, remove $STANDBY_HOST from the 127.x line, then add this line:
-$STANDBY_IP    $STANDBY_HOST"
+    PLAN="-- Correct the names in DNS or in the file /etc/hosts points to:"$'\n'"$H_TODO"
     return 1
   fi
-  if [[ -n "$wrong" ]]; then
-    NOW="${wrong%$'\n'}"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- Make the names resolve to these addresses, in DNS or in /etc/hosts:
-$PRIMARY_IP    $PRIMARY_HOST
-$STANDBY_IP    $STANDBY_HOST"
-    return 1
+  if [[ -n "$why" ]]; then
+    NOW="${why%$'\n'}"
+    PLAN="Correct /etc/hosts (a backup is kept; --undo puts it back):"
+    local f; while IFS='|' read -r h want; do [[ -n "$h" ]] && PLAN+=$'\n'"  take $h off the lines with another address"; done <<< "$H_FIX"
+    PLAN+=$'\n'"  then add:"$'\n'"$(sed 's/^/    /' <<< "$H_TODO")"
+    grep -qE '^hosts:.*dns.*files' /etc/nsswitch.conf 2>/dev/null && PLAN+=$'\n'"Note: /etc/nsswitch.conf asks DNS before /etc/hosts. Correct DNS too."
+  else
+    NOW="The host names do not resolve on this server"
+    PLAN="Add these lines to /etc/hosts (a backup is kept):"$'\n'"$H_TODO"
   fi
-  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $sip"; return 0; fi
-  H_TODO=${todo%$'\n'}
-  NOW="The host names do not resolve on this server"
-  PLAN="Add these lines to /etc/hosts (a backup is kept):
-$H_TODO"
   return 1
 }
 d_2_6() {
   backup_file /etc/hosts || return 1
-  local l add=""
-  while IFS= read -r l; do grep -qxF -- "$l" /etc/hosts || add+="$l"$'\n'; done <<< "$H_TODO"
-  [[ -n "$add" ]] && printf '%s' "${add%$'\n'}" | append_as root /etc/hosts
+  local tmp h want fq
+  tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  cp -- /etc/hosts "$tmp" 2>/dev/null || : > "$tmp"
+  # take each name (and this server's full name) off every line whose address is not the right one
+  while IFS='|' read -r h want; do
+    [[ -n "$h" ]] || continue
+    fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
+    awk -v n="$h" -v f="$fq" -v w="$want" '
+      /^[[:space:]]*(#|$)/ { print; next }
+      {
+        if ($1 == w || index($1, ":")) { print; next }      # the right line, and IPv6 lines, stay as they are
+        out = $1; kept = 0
+        for (i = 2; i <= NF; i++) {
+          if (substr($i, 1, 1) == "#") { for (j = i; j <= NF; j++) out = out " " $j; break }
+          if (tolower($i) == tolower(n) || (f != "" && tolower($i) == tolower(f))) continue
+          out = out " " $i; kept++
+        }
+        if (kept > 0 || NF == 1) print out
+      }' "$tmp" > "$tmp.n" && mv -f -- "$tmp.n" "$tmp" || return 1
+  done <<< "$H_FIX"
+  # a last line without its newline gets one first (else the new line would be glued to it)
+  [[ -s "$tmp" && -n "$(tail -c 1 -- "$tmp")" ]] && printf '\n' >> "$tmp"
+  local l; while IFS= read -r l; do [[ -n "$l" ]] && ! grep -qxF -- "$l" "$tmp" && printf '%s\n' "$l" >> "$tmp"; done <<< "$H_TODO"
+  # written in place: the file keeps its owner, mode and SELinux label; a failed write puts the backup back
+  cat -- "$tmp" > /etc/hosts || { [[ -f "/etc/hosts.bak_$RUN_ID" ]] && cat -- "/etc/hosts.bak_$RUN_ID" > /etc/hosts; bad "/etc/hosts could not be written. The old content was put back."; return 1; }
+  rm -f -- "$tmp"
+  journal_file_written /etc/hosts 1
+  say "Corrected /etc/hosts."
   return 0
 }
 
@@ -4047,7 +4099,7 @@ c_2_14() {
     need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + mb ))
     free_by_mnt[$mnt]=$free
     if [[ -d "$d" && "$(stat -c %U "$d")" == "$ORACLE_USER" ]]; then report+="$d exists (on $mnt)"$'\n'
-    elif [[ -d "$d" && -n "$(ls -A "$d" 2>/dev/null)" ]]; then notmine+="$d is owned by $(stat -c %U "$d") and is not empty"$'\n'
+    elif [[ -d "$d" ]] && ! dir_empty "$d"; then notmine+="$d is owned by $(stat -c %U "$d") and is not empty"$'\n'
     else missing+=("$d"); report+="$d is missing (on $mnt)"$'\n'; fi
   done < <(fs_need_lines)
   if [[ -n "$notmine" ]]; then
@@ -4082,7 +4134,7 @@ mount <mount point>
 d_2_14() { local d; for d in "${FS_TODO[@]}"; do make_dir "$d" "$ORACLE_USER" || return 1; done; }
 
 # ---- 2.15 storage is not shared with the primary ----
-STORAGE_SHARED=""
+STORAGE_SHARED=""; STORAGE_KEYS=()
 disk_ids() {
   # ids of the physical disks below a block device, from lsblk -P output on stdin: W:<wwn> and S:<serial>.
   # Serial numbers that many disks share (QEMU default QM00001, all zeros) are left out.
@@ -4122,7 +4174,7 @@ storage_not_shared() {
   #   else not proven: the duplicate is refused until the user confirms exactly that disk.
   # rc 0 = not shared, 1 = shared, 2 = not proven. A folder found shared outranks one that is not proven.
   local d m fst ans lid pid lsrc psrc luuid net lids wcom key ok why plan np=0 info2="" plan2=""
-  STORAGE_SHARED=""; STORAGE_INFO=""; STORAGE_PLAN=""
+  STORAGE_SHARED=""; STORAGE_INFO=""; STORAGE_PLAN=""; STORAGE_KEYS=()
   read_primary_mounts || { STORAGE_INFO="Cannot read the file systems mounted on the primary (findmnt and lsblk over ssh)"; return 2; }
   for d in $(fs_dirs); do
     ok=0; why=""; plan=""; key=""
@@ -4201,9 +4253,8 @@ lsblk -s -o NAME,TYPE,WWN,SERIAL,SIZE \$(findmnt -n -o SOURCE --target $d)
 lsblk -o NAME,TYPE,WWN,SERIAL,SIZE,MOUNTPOINT
 -- Or check in the storage or virtualization console whether it is the same volume.${plan:+
 $plan}
--- Only if it is a separate disk of this server:
-echo '$key' >> $(storage_clone_file)
--- Then answer r."
+-- If it is a separate disk of this server, the script asks you to confirm it next."
+      STORAGE_KEYS+=("$d|$key")
     fi
     [[ -z "$info2" ]] && { info2=$why; plan2=$plan; }
     np=1
@@ -4219,6 +4270,12 @@ c_2_15() {
   if [[ "$MODE" == "check" ]]; then NOW="Tested only in a normal run, because it writes a small test file"; return 2; fi
   need_ssh || return 2
   local rc=0; storage_not_shared || rc=$?
+  if [[ $rc -eq 2 && ${#STORAGE_KEYS[@]} -gt 0 ]]; then
+    # not proven by the script: you compare the disks, then confirm each one here (your answer is kept)
+    NOW=$STORAGE_INFO
+    PLAN="Compare the disks first:"$'\n'"$STORAGE_PLAN"
+    KIND_NOW=ask; return 1
+  fi
   if [[ $rc -eq 2 ]]; then NOW=$STORAGE_INFO; [[ -n "$STORAGE_PLAN" ]] && PLAN=$STORAGE_PLAN; return 2; fi
   if [[ $rc -eq 0 ]]; then NOW="Each database folder is on storage of this server only:"$'\n'"$STORAGE_INFO"; return 0; fi
   NOW="DANGER: these folders are the SAME storage as on the primary: $STORAGE_SHARED"$'\n'"The RMAN copy would overwrite the files of the primary database."
@@ -4229,6 +4286,19 @@ c_2_15() {
 -- The RMAN copy (step 8.2) is refused until this is fixed."
   :
   return 1
+}
+
+d_2_15() {
+  # your confirmation for each disk the script could not prove (written only after you typed it)
+  local e d key
+  for e in "${STORAGE_KEYS[@]+"${STORAGE_KEYS[@]}"}"; do
+    d=${e%%|*}; key=${e#*|}
+    confirm_word "Is $d ($key) on a separate disk of this server, NOT the storage of the primary?" "SEPARATE" || { say "Not confirmed. The RMAN copy stays refused for $d."; return 3; }
+    install -d -m 700 "$STATE_DIR"; printf '%s\n' "$key" >> "$(storage_clone_file)"; chmod 600 "$(storage_clone_file)"
+    _log CHANGE "storage confirmed by the admin as separate: $d ($key)"
+    journal CONFIRM "storage_clone_ok" "by hand: remove the line $key from $(storage_clone_file)   (your confirmation that $d is a separate disk)"
+  done
+  return 0
 }
 
 phase_2() {
@@ -4247,7 +4317,7 @@ phase_2() {
   run_step 2.12 auto    "ASM disk method (ASMLib or udev)" c_2_12 d_2_12
   run_step 2.13 auto    "ASM disks" c_2_13 d_2_13
   run_step 2.14 auto    "Database folders and free space (file system)" c_2_14 d_2_14
-  run_step 2.15 check   "Database folders are not shared with the primary" c_2_15
+  run_step 2.15 check   "Database folders are not shared with the primary" c_2_15 d_2_15
   build_envs_if_possible
 }
 
@@ -4706,25 +4776,140 @@ unzip_failed_check() {
   # $@ the folders of this software (home and stage folder). An unzip into one of them that did not end with
   # exit code 0 (failed, killed, reboot, closed terminal) leaves a half-filled folder: the installer must not
   # start from it. Lines of an older version have no folder: they count for every folder.
+  # Returns 1 with NOW/PLAN set. SW_UNZIP_DIRS / SW_UNZIP_OUTS: what the do function empties and clears
+  # (empty when the script must not do it itself: then KIND_NOW=manual).
+  SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
   [[ -f "$(unzip_marker)" ]] || return 0
-  local t o dest list="" f hit rmcmd=""
+  local t o dest list="" f hit rmcmd="" manual=0
   while IFS='|' read -r t o dest; do
     [[ -n "$t" ]] || continue
     hit=0; [[ -z "$dest" ]] && hit=1
     for f in "$@"; do [[ "$dest" == "$f" ]] && hit=1; done
     [[ $hit -eq 1 ]] || continue
-    list+="  '$t' into ${dest:-the home or stage folder of that file} (output $o)"$'\n'
+    list+="  $t"$'\n'"    into ${dest:-the home or stage folder of that file}"$'\n'
     rmcmd+="grep -vF -- '|${o}|' '$(unzip_marker)' > '$(unzip_marker).n'; mv -f '$(unzip_marker).n' '$(unzip_marker)'"$'\n'
+    # the script empties only a folder it knows, that no installed home uses
+    if [[ -z "$dest" ]] || in_inventory "$dest" || ! sw_folder_ok "$dest"; then manual=1; fi
+    SW_UNZIP_DIRS+=("$dest"); SW_UNZIP_OUTS+=("$o")
   done < "$(unzip_marker)"
   [[ -n "$list" ]] || return 0
   NOW="An earlier unzip did not finish. Its folder is incomplete:"$'\n'"${list%$'\n'}"
-  MANUAL_HOW="root  ->  shell"
+  if [[ $manual -eq 0 ]]; then
+    PLAN="Empty that folder (nothing is installed there), then unpack the files again"
+    return 1
+  fi
+  SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+  KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
   PLAN="-- Empty the folder named above, and nothing else. First check that nothing is
 -- installed there: it must not be listed in $INVENTORY_DIR/ContentsXML/inventory.xml.
+-- Empty it (hidden files too):  find <folder> -mindepth 1 -delete
 -- Then remove its line from the list of failed unzips:
 ${rmcmd%$'\n'}
 -- Then answer r. The files are unpacked again."
   return 1
+}
+sw_folder_ok() {
+  # $1 a software folder the script may empty: the Grid or database home of the settings, or one of their
+  # stage folders; a plain path; no program of it runs
+  local d=$1 o real fst
+  [[ "$d" =~ ^/[A-Za-z0-9_./-]+$ && "$d" != *..* && "$d" != */ && "$d" != *//* ]] || return 1
+  [[ "$d" == "$DB_HOME" || ( -n "$GRID_HOME" && "$d" == "$GRID_HOME" ) || "$d" == "$(stage_dir db)" || "$d" == "$(stage_dir grid)" ]] || return 1
+  # at least three levels deep (/u01/app/x), not a link, and the same folder when every link is resolved
+  [[ $(tr -cd '/' <<< "$d" | wc -c) -ge 3 && ! -L "$d" ]] || return 1
+  real=$(readlink -f -- "$d" 2>/dev/null); [[ -z "$real" || "$real" == "$d" ]] || return 1
+  # it must not hold (or be) another folder of the setup: base folders, inventory, the other home, database folders
+  for o in "$ORACLE_BASE" "${GRID_BASE:-}" "$INVENTORY_DIR" "$DB_HOME" "${GRID_HOME:-}" $(fs_dirs 2>/dev/null); do
+    [[ -n "$o" && "$o" != "$d" ]] || continue
+    [[ "$o/" == "$d/"* ]] && return 1
+  done
+  # local storage only, and no other file system mounted inside it (rm -rf would go into it)
+  fst=$(findmnt -n -o FSTYPE --target "$(existing_parent "$d")" 2>/dev/null | head -n 1)
+  case "$fst" in nfs*|cifs|smb*|acfs|fuse*|glusterfs|ceph*|ocfs2|gfs2|"") return 1 ;; esac
+  [[ -d "$d" ]] && findmnt -rn -o TARGET 2>/dev/null | grep -q "^$d/" && return 1
+  sw_in_use "$d" && return 1
+  return 0
+}
+sw_in_use() {
+  # 0 when a running program comes from folder $1 (the program file of a process is inside it)
+  local e r; r=$(readlink -f -- "$1" 2>/dev/null); r=${r:-$1}
+  for e in /proc/[0-9]*/exe; do
+    e=$(readlink -f -- "$e" 2>/dev/null) || continue
+    [[ "$e" == "$1/"* || "$e" == "$r/"* ]] && return 0
+  done
+  return 1
+}
+sw_empty_folder() {
+  # $1 folder (checked with sw_folder_ok). Everything in it goes, hidden files too; the folder itself and a
+  # lost+found of a mount point stay.
+  local d=$1
+  sw_folder_ok "$d" || { bad "Not emptied: $d is not a software folder of this setup, or a program of it runs."; return 1; }
+  [[ -d "$d" ]] || return 0
+  find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf --one-file-system -- {} + || return 1
+  journal DELETED "$d" "cannot be undone: the content of this software folder was deleted (it is installed again)"
+  say "Emptied $d"
+  _log CHANGE "emptied the software folder $d"
+  return 0
+}
+sw_unzip_fix() {
+  # the do part of a failed unzip: empty the folders, then drop their lines from the list of failed unzips
+  local i
+  for i in "${!SW_UNZIP_DIRS[@]}"; do
+    sw_empty_folder "${SW_UNZIP_DIRS[$i]}" || return 1
+    grep -vF -- "|${SW_UNZIP_OUTS[$i]}|" "$(unzip_marker)" > "$(unzip_marker).n"
+    if [[ -s "$(unzip_marker).n" ]]; then cat "$(unzip_marker).n" > "$(unzip_marker)"; else rm -f -- "$(unzip_marker)"; fi
+    rm -f -- "$(unzip_marker).n"
+  done
+  return 0
+}
+inventory_mark_removed() {
+  # $1 home: the way the Oracle installer detaches a home - its HOME entry gets REMOVED="T" (a backup is kept,
+  # --undo puts the file back)
+  local inv u tmp; inv="$(inventory_dir)/ContentsXML/inventory.xml"
+  [[ -f "$inv" ]] || return 0
+  in_inventory "$1" || return 0
+  u=$(stat -c '%U' "$inv")
+  backup_file "$inv" "$u" || return 1
+  tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  awk -v loc="LOC=\"$1\"" 'index($0, "<HOME ") && index($0, loc) && !index($0, "REMOVED=") { sub(/[[:space:]]*\/?>/, " REMOVED=\"T\"&") } { print }' "$inv" > "$tmp" || return 1
+  grep -q "LOC=\"$1\"[^>]*REMOVED=\"T\"" "$tmp" || { bad "The HOME entry of $1 in $inv could not be marked."; return 1; }
+  write_as "$u" "$inv" "$(stat -c '%a' "$inv")" < "$tmp" || return 1
+  rm -f -- "$tmp"
+  say "Marked $1 as removed in $inv"
+  return 0
+}
+sw_half_fix() {
+  # $1 home, $2 owner, $3 success record, $4 stage folder. Asks: record it as installed, or clean it.
+  # Return: 0 = recorded (nothing more to do), 10 = cleaned (install now), 3 = not done
+  local home=$1 owner=$2 rec=$3 stg=$4
+  say "Its installer log: the newest file in $INVENTORY_DIR/logs"
+  ask_choice "[m] I installed it myself, without error   [c] Clean it and install again   [s] Skip   [q] Quit" "mcsq"
+  case "$ANSWER" in
+    q) user_stop "Stopped by you" ;;
+    s) return 3 ;;
+    m) [[ -s "$home/bin/oracle" || -x "$home/bin/crsctl" ]] || { bad "The programs of $home are missing. Choose c to install it again."; return 1; }
+       install -d -m 700 "$STATE_DIR"; : > "$rec"; say "Recorded: $home was installed without error."; return 0 ;;
+  esac
+  sw_folder_ok "$home" || { bad "$home cannot be cleaned by the script: a program of it runs, or it is not the home of the settings."; return 1; }
+  if [[ -d "$home/dbs" ]] && ls "$home/dbs" 2>/dev/null | grep -qE '^(spfile|orapw).+'; then
+    bad "$home/dbs has an spfile or a password file. A database used this home. It is not cleaned."; return 1
+  fi
+  # the installer files must be on this server BEFORE the home is emptied (else nothing could install it again)
+  local kind=$5 mvar=DB_MEDIA f; [[ "$kind" == grid ]] && mvar=GRID_MEDIA
+  if ! media_ok "${!mvar}"; then
+    scan_media; f=$(pick_media "$kind")
+    if [[ -z "$f" || "$f" == MISSING:* ]]; then
+      bad "No installer files for $([[ "$kind" == grid ]] && printf 'Grid %s' "$(want_rel grid)" || printf 'the database %s' "$(want_rel)") were found on this server, so nothing was deleted."
+      say "Put them in /stage (owner root, mode 644), then choose c again. Step 3.1 shows where to get them."
+      return 1
+    fi
+    printf -v "$mvar" '%s' "$f"; save_settings; say "Installer files: $f"
+  fi
+  confirm_word "Everything in $home will be deleted, and it will be installed again." "CLEAN" || return 3
+  inventory_mark_removed "$home" || return 1
+  sw_empty_folder "$home" || return 1
+  [[ -d "$stg" ]] && { sw_empty_folder "$stg" || return 1; }
+  rm -f -- "$rec"
+  return 10
 }
 stage_dir() { printf '%s/dg_stage_%s' "$(dirname "$INVENTORY_DIR")" "$1"; }   # for staged (12.x) media
 unpack_media() {
@@ -4767,7 +4952,8 @@ grid_state() {
       else GSTATE=UNKNOWN; GSTATE_OUT=$RUN_OUT; fi
       return
     fi
-    if [[ -f /etc/oracle/olr.loc ]]; then GSTATE=HAS_DOWN; return; fi
+    # a left-over olr.loc of an earlier install does not make an unpacked home "installed"
+    if [[ -f /etc/oracle/olr.loc ]] && in_inventory "$GRID_HOME"; then GSTATE=HAS_DOWN; return; fi
   fi
   if in_inventory "$GRID_HOME"; then
     if [[ -f "$STATE_DIR/grid_install.done" || -f /etc/oracle/olr.loc || -f "$(GRID_ROOT_DONE_FILE)" ]] && [[ -x "$GRID_HOME/bin/crsctl" ]]; then GSTATE=NEED_ROOT
@@ -4781,15 +4967,11 @@ half_installed_plan() {
   # $1 home, $2 owner, $3 the success record: an installer that registered the home but did not finish
   # (relink error, killed), or a home installed by hand before this script ran
   NOW="$1 is in the Oracle inventory, but the script cannot confirm the installation."$'\n'"There is no record that its installer finished, or its programs are missing."
-  KIND_NOW=manual; MANUAL_HOW="$2  ->  shell"
-  PLAN="-- Case 1: you installed this home yourself, and the installer finished without error
--- (see the newest log in $INVENTORY_DIR/logs). Record that, as root, then answer r:
-touch $3
--- Case 2: the installer failed or was stopped. Fix the cause, remove the half-installed
--- home, then answer r. The home is then installed again:
-$1/deinstall/deinstall
--- If deinstall fails, as root:  rm -rf $1/*
--- and remove the HOME line of $1 from $INVENTORY_DIR/ContentsXML/inventory.xml"
+  KIND_NOW=ask; SW_FIX=half
+  PLAN="You choose:
+  m  you installed it yourself and the installer finished without error: the script records that
+  c  clean it and install again: the home is marked as removed in the inventory (a backup is kept),
+     $1 is emptied, and the installer runs again"
 }
 grid_installer() {
   # prints the installer path for the current media (image: in the home; staged: in the stage folder)
@@ -4831,7 +5013,20 @@ write_grid_rsp() {
 }
 
 # ---- 3.2 Grid software ----
+SW_FIX=""; SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+grid_ready() {
+  # what the install needs (NOW says what is missing)
+  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 1; }
+  if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
+    media_ok "$GRID_MEDIA" || { NOW="The Grid installer files are not known yet (step 3.1)"; return 1; }
+    if ! media_is_staged "$GRID_MEDIA"; then
+      dir_empty "$GRID_HOME" || { NOW="$GRID_HOME is not empty, but it has no gridSetup.sh. Check what is in it."; return 1; }
+    fi
+  fi
+  return 0
+}
 c_3_2() {
+  SW_FIX=""
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
   users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   grid_state
@@ -4840,14 +5035,8 @@ c_3_2() {
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     HALF_INSTALLED) half_installed_plan "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done"; return 1 ;;
   esac
-  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 2; }
-  unzip_failed_check "$GRID_HOME" "$(stage_dir grid)" || return 2
-  if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$GRID_MEDIA" || { NOW="The Grid installer files are not known yet (step 3.1)"; return 2; }
-    if ! media_is_staged "$GRID_MEDIA"; then
-      [[ -z "$(ls -A "$GRID_HOME" 2>/dev/null)" ]] || { NOW="$GRID_HOME is not empty, but it has no gridSetup.sh"; return 2; }
-    fi
-  fi
+  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; return 1; fi
+  grid_ready || return 2
   NOW="Grid is not installed yet"
   PLAN=""
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
@@ -4864,6 +5053,16 @@ Ask you for a new ASM password for SYS and ASMSNMP (used only on this server)"
   return 1
 }
 d_3_2() {
+  local fx=0
+  case "$SW_FIX" in
+    half)  sw_half_fix "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done" "$(stage_dir grid)" grid || fx=$?
+           [[ $fx -eq 10 ]] || return $fx ;;
+    unzip) sw_unzip_fix || return 1 ;;
+  esac
+  if [[ -n "$SW_FIX" ]]; then
+    SW_FIX=""; grid_state
+    grid_ready || { bad "$NOW"; return 1; }
+  fi
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$GRID_MEDIA"; then unpack_media "$GRID_MEDIA" "$(stage_dir grid)" as_grid "$GRID_USER" || return 1
     else
@@ -5115,7 +5314,17 @@ primary_edition() {
 }
 
 # ---- 3.6 DB software ----
+db_ready() {
+  if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
+    media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 1; }
+    if ! media_is_staged "$DB_MEDIA"; then
+      dir_empty "$DB_HOME" || { NOW="$DB_HOME is not empty, but it has no runInstaller. Check what is in it."; return 1; }
+    fi
+  fi
+  return 0
+}
 c_3_6() {
+  SW_FIX=""
   users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   db_state
   case "$DSTATE" in
@@ -5123,13 +5332,8 @@ c_3_6() {
     HALF_INSTALLED) half_installed_plan "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done"; return 1 ;;
   esac
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
-  unzip_failed_check "$DB_HOME" "$(stage_dir db)" || return 2
-  if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 2; }
-    if ! media_is_staged "$DB_MEDIA"; then
-      [[ -z "$(ls -A "$DB_HOME" 2>/dev/null)" ]] || { NOW="$DB_HOME is not empty, but it has no runInstaller"; return 2; }
-    fi
-  fi
+  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; return 1; fi
+  db_ready || return 2
   NOW="Database software is not installed yet"
   PLAN=""
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
@@ -5143,7 +5347,17 @@ ${RU_DIR:+  with the Release Update in $RU_DIR}
   return 1
 }
 d_3_6() {
-  local kind=image
+  local kind=image fx=0
+  case "$SW_FIX" in
+    half)  sw_half_fix "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done" "$(stage_dir db)" db || fx=$?
+           [[ $fx -eq 10 ]] || return $fx ;;
+    unzip) sw_unzip_fix || return 1 ;;
+  esac
+  if [[ -n "$SW_FIX" ]]; then
+    SW_FIX=""; db_state
+    primary_edition || { bad "Cannot read the edition of the primary"; return 1; }
+    db_ready || { bad "$NOW"; return 1; }
+  fi
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$DB_MEDIA"; then unpack_media "$DB_MEDIA" "$(stage_dir db)" as_oracle "$ORACLE_USER" || return 1
     else
@@ -5560,6 +5774,8 @@ find_dest() {
 }
 c_4_4() {
   need_ssh || return 2
+  # log_archive_dest may have been moved on the primary since it was read (answer r): read it again
+  if [[ -n "$OLD_ARCH_DEST" ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
   find_dest || { NOW="No free log_archive_dest_N on the primary"; return 2; }
   p_param "log_archive_dest_$DEST_N" || { NOW="Query on the primary failed"; return 2; }
   if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"; return 0; fi
@@ -6093,14 +6309,13 @@ c_6_1() {
   need_ssh || return 2
   # 12.2+: v$passwordfile_info has file_name and format; 12.1: file_name only; else the file in dbs
   local pfile=""
-  if [[ "$PRIMARY_VERSION" != 12.1* ]] && prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
-  elif prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
+  if prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
   fi
   if [[ -z "$pfile" || "$pfile" == "-" ]]; then
     if prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && [[ "$(head -n 1 <<< "$RUN_OUT")" == "YES" ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
     else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
   fi
-  [[ "$pfile" =~ ^[+/][A-Za-z0-9_./+-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
+  [[ "$pfile" =~ ^\+[A-Za-z0-9_./+-]+$ || "$pfile" =~ ^/[A-Za-z0-9_./-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
   if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
@@ -6504,10 +6719,10 @@ c_7_7() {
   local cur; cur=$(grep -E "^${STANDBY_SID}:" /etc/oratab 2>/dev/null | head -n 1)
   if [[ "$cur" == "$STANDBY_SID:$DB_HOME:"* ]]; then NOW="/etc/oratab has the line for $STANDBY_SID:"$'\n'"  $cur"; return 0; fi
   if [[ -n "$cur" ]]; then
+    local yn; yn=$(cut -d: -f3 <<< "$cur"); [[ "$yn" =~ ^[YNyn]$ ]] || yn=N
     NOW="/etc/oratab has another home for $STANDBY_SID:"$'\n'"  $cur"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- Edit /etc/oratab and change that line to:
-$STANDBY_SID:$DB_HOME:N"; return 1
+    PLAN="Change that line in /etc/oratab to (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:$yn"
+    return 1
   fi
   NOW="/etc/oratab has no line for $STANDBY_SID. oraenv and dbstart need it."
   PLAN="Add this line to /etc/oratab (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:N"
@@ -6516,6 +6731,15 @@ $STANDBY_SID:$DB_HOME:N"; return 1
 d_7_7() {
   local new=0; [[ -f /etc/oratab ]] || new=1
   backup_file /etc/oratab || return 1
+  if [[ $new -eq 0 && ! -L /etc/oratab ]] && grep -qE "^${STANDBY_SID}:" /etc/oratab; then
+    # only the line of this SID changes (its Y/N stays); written in place, so owner, mode and label stay
+    local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+    awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' /etc/oratab > "$tmp" || return 1
+    cat -- "$tmp" > /etc/oratab || { [[ -f "/etc/oratab.bak_$RUN_ID" ]] && cat -- "/etc/oratab.bak_$RUN_ID" > /etc/oratab; bad "/etc/oratab could not be written. The old content was put back."; return 1; }
+    rm -f -- "$tmp"
+    journal_file_written /etc/oratab 1
+    return 0
+  fi
   printf '%s:%s:N' "$STANDBY_SID" "$DB_HOME" | append_as root /etc/oratab || return 1
   # a new file gets the usual owner; an existing one (Grid makes it) keeps its owner
   [[ $new -eq 1 ]] && { chown root:"$INSTALL_GROUP" /etc/oratab; chmod 664 /etc/oratab; }
@@ -6538,6 +6762,7 @@ fs_cleanup_cmds() {
   done <<< "$SQL_OUT"
 }
 c_7_2() {
+  L72_CLEAN=""
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   pwfile_ok || { NOW="Password file is not ready (step 6.1)"; return 2; }
   storage_cache
@@ -6548,6 +6773,7 @@ c_7_2() {
       # the next duplicate needs an instance started from the text pfile
       if spfile_from_failed_copy; then
         NOW="Instance $STANDBY_SID is in NOMOUNT, but it runs from the spfile of an unfinished copy:"$'\n'"$(spfile_path)"
+        cleanup_auto_plan spfile && return 1
         PLAN="# As $ORACLE_USER, on this server only:
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && mv $(spfile_path) $(spfile_path).failed_$RUN_ID
@@ -6561,6 +6787,7 @@ $(leftover_cleanup_plan | grep -v "rm -f $(spfile_path) ")
         local ol; ol=$(orphan_leftovers)
         if [[ -n "$ol" ]]; then
           NOW="Instance $STANDBY_SID is in NOMOUNT, but files of an unfinished copy are still here:"$'\n'"$ol"
+          cleanup_auto_plan keep && return 1
           PLAN="# As $ORACLE_USER, on this server only:
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'
 $(leftover_cleanup_plan)
@@ -6580,6 +6807,7 @@ touch $STATE_DIR/existing_files_ok"
       if [[ $sc -eq 0 ]]; then STANDBY_BUILT=1; NOW="The standby database already exists ($LSTATE, PHYSICAL STANDBY). No copy is needed."; return 0; fi
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
       NOW="A standby control file exists, but the database is incomplete, probably from a failed copy:"$'\n'"$SC_INFO"
+      cleanup_auto_plan mounted && return 1
       KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER${GRID_HOME:+ / $GRID_USER}"
       PLAN="# As $ORACLE_USER, on this server only:"$'\n'"[ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'"$'\n'"$(leftover_cleanup_plan)"
       PLAN+=$'\n'"# Then answer r. The script starts the instance again from the pfile."
@@ -6594,6 +6822,7 @@ touch $STATE_DIR/existing_files_ok"
       local lo; lo=$(leftover_files)
       if [[ -n "$lo" && ! -f "$STATE_DIR/existing_files_ok" ]]; then
         NOW="Instance $STANDBY_SID is not started, and files already exist where the standby database will be written:"$'\n'"$lo"
+        cleanup_auto_plan keep && return 1
         PLAN="$(leftover_cleanup_plan)
 # RMAN overwrites files with the same names. Files with OMF names would stay unused and take space.
 # Then answer r.
@@ -6613,7 +6842,78 @@ Start the instance as $ORACLE_USER:
     *) NOW="Cannot read the state of the instance on this server ($(ora_errors "$SQL_OUT"))"; return 2 ;;
   esac
 }
+# The clean-up of a copy that did not finish, done by the script after you typed DELETE.
+# Only the standby's own names are removed: +DG/<standby unique name> in ASM, and in the folders the
+# primary's file names only when step 2.15 proved that the folders are storage of this server.
+L72_CLEAN=""; L72_FS=0
+cleanup_auto_plan() {
+  # $1 spfile | keep | mounted. Sets the plan for d_7_2 and returns 0, or 1 when the script must not do it
+  # itself (folders whose storage is not proven: then the commands are shown, as before)
+  local fs=0 dg lines=""
+  [[ -n "$STANDBY_UNIQUE" && "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" && "${STANDBY_UNIQUE^^}" != "${DB_NAME^^}" ]] || return 1
+  # only the leftovers of a copy THIS script started and that did not finish (else the files may be a complete
+  # standby, or an older database with the same name: then the commands are shown, nothing is done by the script)
+  [[ -f "$STATE_DIR/dup_attempt" && ! -f "$(dup_marker)" ]] || return 1
+  # files in folders are never deleted by the script (a shared disk can look local): the commands are shown
+  [[ -z "$(fs_dirs)" ]] || return 1
+  L72_CLEAN=$1; L72_FS=$fs
+  local_state
+  [[ "$LSTATE" != "IDLE" ]] && lines+="  stop the instance $STANDBY_SID (shutdown abort)"$'\n'
+  [[ -f "$(spfile_path)" ]] && lines+="  rename its spfile to $(basename "$(spfile_path)").failed_$RUN_ID"$'\n'
+  for dg in $(asm_dgs); do lines+="  delete +$dg/${STANDBY_UNIQUE^^} in ASM"$'\n'; done
+  lines+="  then start the instance again from the pfile"
+  PLAN="Clean up this server (after you type DELETE):"$'\n'"$lines"
+  [[ -n "$(asm_dgs)" ]] && PLAN+=$'\n'"Never touched: $(asm_dgs | sed "s#^#+#; s#\$#/${PRIMARY_UNIQUE^^}#" | paste -sd' ' -) (the primary's files)"
+  KIND_NOW=ask
+  return 0
+}
+leftover_cleanup_do() {
+  local dg f n=0
+  local_state
+  if [[ "$LSTATE" != "IDLE" ]]; then
+    sql_local "shutdown abort" || { bad "shutdown abort failed: $(ora_errors "$SQL_OUT")"; return 1; }
+    say "Instance $STANDBY_SID stopped."
+  fi
+  if [[ -f "$(spfile_path)" ]]; then
+    runuser -u "$ORACLE_USER" -- mv -f -- "$(spfile_path)" "$(spfile_path).failed_$RUN_ID" || return 1
+    journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID"
+    say "Renamed $(spfile_path) to .failed_$RUN_ID"
+  fi
+  rm -f -- "$(dup_marker)"
+  [[ -n "$STANDBY_UNIQUE" ]] || { bad "STANDBY_UNIQUE is empty. Nothing was deleted."; return 1; }
+  for dg in $(asm_dgs); do
+    grid_sw_ok || { bad "Grid is not installed here. Nothing was deleted in ASM."; return 1; }
+    # the folder of the standby at the top of the disk group (parent_index = the disk group's root)
+    sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" \
+      || { bad "Cannot read ASM ($(ora_errors "$SQL_OUT")). Nothing was deleted in +$dg."; return 1; }
+    [[ "$(first_line)" != "0" ]] || continue
+    run_logged "asmcmd rm" as_grid "$GRID_HOME/bin/asmcmd" rm -rf "+$dg/${STANDBY_UNIQUE^^}" || { bad "Could not delete +$dg/${STANDBY_UNIQUE^^}: ${RUN_OUT%%$'\n'*}"; return 1; }
+    journal DELETED "+$dg/${STANDBY_UNIQUE^^}" "cannot be undone: files of the unfinished copy, deleted after you typed DELETE"
+    say "Deleted +$dg/${STANDBY_UNIQUE^^}"
+  done
+  _log CHANGE "clean-up of the unfinished copy done on $(hostname -s)"
+  return 0
+}
 d_7_2() {
+  if [[ -n "$L72_CLEAN" ]]; then
+    local opts="[d] Delete them   [s] Skip   [h] Help   [q] Quit" allowed="dshq"
+    [[ "$L72_CLEAN" == keep && -f "$STATE_DIR/dup_attempt" ]] && { opts="[d] Delete them   [k] Keep them (RMAN overwrites files with the same names)   [s] Skip   [h] Help   [q] Quit"; allowed="dkshq"; }
+    while true; do
+      ask_choice "$opts" "$allowed"
+      case "$ANSWER" in
+        h) show_help 7.2 || true ;;
+        q) user_stop "Stopped by you" ;;
+        s) L72_CLEAN=""; return 3 ;;
+        k) install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/existing_files_ok"; say "The files stay. RMAN overwrites files with the same names."; break ;;
+        d) confirm_word "The files of the unfinished copy on THIS server ($(hostname -s)) will be deleted." "DELETE" || { L72_CLEAN=""; return 3; }
+           leftover_cleanup_do || { L72_CLEAN=""; return 1; }
+           break ;;
+      esac
+    done
+    L72_CLEAN=""
+    local_state
+    [[ "$LSTATE" == "IDLE" ]] || return 0          # NOMOUNT from the pfile already: nothing more to start
+  fi
   local p; p=$(pfile_path)
   if [[ -f "$p" && "$(cat "$p")" != "$(pfile_text)" ]]; then backup_file "$p" "$ORACLE_USER" || return 1; fi
   [[ -f "$p" && "$(cat "$p")" == "$(pfile_text)" ]] || { pfile_text | write_as "$ORACLE_USER" "$p" 644 || return 1; }
@@ -6686,13 +6986,6 @@ c_7_6() {
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   need_ssh || return 2
-  # the test needs the standby side: software, listener (phase 5) and the instance (step 7.2)
-  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
-  local_state
-  if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
-    NOW="The instance is not started (step 7.2)"; return 2
-  fi
   if prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;"; then NOW="Login from the primary works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
     built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
@@ -6813,19 +7106,26 @@ dup_prechecks() {
     l1=$(asm_labels "$DATA_DG" | head -n 1); want=""
     [[ -n "$l1" ]] && want=$(stat -L -c '%G' "$(asm_disk_dir)/$l1" 2>/dev/null)
     [[ -n "$want" && "$want" != "root" ]] || want=$(asm_owner_group)
-    [[ "$og" == "$want" ]] || { PRE_FIX="$DB_HOME/bin/oracle has group $og. It must be $want, the group of the ASM disks, or it cannot open them (ORA-15025)."$'\n'"As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"; return 1; }
+    if [[ "$og" != "$want" ]]; then
+      PRE_FIX="$DB_HOME/bin/oracle has group $og. It must be $want, the group of the ASM disks, or it cannot open them (ORA-15025)."$'\n'"As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"
+      # the script can fix this itself (step 8.1 offers it); the old group is kept for the undo
+      [[ -x "$GRID_HOME/bin/setasmgidwrap" ]] && { PRE_ASMGID_OLD=$og; PRE_ASMGID_WANT=$want; }
+      return 1
+    fi
   fi
   # RMAN uses the TNS aliases: prove they reach the right databases
   local pu pr pn ph ti th ts ls; ls=$(hostname -s 2>/dev/null || hostname)
   sql_primary_tns "select d.db_unique_name||'|'||d.database_role||'|'||d.name||'|'||i.host_name from v\$database d, v\$instance i;" || { PRE_FIX="Cannot reach the primary through $PRIMARY_TNS: $(ora_errors "$SQL_OUT") (step 7.5)"; return 1; }
   IFS='|' read -r pu pr pn ph <<< "$(first_line)"
-  if [[ "${pu^^}" != "${PRIMARY_UNIQUE^^}" || "$pr" != "PRIMARY" || "${pn^^}" != "${DB_NAME^^}" || "${ph%%.*}" == "${ls,,}" || "${ph%%.*}" == "${ls}" ]]; then
+  local phs=${ph%%.*}
+  if [[ "${pu^^}" != "${PRIMARY_UNIQUE^^}" || "$pr" != "PRIMARY" || "${pn^^}" != "${DB_NAME^^}" || "${phs,,}" == "${ls,,}" ]]; then
     PRE_FIX="Alias $PRIMARY_TNS does not reach the primary. It reaches: $pu, $pr, $pn, host $ph"; return 1
   fi
   PRE_INFO+="$PRIMARY_TNS reaches $pu (PRIMARY) on $ph"$'\n'
   sql_standby_tns "select instance_name||'|'||host_name||'|'||status from v\$instance;" || { PRE_FIX="Cannot reach the standby through $STANDBY_TNS: $(ora_errors "$SQL_OUT") (step 7.4)"; return 1; }
   IFS='|' read -r ti th ts <<< "$(first_line)"
-  if [[ "$ti" != "$STANDBY_SID" || "${th%%.*}" != "$ls" || "$ts" != "STARTED" ]]; then
+  local ths=${th%%.*}      # host names compared without the domain and without case
+  if [[ "${ti^^}" != "${STANDBY_SID^^}" || "${ths,,}" != "${ls,,}" || "$ts" != "STARTED" ]]; then
     PRE_FIX="Alias $STANDBY_TNS does not reach the NOMOUNT instance on this server. It reaches: $ti, host $th, $ts"; return 1
   fi
   PRE_INFO+="$STANDBY_TNS reaches $ti (NOMOUNT) on this server"$'\n'
@@ -7004,7 +7304,9 @@ dup_prechecks() {
 }
 HAS_LFNC=0; RMAN_PREFLIGHT_OK=""
 
+PRE_ASMGID_OLD=""; PRE_ASMGID_WANT=""
 c_8_1() {
+  PRE_ASMGID_OLD=""; PRE_ASMGID_WANT=""
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   need_ssh || return 2
   detect_built
@@ -7013,7 +7315,19 @@ c_8_1() {
   if dup_prechecks; then NOW=$PRE_INFO; return 0; fi
   NOW=$PRE_FIX
   [[ "$PRE_FIX" == *"(step "* ]] && return 2          # an earlier step is not done yet
+  if [[ -n "$PRE_ASMGID_OLD" ]]; then
+    # the one pre-check the script fixes itself: the group of the oracle program
+    NOW="$DB_HOME/bin/oracle has group $PRE_ASMGID_OLD. It must be $PRE_ASMGID_WANT, the group of the ASM disks (ORA-15025)."
+    PLAN="As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"$'\n'"Then all pre-checks run again."
+    KIND_NOW=auto; return 1
+  fi
   PLAN="$PRE_FIX"; return 1
+}
+d_8_1() {
+  run_logged "setasmgidwrap" "$GRID_HOME/bin/setasmgidwrap" "o=$DB_HOME/bin/oracle" || { bad "setasmgidwrap failed: ${RUN_OUT%%$'\n'*}"; return 1; }
+  journal ASMGID "$DB_HOME/bin/oracle" "by hand, only if wanted, as root: chgrp $PRE_ASMGID_OLD $DB_HOME/bin/oracle ; chmod 6751 $DB_HOME/bin/oracle  (the group it had before)"
+  say "$DB_HOME/bin/oracle now has group $(stat -c '%G' "$DB_HOME/bin/oracle" 2>/dev/null)."
+  return 0
 }
 
 rman_script() {
@@ -7129,7 +7443,7 @@ dup_success_record() {
 
 phase_8() {
   phase_header 8 "Copy the database (RMAN)"
-  run_step 8.1 check "Pre-checks: space, storage, logins, parameters" c_8_1
+  run_step 8.1 check "Pre-checks: space, storage, logins, parameters" c_8_1 d_8_1
   run_step 8.2 auto  "RMAN duplicate for standby" c_8_2 d_8_2
 }
 

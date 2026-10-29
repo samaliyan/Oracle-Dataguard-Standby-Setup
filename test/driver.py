@@ -148,10 +148,17 @@ def main():
         if m:
             w = m.group(1)
             if w == "DUPLICATE": w = E("DG_TEST_DUP", w)
+            elif w == "SEPARATE": w = E("DG_TEST_SEPARATE", "n")
+            elif w == "DELETE": w = E("DG_TEST_DELETE", w)
+            elif w == "CLEAN": w = E("DG_TEST_CLEAN", w)
             elif w == "IGNORE": w = E("DG_TEST_IGNORE", w)
             elif w.startswith("/dev/"): w = E("DG_TEST_DISKWORD", w)
             send(w); continue
         if "[w] Watch until it ends" in bt: send("w"); continue
+        if bt.startswith("[d] Delete them"):
+            if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
+            send("s" if step in lst("DG_TEST_NOFIX") else E("DG_TEST_L72", "d")); continue
+        if bt.startswith("[m] I installed it myself"): send("s" if step in lst("DG_TEST_NOFIX") else E("DG_TEST_HALF", "c")); continue
         if "[p] Type the sys password" in bt and step in lst("DG_TEST_PSYS"): send("p"); continue
         if bt.endswith("[a] Accept   [e] Edit   [h] Help   [q] Quit"):
             send(settings_answers.pop(0) if settings_answers else "a"); continue

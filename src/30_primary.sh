@@ -8,7 +8,7 @@ SETTINGS_ACCEPTED=0
 SYS_VERIFIED=0
 PRIMARY_TNS_ADMIN=""
 
-v_name() { [[ "$1" =~ ^[A-Za-z0-9_.+-]+$ ]]; }
+v_name() { [[ "$1" =~ ^[A-Za-z0-9_.+-]+$ && "$1" != -* ]]; }
 v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ ]]; }
 
 ssh_alive() {

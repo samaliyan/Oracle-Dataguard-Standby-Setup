@@ -453,25 +453,140 @@ unzip_failed_check() {
   # $@ the folders of this software (home and stage folder). An unzip into one of them that did not end with
   # exit code 0 (failed, killed, reboot, closed terminal) leaves a half-filled folder: the installer must not
   # start from it. Lines of an older version have no folder: they count for every folder.
+  # Returns 1 with NOW/PLAN set. SW_UNZIP_DIRS / SW_UNZIP_OUTS: what the do function empties and clears
+  # (empty when the script must not do it itself: then KIND_NOW=manual).
+  SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
   [[ -f "$(unzip_marker)" ]] || return 0
-  local t o dest list="" f hit rmcmd=""
+  local t o dest list="" f hit rmcmd="" manual=0
   while IFS='|' read -r t o dest; do
     [[ -n "$t" ]] || continue
     hit=0; [[ -z "$dest" ]] && hit=1
     for f in "$@"; do [[ "$dest" == "$f" ]] && hit=1; done
     [[ $hit -eq 1 ]] || continue
-    list+="  '$t' into ${dest:-the home or stage folder of that file} (output $o)"$'\n'
+    list+="  $t"$'\n'"    into ${dest:-the home or stage folder of that file}"$'\n'
     rmcmd+="grep -vF -- '|${o}|' '$(unzip_marker)' > '$(unzip_marker).n'; mv -f '$(unzip_marker).n' '$(unzip_marker)'"$'\n'
+    # the script empties only a folder it knows, that no installed home uses
+    if [[ -z "$dest" ]] || in_inventory "$dest" || ! sw_folder_ok "$dest"; then manual=1; fi
+    SW_UNZIP_DIRS+=("$dest"); SW_UNZIP_OUTS+=("$o")
   done < "$(unzip_marker)"
   [[ -n "$list" ]] || return 0
   NOW="An earlier unzip did not finish. Its folder is incomplete:"$'\n'"${list%$'\n'}"
-  MANUAL_HOW="root  ->  shell"
+  if [[ $manual -eq 0 ]]; then
+    PLAN="Empty that folder (nothing is installed there), then unpack the files again"
+    return 1
+  fi
+  SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+  KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
   PLAN="-- Empty the folder named above, and nothing else. First check that nothing is
 -- installed there: it must not be listed in $INVENTORY_DIR/ContentsXML/inventory.xml.
+-- Empty it (hidden files too):  find <folder> -mindepth 1 -delete
 -- Then remove its line from the list of failed unzips:
 ${rmcmd%$'\n'}
 -- Then answer r. The files are unpacked again."
   return 1
+}
+sw_folder_ok() {
+  # $1 a software folder the script may empty: the Grid or database home of the settings, or one of their
+  # stage folders; a plain path; no program of it runs
+  local d=$1 o real fst
+  [[ "$d" =~ ^/[A-Za-z0-9_./-]+$ && "$d" != *..* && "$d" != */ && "$d" != *//* ]] || return 1
+  [[ "$d" == "$DB_HOME" || ( -n "$GRID_HOME" && "$d" == "$GRID_HOME" ) || "$d" == "$(stage_dir db)" || "$d" == "$(stage_dir grid)" ]] || return 1
+  # at least three levels deep (/u01/app/x), not a link, and the same folder when every link is resolved
+  [[ $(tr -cd '/' <<< "$d" | wc -c) -ge 3 && ! -L "$d" ]] || return 1
+  real=$(readlink -f -- "$d" 2>/dev/null); [[ -z "$real" || "$real" == "$d" ]] || return 1
+  # it must not hold (or be) another folder of the setup: base folders, inventory, the other home, database folders
+  for o in "$ORACLE_BASE" "${GRID_BASE:-}" "$INVENTORY_DIR" "$DB_HOME" "${GRID_HOME:-}" $(fs_dirs 2>/dev/null); do
+    [[ -n "$o" && "$o" != "$d" ]] || continue
+    [[ "$o/" == "$d/"* ]] && return 1
+  done
+  # local storage only, and no other file system mounted inside it (rm -rf would go into it)
+  fst=$(findmnt -n -o FSTYPE --target "$(existing_parent "$d")" 2>/dev/null | head -n 1)
+  case "$fst" in nfs*|cifs|smb*|acfs|fuse*|glusterfs|ceph*|ocfs2|gfs2|"") return 1 ;; esac
+  [[ -d "$d" ]] && findmnt -rn -o TARGET 2>/dev/null | grep -q "^$d/" && return 1
+  sw_in_use "$d" && return 1
+  return 0
+}
+sw_in_use() {
+  # 0 when a running program comes from folder $1 (the program file of a process is inside it)
+  local e r; r=$(readlink -f -- "$1" 2>/dev/null); r=${r:-$1}
+  for e in /proc/[0-9]*/exe; do
+    e=$(readlink -f -- "$e" 2>/dev/null) || continue
+    [[ "$e" == "$1/"* || "$e" == "$r/"* ]] && return 0
+  done
+  return 1
+}
+sw_empty_folder() {
+  # $1 folder (checked with sw_folder_ok). Everything in it goes, hidden files too; the folder itself and a
+  # lost+found of a mount point stay.
+  local d=$1
+  sw_folder_ok "$d" || { bad "Not emptied: $d is not a software folder of this setup, or a program of it runs."; return 1; }
+  [[ -d "$d" ]] || return 0
+  find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf --one-file-system -- {} + || return 1
+  journal DELETED "$d" "cannot be undone: the content of this software folder was deleted (it is installed again)"
+  say "Emptied $d"
+  _log CHANGE "emptied the software folder $d"
+  return 0
+}
+sw_unzip_fix() {
+  # the do part of a failed unzip: empty the folders, then drop their lines from the list of failed unzips
+  local i
+  for i in "${!SW_UNZIP_DIRS[@]}"; do
+    sw_empty_folder "${SW_UNZIP_DIRS[$i]}" || return 1
+    grep -vF -- "|${SW_UNZIP_OUTS[$i]}|" "$(unzip_marker)" > "$(unzip_marker).n"
+    if [[ -s "$(unzip_marker).n" ]]; then cat "$(unzip_marker).n" > "$(unzip_marker)"; else rm -f -- "$(unzip_marker)"; fi
+    rm -f -- "$(unzip_marker).n"
+  done
+  return 0
+}
+inventory_mark_removed() {
+  # $1 home: the way the Oracle installer detaches a home - its HOME entry gets REMOVED="T" (a backup is kept,
+  # --undo puts the file back)
+  local inv u tmp; inv="$(inventory_dir)/ContentsXML/inventory.xml"
+  [[ -f "$inv" ]] || return 0
+  in_inventory "$1" || return 0
+  u=$(stat -c '%U' "$inv")
+  backup_file "$inv" "$u" || return 1
+  tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  awk -v loc="LOC=\"$1\"" 'index($0, "<HOME ") && index($0, loc) && !index($0, "REMOVED=") { sub(/[[:space:]]*\/?>/, " REMOVED=\"T\"&") } { print }' "$inv" > "$tmp" || return 1
+  grep -q "LOC=\"$1\"[^>]*REMOVED=\"T\"" "$tmp" || { bad "The HOME entry of $1 in $inv could not be marked."; return 1; }
+  write_as "$u" "$inv" "$(stat -c '%a' "$inv")" < "$tmp" || return 1
+  rm -f -- "$tmp"
+  say "Marked $1 as removed in $inv"
+  return 0
+}
+sw_half_fix() {
+  # $1 home, $2 owner, $3 success record, $4 stage folder. Asks: record it as installed, or clean it.
+  # Return: 0 = recorded (nothing more to do), 10 = cleaned (install now), 3 = not done
+  local home=$1 owner=$2 rec=$3 stg=$4
+  say "Its installer log: the newest file in $INVENTORY_DIR/logs"
+  ask_choice "[m] I installed it myself, without error   [c] Clean it and install again   [s] Skip   [q] Quit" "mcsq"
+  case "$ANSWER" in
+    q) user_stop "Stopped by you" ;;
+    s) return 3 ;;
+    m) [[ -s "$home/bin/oracle" || -x "$home/bin/crsctl" ]] || { bad "The programs of $home are missing. Choose c to install it again."; return 1; }
+       install -d -m 700 "$STATE_DIR"; : > "$rec"; say "Recorded: $home was installed without error."; return 0 ;;
+  esac
+  sw_folder_ok "$home" || { bad "$home cannot be cleaned by the script: a program of it runs, or it is not the home of the settings."; return 1; }
+  if [[ -d "$home/dbs" ]] && ls "$home/dbs" 2>/dev/null | grep -qE '^(spfile|orapw).+'; then
+    bad "$home/dbs has an spfile or a password file. A database used this home. It is not cleaned."; return 1
+  fi
+  # the installer files must be on this server BEFORE the home is emptied (else nothing could install it again)
+  local kind=$5 mvar=DB_MEDIA f; [[ "$kind" == grid ]] && mvar=GRID_MEDIA
+  if ! media_ok "${!mvar}"; then
+    scan_media; f=$(pick_media "$kind")
+    if [[ -z "$f" || "$f" == MISSING:* ]]; then
+      bad "No installer files for $([[ "$kind" == grid ]] && printf 'Grid %s' "$(want_rel grid)" || printf 'the database %s' "$(want_rel)") were found on this server, so nothing was deleted."
+      say "Put them in /stage (owner root, mode 644), then choose c again. Step 3.1 shows where to get them."
+      return 1
+    fi
+    printf -v "$mvar" '%s' "$f"; save_settings; say "Installer files: $f"
+  fi
+  confirm_word "Everything in $home will be deleted, and it will be installed again." "CLEAN" || return 3
+  inventory_mark_removed "$home" || return 1
+  sw_empty_folder "$home" || return 1
+  [[ -d "$stg" ]] && { sw_empty_folder "$stg" || return 1; }
+  rm -f -- "$rec"
+  return 10
 }
 stage_dir() { printf '%s/dg_stage_%s' "$(dirname "$INVENTORY_DIR")" "$1"; }   # for staged (12.x) media
 unpack_media() {
@@ -514,7 +629,8 @@ grid_state() {
       else GSTATE=UNKNOWN; GSTATE_OUT=$RUN_OUT; fi
       return
     fi
-    if [[ -f /etc/oracle/olr.loc ]]; then GSTATE=HAS_DOWN; return; fi
+    # a left-over olr.loc of an earlier install does not make an unpacked home "installed"
+    if [[ -f /etc/oracle/olr.loc ]] && in_inventory "$GRID_HOME"; then GSTATE=HAS_DOWN; return; fi
   fi
   if in_inventory "$GRID_HOME"; then
     if [[ -f "$STATE_DIR/grid_install.done" || -f /etc/oracle/olr.loc || -f "$(GRID_ROOT_DONE_FILE)" ]] && [[ -x "$GRID_HOME/bin/crsctl" ]]; then GSTATE=NEED_ROOT
@@ -528,15 +644,11 @@ half_installed_plan() {
   # $1 home, $2 owner, $3 the success record: an installer that registered the home but did not finish
   # (relink error, killed), or a home installed by hand before this script ran
   NOW="$1 is in the Oracle inventory, but the script cannot confirm the installation."$'\n'"There is no record that its installer finished, or its programs are missing."
-  KIND_NOW=manual; MANUAL_HOW="$2  ->  shell"
-  PLAN="-- Case 1: you installed this home yourself, and the installer finished without error
--- (see the newest log in $INVENTORY_DIR/logs). Record that, as root, then answer r:
-touch $3
--- Case 2: the installer failed or was stopped. Fix the cause, remove the half-installed
--- home, then answer r. The home is then installed again:
-$1/deinstall/deinstall
--- If deinstall fails, as root:  rm -rf $1/*
--- and remove the HOME line of $1 from $INVENTORY_DIR/ContentsXML/inventory.xml"
+  KIND_NOW=ask; SW_FIX=half
+  PLAN="You choose:
+  m  you installed it yourself and the installer finished without error: the script records that
+  c  clean it and install again: the home is marked as removed in the inventory (a backup is kept),
+     $1 is emptied, and the installer runs again"
 }
 grid_installer() {
   # prints the installer path for the current media (image: in the home; staged: in the stage folder)
@@ -578,7 +690,20 @@ write_grid_rsp() {
 }
 
 # ---- 3.2 Grid software ----
+SW_FIX=""; SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+grid_ready() {
+  # what the install needs (NOW says what is missing)
+  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 1; }
+  if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
+    media_ok "$GRID_MEDIA" || { NOW="The Grid installer files are not known yet (step 3.1)"; return 1; }
+    if ! media_is_staged "$GRID_MEDIA"; then
+      dir_empty "$GRID_HOME" || { NOW="$GRID_HOME is not empty, but it has no gridSetup.sh. Check what is in it."; return 1; }
+    fi
+  fi
+  return 0
+}
 c_3_2() {
+  SW_FIX=""
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
   users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   grid_state
@@ -587,14 +712,8 @@ c_3_2() {
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     HALF_INSTALLED) half_installed_plan "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done"; return 1 ;;
   esac
-  [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 2; }
-  unzip_failed_check "$GRID_HOME" "$(stage_dir grid)" || return 2
-  if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$GRID_MEDIA" || { NOW="The Grid installer files are not known yet (step 3.1)"; return 2; }
-    if ! media_is_staged "$GRID_MEDIA"; then
-      [[ -z "$(ls -A "$GRID_HOME" 2>/dev/null)" ]] || { NOW="$GRID_HOME is not empty, but it has no gridSetup.sh"; return 2; }
-    fi
-  fi
+  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; return 1; fi
+  grid_ready || return 2
   NOW="Grid is not installed yet"
   PLAN=""
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
@@ -611,6 +730,16 @@ Ask you for a new ASM password for SYS and ASMSNMP (used only on this server)"
   return 1
 }
 d_3_2() {
+  local fx=0
+  case "$SW_FIX" in
+    half)  sw_half_fix "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done" "$(stage_dir grid)" grid || fx=$?
+           [[ $fx -eq 10 ]] || return $fx ;;
+    unzip) sw_unzip_fix || return 1 ;;
+  esac
+  if [[ -n "$SW_FIX" ]]; then
+    SW_FIX=""; grid_state
+    grid_ready || { bad "$NOW"; return 1; }
+  fi
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$GRID_MEDIA"; then unpack_media "$GRID_MEDIA" "$(stage_dir grid)" as_grid "$GRID_USER" || return 1
     else
@@ -862,7 +991,17 @@ primary_edition() {
 }
 
 # ---- 3.6 DB software ----
+db_ready() {
+  if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
+    media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 1; }
+    if ! media_is_staged "$DB_MEDIA"; then
+      dir_empty "$DB_HOME" || { NOW="$DB_HOME is not empty, but it has no runInstaller. Check what is in it."; return 1; }
+    fi
+  fi
+  return 0
+}
 c_3_6() {
+  SW_FIX=""
   users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   db_state
   case "$DSTATE" in
@@ -870,13 +1009,8 @@ c_3_6() {
     HALF_INSTALLED) half_installed_plan "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done"; return 1 ;;
   esac
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
-  unzip_failed_check "$DB_HOME" "$(stage_dir db)" || return 2
-  if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
-    media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 2; }
-    if ! media_is_staged "$DB_MEDIA"; then
-      [[ -z "$(ls -A "$DB_HOME" 2>/dev/null)" ]] || { NOW="$DB_HOME is not empty, but it has no runInstaller"; return 2; }
-    fi
-  fi
+  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; return 1; fi
+  db_ready || return 2
   NOW="Database software is not installed yet"
   PLAN=""
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
@@ -890,7 +1024,17 @@ ${RU_DIR:+  with the Release Update in $RU_DIR}
   return 1
 }
 d_3_6() {
-  local kind=image
+  local kind=image fx=0
+  case "$SW_FIX" in
+    half)  sw_half_fix "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done" "$(stage_dir db)" db || fx=$?
+           [[ $fx -eq 10 ]] || return $fx ;;
+    unzip) sw_unzip_fix || return 1 ;;
+  esac
+  if [[ -n "$SW_FIX" ]]; then
+    SW_FIX=""; db_state
+    primary_edition || { bad "Cannot read the edition of the primary"; return 1; }
+    db_ready || { bad "$NOW"; return 1; }
+  fi
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$DB_MEDIA"; then unpack_media "$DB_MEDIA" "$(stage_dir db)" as_oracle "$ORACLE_USER" || return 1
     else

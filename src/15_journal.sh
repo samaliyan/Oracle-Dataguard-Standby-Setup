@@ -196,7 +196,7 @@ change_word() {
     SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
     LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|SRL|MRP) printf 'database' ;;
-    SRVCTL|SRVCTL_OLD) printf 'restart' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
+    SRVCTL|SRVCTL_OLD) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
 journal_run_summary() {
@@ -275,7 +275,7 @@ _srl_drop() {
   for g in $1; do
     num "$g" || continue
     grep -q "^$g|" <<< "$have" || { say "Group $g is already gone."; continue; }
-    if grep -q "^$g|ACTIVE" <<< "$have"; then
+    if grep -qE "^$g\|(ACTIVE|CURRENT|CLEARING)" <<< "$have"; then
       bad "Group $g is in use: redo from the primary is written into it.
 Stop the redo transport first (the undo of step 9.5). On the primary:
   alter system set log_archive_dest_state_<N of step 4.4>=defer scope=both;
@@ -341,7 +341,8 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
       { head -c "$off" -- "$obj"; [[ $keep_nl -eq 1 ]] && printf '\n'; tail -c +$((off + len + 1)) -- "$obj"; } > "$tmp" || { rm -f -- "$tmp"; return 1; }
       if [[ "$u" == "root" ]]; then cat "$tmp" > "$obj" || { rm -f -- "$tmp"; return 1; }
-      else chmod 644 "$tmp"; runuser -u "$u" -- cp -- "$tmp" "$obj" || { rm -f -- "$tmp"; return 1; }; fi
+      # root reads the private temp copy; the owner writes its own file (the copy is never made readable for others)
+      else runuser -u "$u" -- sh -c 'cat > "$1"' sh "$obj" < "$tmp" || { rm -f -- "$tmp"; return 1; }; fi
       rm -f -- "$tmp"
       if [[ $off -eq 0 && ! -s "$obj" ]]; then rm -f -- "$obj"; say "Removed $obj. It held only the added block."
       else say "Removed the block that was added to $obj."; fi

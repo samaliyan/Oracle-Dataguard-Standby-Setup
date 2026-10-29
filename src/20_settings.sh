@@ -24,6 +24,7 @@ PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_M
 # may be empty
 readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP "
 # values the user may change (everything else is read from the primary at every run)
+readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
 readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
@@ -47,7 +48,14 @@ valid_value() {
     opt_name)  [[ -z "$v" || ( "$v" =~ ^[A-Za-z0-9_.-]+$ && "$v" != -* ) ]] ;;
     dbname)    [[ "$v" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ;;
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
-    ip)        [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$v" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] ;;
+    ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
+                 # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
+                 [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+                   && (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 ))
+               else
+                 # a host name: letters, digits, dots and dashes, at least one letter, no empty label
+                 [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$v" =~ [A-Za-z] && "$v" != *..* ]]
+               fi ;;
     num)       [[ "$v" =~ ^[0-9]{1,9}$ ]] ;;
     port)      [[ "$v" =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )) ;;
     list)      [[ "$v" =~ ^[A-Za-z0-9_.,:+-]*$ ]] ;;
@@ -90,8 +98,11 @@ load_settings() {
     spec=""
     for t in $SETTING_SPECS; do [[ "${t%%:*}" == "$key" ]] && spec=${t#*:}; done
     if [[ -z "$spec" ]]; then DROPPED_KEYS+=" $key"; continue; fi
+    # values that are derived again when empty (the settings file says so for a new standby name)
+    if [[ -z "$val" && "$DERIVED_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
     if ! valid_value "$spec" "$val"; then
-      if is_standby_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
+      # a typo in a value you may edit is an error; it is never ignored silently
+      if is_standby_key "$key" || assumed_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
       continue        # a primary value is read again from the primary anyway
     fi
     printf -v "$key" '%s' "$val"
@@ -194,7 +205,7 @@ validate_settings() {
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
   [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qFw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
   [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "STANDBY_UNIQUE must differ from the db_unique_name of the primary."; bad_n=1; }

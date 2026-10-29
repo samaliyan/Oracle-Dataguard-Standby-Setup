@@ -607,6 +607,8 @@ batch_primary_steps() {
   for id in "$@"; do
     step_in_range "$id" || continue
     cf="c_${id//./_}"; declare -F "$cf" >/dev/null || continue
+    # a lost connection is opened again here, on the screen (the checks below run quietly)
+    need_ssh || break
     NOW=""; PLAN=""; PLAN_UNDO=""; USING=""; KIND_NOW=""; PRIMARY_HOW_STEP=""; NEED_SYS=0; CUR_STEP=$id
     "$cf" >/dev/null 2>"$BATCH_ERR"; rc=$?
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"

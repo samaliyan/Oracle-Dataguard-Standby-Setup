@@ -276,7 +276,7 @@ check "duplicate not confirmed -> not run" "grep -q 'The copy was not started' $
 check "8.2 SKIPPED (not started is not a failure), 9.x cannot run" "[[ \$(res 8.2 $T/l1.txt) == SKIPPED ]] && grep -q 'does not exist yet (phase 8)' $T/l1.txt"
 fresh; jset $S "d['instances']['PRODDB_STBY']={'state':'mounted','datafiles':10,'df_errors':7}"
 rc=$(run $T/l2.txt)
-check "incomplete standby (failed duplicate) -> cleanup instructions, no rman" "grep -q 'the database is incomplete' $T/l2.txt && grep -q 'NEVER remove +DATA/PRODDB' $T/l2.txt && ! grep -q \"^rman .*args=\\[\\]\" $T/state/calls.log"
+check "incomplete standby, no copy of this script recorded -> commands shown only, no rman" "grep -q 'the database is incomplete' $T/l2.txt && grep -q 'NEVER remove +DATA/PRODDB' $T/l2.txt && ! grep -q \"^rman .*args=\\[\\]\" $T/state/calls.log"
 fresh; python3 - <<EOF
 import json; f='$T/state/env.json'; d=json.load(open(f)); d['data_free']=1000; json.dump(d,open(f,'w'))
 EOF
@@ -378,7 +378,7 @@ rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
 fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/dgt-hosts.$$; cat /etc/hosts >> /tmp/dgt-hosts.$$; cp /tmp/dgt-hosts.$$ /etc/hosts; rm -f /tmp/dgt-hosts.$$
 rc=$(DG_TEST_QUIT_AT=2.7 run $T/p12.txt)
-check "standby host name on loopback -> manual fix shown" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt"
+check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^192\.0\.2\.2[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
 fresh
 cat > $T/ed.sh <<'EOF'
 #!/bin/bash
@@ -596,7 +596,7 @@ CUR=U; echo "== U. Audit round 3"
 # U1 the same file system UUID as on primary, test file not seen: copy or the SAME disk -> not proven
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'"
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1a.txt)
-check "same file system UUID -> not accepted, compare the disks, no advice to change the disk" "grep -q 'same file system UUID (aaaa1111' $T/u1a.txt && ! grep -q 'xfs_admin' $T/u1a.txt && grep -q 'storage_clone_ok' $T/u1a.txt && ! grep -qE '^    2\.15 +ok' $T/u1a.txt"
+check "same file system UUID -> not accepted, compare the disks, no advice to change the disk" "grep -q 'same file system UUID (aaaa1111' $T/u1a.txt && ! grep -q 'xfs_admin' $T/u1a.txt && grep -q 'Type SEPARATE to continue' $T/u1a.txt && ! grep -qE '^    2\.15 +(ok|done)' $T/u1a.txt"
 touch $T/varlib/storage_clone_confirmed; echo bbbb1111-2222-3333-4444-555566667777 > $T/varlib/storage_clone_ok
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1b.txt)
 check "... a general confirmation file or another UUID does not count" "! grep -qE '^    2\.15 +ok' $T/u1b.txt"
@@ -809,7 +809,7 @@ check "3.1 says the primary has patches and how to avoid patching by hand" "grep
 # X18 a home in the inventory without a finished installer -> not 'installed'
 fresh; chown oracle $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oradism; rm -f $T/varlib/db_install.done
 rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/x18.txt --from 3.6)
-check "inventory entry without finished installer -> HALF installed, plan with touch / deinstall" "grep -q 'no record that its installer finished' $T/x18.txt && grep -q 'db_install.done' $T/x18.txt && ! grep -q 'runInstaller user=' $T/state/calls.log"
+check "inventory entry without finished installer -> HALF installed, m / c choice offered" "grep -q 'no record that its installer finished' $T/x18.txt && grep -q 'I installed it myself, without error' $T/x18.txt && ! grep -q 'runInstaller user=' $T/state/calls.log"
 # X19 DUPLICATE typed in lower case is accepted; a wrong word gets two more tries
 fresh
 rc=$(DG_TEST_DUP=duplicate DG_TEST_QUIT_AT=9.1 run $T/x19.txt)
@@ -884,6 +884,50 @@ check "LOCAL auto-login wallet: not copied, orapki -auto_login_local shown" "gre
 # Y11 typed word: an Enter by mistake asks again
 fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
+
+#==============================================================================
+CUR=Z; echo "== Z. External review fixes (5.1)"
+fresh
+G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
+for v in 10.0.0.5 192.168.1.20 db01 db01.example.local; do
+  out=$(bash -c "source $G; valid_value ip '$v' && echo OK" 2>&1); check "ip accepted: $v" "[[ '$out' == OK ]]"
+done
+for v in 10.0.0 192.168.1. 999.1.1.1 1.2.3.4.5 -host a..b; do
+  out=$(bash -c "source $G; valid_value ip '$v' && echo OK" 2>&1); check "ip refused: $v" "[[ '$out' != OK ]]"
+done
+out=$(bash -c "source $G; v_name -inherit && echo OK" 2>&1); check "listener name -inherit refused (skipped, no safety stop)" "[[ '$out' != OK ]]"
+rm -f "$G"
+# empty derived keys in the settings file are derived again (as the file itself says)
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z1.txt)
+sed -i 's/^STANDBY_SID=.*/STANDBY_SID=/; s/^STANDBY_TNS=.*/STANDBY_TNS=/' $T/varlib/settings.conf
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z2.txt --settings)
+check "empty STANDBY_SID / STANDBY_TNS in the settings are derived again" "! grep -q 'Invalid value' $T/z2.txt && grep -q '^STANDBY_SID=PRODDB_STBY$' $T/varlib/settings.conf"
+
+# ---- 5.3: the script fixes what is safe on this server itself ----
+# oratab line with another home -> corrected, Y/N kept
+fresh; printf 'PRODDB_STBY:/u01/other/home:Y\n' >> /etc/oratab
+rc=$(DG_TEST_QUIT_AT=8.1 run $T/z3.txt --from 7.7)
+check "oratab line with another home -> corrected by the script, Y kept" "grep -qx 'PRODDB_STBY:$T/u01/app/oracle/product/19.0.0/dbhome_1:Y' /etc/oratab && ! grep -q '/u01/other/home' /etc/oratab"
+# a fresh mount point with only lost+found counts as empty: the script sets its owner
+fresh empty; mkdir -p $T/u01/app/oracle/lost+found; chown root:root $T/u01/app/oracle
+rc=$(DG_TEST_QUIT_AT=2.6 run $T/z4.txt)
+check "folder with only lost+found -> owner set by the script" "[[ \$(stat -c %U $T/u01/app/oracle) == oracle ]] && grep -qE '^    2\.5 +done' $T/z4.txt"
+# half-installed database home: [c] cleans it (inventory marked REMOVED) and installs again
+fresh; chown oracle $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oradism; rm -f $T/varlib/db_install.done
+rc=$(DG_TEST_QUIT_AT=3.7 run $T/z5.txt --from 3.6)
+check "half-installed home: c -> marked removed in the inventory, emptied, installed again" "grep -q 'Marked $T/u01/app/oracle/product/19.0.0/dbhome_1 as removed' $T/z5.txt && grep -q 'Emptied $T/u01/app/oracle/product/19.0.0/dbhome_1' $T/z5.txt && grep -q 'runInstaller user=' $T/state/calls.log"
+# oracle program with the wrong group (role separation) -> 8.1 runs setasmgidwrap itself, journaled
+fresh; chgrp oinstall $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oracle; jset $S "d['instances']['PRODDB_STBY']={'state':'started'}"; jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='YES'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/z6.txt --from 7.2)
+check "wrong group of the oracle program -> setasmgidwrap run by step 8.1, in the journal" "grep -q 'setasmgidwrap user=' $T/state/calls.log && [[ \$(stat -c %G $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oracle) == asmadmin ]] && grep -q '|8.1|ASMGID|' $T/varlib/changes.log"
+# files of an unfinished copy of this script in ASM, instance down -> DELETE typed -> removed by the script, then NOMOUNT
+fresh; jset $S "d['instances']['PRODDB_STBY']={'state':'idle'}; d['asm_leftovers']=1"; mkdir -p $T/varlib; chmod 700 $T/varlib; touch $T/varlib/dup_attempt; rm -f $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/.dg_duplicate_done_PRODDB_STBY
+rc=$(DG_TEST_QUIT_AT=7.3 run $T/z7.txt --from 6.1)
+check "leftovers of an unfinished copy: DELETE -> +DATA/PRODDB_STBY removed, never the primary's, instance started" "python3 -c \"import json;d=json.load(open('$S'));assert d.get('asm_removed') and all(x.upper().endswith('/PRODDB_STBY') for x in d['asm_removed']);assert d['instances']['PRODDB_STBY']['state']=='started'\""
+# the same, but the admin keeps the files
+fresh; jset $S "d['instances']['PRODDB_STBY']={'state':'idle'}; d['asm_leftovers']=1"; mkdir -p $T/varlib; chmod 700 $T/varlib; touch $T/varlib/dup_attempt; rm -f $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/.dg_duplicate_done_PRODDB_STBY
+rc=$(DG_TEST_L72=k DG_TEST_QUIT_AT=7.3 run $T/z8.txt --from 6.1)
+check "leftovers kept with k -> nothing removed, existing_files_ok recorded" "[[ -f $T/varlib/existing_files_ok ]] && ! python3 -c \"import json;assert json.load(open('$S')).get('asm_removed')\" 2>/dev/null"
 
 echo
 echo "RESULT: $PASS passed, $FAILN failed"

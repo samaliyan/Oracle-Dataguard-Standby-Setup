@@ -53,7 +53,7 @@ d_2_1() {
   local c; while IFS= read -r c; do
     [[ -n "$c" ]] || continue
     run_cmds <<< "$c" || return 1
-    [[ "$c" =~ ^groupadd\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal GROUP "${BASH_REMATCH[1]}" "gid ${c#groupadd -g }"
+    [[ "$c" =~ ^groupadd\ -g\ ([0-9]+)\ ([A-Za-z0-9_.-]+)$ ]] && journal GROUP "${BASH_REMATCH[2]}" "gid ${BASH_REMATCH[1]}"
   done <<< "$G_TODO"
   return 0
 }
@@ -61,7 +61,11 @@ d_2_1() {
 # ---- 2.2 users ----
 U_TODO=""
 c_2_2() {
-  local spec name uid pg supp g miss_g todo="" err="" fix="" why=""
+  local spec name uid pg supp g miss_g todo="" err="" fix="" why="" ge
+  # the users need their groups: without them useradd fails
+  for ge in ${GROUP_GIDS//,/ }; do
+    getent group "${ge%%:*}" >/dev/null 2>&1 || { NOW="The group ${ge%%:*} does not exist yet (step 2.1)"; return 2; }
+  done
   local -a specs=("$ORACLE_USER|$ORACLE_UID|$INSTALL_GROUP|$ORACLE_GROUPS")
   single_owner || specs+=("$GRID_USER|$GRID_UID|$GRID_PGROUP|$GRID_GROUPS")
   for spec in "${specs[@]}"; do
@@ -220,7 +224,7 @@ make_dir() {
     if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
-  if [[ -z "$(ls -A "$path" 2>/dev/null)" ]]; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
+  if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
 }
 dir_specs() {
   if use_grid; then printf '%s\n' "$GRID_BASE:$GRID_USER" "$GRID_HOME:$GRID_USER"; fi
@@ -236,7 +240,7 @@ c_2_5() {
     if [[ ! -d "$d" ]]; then miss+="  $d  (owner $own)"$'\n'; continue; fi
     local cur; cur=$(stat -c '%U' "$d")
     if [[ "$cur" != "$own" && ! ( "$cur" == "root" && "$d" == "$GRID_HOME" ) ]]; then
-      if [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
+      if dir_empty "$d"; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
       else wrong+="$d is not empty and belongs to $cur, not $own"$'\n'; fixw+="chown $own:$INSTALL_GROUP $d"$'\n'; fi
     fi
   done < <(dir_specs)
@@ -251,7 +255,7 @@ ${fixw%$'\n'}"
   # an empty home needs room for the software (about 15 GB each)
   local short="" h
   for h in "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"}; do
-    [[ -n "$(ls -A "$h" 2>/dev/null)" ]] && continue
+    dir_empty "$h" || continue
     use_grid || [[ "$h" != "$GRID_HOME" ]] || continue
     [[ $(free_mb_of "$h") -ge 15360 ]] || short+="$(mnt_of "$h") has $(human_mb "$(free_mb_of "$h")") free for $h. It needs about 15 GB."$'\n'
   done
@@ -267,52 +271,81 @@ Folders that are not empty keep their owner."
 d_2_5() { local d own; while IFS=: read -r d own; do make_dir "$d" "$own" || return 1; done < <(dir_specs); }
 
 # ---- 2.6 /etc/hosts on standby ----
-H_TODO=""
+# The script fixes /etc/hosts itself (a backup is kept, --undo puts it back):
+#   a name that does not resolve gets a line; a name on a 127.x line or on a wrong address is taken off
+#   that line and gets its own correct line (lines of other names are never changed).
+H_TODO=""; H_FIX=""
 v4_of() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'; }
+host_fq() {   # the full name of this server when it is <short name>.<domain>
+  local fq; fq=$(hostname 2>/dev/null)
+  [[ "$fq" == *.* && "${fq%%.*}" == "$STANDBY_HOST" ]] && printf '%s' "$fq"
+}
 c_2_6() {
-  local todo="" h ip want wrong=""
+  local todo="" fix="" h ip want why=""
+  H_TODO=""; H_FIX=""
   for h in "$PRIMARY_HOST|$PRIMARY_IP" "$STANDBY_HOST|$STANDBY_IP"; do
     IFS='|' read -r h want <<< "$h"
     ip=$(v4_of "$h")
+    local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
     if [[ -z "$ip" ]]; then
-      if [[ "$want" =~ ^[0-9.]+$ ]]; then
-        local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(hostname 2>/dev/null) && [[ "$fq" == *.* && "${fq%%.*}" == "$h" ]] || fq=""
-        todo+="$want    ${fq:+$fq }$h"$'\n'
-      else NOW="$h does not resolve, and its IP address is not known"; return 2; fi
-    elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" && "$ip" != 127.* ]]; then
-      wrong+="$h resolves to $ip here, but should be $want"$'\n'
+      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known"; return 2; }
+      todo+="$want    ${fq:+$fq }$h"$'\n'
+    elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" ]]; then
+      if [[ "$ip" == 127.* ]]; then why+="$h resolves to $ip (loopback). The primary could not reach this server's listener."$'\n'
+      else why+="$h resolves to $ip here, but it is $want"$'\n'; fi
+      fix+="$h|$want"$'\n'; todo+="$want    ${fq:+$fq }$h"$'\n'
     fi
   done
-  local sip; sip=$(v4_of "$STANDBY_HOST")
-  if [[ "$sip" == 127.* ]]; then
-    # the Grid listener would listen only on loopback; primary could not reach it
-    NOW="$STANDBY_HOST resolves to $sip (loopback) on this server
-The primary could not reach the listener here."
+  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $(v4_of "$STANDBY_HOST")"; return 0; fi
+  H_TODO=${todo%$'\n'}; H_FIX=${fix%$'\n'}
+  if [[ -L /etc/hosts ]]; then
+    NOW="${why:-The host names do not resolve on this server}"$'\n'"/etc/hosts is a symbolic link, so the script does not change it."
     KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- In /etc/hosts, remove $STANDBY_HOST from the 127.x line, then add this line:
-$STANDBY_IP    $STANDBY_HOST"
+    PLAN="-- Correct the names in DNS or in the file /etc/hosts points to:"$'\n'"$H_TODO"
     return 1
   fi
-  if [[ -n "$wrong" ]]; then
-    NOW="${wrong%$'\n'}"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- Make the names resolve to these addresses, in DNS or in /etc/hosts:
-$PRIMARY_IP    $PRIMARY_HOST
-$STANDBY_IP    $STANDBY_HOST"
-    return 1
+  if [[ -n "$why" ]]; then
+    NOW="${why%$'\n'}"
+    PLAN="Correct /etc/hosts (a backup is kept; --undo puts it back):"
+    local f; while IFS='|' read -r h want; do [[ -n "$h" ]] && PLAN+=$'\n'"  take $h off the lines with another address"; done <<< "$H_FIX"
+    PLAN+=$'\n'"  then add:"$'\n'"$(sed 's/^/    /' <<< "$H_TODO")"
+    grep -qE '^hosts:.*dns.*files' /etc/nsswitch.conf 2>/dev/null && PLAN+=$'\n'"Note: /etc/nsswitch.conf asks DNS before /etc/hosts. Correct DNS too."
+  else
+    NOW="The host names do not resolve on this server"
+    PLAN="Add these lines to /etc/hosts (a backup is kept):"$'\n'"$H_TODO"
   fi
-  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $sip"; return 0; fi
-  H_TODO=${todo%$'\n'}
-  NOW="The host names do not resolve on this server"
-  PLAN="Add these lines to /etc/hosts (a backup is kept):
-$H_TODO"
   return 1
 }
 d_2_6() {
   backup_file /etc/hosts || return 1
-  local l add=""
-  while IFS= read -r l; do grep -qxF -- "$l" /etc/hosts || add+="$l"$'\n'; done <<< "$H_TODO"
-  [[ -n "$add" ]] && printf '%s' "${add%$'\n'}" | append_as root /etc/hosts
+  local tmp h want fq
+  tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  cp -- /etc/hosts "$tmp" 2>/dev/null || : > "$tmp"
+  # take each name (and this server's full name) off every line whose address is not the right one
+  while IFS='|' read -r h want; do
+    [[ -n "$h" ]] || continue
+    fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
+    awk -v n="$h" -v f="$fq" -v w="$want" '
+      /^[[:space:]]*(#|$)/ { print; next }
+      {
+        if ($1 == w || index($1, ":")) { print; next }      # the right line, and IPv6 lines, stay as they are
+        out = $1; kept = 0
+        for (i = 2; i <= NF; i++) {
+          if (substr($i, 1, 1) == "#") { for (j = i; j <= NF; j++) out = out " " $j; break }
+          if (tolower($i) == tolower(n) || (f != "" && tolower($i) == tolower(f))) continue
+          out = out " " $i; kept++
+        }
+        if (kept > 0 || NF == 1) print out
+      }' "$tmp" > "$tmp.n" && mv -f -- "$tmp.n" "$tmp" || return 1
+  done <<< "$H_FIX"
+  # a last line without its newline gets one first (else the new line would be glued to it)
+  [[ -s "$tmp" && -n "$(tail -c 1 -- "$tmp")" ]] && printf '\n' >> "$tmp"
+  local l; while IFS= read -r l; do [[ -n "$l" ]] && ! grep -qxF -- "$l" "$tmp" && printf '%s\n' "$l" >> "$tmp"; done <<< "$H_TODO"
+  # written in place: the file keeps its owner, mode and SELinux label; a failed write puts the backup back
+  cat -- "$tmp" > /etc/hosts || { [[ -f "/etc/hosts.bak_$RUN_ID" ]] && cat -- "/etc/hosts.bak_$RUN_ID" > /etc/hosts; bad "/etc/hosts could not be written. The old content was put back."; return 1; }
+  rm -f -- "$tmp"
+  journal_file_written /etc/hosts 1
+  say "Corrected /etc/hosts."
   return 0
 }
 
@@ -857,7 +890,7 @@ c_2_14() {
     need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + mb ))
     free_by_mnt[$mnt]=$free
     if [[ -d "$d" && "$(stat -c %U "$d")" == "$ORACLE_USER" ]]; then report+="$d exists (on $mnt)"$'\n'
-    elif [[ -d "$d" && -n "$(ls -A "$d" 2>/dev/null)" ]]; then notmine+="$d is owned by $(stat -c %U "$d") and is not empty"$'\n'
+    elif [[ -d "$d" ]] && ! dir_empty "$d"; then notmine+="$d is owned by $(stat -c %U "$d") and is not empty"$'\n'
     else missing+=("$d"); report+="$d is missing (on $mnt)"$'\n'; fi
   done < <(fs_need_lines)
   if [[ -n "$notmine" ]]; then
@@ -892,7 +925,7 @@ mount <mount point>
 d_2_14() { local d; for d in "${FS_TODO[@]}"; do make_dir "$d" "$ORACLE_USER" || return 1; done; }
 
 # ---- 2.15 storage is not shared with the primary ----
-STORAGE_SHARED=""
+STORAGE_SHARED=""; STORAGE_KEYS=()
 disk_ids() {
   # ids of the physical disks below a block device, from lsblk -P output on stdin: W:<wwn> and S:<serial>.
   # Serial numbers that many disks share (QEMU default QM00001, all zeros) are left out.
@@ -932,7 +965,7 @@ storage_not_shared() {
   #   else not proven: the duplicate is refused until the user confirms exactly that disk.
   # rc 0 = not shared, 1 = shared, 2 = not proven. A folder found shared outranks one that is not proven.
   local d m fst ans lid pid lsrc psrc luuid net lids wcom key ok why plan np=0 info2="" plan2=""
-  STORAGE_SHARED=""; STORAGE_INFO=""; STORAGE_PLAN=""
+  STORAGE_SHARED=""; STORAGE_INFO=""; STORAGE_PLAN=""; STORAGE_KEYS=()
   read_primary_mounts || { STORAGE_INFO="Cannot read the file systems mounted on the primary (findmnt and lsblk over ssh)"; return 2; }
   for d in $(fs_dirs); do
     ok=0; why=""; plan=""; key=""
@@ -1011,9 +1044,8 @@ lsblk -s -o NAME,TYPE,WWN,SERIAL,SIZE \$(findmnt -n -o SOURCE --target $d)
 lsblk -o NAME,TYPE,WWN,SERIAL,SIZE,MOUNTPOINT
 -- Or check in the storage or virtualization console whether it is the same volume.${plan:+
 $plan}
--- Only if it is a separate disk of this server:
-echo '$key' >> $(storage_clone_file)
--- Then answer r."
+-- If it is a separate disk of this server, the script asks you to confirm it next."
+      STORAGE_KEYS+=("$d|$key")
     fi
     [[ -z "$info2" ]] && { info2=$why; plan2=$plan; }
     np=1
@@ -1029,6 +1061,12 @@ c_2_15() {
   if [[ "$MODE" == "check" ]]; then NOW="Tested only in a normal run, because it writes a small test file"; return 2; fi
   need_ssh || return 2
   local rc=0; storage_not_shared || rc=$?
+  if [[ $rc -eq 2 && ${#STORAGE_KEYS[@]} -gt 0 ]]; then
+    # not proven by the script: you compare the disks, then confirm each one here (your answer is kept)
+    NOW=$STORAGE_INFO
+    PLAN="Compare the disks first:"$'\n'"$STORAGE_PLAN"
+    KIND_NOW=ask; return 1
+  fi
   if [[ $rc -eq 2 ]]; then NOW=$STORAGE_INFO; [[ -n "$STORAGE_PLAN" ]] && PLAN=$STORAGE_PLAN; return 2; fi
   if [[ $rc -eq 0 ]]; then NOW="Each database folder is on storage of this server only:"$'\n'"$STORAGE_INFO"; return 0; fi
   NOW="DANGER: these folders are the SAME storage as on the primary: $STORAGE_SHARED"$'\n'"The RMAN copy would overwrite the files of the primary database."
@@ -1039,6 +1077,19 @@ c_2_15() {
 -- The RMAN copy (step 8.2) is refused until this is fixed."
   :
   return 1
+}
+
+d_2_15() {
+  # your confirmation for each disk the script could not prove (written only after you typed it)
+  local e d key
+  for e in "${STORAGE_KEYS[@]+"${STORAGE_KEYS[@]}"}"; do
+    d=${e%%|*}; key=${e#*|}
+    confirm_word "Is $d ($key) on a separate disk of this server, NOT the storage of the primary?" "SEPARATE" || { say "Not confirmed. The RMAN copy stays refused for $d."; return 3; }
+    install -d -m 700 "$STATE_DIR"; printf '%s\n' "$key" >> "$(storage_clone_file)"; chmod 600 "$(storage_clone_file)"
+    _log CHANGE "storage confirmed by the admin as separate: $d ($key)"
+    journal CONFIRM "storage_clone_ok" "by hand: remove the line $key from $(storage_clone_file)   (your confirmation that $d is a separate disk)"
+  done
+  return 0
 }
 
 phase_2() {
@@ -1057,6 +1108,6 @@ phase_2() {
   run_step 2.12 auto    "ASM disk method (ASMLib or udev)" c_2_12 d_2_12
   run_step 2.13 auto    "ASM disks" c_2_13 d_2_13
   run_step 2.14 auto    "Database folders and free space (file system)" c_2_14 d_2_14
-  run_step 2.15 check   "Database folders are not shared with the primary" c_2_15
+  run_step 2.15 check   "Database folders are not shared with the primary" c_2_15 d_2_15
   build_envs_if_possible
 }

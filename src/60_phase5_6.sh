@@ -239,14 +239,13 @@ c_6_1() {
   need_ssh || return 2
   # 12.2+: v$passwordfile_info has file_name and format; 12.1: file_name only; else the file in dbs
   local pfile=""
-  if [[ "$PRIMARY_VERSION" != 12.1* ]] && prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
-  elif prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
+  if prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
   fi
   if [[ -z "$pfile" || "$pfile" == "-" ]]; then
     if prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && [[ "$(head -n 1 <<< "$RUN_OUT")" == "YES" ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
     else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
   fi
-  [[ "$pfile" =~ ^[+/][A-Za-z0-9_./+-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
+  [[ "$pfile" =~ ^\+[A-Za-z0-9_./+-]+$ || "$pfile" =~ ^/[A-Za-z0-9_./-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
   if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)

@@ -27,7 +27,9 @@ c_1_6() {
   [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] || { NOW="Operating system version unknown; not checked"; return 0; }
   local v=$PRIMARY_VERSION why="" r w
   # the database release, and the Grid release when there is Grid (Grid may be newer)
-  for r in "$(want_rel)" ${GRID_REL:+"$GRID_REL"}; do
+  local -a rels=("$(want_rel)")
+  [[ -n "$GRID_REL" && "$GRID_REL" != "${rels[0]}" ]] && rels+=("$GRID_REL")    # the same release is checked once
+  for r in "${rels[@]}"; do
     w=""
     case "$r" in
       12.1) [[ $OS_MAJOR -ge 8 ]] && w="12.1 is certified on Oracle Linux 7 only."
@@ -51,7 +53,7 @@ c_1_6() {
 }
 
 c_1_2() {
-  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qFw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
     fatal "$PRIMARY_IP is an address of this server, but you gave it as the primary.
 Run the script on the standby server."
   fi
@@ -137,7 +139,7 @@ d_1_4() {
         # check the edited file first (a typo must not stop the script)
         local -A keep=(); local line
         while IFS= read -r line; do [[ -n "$line" ]] && keep[${line%%=*}]=${line#*=}; done <<< "$snap"
-        local save_vals=""; for k in $STANDBY_KEYS; do save_vals+="$k=${!k}"$'\n'; done
+        local save_vals=""; for k in $STANDBY_KEYS PORT LISTENER_NAME PRIMARY_SERVICE; do save_vals+="$k=${!k}"$'\n'; done
         if ! load_settings soft; then
           bad "The edited file has an error: $LOAD_ERR"; say "Your edits are still in $SETTINGS_FILE."
           while IFS= read -r line; do [[ -n "$line" ]] && printf -v "${line%%=*}" '%s' "${line#*=}"; done <<< "$save_vals"

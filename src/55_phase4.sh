@@ -188,6 +188,8 @@ find_dest() {
 }
 c_4_4() {
   need_ssh || return 2
+  # log_archive_dest may have been moved on the primary since it was read (answer r): read it again
+  if [[ -n "$OLD_ARCH_DEST" ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
   find_dest || { NOW="No free log_archive_dest_N on the primary"; return 2; }
   p_param "log_archive_dest_$DEST_N" || { NOW="Query on the primary failed"; return 2; }
   if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"; return 0; fi

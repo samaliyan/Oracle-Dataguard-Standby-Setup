@@ -177,10 +177,10 @@ c_7_7() {
   local cur; cur=$(grep -E "^${STANDBY_SID}:" /etc/oratab 2>/dev/null | head -n 1)
   if [[ "$cur" == "$STANDBY_SID:$DB_HOME:"* ]]; then NOW="/etc/oratab has the line for $STANDBY_SID:"$'\n'"  $cur"; return 0; fi
   if [[ -n "$cur" ]]; then
+    local yn; yn=$(cut -d: -f3 <<< "$cur"); [[ "$yn" =~ ^[YNyn]$ ]] || yn=N
     NOW="/etc/oratab has another home for $STANDBY_SID:"$'\n'"  $cur"
-    KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-    PLAN="-- Edit /etc/oratab and change that line to:
-$STANDBY_SID:$DB_HOME:N"; return 1
+    PLAN="Change that line in /etc/oratab to (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:$yn"
+    return 1
   fi
   NOW="/etc/oratab has no line for $STANDBY_SID. oraenv and dbstart need it."
   PLAN="Add this line to /etc/oratab (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:N"
@@ -189,6 +189,15 @@ $STANDBY_SID:$DB_HOME:N"; return 1
 d_7_7() {
   local new=0; [[ -f /etc/oratab ]] || new=1
   backup_file /etc/oratab || return 1
+  if [[ $new -eq 0 && ! -L /etc/oratab ]] && grep -qE "^${STANDBY_SID}:" /etc/oratab; then
+    # only the line of this SID changes (its Y/N stays); written in place, so owner, mode and label stay
+    local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+    awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' /etc/oratab > "$tmp" || return 1
+    cat -- "$tmp" > /etc/oratab || { [[ -f "/etc/oratab.bak_$RUN_ID" ]] && cat -- "/etc/oratab.bak_$RUN_ID" > /etc/oratab; bad "/etc/oratab could not be written. The old content was put back."; return 1; }
+    rm -f -- "$tmp"
+    journal_file_written /etc/oratab 1
+    return 0
+  fi
   printf '%s:%s:N' "$STANDBY_SID" "$DB_HOME" | append_as root /etc/oratab || return 1
   # a new file gets the usual owner; an existing one (Grid makes it) keeps its owner
   [[ $new -eq 1 ]] && { chown root:"$INSTALL_GROUP" /etc/oratab; chmod 664 /etc/oratab; }
@@ -211,6 +220,7 @@ fs_cleanup_cmds() {
   done <<< "$SQL_OUT"
 }
 c_7_2() {
+  L72_CLEAN=""
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   pwfile_ok || { NOW="Password file is not ready (step 6.1)"; return 2; }
   storage_cache
@@ -221,6 +231,7 @@ c_7_2() {
       # the next duplicate needs an instance started from the text pfile
       if spfile_from_failed_copy; then
         NOW="Instance $STANDBY_SID is in NOMOUNT, but it runs from the spfile of an unfinished copy:"$'\n'"$(spfile_path)"
+        cleanup_auto_plan spfile && return 1
         PLAN="# As $ORACLE_USER, on this server only:
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && mv $(spfile_path) $(spfile_path).failed_$RUN_ID
@@ -234,6 +245,7 @@ $(leftover_cleanup_plan | grep -v "rm -f $(spfile_path) ")
         local ol; ol=$(orphan_leftovers)
         if [[ -n "$ol" ]]; then
           NOW="Instance $STANDBY_SID is in NOMOUNT, but files of an unfinished copy are still here:"$'\n'"$ol"
+          cleanup_auto_plan keep && return 1
           PLAN="# As $ORACLE_USER, on this server only:
 [ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'
 $(leftover_cleanup_plan)
@@ -253,6 +265,7 @@ touch $STATE_DIR/existing_files_ok"
       if [[ $sc -eq 0 ]]; then STANDBY_BUILT=1; NOW="The standby database already exists ($LSTATE, PHYSICAL STANDBY). No copy is needed."; return 0; fi
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
       NOW="A standby control file exists, but the database is incomplete, probably from a failed copy:"$'\n'"$SC_INFO"
+      cleanup_auto_plan mounted && return 1
       KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER${GRID_HOME:+ / $GRID_USER}"
       PLAN="# As $ORACLE_USER, on this server only:"$'\n'"[ \"\$(hostname -s)\" = \"$(hostname -s)\" ] && ORACLE_HOME=$DB_HOME ORACLE_SID=$STANDBY_SID $DB_HOME/bin/sqlplus -S / as sysdba <<< 'shutdown abort'"$'\n'"$(leftover_cleanup_plan)"
       PLAN+=$'\n'"# Then answer r. The script starts the instance again from the pfile."
@@ -267,6 +280,7 @@ touch $STATE_DIR/existing_files_ok"
       local lo; lo=$(leftover_files)
       if [[ -n "$lo" && ! -f "$STATE_DIR/existing_files_ok" ]]; then
         NOW="Instance $STANDBY_SID is not started, and files already exist where the standby database will be written:"$'\n'"$lo"
+        cleanup_auto_plan keep && return 1
         PLAN="$(leftover_cleanup_plan)
 # RMAN overwrites files with the same names. Files with OMF names would stay unused and take space.
 # Then answer r.
@@ -286,7 +300,78 @@ Start the instance as $ORACLE_USER:
     *) NOW="Cannot read the state of the instance on this server ($(ora_errors "$SQL_OUT"))"; return 2 ;;
   esac
 }
+# The clean-up of a copy that did not finish, done by the script after you typed DELETE.
+# Only the standby's own names are removed: +DG/<standby unique name> in ASM, and in the folders the
+# primary's file names only when step 2.15 proved that the folders are storage of this server.
+L72_CLEAN=""; L72_FS=0
+cleanup_auto_plan() {
+  # $1 spfile | keep | mounted. Sets the plan for d_7_2 and returns 0, or 1 when the script must not do it
+  # itself (folders whose storage is not proven: then the commands are shown, as before)
+  local fs=0 dg lines=""
+  [[ -n "$STANDBY_UNIQUE" && "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" && "${STANDBY_UNIQUE^^}" != "${DB_NAME^^}" ]] || return 1
+  # only the leftovers of a copy THIS script started and that did not finish (else the files may be a complete
+  # standby, or an older database with the same name: then the commands are shown, nothing is done by the script)
+  [[ -f "$STATE_DIR/dup_attempt" && ! -f "$(dup_marker)" ]] || return 1
+  # files in folders are never deleted by the script (a shared disk can look local): the commands are shown
+  [[ -z "$(fs_dirs)" ]] || return 1
+  L72_CLEAN=$1; L72_FS=$fs
+  local_state
+  [[ "$LSTATE" != "IDLE" ]] && lines+="  stop the instance $STANDBY_SID (shutdown abort)"$'\n'
+  [[ -f "$(spfile_path)" ]] && lines+="  rename its spfile to $(basename "$(spfile_path)").failed_$RUN_ID"$'\n'
+  for dg in $(asm_dgs); do lines+="  delete +$dg/${STANDBY_UNIQUE^^} in ASM"$'\n'; done
+  lines+="  then start the instance again from the pfile"
+  PLAN="Clean up this server (after you type DELETE):"$'\n'"$lines"
+  [[ -n "$(asm_dgs)" ]] && PLAN+=$'\n'"Never touched: $(asm_dgs | sed "s#^#+#; s#\$#/${PRIMARY_UNIQUE^^}#" | paste -sd' ' -) (the primary's files)"
+  KIND_NOW=ask
+  return 0
+}
+leftover_cleanup_do() {
+  local dg f n=0
+  local_state
+  if [[ "$LSTATE" != "IDLE" ]]; then
+    sql_local "shutdown abort" || { bad "shutdown abort failed: $(ora_errors "$SQL_OUT")"; return 1; }
+    say "Instance $STANDBY_SID stopped."
+  fi
+  if [[ -f "$(spfile_path)" ]]; then
+    runuser -u "$ORACLE_USER" -- mv -f -- "$(spfile_path)" "$(spfile_path).failed_$RUN_ID" || return 1
+    journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID"
+    say "Renamed $(spfile_path) to .failed_$RUN_ID"
+  fi
+  rm -f -- "$(dup_marker)"
+  [[ -n "$STANDBY_UNIQUE" ]] || { bad "STANDBY_UNIQUE is empty. Nothing was deleted."; return 1; }
+  for dg in $(asm_dgs); do
+    grid_sw_ok || { bad "Grid is not installed here. Nothing was deleted in ASM."; return 1; }
+    # the folder of the standby at the top of the disk group (parent_index = the disk group's root)
+    sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" \
+      || { bad "Cannot read ASM ($(ora_errors "$SQL_OUT")). Nothing was deleted in +$dg."; return 1; }
+    [[ "$(first_line)" != "0" ]] || continue
+    run_logged "asmcmd rm" as_grid "$GRID_HOME/bin/asmcmd" rm -rf "+$dg/${STANDBY_UNIQUE^^}" || { bad "Could not delete +$dg/${STANDBY_UNIQUE^^}: ${RUN_OUT%%$'\n'*}"; return 1; }
+    journal DELETED "+$dg/${STANDBY_UNIQUE^^}" "cannot be undone: files of the unfinished copy, deleted after you typed DELETE"
+    say "Deleted +$dg/${STANDBY_UNIQUE^^}"
+  done
+  _log CHANGE "clean-up of the unfinished copy done on $(hostname -s)"
+  return 0
+}
 d_7_2() {
+  if [[ -n "$L72_CLEAN" ]]; then
+    local opts="[d] Delete them   [s] Skip   [h] Help   [q] Quit" allowed="dshq"
+    [[ "$L72_CLEAN" == keep && -f "$STATE_DIR/dup_attempt" ]] && { opts="[d] Delete them   [k] Keep them (RMAN overwrites files with the same names)   [s] Skip   [h] Help   [q] Quit"; allowed="dkshq"; }
+    while true; do
+      ask_choice "$opts" "$allowed"
+      case "$ANSWER" in
+        h) show_help 7.2 || true ;;
+        q) user_stop "Stopped by you" ;;
+        s) L72_CLEAN=""; return 3 ;;
+        k) install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/existing_files_ok"; say "The files stay. RMAN overwrites files with the same names."; break ;;
+        d) confirm_word "The files of the unfinished copy on THIS server ($(hostname -s)) will be deleted." "DELETE" || { L72_CLEAN=""; return 3; }
+           leftover_cleanup_do || { L72_CLEAN=""; return 1; }
+           break ;;
+      esac
+    done
+    L72_CLEAN=""
+    local_state
+    [[ "$LSTATE" == "IDLE" ]] || return 0          # NOMOUNT from the pfile already: nothing more to start
+  fi
   local p; p=$(pfile_path)
   if [[ -f "$p" && "$(cat "$p")" != "$(pfile_text)" ]]; then backup_file "$p" "$ORACLE_USER" || return 1; fi
   [[ -f "$p" && "$(cat "$p")" == "$(pfile_text)" ]] || { pfile_text | write_as "$ORACLE_USER" "$p" 644 || return 1; }
@@ -359,13 +444,6 @@ c_7_6() {
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   need_ssh || return 2
-  # the test needs the standby side: software, listener (phase 5) and the instance (step 7.2)
-  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
-  local_state
-  if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
-    NOW="The instance is not started (step 7.2)"; return 2
-  fi
   if prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;"; then NOW="Login from the primary works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
     built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
@@ -486,19 +564,26 @@ dup_prechecks() {
     l1=$(asm_labels "$DATA_DG" | head -n 1); want=""
     [[ -n "$l1" ]] && want=$(stat -L -c '%G' "$(asm_disk_dir)/$l1" 2>/dev/null)
     [[ -n "$want" && "$want" != "root" ]] || want=$(asm_owner_group)
-    [[ "$og" == "$want" ]] || { PRE_FIX="$DB_HOME/bin/oracle has group $og. It must be $want, the group of the ASM disks, or it cannot open them (ORA-15025)."$'\n'"As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"; return 1; }
+    if [[ "$og" != "$want" ]]; then
+      PRE_FIX="$DB_HOME/bin/oracle has group $og. It must be $want, the group of the ASM disks, or it cannot open them (ORA-15025)."$'\n'"As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"
+      # the script can fix this itself (step 8.1 offers it); the old group is kept for the undo
+      [[ -x "$GRID_HOME/bin/setasmgidwrap" ]] && { PRE_ASMGID_OLD=$og; PRE_ASMGID_WANT=$want; }
+      return 1
+    fi
   fi
   # RMAN uses the TNS aliases: prove they reach the right databases
   local pu pr pn ph ti th ts ls; ls=$(hostname -s 2>/dev/null || hostname)
   sql_primary_tns "select d.db_unique_name||'|'||d.database_role||'|'||d.name||'|'||i.host_name from v\$database d, v\$instance i;" || { PRE_FIX="Cannot reach the primary through $PRIMARY_TNS: $(ora_errors "$SQL_OUT") (step 7.5)"; return 1; }
   IFS='|' read -r pu pr pn ph <<< "$(first_line)"
-  if [[ "${pu^^}" != "${PRIMARY_UNIQUE^^}" || "$pr" != "PRIMARY" || "${pn^^}" != "${DB_NAME^^}" || "${ph%%.*}" == "${ls,,}" || "${ph%%.*}" == "${ls}" ]]; then
+  local phs=${ph%%.*}
+  if [[ "${pu^^}" != "${PRIMARY_UNIQUE^^}" || "$pr" != "PRIMARY" || "${pn^^}" != "${DB_NAME^^}" || "${phs,,}" == "${ls,,}" ]]; then
     PRE_FIX="Alias $PRIMARY_TNS does not reach the primary. It reaches: $pu, $pr, $pn, host $ph"; return 1
   fi
   PRE_INFO+="$PRIMARY_TNS reaches $pu (PRIMARY) on $ph"$'\n'
   sql_standby_tns "select instance_name||'|'||host_name||'|'||status from v\$instance;" || { PRE_FIX="Cannot reach the standby through $STANDBY_TNS: $(ora_errors "$SQL_OUT") (step 7.4)"; return 1; }
   IFS='|' read -r ti th ts <<< "$(first_line)"
-  if [[ "$ti" != "$STANDBY_SID" || "${th%%.*}" != "$ls" || "$ts" != "STARTED" ]]; then
+  local ths=${th%%.*}      # host names compared without the domain and without case
+  if [[ "${ti^^}" != "${STANDBY_SID^^}" || "${ths,,}" != "${ls,,}" || "$ts" != "STARTED" ]]; then
     PRE_FIX="Alias $STANDBY_TNS does not reach the NOMOUNT instance on this server. It reaches: $ti, host $th, $ts"; return 1
   fi
   PRE_INFO+="$STANDBY_TNS reaches $ti (NOMOUNT) on this server"$'\n'
@@ -677,7 +762,9 @@ dup_prechecks() {
 }
 HAS_LFNC=0; RMAN_PREFLIGHT_OK=""
 
+PRE_ASMGID_OLD=""; PRE_ASMGID_WANT=""
 c_8_1() {
+  PRE_ASMGID_OLD=""; PRE_ASMGID_WANT=""
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   need_ssh || return 2
   detect_built
@@ -686,7 +773,19 @@ c_8_1() {
   if dup_prechecks; then NOW=$PRE_INFO; return 0; fi
   NOW=$PRE_FIX
   [[ "$PRE_FIX" == *"(step "* ]] && return 2          # an earlier step is not done yet
+  if [[ -n "$PRE_ASMGID_OLD" ]]; then
+    # the one pre-check the script fixes itself: the group of the oracle program
+    NOW="$DB_HOME/bin/oracle has group $PRE_ASMGID_OLD. It must be $PRE_ASMGID_WANT, the group of the ASM disks (ORA-15025)."
+    PLAN="As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"$'\n'"Then all pre-checks run again."
+    KIND_NOW=auto; return 1
+  fi
   PLAN="$PRE_FIX"; return 1
+}
+d_8_1() {
+  run_logged "setasmgidwrap" "$GRID_HOME/bin/setasmgidwrap" "o=$DB_HOME/bin/oracle" || { bad "setasmgidwrap failed: ${RUN_OUT%%$'\n'*}"; return 1; }
+  journal ASMGID "$DB_HOME/bin/oracle" "by hand, only if wanted, as root: chgrp $PRE_ASMGID_OLD $DB_HOME/bin/oracle ; chmod 6751 $DB_HOME/bin/oracle  (the group it had before)"
+  say "$DB_HOME/bin/oracle now has group $(stat -c '%G' "$DB_HOME/bin/oracle" 2>/dev/null)."
+  return 0
 }
 
 rman_script() {
@@ -802,6 +901,6 @@ dup_success_record() {
 
 phase_8() {
   phase_header 8 "Copy the database (RMAN)"
-  run_step 8.1 check "Pre-checks: space, storage, logins, parameters" c_8_1
+  run_step 8.1 check "Pre-checks: space, storage, logins, parameters" c_8_1 d_8_1
   run_step 8.2 auto  "RMAN duplicate for standby" c_8_2 d_8_2
 }

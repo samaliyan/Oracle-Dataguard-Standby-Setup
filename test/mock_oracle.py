@@ -156,6 +156,10 @@ def local_sql(q, st, sid):
         if not os.path.exists(os.path.join(cfg["db_home"], "dbs", "spfile" + sid + ".ora")): return "ORA-01078: failure in processing system parameters"
         inst["state"] = "mounted"; st["instances"][sid] = inst
         return "ORACLE instance started.\nDatabase mounted."
+    if l.startswith("shutdown abort"):
+        if s == "idle": return "ORACLE instance shut down."
+        inst["state"] = "idle"; inst["mrp"] = 0; st["instances"][sid] = inst
+        return "ORACLE instance shut down."
     if l.startswith("shutdown immediate"):
         if s == "idle": return "ORA-01034: ORACLE not available"
         inst["state"] = "idle"; inst["mrp"] = 0; st["instances"][sid] = inst
@@ -497,5 +501,18 @@ def opatch():
         print("\nOPatch succeeded."); return 0
     return 1
 
+def asmcmd():
+    # only "rm -rf +DG/NAME" is used: the leftovers of an unfinished copy go away
+    if args[:2] == ["rm", "-rf"] and len(args) == 3 and args[2].startswith("+"):
+        st = load(os.path.join(STATE_DIR, "standby.json")); st["asm_leftovers"] = 0; st.setdefault("asm_removed", []).append(args[2])
+        save(os.path.join(STATE_DIR, "standby.json"), st); return 0
+    print("ASMCMD-8001: unknown command"); return 1
+
+def setasmgidwrap():
+    # o=<db home>/bin/oracle: the group of the oracle program becomes the group of the ASM disks
+    if len(args) == 1 and args[0].startswith("o="):
+        os.system(f"chgrp asmadmin {args[0][2:]}"); return 0
+    return 1
+
 sys.exit({"opatch": opatch, "sqlplus": sqlplus, "srvctl": srvctl, "rman": rman, "lsnrctl": lsnrctl, "tnsping": tnsping,
-          "crsctl": crsctl, "orapwd": orapwd, "oraversion": oraversion, "orabasehome": orabasehome, "roohctl": roohctl}[prog]() or 0)
+          "crsctl": crsctl, "orapwd": orapwd, "oraversion": oraversion, "orabasehome": orabasehome, "roohctl": roohctl, "asmcmd": asmcmd, "setasmgidwrap": setasmgidwrap}[prog]() or 0)

@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.1"
+readonly SCRIPT_VERSION="5.3"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -244,7 +244,8 @@ cleanup() {
   for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
     [[ -n "$f" ]] || continue
     # a response file of a job that still runs is removed by the job itself when it ends
-    [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && continue
+    # (once the job's command has ended, its .rc file exists: the response file is no longer needed and goes now)
+    [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && [[ ! -f "${JOB_OUT:-/nonexistent}.rc" ]] && continue
     rm -f -- "$f"
     [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
@@ -646,6 +647,8 @@ first_line() {
   printf '%s' "$l"
 }
 
+# empty, or only the lost+found folder that a new file system has at its top (a fresh mount point counts as empty)
+dir_empty() { [[ -z "$(ls -A -- "$1" 2>/dev/null | grep -vx 'lost+found')" ]]; }
 norm() { printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'; }
 ora_errors() {
   # the first error with its text (so the admin sees what it means), then the other codes
