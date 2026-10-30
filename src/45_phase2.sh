@@ -1070,7 +1070,7 @@ c_2_15() {
   if [[ $rc -eq 2 ]]; then NOW=$STORAGE_INFO; [[ -n "$STORAGE_PLAN" ]] && PLAN=$STORAGE_PLAN; return 2; fi
   if [[ $rc -eq 0 ]]; then NOW="Each database folder is on storage of this server only:"$'\n'"$STORAGE_INFO"; return 0; fi
   NOW="DANGER: these folders are the SAME storage as on the primary: $STORAGE_SHARED"$'\n'"The RMAN copy would overwrite the files of the primary database."
-  KIND_NOW=manual; MANUAL_HOW="root  ->  storage and mount"
+  KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
   PLAN="-- Give this server its own storage for these paths.
 -- Do not use the NFS export or SAN volume of the primary.
 -- Mount it at the same path, then answer r.
@@ -1092,6 +1092,104 @@ d_2_15() {
   return 0
 }
 
+# ---- 2.16 memory ----
+# The copy gives the standby the primary's memory settings. A server with too little RAM fails at
+# startup (ORA-27102, ORA-00845, ORA-04031), so this is checked here, and again just before the copy.
+MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0
+mem_probe() {
+  # 0 fits (MEM_WARN may hold a warning), 1 does not fit (MEM_FAIL), 2 the primary cannot be read
+  MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0
+  prim_sql "select name||'|'||nvl(value,'0') from v\$parameter where name in ('sga_target','sga_max_size','memory_target','memory_max_target','pga_aggregate_target','use_large_pages','db_recovery_file_dest_size');" || return 2
+  local pn pv mmt=0
+  while IFS='|' read -r pn pv; do
+    case "$pn" in
+      sga_target|sga_max_size) num "$pv" && [[ $pv -gt $MEM_SGA ]] && MEM_SGA=$pv ;;
+      memory_target) num "$pv" && MEM_MT=$pv ;;
+      memory_max_target) num "$pv" && mmt=$pv ;;
+      pga_aggregate_target) num "$pv" && MEM_PGA=$pv ;;
+      use_large_pages) MEM_ULP=${pv^^} ;;
+      db_recovery_file_dest_size) num "$pv" && MEM_RFS=$pv ;;
+    esac
+  done <<< "$SQL_OUT"
+  local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); num "$kb" || kb=0
+  MEM_RAM_MB=$(( kb / 1024 ))
+  local sga_mb=$(( MEM_SGA / 1048576 )) pga_mb=$(( MEM_PGA / 1048576 )) mt_mb=$(( MEM_MT / 1048576 )) mmt_mb=$(( mmt / 1048576 )) need_mb shm_need=0
+  # automatic memory (memory_target > 0) holds the SGA and the PGA; otherwise they are added.
+  # memory_max_target alone does not turn it on, but the instance then lives in /dev/shm.
+  if [[ $mt_mb -gt 0 ]]; then
+    [[ $mmt_mb -gt $mt_mb ]] && mt_mb=$mmt_mb
+    [[ $mt_mb -gt $sga_mb ]] && sga_mb=$mt_mb
+    need_mb=$sga_mb; shm_need=$mt_mb
+    MEM_INFO="The primary uses $(human_mb "$need_mb") (memory_target: SGA and PGA together)"
+  else
+    [[ $mmt_mb -gt 0 ]] && shm_need=$mmt_mb
+    need_mb=$(( sga_mb + pga_mb ))
+    MEM_INFO="The primary uses $(human_mb "$need_mb"): SGA $(human_mb "$sga_mb") + PGA $(human_mb "$pga_mb")"
+  fi
+  if [[ $MEM_RAM_MB -gt 0 ]]; then
+    MEM_INFO+=$'\n'"This server has $(human_mb "$MEM_RAM_MB") RAM"
+    # the SGA is taken at startup: it must fit. The PGA is a target, used as sessions need it.
+    if [[ $sga_mb -gt $(( MEM_RAM_MB * 80 / 100 )) ]]; then
+      MEM_FAIL="Not enough RAM. This server needs at least $(human_mb $(( sga_mb * 100 / 80 + 1 )))."
+      MEM_INFO+=$'\n'"The standby gets the same memory settings as the primary."
+      return 1
+    fi
+    if [[ $need_mb -gt $(( MEM_RAM_MB * 90 / 100 )) ]]; then
+      MEM_WARN="SGA + PGA is more than 90% of the RAM here. The standby starts, but with many"
+      MEM_WARN+=$'\n'"sessions (after a switchover) it may run short. Better: $(human_mb $(( need_mb * 100 / 90 + 1 ))) RAM or more."
+    fi
+  else
+    MEM_INFO+=$'\n'"The RAM of this server could not be read"
+  fi
+  if [[ $shm_need -gt 0 ]]; then
+    # memory_target / memory_max_target live in /dev/shm (ORA-00845); ASM may use some of it too: 1 GB room
+    local shm; shm=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$shm" || shm=0
+    if [[ $shm -lt $(( shm_need + 1024 )) ]]; then
+      MEM_FAIL="/dev/shm is too small: $(human_mb "$shm"). The database needs $(human_mb $(( shm_need + 1024 ))) there"
+      MEM_FAIL+=$'\n'"(memory_target or memory_max_target of the primary, plus room for ASM). Otherwise: ORA-00845."
+      MEM_SHM_MB=$(( shm_need + 2048 ))
+      return 1
+    fi
+  fi
+  if [[ "$MEM_ULP" == "ONLY" || "$MEM_ULP" == "AUTO_ONLY" ]]; then
+    local hp hpkb; hp=$(awk '/^HugePages_Total:/{print $2}' /proc/meminfo 2>/dev/null); num "$hp" || hp=0
+    hpkb=$(awk '/^Hugepagesize:/{print $2}' /proc/meminfo 2>/dev/null); num "$hpkb" || hpkb=0
+    if [[ $(( hp * hpkb / 1024 )) -lt $sga_mb ]]; then
+      MEM_HP_LOW=1
+      MEM_INFO+=$'\n'"HugePages: the primary requires them (use_large_pages=$MEM_ULP), this server has too few."
+      MEM_INFO+=$'\n'"The standby gets use_large_pages=TRUE, so it starts without them. Add HugePages later."
+    fi
+  fi
+  return 0
+}
+
+c_2_16() {
+  [[ "$(marker_kind 2>/dev/null)" == "duplicate" ]] && { NOW="The RMAN copy already ran. The memory was checked before it started."; return 0; }
+  need_ssh || return 2
+  local rc=0; mem_probe || rc=$?
+  if [[ $rc -eq 2 ]]; then local e; e=$(ora_errors "$SQL_OUT"); NOW="Cannot read the memory settings of the primary${e:+: $e}"; return 2; fi
+  if [[ $rc -eq 0 ]]; then
+    NOW="Enough RAM:"$'\n'"$MEM_INFO"
+    [[ -n "$MEM_WARN" ]] && NOW+=$'\n'"Warning: $MEM_WARN"
+    return 0
+  fi
+  NOW="$MEM_FAIL"$'\n'"$MEM_INFO"
+  KIND_NOW=manual
+  if [[ $MEM_SHM_MB -gt 0 ]]; then
+    MANUAL_HOW="root  ->  shell"
+    PLAN="mount -o remount,size=${MEM_SHM_MB}m /dev/shm
+-- Keep it after a reboot: in /etc/fstab, the /dev/shm line gets size=${MEM_SHM_MB}m
+-- tmpfs  /dev/shm  tmpfs  defaults,size=${MEM_SHM_MB}m  0 0
+-- Then answer r."
+  else
+    MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
+    PLAN="-- Add RAM to the standby, then restart it and answer r.
+-- A standby that may become the primary needs as much memory as the primary.
+-- The RMAN copy (step 8.2) is refused until this is fixed."
+  fi
+  return 1
+}
+
 phase_2() {
   phase_header 2 "Prepare this server"
   run_step 2.1  auto    "Groups (same names and ids as primary)" c_2_1 d_2_1
@@ -1109,5 +1207,6 @@ phase_2() {
   run_step 2.13 auto    "ASM disks" c_2_13 d_2_13
   run_step 2.14 auto    "Database folders and free space (file system)" c_2_14 d_2_14
   run_step 2.15 check   "Database folders are not shared with the primary" c_2_15 d_2_15
+  run_step 2.16 check   "Memory (RAM) for the database" c_2_16
   build_envs_if_possible
 }

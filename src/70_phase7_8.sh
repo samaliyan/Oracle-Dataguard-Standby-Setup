@@ -587,32 +587,17 @@ dup_prechecks() {
     PRE_FIX="Alias $STANDBY_TNS does not reach the NOMOUNT instance on this server. It reaches: $ti, host $th, $ts"; return 1
   fi
   PRE_INFO+="$STANDBY_TNS reaches $ti (NOMOUNT) on this server"$'\n'
-  # memory: the spfile of primary is copied; the standby must be able to start with it
-  prim_sql "select name||'|'||nvl(value,'0') from v\$parameter where name in ('sga_target','sga_max_size','memory_target','memory_max_target','use_large_pages','db_recovery_file_dest_size');" \
-    || { PRE_FIX="Cannot read the memory parameters of the primary"; return 1; }
-  local pn pv sga=0 ulp="" rfs=0 memkb hp hpkb mt=0
-  while IFS='|' read -r pn pv; do
-    case "$pn" in
-      sga_target|sga_max_size|memory_target|memory_max_target) num "$pv" && [[ $pv -gt $sga ]] && sga=$pv
-                                                             [[ "$pn" == memory_* ]] && num "$pv" && [[ $pv -gt $mt ]] && mt=$pv ;;
-      use_large_pages) ulp=${pv^^} ;;
-      db_recovery_file_dest_size) num "$pv" && rfs=$pv ;;
-    esac
-  done <<< "$SQL_OUT"
-  memkb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); num "$memkb" || memkb=0
-  hp=$(awk '/^HugePages_Total:/{print $2}' /proc/meminfo 2>/dev/null); num "$hp" || hp=0
-  hpkb=$(awk '/^Hugepagesize:/{print $2}' /proc/meminfo 2>/dev/null); num "$hpkb" || hpkb=0
-  if [[ $memkb -gt 0 && $(( sga / 1024 )) -gt $(( memkb * 80 / 100 )) ]]; then
-    PRE_FIX="The SGA or memory target of the primary is $(human_mb $(( sga / 1048576 ))), but this server has only $(human_mb $(( memkb / 1024 ))) RAM."$'\n'"Add RAM to the standby. It needs as much memory as the primary."
+  # memory: the spfile of primary is copied; the standby must be able to start with it (same rules as step 2.16)
+  local mrc=0 rfs; mem_probe || mrc=$?
+  [[ $mrc -eq 2 ]] && { PRE_FIX="Cannot read the memory parameters of the primary"; return 1; }
+  if [[ $mrc -eq 1 ]]; then
+    PRE_FIX="$MEM_FAIL"$'\n'"$MEM_INFO"$'\n'"Step 2.16 shows what to do."
     return 1
   fi
-  PRE_INFO+="Memory: the primary needs $(human_mb $(( sga / 1048576 ))), this server has $(human_mb $(( memkb / 1024 )))"$'\n'
-  if [[ $mt -gt 0 ]]; then
-    # AMM (memory_target) uses /dev/shm; it must be at least as big (ORA-00845)
-    local shm; shm=$(df -m --output=avail /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$shm" || shm=0
-    [[ $shm -ge $(( mt / 1048576 )) ]] || { PRE_FIX="memory_target is $(( mt / 1048576 )) MB, but /dev/shm has only $shm MB (ORA-00845)."$'\n'"As root:  mount -o remount,size=$(( mt / 1048576 + 1024 ))m /dev/shm"$'\n'"Set the same size in /etc/fstab too."; return 1; }
-  fi
-  if [[ "$ulp" == "ONLY" && $(( hp * hpkb )) -lt $(( sga / 1024 )) ]]; then
+  PRE_INFO+="Memory: ${MEM_INFO%%$'\n'*}; this server has $(human_mb "$MEM_RAM_MB")"$'\n'
+  [[ -n "$MEM_WARN" ]] && PRE_INFO+="Warning: $MEM_WARN"$'\n'
+  rfs=$MEM_RFS
+  if [[ $MEM_HP_LOW -eq 1 ]]; then
     DUP_EXTRA+="      set use_large_pages='TRUE'"$'\n'
     PRE_INFO+="The primary has use_large_pages=ONLY, but this server has too few HugePages."$'\n'"The standby gets TRUE. Configure HugePages later."$'\n'
   fi

@@ -100,7 +100,7 @@ check "prim_probe refuses \$( ) in an argument" "[[ '$out' == FATAL:* ]]"
 CUR=B; echo "== B. Empty server, full run (only IP + passwords given)"
 fresh empty
 rc=$(run $T/b.txt)
-check "exit code 0" "[[ $rc -eq 0 ]]"
+cp $T/b.txt /tmp/claude-0/sc/keep_b.txt; check "exit code 0" "[[ $rc -eq 0 ]]"
 check "summary: no SKIPPED/FAILED/TODO" "! grep -qE '^    [0-9.]+ +(skipped|failed, skipped|to do|UNKNOWN)' $T/b.txt"
 check "setup complete message" "grep -q 'Standby setup is complete' $T/b.txt"
 check "primary: only whitelisted read-only commands" "cmds_whitelisted"
@@ -230,11 +230,11 @@ fresh empty; rc=$(DG_TEST_CTRLC_AT=3.4 run $T/h4.txt)
 check "Ctrl-C -> stopped, message" "[[ $rc -ne 0 ]] && grep -q 'Interrupted' $T/h4.txt"
 check "Ctrl-C: no response file left, ssh closed" "! ls -d /tmp/dg_rsp.* 2>/dev/null | grep -q . && [[ ! -e $T/varlib/ssh_ctl ]]"
 out=$(cd $T && bash ./dg_standby_setup.sh --help-step all 2>&1); n=$(grep -cE 'Help .{1,3} Step [0-9]' <<< "$out")
-check "--help-step all prints every step (71)" "[[ $n -eq 71 ]]"
+check "--help-step all prints every step (72)" "[[ $n -eq 72 ]]"
 check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\" || true"
 out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.9 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help 2>&1); check "--help shows usage" "grep -q -- '--primary' <<< \"\$out\""
-for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11 5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2 9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4; do
+for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 2.16 3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11 5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2 9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4; do
   grep -q "run_step $st " $T/dg_standby_setup.sh || fail "step $st exists in the script"
 done
 pass "all help ids are real steps"
@@ -376,7 +376,7 @@ check "gid already used by another group -> manual instructions shown" "grep -q 
 fresh; jset $P "d['ids']['oracle']=d['ids']['oracle']+',10(wheel),990(docker)'"
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
-fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/dgt-hosts.$$; cat /etc/hosts >> /tmp/dgt-hosts.$$; cp /tmp/dgt-hosts.$$ /etc/hosts; rm -f /tmp/dgt-hosts.$$
+fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/claude-hosts.$$; cat /etc/hosts >> /tmp/claude-hosts.$$; cp /tmp/claude-hosts.$$ /etc/hosts; rm -f /tmp/claude-hosts.$$
 rc=$(DG_TEST_QUIT_AT=2.7 run $T/p12.txt)
 check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^192\.0\.2\.2[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
 fresh
@@ -886,7 +886,7 @@ fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
 
 #==============================================================================
-CUR=Z; echo "== Z. External review fixes (5.1)"
+CUR=Z; echo "== Z. External review fixes (5.1 - 5.6)"
 fresh
 G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
 for v in 10.0.0.5 192.168.1.20 db01 db01.example.local; do
@@ -934,6 +934,29 @@ fresh; rm -f /etc/oraInst.loc $T/varlib/db_install.done
 sed -i '\#dbhome_1#d' $T/u01/app/oraInventory/ContentsXML/inventory.xml
 rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/z9.txt --from 3.6)
 check "no /etc/oraInst.loc with Grid -> 3.6 waits for the Grid root scripts, installer not started" "grep -q '/etc/oraInst.loc is missing' $T/z9.txt && ! grep -q 'runInstaller user=' $T/state/calls.log"
+
+# ---- 5.5: a sys password with @ / $ is accepted (it travels in double quotes, through stdin) ----
+fresh; jset $T/state/env.json "d['pw']='Pass@word/1\$x'"
+rc=$(DG_TEST_PW='Pass@word/1$x' DG_TEST_QUIT_AT=2.1 run $T/z10.txt)
+check "sys password with @ / \$ accepted and working" "grep -q 'The sys password works on the primary' $T/z10.txt && ! grep -q 'Pass@word' $T/log/run_*.log"
+
+# ---- 5.6: memory of the standby against SGA + PGA of the primary (step 2.16, and again before the copy) ----
+fresh
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z11.txt)
+check "2.16: enough RAM -> ok, SGA and PGA shown" "grep -q 'Enough RAM' $T/z11.txt && grep -q 'SGA 1024 MB + PGA 512 MB' $T/z11.txt && grep -qE '^    2\.16 +ok' $T/z11.txt"
+fresh; jset $P "d['mem']={'sga_target':str(5*1024**3),'sga_max_size':str(5*1024**3),'memory_target':'0','memory_max_target':'0','pga_aggregate_target':str(3*1024**3),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z12.txt)
+check "2.16: SGA fits, SGA + PGA over 90% -> ok with a warning (PGA is only a target)" "grep -q 'Warning: SGA + PGA is more than 90%' $T/z12.txt && grep -qE '^    2\.16 +ok' $T/z12.txt"
+fresh; jset $P "d['mem']={'sga_target':str(7*1024**3),'sga_max_size':str(7*1024**3),'memory_target':'0','memory_max_target':'0','pga_aggregate_target':str(1024**3),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
+rc=$(run $T/z13.txt)
+check "SGA over 80% of RAM: 2.16 refuses, the minimum shown; skipped -> the copy is still refused" "grep -q 'Not enough RAM. This server needs at least' $T/z13.txt && grep -q 'Step 2.16 shows what to do' $T/z13.txt && ! grep -qE '^    2\.16 +ok' $T/z13.txt && ! grep -q '^rman' $T/state/calls.log"
+fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':'0','pga_aggregate_target':str(256*1024**2),'use_large_pages':'ONLY','db_recovery_file_dest_size':'0'}"
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z14.txt)
+check "2.16: use_large_pages=ONLY without HugePages -> ok, with the HugePages note" "grep -q 'HugePages: the primary requires them' $T/z14.txt && grep -qE '^    2\.16 +ok' $T/z14.txt"
+
+fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':str(7680*1024**2),'pga_aggregate_target':str(256*1024**2),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z15.txt)
+check "2.16: memory_max_target bigger than /dev/shm -> refused, the remount command shown" "grep -q '/dev/shm is too small' $T/z15.txt && grep -q 'mount -o remount,size=9728m /dev/shm' $T/z15.txt && ! grep -qE '^    2\.16 +ok' $T/z15.txt"
 
 echo
 echo "RESULT: $PASS passed, $FAILN failed"

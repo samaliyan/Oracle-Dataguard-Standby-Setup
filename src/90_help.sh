@@ -4,7 +4,7 @@
 # text; continuation lines start with 7 spaces.
 #------------------------------------------------------------------------------
 readonly HELP_IDS=(1.1 1.2 1.3 1.4 1.5 1.6
-  2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15
+  2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 2.16
   3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11
   4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11
   5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2
@@ -299,6 +299,24 @@ IF     The file system UUID is the same on both servers
        or the same disk mounted twice. Compare the disks on both servers:
        lsblk -s -o NAME,TYPE,WWN,SERIAL,SIZE \$(findmnt -n -o SOURCE --target <folder>)
        Change nothing on such a disk until you know which it is.
+EOF
+  ;;
+  2.16) cat <<EOF
+TITLE  Memory (RAM) for the database
+WHERE  This server ($S), as root
+WHY    The copy gives the standby the same memory settings (SGA, PGA) as the primary.
+       With too little RAM the standby does not start (ORA-27102, ORA-00845, ORA-04031).
+RUN    On the primary, as oracle in sqlplus:
+       show parameter sga_max_size
+       show parameter pga_aggregate_target
+       show parameter memory_target
+       On this server:
+       free -g
+EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
+       (the PGA is a target, not taken at startup).
+       With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB.
+IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
+       /dev/shm too small: mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
 EOF
   ;;
   3.1)

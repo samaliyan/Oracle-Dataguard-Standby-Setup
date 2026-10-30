@@ -197,7 +197,7 @@ d_1_5() {
   if [[ -z "$SECRET" ]] || ! sys_pw_ok "$SECRET"; then
     SECRET=""
     bad "This password cannot be used. It is empty, or it has a space, a quote,
-one of @ / & ; # \\ \$ \` or a non-ASCII character."
+one of  # & ; \\ \`  or a non-ASCII character."
     printf 'The script cannot pass such a password to sqlplus and RMAN.\nChange it on the primary first, as %s in sqlplus / as sysdba:\n  alter user sys identified by "<new password>";\nFrom 12.2 on, this also updates the password file. Then answer r.\n' "$ORACLE_USER" | hint
     return 1
   fi
@@ -236,7 +236,9 @@ sys_pw_ok() {
   # and so are non-ASCII characters (the two servers may use different character sets)
   local LC_ALL=C
   [[ "$1" =~ ^[[:print:]]+$ ]] || return 1
-  [[ "$1" =~ [[:space:]\"\'@/\&\;#\\\$\`] ]] && return 1
+  # @ / $ ! % and the like are fine: the password always travels in double quotes, through stdin.
+  # Refused: space, quotes, backslash, backtick, and # & ; (comment, substitution and end of command in RMAN)
+  [[ "$1" =~ [[:space:]\"\'\&\;#\\\`] ]] && return 1
   return 0
 }
 

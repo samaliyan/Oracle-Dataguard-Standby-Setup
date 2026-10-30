@@ -98,7 +98,7 @@ def primary_sql(q, pri):
     if "select db_unique_name||' '||database_role from v$database" in l: return f"{pri['unique']} {pri['role']}"
     if "from v$tempfile" in l: return f"{pri['data_mb']}|{pri['temp_mb']}"
     if "name in ('sga_target'" in l:
-        p = pri.get("mem", {"sga_target": "1073741824", "sga_max_size": "1073741824", "memory_target": "0", "memory_max_target": "0", "use_large_pages": "TRUE", "db_recovery_file_dest_size": str(50 * 1024**3)})
+        p = pri.get("mem", {"sga_target": "1073741824", "sga_max_size": "1073741824", "memory_target": "0", "memory_max_target": "0", "pga_aggregate_target": "536870912", "use_large_pages": "TRUE", "db_recovery_file_dest_size": str(50 * 1024**3)})
         return "\n".join(f"{k}|{v}" for k, v in p.items())
     if "name like 'log_archive_dest_%'" in l and "db_create" not in l:
         rows = [f"{k}|{v}" for k, v in pri["params"].items() if re.fullmatch(r"log_archive_dest_\d+", k)]

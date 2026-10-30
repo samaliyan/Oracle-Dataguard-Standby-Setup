@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.4"
+readonly SCRIPT_VERSION="5.6"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -339,11 +339,22 @@ distid_for() {
   elif [[ ${OS_MAJOR:-0} -ge 8 && -z "${RU_DIR:-}" ]]; then printf 'CV_ASSUME_DISTID=OEL7.8'; fi
   return 0
 }
+oracle_tmp() {
+  # The Oracle installers run programs from their temporary folder. When /tmp is mounted noexec (hardened
+  # servers) they fail, so a folder next to the inventory is used instead (root-owned, sticky, like /tmp).
+  [[ "$MODE" == "run" ]] || return 0
+  findmnt -n -o OPTIONS --target /tmp 2>/dev/null | tr ',' '\n' | grep -qx noexec || return 0
+  local t; t="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")/dg_tmp"
+  [[ "$t" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 0
+  [[ -d "$t" ]] || { install -d -o root -g root -m 1777 "$t" 2>/dev/null || return 0; }
+  printf '%s' "$t"
+}
 build_envs() {
-  local oh gh dx=() gx=() v
+  local oh gh dx=() gx=() v t
+  t=$(oracle_tmp); [[ -n "$t" ]] && { dx+=("TMP=$t" "TMPDIR=$t"); gx+=("TMP=$t" "TMPDIR=$t"); }
   oh=$(home_of "$ORACLE_USER"); gh=$(home_of "$GRID_USER")
-  v=$(distid_for "${DB_MAJOR:-0}"); [[ -n "$v" ]] && dx=("$v")
-  v=$(distid_for "$(rel_major "${GRID_REL:-${DB_MAJOR:-0}}")"); [[ -n "$v" ]] && gx=("$v")
+  v=$(distid_for "${DB_MAJOR:-0}"); [[ -n "$v" ]] && dx+=("$v")
+  v=$(distid_for "$(rel_major "${GRID_REL:-${DB_MAJOR:-0}}")"); [[ -n "$v" ]] && gx+=("$v")
   ORA_ENV=( "HOME=${oh:-/}" "USER=$ORACLE_USER" "LOGNAME=$ORACLE_USER" "LANG=C" "LC_ALL=C"
             "PATH=$DB_HOME/bin:$DB_HOME/OPatch:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             "ORACLE_HOME=$DB_HOME" "ORACLE_BASE=$ORACLE_BASE" "ORACLE_SID=$STANDBY_SID"
