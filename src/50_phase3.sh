@@ -335,6 +335,23 @@ run_installer() {
     done
     args=("${a2[@]}"); say "The Release Update is already in $home. A retry does not apply it again."
   fi
+  if grep -qE 'INS-32035|INS-32039' <<< "$RUN_OUT"; then
+    if [[ ! -f /etc/oraInst.loc ]]; then
+      printf 'Cause: /etc/oraInst.loc is missing, so the installer tried to create a new inventory in a
+folder that already has files (%s).
+' "$INVENTORY_DIR" | hint
+      if use_grid; then printf 'Fix: finish Grid first. Its root scripts (step 3.3) create /etc/oraInst.loc.
+Answer q, then run the script again: it continues with the Grid steps.
+' | hint
+      else printf 'Fix: answer q and run the script again: step 3.6 then shows what to do with that folder.
+' | hint; fi
+    else
+      printf 'Cause: the installer user cannot write to the inventory %s.
+Its group must be %s with write access for the group (mode 770).
+' "$(inventory_dir)" "$INSTALL_GROUP" | hint
+    fi
+    return 1
+  fi
   if grep -q 'INS-08101' <<< "$RUN_OUT"; then
     local did; did=$([[ ${OS_MAJOR:-0} -ge 9 ]] && printf 'OL8' || printf 'OEL7.8')
     if [[ "${INS08101_RETRIED:-0}" -eq 0 ]] && [[ " ${ORA_ENV[*]} ${GRID_ENV[*]} " != *" CV_ASSUME_DISTID=$did "* ]]; then
@@ -991,6 +1008,25 @@ primary_edition() {
 }
 
 # ---- 3.6 DB software ----
+inventory_ready() {
+  # The database installer uses the central inventory of this server. /etc/oraInst.loc says where it is.
+  # Without that file the installer tries to create a NEW inventory and stops (INS-32035 / INS-32039) when
+  # the folder already has files (for example from the Grid installer).
+  [[ -f /etc/oraInst.loc ]] && return 0
+  if use_grid; then
+    NOW="The Oracle inventory is not registered on this server yet: /etc/oraInst.loc is missing."$'\n'"The Grid root scripts create it. Grid must be installed and its root scripts run first (step 3.3)"
+    return 2
+  fi
+  dir_empty "$INVENTORY_DIR" && return 0      # the database installer creates it
+  NOW="$INVENTORY_DIR has files, but /etc/oraInst.loc is missing, so no installer can use it."$'\n'"The database installer would stop with INS-32035."
+  KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
+  PLAN="-- If Oracle software on this server uses this inventory, register it:
+printf 'inventory_loc=$INVENTORY_DIR\ninst_group=$INSTALL_GROUP\n' > /etc/oraInst.loc
+-- If it is left over from an earlier attempt and nothing uses it, move it aside instead:
+mv $INVENTORY_DIR $INVENTORY_DIR.old_\$(date +%F)
+-- Then answer r."
+  return 1
+}
 db_ready() {
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
     media_ok "$DB_MEDIA" || { NOW="The database installer files are not known yet (step 3.1)"; return 1; }
@@ -1010,6 +1046,7 @@ c_3_6() {
   esac
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
   if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; return 1; fi
+  inventory_ready || return $?
   db_ready || return 2
   NOW="Database software is not installed yet"
   PLAN=""

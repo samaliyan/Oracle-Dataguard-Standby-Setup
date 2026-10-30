@@ -929,6 +929,12 @@ fresh; jset $S "d['instances']['PRODDB_STBY']={'state':'idle'}; d['asm_leftovers
 rc=$(DG_TEST_L72=k DG_TEST_QUIT_AT=7.3 run $T/z8.txt --from 6.1)
 check "leftovers kept with k -> nothing removed, existing_files_ok recorded" "[[ -f $T/varlib/existing_files_ok ]] && ! python3 -c \"import json;assert json.load(open('$S')).get('asm_removed')\" 2>/dev/null"
 
+# ---- 5.4: the database installer waits for the inventory (field report: INS-32035 / INS-32039) ----
+fresh; rm -f /etc/oraInst.loc $T/varlib/db_install.done
+sed -i '\#dbhome_1#d' $T/u01/app/oraInventory/ContentsXML/inventory.xml
+rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/z9.txt --from 3.6)
+check "no /etc/oraInst.loc with Grid -> 3.6 waits for the Grid root scripts, installer not started" "grep -q '/etc/oraInst.loc is missing' $T/z9.txt && ! grep -q 'runInstaller user=' $T/state/calls.log"
+
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
 for f in "${FAILED[@]}"; do echo "  - $f"; done
