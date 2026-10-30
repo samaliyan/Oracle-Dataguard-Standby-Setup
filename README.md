@@ -39,7 +39,7 @@ Before each step the script shows what it found and what it will do, and asks:
 | Phase | What happens |
 |---|---|
 | 1 | Connect to the primary over ssh and read its configuration |
-| 2 | OS: packages, kernel settings, users, limits, disks |
+| 2 | OS: packages, kernel settings, users, limits, disks, and enough memory (RAM, /dev/shm) for the SGA and PGA of the primary |
 | 3 | Install the Oracle software (and Grid if ASM is used) and patches |
 | 4 | Primary readiness: force logging, standby redo logs, archive settings (**printed** for the DBA) |
 | 5 | Network files (listener, tnsnames) |
