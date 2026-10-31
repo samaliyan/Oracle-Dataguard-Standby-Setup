@@ -76,6 +76,7 @@ parse_args() {
       --from)
         [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit 2; }
         FROM_STEP=$2
+        [[ "$FROM_STEP" == *.0 ]] && FROM_STEP=${FROM_STEP%.0}     # N.0 is the same as N (the start of phase N)
         if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit 2; }
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
@@ -167,6 +168,8 @@ main() {
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit 1; }
   dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit 1; }
+  # it holds settings and password-file copies: only root reads it (only the script's own folder is changed)
+  [[ "$(basename "$STATE_DIR")" == dg_standby_setup ]] && chmod 700 "$STATE_DIR" 2>/dev/null
   dir_safe "$LOG_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nroot writes the logs there.\n' "$LOG_DIR"; exit 1; }
   SETTINGS_FILE="$STATE_DIR/settings.conf"; ACCEPTED_FILE="$STATE_DIR/settings.accepted"; JOB_FILE="$STATE_DIR/job"
   PROGRESS_FILE="$STATE_DIR/progress"; LASTRUN_FILE="$STATE_DIR/last_run"; JOURNAL_FILE="$STATE_DIR/changes.log"

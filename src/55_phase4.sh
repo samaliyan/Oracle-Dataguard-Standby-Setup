@@ -169,23 +169,28 @@ dg_config_names_ok() {
 }
 
 # ---- 4.4 ----
-DEST_N=""
+DEST_N=""; DEST_FREE2=""
 find_dest() {
   # Which log_archive_dest_N on primary ships (or will ship) to this standby. Read-only.
   # 1) an N that already points to the standby alias, 2) dest_2 if it is free, 3) the first free N.
   prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name like 'log_archive_dest_%';" || return 1
-  local line n v used=" "
-  DEST_N=""
+  local line n v used=" " found=""
+  DEST_N=""; DEST_FREE2=""
   while IFS= read -r line; do
     [[ "$line" =~ ^log_archive_dest_([0-9]+)\|(.*)$ ]] || continue
     n=${BASH_REMATCH[1]}; v=$(tr '[:lower:]' '[:upper:]' <<< "${BASH_REMATCH[2]}" | tr -d "\"'" | sed -E 's/ *= */=/g')
     num "$n" && [[ $n -ge 2 && $n -le 31 ]] || continue
-    if has_token "$v" "SERVICE=${STANDBY_TNS^^}"; then DEST_N=$n; return 0; fi
+    [[ -z "$found" ]] && has_token "$v" "SERVICE=${STANDBY_TNS^^}" && found=$n
     [[ "$v" == "-" ]] || used+="$n "
   done <<< "$SQL_OUT"
   # a destination without a value (or not listed) is free; prefer 2
-  for ((n = 2; n <= 31; n++)); do [[ "$used" == *" $n "* ]] || { DEST_N=$n; return 0; }; done
-  return 1
+  if [[ -n "$found" ]]; then DEST_N=$found
+  else for ((n = 2; n <= 31; n++)); do [[ "$used" == *" $n "* ]] || { DEST_N=$n; break; }; done; fi
+  [[ -n "$DEST_N" ]] || return 1
+  # a second free one (not DEST_N), for the duplex folder when log_archive_dest is moved (4.4)
+  DEST_FREE2=""
+  for ((n = 3; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
+  return 0
 }
 c_4_4() {
   need_ssh || return 2
@@ -205,11 +210,12 @@ c_4_4() {
 -- Run these lines together: between them the archiver writes to \$ORACLE_HOME/dbs.
 "
     if [[ -n "$dup" && "$dup" != "-" ]]; then
-      local dn=3; [[ "$DEST_N" == "3" ]] && dn=4
+      local dn=$DEST_FREE2
+      [[ -n "$dn" ]] || { NOW+=$'\n'"No second free log_archive_dest_N for the duplex folder $dup."; return 2; }
       PLAN+="alter system set log_archive_duplex_dest='' scope=both;
 alter system set log_archive_dest='' scope=both;
 alter system set log_archive_dest_1='location=$OLD_ARCH_DEST' scope=both;
-alter system set log_archive_dest_$dn='location=$dup' scope=both;     -- the duplex folder, kept (check that dest_$dn is free)
+alter system set log_archive_dest_$dn='location=$dup' scope=both;     -- the duplex folder, kept (dest_$dn is free)
 "
     else
       PLAN+="alter system set log_archive_dest='' scope=both;
@@ -222,7 +228,7 @@ alter system set log_archive_dest_1='location=$OLD_ARCH_DEST' scope=both;
 alter system set log_archive_dest_$DEST_N='service=$STANDBY_TNS async valid_for=(online_logfiles,primary_role) db_unique_name=$STANDBY_UNIQUE' scope=both;
 -- Step 9.5 enables it, after the standby exists."
   PLAN_UNDO="alter system reset log_archive_dest_$DEST_N scope=both; alter system reset log_archive_dest_state_$DEST_N scope=both;"
-  [[ -n "$OLD_ARCH_DEST" ]] && PLAN_UNDO+="   (log_archive_dest_1='location=$OLD_ARCH_DEST' can stay)"
+  [[ -n "$OLD_ARCH_DEST" ]] && PLAN_UNDO+="   (log_archive_dest_1='location=$OLD_ARCH_DEST'${dn:+ and log_archive_dest_$dn='location=$dup'} can stay: they keep the old archiving)"
   return 1
 }
 
@@ -291,7 +297,8 @@ startup"
     else
       PLAN+="alter system set remote_login_passwordfile=exclusive scope=spfile;
 -- Then restart the primary at a quiet time."$'\n'
-      PLAN_UNDO="alter system set remote_login_passwordfile=${rlp:-NONE} scope=spfile;  then restart"
+      if [[ -z "$rlp" || "$rlp" == "-" ]]; then PLAN_UNDO="alter system reset remote_login_passwordfile scope=spfile;  then restart"
+      else PLAN_UNDO="alter system set remote_login_passwordfile=$rlp scope=spfile;  then restart"; fi
     fi
   fi
   if [[ "$n" -lt 1 ]]; then
@@ -347,8 +354,17 @@ c_4_8() {
   p_param fal_server || { NOW="Query on the primary failed"; return 2; }
   if has_token "$PVAL" "${STANDBY_TNS^^}"; then NOW="fal_server = $PVAL"; return 0; fi
   NOW="fal_server = $(disp_val "$PVAL")"
-  PLAN="alter system set fal_server='$STANDBY_TNS' scope=both;"
-  PLAN_UNDO="alter system reset fal_server scope=both;"
+  if [[ -n "$PVAL" && "$PVAL" != "-" ]]; then
+    # an existing value (for example another standby) stays: the new alias is added to the list
+    local old; prim_sql "select nvl(value,'-') from v\$parameter where name='fal_server';" && old=$(first_line)
+    [[ -n "$old" ]] || { NOW="Query on the primary failed"; return 2; }
+    local list; list=$(tr -d "\"'" <<< "$old" | sed -E "s/[[:space:]]*,[[:space:]]*/','/g")
+    PLAN="alter system set fal_server='$list','$STANDBY_TNS' scope=both;"
+    PLAN_UNDO="alter system set fal_server='$list' scope=both;"
+  else
+    PLAN="alter system set fal_server='$STANDBY_TNS' scope=both;"
+    PLAN_UNDO="alter system reset fal_server scope=both;"
+  fi
   return 1
 }
 
@@ -370,6 +386,8 @@ tns_desc_ok() {
   [[ "$d" == *"(SERVICE_NAME=${3^^})"* ]] || { TNS_WHY="SERVICE_NAME is not $3"; return 1; }
   [[ "$d" == *"(UR=A)"* ]] || { TNS_WHY="(UR = A) is missing"; return 1; }
   [[ "$d" == *"(PORT=$PORT)"* ]] || { TNS_WHY="PORT is not $PORT"; return 1; }
+  [[ "$d" == *"(PROTOCOL=TCP)"* ]] || { TNS_WHY="PROTOCOL is not TCP"; return 1; }
+  [[ "$d" != *"(SERVER=SHARED)"* ]] || { TNS_WHY="SERVER = SHARED (sys needs a dedicated server)"; return 1; }
   return 0
 }
 tnsping_class() {

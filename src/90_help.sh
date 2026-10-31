@@ -959,7 +959,9 @@ RUN    $SSQL
        select count(*) from v\$standby_log where status='ACTIVE';
        (1 or more: real-time apply gets redo)
        select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;
-EXPECT MRP0 runs, at least one standby log is ACTIVE, and there are no new errors
+EXPECT MRP0 runs (the step fails only if it does not).
+       No ACTIVE standby log, or errors of the last 24 hours, are shown as
+       warnings: apply still runs, but they need a look.
 EOF
   ;;
   *) return 1 ;;

@@ -65,6 +65,10 @@ def primary_sql(q, pri):
         d0 = pri["locs"][0].split(":")[0]
         rows.append(f"T|1|{d0}/PRODDB/TEMPFILE/temp.300.1" if d0.startswith("+") else f"T|1|{d0}/temp01.dbf")
         return "\n".join(rows)
+    if "from v$logfile where member like '+%'" in l:
+        dgs = pri.get("log_dgs")
+        if dgs is None: dgs = sorted({loc.split(":")[0].lstrip("+").split("/")[0].upper() for loc in pri["locs"] if loc.startswith("+")})
+        return "\n".join(dgs)
     if "select name from v$datafile union all select name from v$tempfile union all select member from v$logfile" in l:
         rows = []
         for loc in pri["locs"]:
@@ -87,6 +91,11 @@ def primary_sql(q, pri):
         return "\n".join(pri.get("controlfiles", ["+DATA/PRODDB/CONTROLFILE/current.261.1", "+FRA/PRODDB/CONTROLFILE/current.256.1"]))
     if "from v$log group by thread# order by thread#" in l:
         return "\n".join(f"{t}|{pri['orl']}|{pri['orl_bytes']}" for t in range(1, pri.get("threads", 1) + 1))
+    if "count(*)+count(distinct thread#) from v$log" in l:
+        th = pri.get("threads", 1); need = (pri["orl"] + 1) * th
+        have = pri["srl"] * th if (pri["srl"] and pri["srl_bytes"] >= pri["orl_bytes"]) else 0
+        omf = pri["params"].get("db_create_file_dest", "+DATA") or "-"
+        return f"{need}|{have}|{pri['orl_bytes']}|{pri.get('online_log_dests', 0)}|{omf}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
     if "from v$standby_log where bytes>=(select max(bytes) from v$log) group by thread#" in l:
         if pri["srl"] and pri["srl_bytes"] >= pri["orl_bytes"]:
             return "\n".join(f"{t}|{pri['srl']}" for t in range(1, pri.get("threads", 1) + 1))
@@ -286,7 +295,10 @@ def sqlplus():
         elif "from v$asm_attribute" in ql:
             out.append("19.0.0.0.0|19.0.0.0.0")
         elif "select sector_size from v$asm_diskgroup" in ql:
-            out.append(str(st.get("sector_size", 512)))
+            m = re.search(r"name=upper\('([^']*)'\)", ql)
+            out.append(str(st.get("sector_sizes", {}).get((m.group(1) if m else "").upper(), st.get("sector_size", 512))))
+        elif "select usable_file_mb from v$asm_diskgroup" in ql:
+            out.append(str(cfg.get("fra_usable", cfg["data_free"])))
         elif "select total_mb from v$asm_diskgroup" in ql:
             out.append(str(cfg.get("fra_total", 400000)))
         elif "v$asm_diskgroup" in ql:
@@ -346,12 +358,17 @@ def srvctl():
     if a[:2] == ["config", "database"]:
         if not reg: print(f"PRCD-1120 : The resource for database {a[-1]} could not be found."); return 1
         print(f"Database unique name: {a[-1]}\nDatabase name: proddb\nOracle home: {reg['home']}\nSpfile: {reg['spfile']}\n"
-              f"Password file: {reg['pwfile']}\nStart options: mount\nDatabase role: {reg['role']}\nDatabase instance: {reg['instance']}")
+              f"Password file: {reg['pwfile']}\nStart options: {reg.get('startopt', 'mount')}\nDatabase role: {reg['role']}\nDatabase instance: {reg['instance']}")
         return 0
     if a[:2] == ["add", "database"]:
         if reg: print("PRCS-1007 : Server pool already exists"); return 1
         d = dict(zip(a[2::2], a[3::2]))
         st["srvctl"] = {"home": d["-oraclehome"], "spfile": d["-spfile"], "pwfile": d["-pwfile"], "role": d["-role"], "instance": d["-instance"], "running": 0}
+        save(STB, st); return 0
+    if a[:2] == ["modify", "database"]:
+        if not reg: print("PRCD-1120"); return 1
+        d = dict(zip(a[2::2], a[3::2]))
+        if "-startoption" in d: reg["startopt"] = d["-startoption"].lower()
         save(STB, st); return 0
     if a[:2] == ["status", "database"]:
         if not reg: print("PRCD-1120"); return 1

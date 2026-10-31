@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.7"
+readonly SCRIPT_VERSION="5.8"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -150,12 +150,12 @@ todo() { _mark "$C_M" "$S_TODO" TODO "$*"; }
 wait_msg() { _mark "$C_D" "$S_WAIT" WAIT "$*"; }
 
 hint() {
-  # explanations and advice: plain text under the message they belong to
+  # explanations and advice: plain text under the message they belong to (often tool output: masked on screen too)
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
     printf '      %s\n' "$line"
     _log HINT "$line"
-  done
+  done < <(mask_pw)
 }
 
 block() {
@@ -676,7 +676,11 @@ write_as() {
     local t; t=$(mktemp "$(dirname "$f")/.dgtmp.XXXXXX") || return 1
     cat > "$t" && chmod "$m" "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; return 1; }
   else
-    runuser -u "$u" -- sh -c 'cat > "$1" && chmod "$2" "$1"' sh "$f" "$m" || return 1
+    # as the owner, also through a temp file in the same folder and a rename: a crash never leaves half a file
+    # (the group of the old file is kept)
+    runuser -u "$u" -- sh -c 't=$(mktemp "$(dirname "$1")/.dgtmp.XXXXXX") || exit 1
+      if cat > "$t" && chmod "$2" "$t" && { [ ! -e "$1" ] || chgrp --reference="$1" "$t" 2>/dev/null || true; } && mv -f -- "$t" "$1"; then exit 0; fi
+      rm -f -- "$t"; exit 1' sh "$f" "$m" || return 1
   fi
   declare -F journal_file_written >/dev/null && journal_file_written "$f" "$existed"
   return 0

@@ -132,7 +132,7 @@ undo_text() {
     USER)       printf 'by hand: userdel -r %s   (this also removes its home folder)' "$obj" ;;
     USERMOD)    printf 'by hand: the groups of %s were changed (%s). Set them back with usermod if needed.' "$obj" "$det" ;;
     PKG)        printf 'by hand, usually not wanted: %s remove %s' "$PKG" "$obj" ;;
-    FWPORT)     printf 'auto: firewall-cmd --permanent --zone=%s --remove-port=%s ; firewall-cmd --reload' "${obj%%:*}" "${obj#*:}" ;;
+    FWPORT)     printf 'auto: firewall-cmd --permanent --zone=%s --remove-port=%s ; firewall-cmd --zone=%s --remove-port=%s' "${obj%%:*}" "${obj#*:}" "${obj%%:*}" "${obj#*:}" ;;
     SERVICE)    printf 'nothing: %s was enabled and started. Every server should have a time service.' "$obj" ;;
     ASMCFG)     printf 'by hand: oracleasm configure -d ; systemctl disable oracleasm   (only if no ASM disk uses ASMLib)' ;;
     SETTING)    printf 'in the settings file: %s' "$det" ;;
@@ -160,6 +160,7 @@ undo_text() {
     UNIT)       if [[ "$obj" == *.timer ]]; then printf 'auto: systemctl disable --now %s   (the nightly clean-up stops)' "$obj"
                 else printf 'auto: systemctl disable %s   (a running standby keeps running)' "$obj"; fi ;;
     OPATCH)     printf 'by hand, only if wanted: rm -rf %s ; mv %s %s   (puts back the OPatch of the media)' "$obj" "$(detail_field "$det" old)" "$obj" ;;
+    SRVOPT)     printf 'by hand, usually not wanted: srvctl modify database -db %s -startoption <the old one>   (it is in the log of that run)' "$obj" ;;
     SRVCTL_OLD) printf 'by hand: the old registration of %s is in the log of that run (srvctl config). Add it again with srvctl add database.' "$obj" ;;
     RMANCFG)    local ov; ov=$(detail_field "$det" old); ov=${ov//\~/ }
                 if [[ -z "$ov" || "$ov" == "-" ]]; then printf 'by hand, usually not wanted: as %s  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY CLEAR;' "$ORACLE_USER"
@@ -196,7 +197,7 @@ change_word() {
     SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
     LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|SRL|MRP) printf 'database' ;;
-    SRVCTL|SRVCTL_OLD) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
+    SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
 journal_run_summary() {
@@ -367,7 +368,7 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       say "$obj is not empty. It is left as it is."; return 2 ;;
     FWPORT)
       run_cmds <<< "firewall-cmd --permanent --zone=${obj%%:*} --remove-port=${obj#*:}
-firewall-cmd --reload" ;;
+firewall-cmd --zone=${obj%%:*} --remove-port=${obj#*:}" ;;
     UNIT)
       if [[ ! -f "/etc/systemd/system/$obj" ]] && ! systemctl cat "$obj" >/dev/null 2>&1; then say "$obj is already gone."; return 0; fi
       if [[ "$obj" == *.timer ]]; then

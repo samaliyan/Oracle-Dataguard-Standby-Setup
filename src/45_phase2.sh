@@ -172,32 +172,44 @@ limit_users() {
   use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
   return 0
 }
-LIM_TODO=()
+LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
+lim_line() {
+  # $1 user, $2 item -> the two lines (soft and hard) this script adds for it
+  case "$2" in
+    nofile)  printf '%s  soft  nofile   1024\n%s  hard  nofile   65536\n' "$1" "$1" ;;
+    nproc)   printf '%s  soft  nproc    16384\n%s  hard  nproc    16384\n' "$1" "$1" ;;
+    stack)   printf '%s  soft  stack    10240\n%s  hard  stack    32768\n' "$1" "$1" ;;
+    memlock) printf '%s  soft  memlock  unlimited\n%s  hard  memlock  unlimited\n' "$1" "$1" ;;
+  esac
+}
 c_2_4() {
-  local u miss=()
+  local u it miss=() users=()
   LIM_TODO=()
+  if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
+  # every limit the script sets is checked (a hard line for each); a value set by the admin is kept as it is
+  # a limit counts when it is set for the user, one of its groups (@group) or everyone (*), as hard or - (both)
+  local who g
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
-    grep -qsE "^[[:space:]]*$u[[:space:]]+hard[[:space:]]+nofile" /etc/security/limits.d/*.conf /etc/security/limits.conf 2>/dev/null || miss+=("$u")
+    who="$u|\\*"; for g in $(id -nG "$u" 2>/dev/null); do [[ "$g" =~ ^[A-Za-z0-9_.-]+$ ]] && who+="|@$g"; done
+    for it in nofile nproc stack memlock; do
+      grep -qsE "^[[:space:]]*($who)[[:space:]]+(hard|-)[[:space:]]+$it[[:space:]]" /etc/security/limits.d/*.conf /etc/security/limits.conf 2>/dev/null \
+        || { LIM_TODO+=("$u $it"); miss+=("$u:$it"); }
+    done
   done < <(limit_users)
-  if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
-  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits are set for: $(limit_users | paste -sd' ' -)"; return 0; fi
-  LIM_TODO=("${miss[@]}")
-  NOW="No limits are set for: ${miss[*]}
+  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits (nofile, nproc, stack, memlock) are set for: $(limit_users | paste -sd' ' -)"; return 0; fi
+  NOW="Missing limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
-  PLAN="Add limits for ${miss[*]} to $LIMITS_FILE:
-nofile 1024/65536, nproc 16384, stack 10240/32768, memlock unlimited"
+  PLAN="Add the missing limits to $LIMITS_FILE (lines set by you stay as they are):
+$(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
   [[ "$ORACLE_USER" != "oracle" ]] && ! id oracle >/dev/null 2>&1 && \
     PLAN+=$'\n'"The preinstall package may create a user named oracle (uid 54321). This standby does not use it."
   return 1
 }
 d_2_4() {
   backup_file "$LIMITS_FILE" || return 1
-  local u txt=""
-  for u in "${LIM_TODO[@]}"; do
-    txt+="$u  soft  nofile   1024"$'\n'"$u  hard  nofile   65536"$'\n'"$u  soft  nproc    16384"$'\n'"$u  hard  nproc    16384"$'\n'
-    txt+="$u  soft  stack    10240"$'\n'"$u  hard  stack    32768"$'\n'"$u  soft  memlock  unlimited"$'\n'"$u  hard  memlock  unlimited"$'\n'
-  done
+  local it txt=""
+  for it in "${LIM_TODO[@]}"; do txt+=$(lim_line ${it})$'\n'; done
   # other lines in the file (limits of other users on a shared server) stay
   printf '# added by dg_standby_setup.sh %s\n%s' "$RUN_ID" "$txt" | append_as root "$LIMITS_FILE" || return 1
   chmod 644 "$LIMITS_FILE"
@@ -239,7 +251,8 @@ c_2_5() {
   while IFS=: read -r d own; do
     if [[ ! -d "$d" ]]; then miss+="  $d  (owner $own)"$'\n'; continue; fi
     local cur; cur=$(stat -c '%U' "$d")
-    if [[ "$cur" != "$own" && ! ( "$cur" == "root" && "$d" == "$GRID_HOME" ) ]]; then
+    # an installed Grid home belongs to root (root.sh); an EMPTY one must belong to the grid owner, who unpacks it
+    if [[ "$cur" != "$own" && ! ( "$cur" == "root" && "$d" == "$GRID_HOME" && -e "$d/bin" ) ]]; then
       if dir_empty "$d"; then miss+="  $d  (owner $cur, becomes $own)"$'\n'
       else wrong+="$d is not empty and belongs to $cur, not $own"$'\n'; fixw+="chown $own:$INSTALL_GROUP $d"$'\n'; fi
     fi
@@ -392,28 +405,46 @@ c_2_9() {
   [[ -n "$FW_ZONE" ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=public
-  if firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1; then NOW="Port $PORT/tcp is open (zone $FW_ZONE)"; return 0; fi
-  NOW="Port $PORT/tcp is closed in firewalld (zone $FW_ZONE${ifc:+, interface $ifc})"
-  PLAN="firewall-cmd --permanent --zone=$FW_ZONE --add-port=$PORT/tcp
-firewall-cmd --reload"
+  # open now AND after a reboot: the running rules and the saved (permanent) ones are both checked
+  local rt=0 pm=0
+  firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && rt=1
+  firewall-cmd --permanent --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && pm=1
+  if [[ $rt -eq 1 && $pm -eq 1 ]]; then NOW="Port $PORT/tcp is open (zone $FW_ZONE), also after a reboot"; return 0; fi
+  if [[ $rt -eq 1 ]]; then NOW="Port $PORT/tcp is open now, but not saved: it closes at the next reboot (zone $FW_ZONE)"
+  elif [[ $pm -eq 1 ]]; then NOW="Port $PORT/tcp is saved as open, but the running firewall does not have it yet (zone $FW_ZONE)"
+  else NOW="Port $PORT/tcp is closed in firewalld (zone $FW_ZONE${ifc:+, interface $ifc})"; fi
+  # no --reload: it would also drop other rules that are only in the running firewall
+  PLAN=""
+  [[ $pm -eq 1 ]] || PLAN="firewall-cmd --permanent --zone=$FW_ZONE --add-port=$PORT/tcp"$'\n'
+  [[ $rt -eq 1 ]] || PLAN+="firewall-cmd --zone=$FW_ZONE --add-port=$PORT/tcp"
+  PLAN=${PLAN%$'\n'}
   return 1
 }
 d_2_9() {
   local c; while IFS= read -r c; do
     [[ -n "$c" ]] || continue
     run_cmds <<< "$c" || return 1
-    [[ "$c" =~ --zone=([A-Za-z0-9_-]+)\ --add-port=([0-9]+/tcp) ]] && journal FWPORT "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+    [[ "$c" == *--permanent* && "$c" =~ --zone=([A-Za-z0-9_-]+)\ --add-port=([0-9]+/tcp) ]] && journal FWPORT "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
   done <<< "$PLAN"
   return 0
 }
 
 # ---- 2.10 time ----
 c_2_10() {
+  # a running service is enough to go on; a clock that is not in sync (yet) is a warning: redo shipping and
+  # apply work, but the times in the alert logs and lag reports of the two servers do not match
   if systemctl is-active --quiet chronyd 2>/dev/null; then
-    if grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)"; then NOW="chronyd is running and the clock is in sync"; else NOW="chronyd is running; the sync is not confirmed yet"; fi
+    if grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)"; then NOW="chronyd is running and the clock is in sync"; return 0; fi
+    NOW="chronyd is running, but the clock is not in sync"
+    warn "The clock of this server is not in sync. Check:  chronyc sources -v  (a time server must be reachable)"
     return 0
   fi
-  if systemctl is-active --quiet ntpd 2>/dev/null; then NOW="ntpd is running"; return 0; fi
+  if systemctl is-active --quiet ntpd 2>/dev/null; then
+    if timedatectl status 2>/dev/null | grep -qiE 'synchronized: yes'; then NOW="ntpd is running and the clock is in sync"; return 0; fi
+    NOW="ntpd is running, but the clock is not in sync"
+    warn "The clock of this server is not in sync. Check:  ntpq -p  (a time server must be reachable)"
+    return 0
+  fi
   NOW="No time sync is running (neither chronyd nor ntpd)"
   PLAN="systemctl enable --now chronyd"
   return 1
@@ -875,17 +906,37 @@ fs_need_lines() {
     printf '%s|%s\n' "$d" "$mb"
   done < <(fs_dirs)
 }
+earlier_copy_mb() {
+  # $1 folder -> MB of the files in it that a copy of the primary would write. Uses FS_FILENAMES (read by the
+  # caller, not here: this runs in a $( ) and its cache would be lost). Only this standby's own OMF folders count.
+  local d=$1 f b=0 sz u
+  if [[ -n "$FS_FILENAMES" ]]; then
+    while IFS= read -r f; do
+      [[ "$f" == "$d"/* && "$f" != */o1_mf_* && -f "$f" && ! -L "$f" ]] || continue   # (OMF names: counted below)
+      sz=$(stat -c %s -- "$f" 2>/dev/null); num "$sz" && b=$((b + sz))
+    done <<< "$FS_FILENAMES"
+  fi
+  for u in "${STANDBY_UNIQUE^^}" "${STANDBY_UNIQUE,,}"; do
+    [[ -n "$STANDBY_UNIQUE" && -d "$d/$u" && ! -L "$d/$u" ]] || continue
+    sz=$(find "$d/$u" -xdev -type f -name 'o1_mf_*' \( -path '*/datafile/*' -o -path '*/onlinelog/*' -o -path '*/controlfile/*' -o -path '*/tempfile/*' \) -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    num "$sz" && b=$((b + sz))
+    [[ "${STANDBY_UNIQUE^^}" == "${STANDBY_UNIQUE,,}" ]] && break
+  done
+  printf '%s' "$((b / 1048576))"
+}
 FS_TODO=()
 c_2_14() {
   [[ -n "$(fs_dirs)" ]] || { NOW="Not needed (all database files are in ASM)"; return 0; }
   users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   local d mb mnt free used missing=() short="" report="" notmine=""
   declare -A need_by_mnt=() free_by_mnt=()
+  sql_or_cached_filenames >/dev/null 2>&1 || FS_FILENAMES=""     # once, here (not in the $( ) below)
   while IFS='|' read -r d mb; do
     mnt=$(mnt_of "$d"); [[ -n "$mnt" ]] || { NOW="Cannot read the free space of $d (df failed)"; return 2; }
     free=$(free_mb_of "$d")
-    # files that are already there (an earlier duplicate) already use their space
-    used=0; [[ -d "$d" ]] && used=$(du -smx -- "$d" 2>/dev/null | awk '{print $1+0}'); num "$used" || used=0
+    # files of an earlier copy already use their space: only those count (the primary's file names, or OMF
+    # names o1_mf_*); other files in the folder stay and need their own space
+    used=0; [[ -d "$d" ]] && used=$(earlier_copy_mb "$d"); num "$used" || used=0
     mb=$(( mb > used ? mb - used : 0 ))
     need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + mb ))
     free_by_mnt[$mnt]=$free
@@ -1178,6 +1229,7 @@ c_2_16() {
   if [[ $MEM_SHM_MB -gt 0 ]]; then
     MANUAL_HOW="root  ->  shell"
     PLAN="mount -o remount,size=${MEM_SHM_MB}m /dev/shm
+-- (the size needed, plus 1 GB more room)
 -- Keep it after a reboot: in /etc/fstab, the /dev/shm line gets size=${MEM_SHM_MB}m
 -- tmpfs  /dev/shm  tmpfs  defaults,size=${MEM_SHM_MB}m  0 0
 -- Then answer r."

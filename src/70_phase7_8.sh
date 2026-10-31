@@ -327,6 +327,8 @@ cleanup_auto_plan() {
 }
 leftover_cleanup_do() {
   local dg f n=0
+  # never on the primary's own name, whatever the caller checked (this deletes files and stops the instance)
+  [[ -n "$STANDBY_UNIQUE" && "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" ]] || { bad "Safety stop: STANDBY_UNIQUE equals the primary's unique name. Nothing is deleted."; return 1; }
   local_state
   if [[ "$LSTATE" != "IDLE" ]]; then
     sql_local "shutdown abort" || { bad "shutdown abort failed: $(ora_errors "$SQL_OUT")"; return 1; }
@@ -469,14 +471,30 @@ phase_7() {
 DUP_EXTRA=""; PRE_OK=0; PRE_INFO=""; NEWNAMES=""
 
 CF_LIST=""
+srl_plan_space() {
+  # Standby logs that step 9.3 still has to create (missing or smaller than the online logs), which are not in the
+  # sizes read from the primary: SRL_MB, and SRL_LOC = where 9.3 puts them (the same rule as srl_statements:
+  # the OMF destination, else the first online-log folder outside the recovery area). Multiplexed OMF logs count twice.
+  SRL_MB=0; SRL_LOC=""
+  prim_sql "select (select count(*)+count(distinct thread#) from v\$log)||'|'||(select count(*) from v\$standby_log where bytes>=(select max(bytes) from v\$log))||'|'||(select max(bytes) from v\$log)||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select nvl(max(value),'-') from v\$parameter where name in ('db_create_file_dest','db_create_online_log_dest_1') and value is not null)||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 0
+  local need have b copies omf dir; IFS='|' read -r need have b copies omf dir <<< "$(first_line)"
+  num "$need" && num "$have" && num "$b" || return 0
+  num "$copies" && [[ $copies -ge 1 ]] || copies=1
+  [[ $need -gt $have ]] || return 0
+  SRL_MB=$(( (need - have) * ((b + 1048575) / 1048576) ))
+  if [[ -n "$omf" && "$omf" != "-" ]]; then SRL_LOC=$omf; SRL_MB=$((SRL_MB * copies)); else SRL_LOC=$dir; fi
+}
 space_check() {
   # appends to PRE_INFO; sets PRE_FIX and returns 1 if there is not enough space for the database files
   local dg need free l d mnt
+  srl_plan_space
+  local srl_dg=""; [[ "$SRL_LOC" == +* ]] && { srl_dg=${SRL_LOC#+}; srl_dg=${srl_dg%%/*}; srl_dg=${srl_dg^^}; }
   for dg in $(asm_dgs); do
     need=0
     while IFS= read -r l; do
       d=${l%%:*}; d=${d#+}; d=${d%%/*}; [[ "${d^^}" == "$dg" ]] && need=$((need + ${l##*:}))
     done < <(loc_list | grep '^+')
+    [[ "$dg" == "$srl_dg" && $SRL_MB -gt 0 ]] && { need=$((need + SRL_MB)); PRE_INFO+="+$dg also gets the standby logs of step 9.3: $(human_mb "$SRL_MB")"$'\n'; }
     [[ $need -eq 0 ]] && continue
     need=$(( need * 110 / 100 ))
     free=0; sql_asm "select free_mb from v\$asm_diskgroup where name=upper('$dg');" && free=$(first_line)
@@ -498,6 +516,13 @@ space_check() {
     need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + ${l##*:} ))
     free_by_mnt[$mnt]=$(free_mb_of "$d")
   done < <(loc_list | grep '^/')
+  if [[ "$SRL_LOC" == /* && $SRL_MB -gt 0 ]]; then
+    mnt=$(mnt_of "$SRL_LOC")
+    if [[ -n "$mnt" ]]; then
+      need_by_mnt[$mnt]=$(( ${need_by_mnt[$mnt]:-0} + SRL_MB )); [[ -n "${free_by_mnt[$mnt]:-}" ]] || free_by_mnt[$mnt]=$(free_mb_of "$SRL_LOC")
+      PRE_INFO+="$mnt also gets the standby logs of step 9.3: $(human_mb "$SRL_MB")"$'\n'
+    fi
+  fi
   # files at exactly the target paths (an earlier copy) are overwritten by RMAN: their space counts as free (once per file)
   if [[ ${#need_by_mnt[@]} -gt 0 ]] && sql_or_cached_filenames; then
     local f sz
@@ -525,15 +550,23 @@ dup_prechecks() {
   if spfile_from_failed_copy; then PRE_FIX="The instance runs from the spfile of an unfinished copy. Clean up first (step 7.2)"; return 1; fi
   # the disk group of the logs must fit the block size of the primary's redo (else ORA-01378 after the copy, at 9.3)
   if use_grid && grid_sw_ok; then
-    local ldg="$DATA_DG"; [[ "$CFD" == +* ]] && { ldg=$(norm_loc "$CFD"); ldg=${ldg#+}; }
-    if [[ -n "$ldg" ]] && sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)"; then
-      local ss; ss=$(first_line)
+    # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
+    # the primary's online log members, and db_create_online_log_dest_1..5 (the standby uses the same names)
+    local ldg ldgs="$DATA_DG"; [[ "$CFD" == +* ]] && { ldg=$(norm_loc "$CFD"); ldgs=${ldg#+}; }
+    if prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
+      ldgs+=" $(grep -E '^[A-Z0-9_$#]+$' <<< "$SQL_OUT" | tr '\n' ' ')"
+    fi
+    local ss seen=" "
+    for ldg in $ldgs; do
+      ldg=${ldg^^}; [[ "$seen" == *" $ldg "* ]] && continue; seen+="$ldg "
+      sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)" || continue
+      ss=$(first_line)
       if [[ "${PRIMARY_REDO_BS:-512}" == "4096" && "$ss" != "4096" ]] || [[ "${PRIMARY_REDO_BS:-512}" == "512" && "$ss" == "4096" ]]; then
-        PRE_FIX="+$ldg has a sector size of $ss bytes, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"After the copy, the standby logs could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
+        PRE_FIX="+$ldg has a sector size of $ss bytes, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"Log files go there, so after the copy they could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
         return 1
       fi
       PRE_INFO+="+$ldg: sector size $ss bytes fits the redo block size ${PRIMARY_REDO_BS:-512}"$'\n'
-    fi
+    done
   fi
   # the copy takes the spfile of the primary (duplicate ... spfile): a primary started from a pfile fails there
   prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && [[ "$(first_line)" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
@@ -601,17 +634,31 @@ dup_prechecks() {
     DUP_EXTRA+="      set use_large_pages='TRUE'"$'\n'
     PRE_INFO+="The primary has use_large_pages=ONLY, but this server has too few HugePages."$'\n'"The standby gets TRUE. Configure HugePages later."$'\n'
   fi
-  # recovery area: never bigger than the space here
-  local fra_total=0
+  # recovery area: never bigger than the FREE space here, less what the copy itself puts there
+  # (a full disk group or file system must not get a quota that it cannot hold)
+  # (ASM: usable_file_mb, the space after mirroring; the files counted are the ones of this copy, and the standby
+  # logs of step 9.3 when they go there. A re-run after a part copy counts its files twice: on the safe side.)
+  local fra_free=0 fra_files=0 l dgn d fmnt=""
   if [[ "$FRA_LOC" == +* ]]; then
-    sql_asm "select total_mb from v\$asm_diskgroup where name=upper('${FRA_LOC#+}');" && fra_total=$(first_line)
+    dgn=${FRA_LOC#+}; dgn=${dgn%%/*}
+    sql_asm "select usable_file_mb from v\$asm_diskgroup where name=upper('$dgn');" && fra_free=$(first_line)
+    while IFS= read -r l; do d=${l%%:*}; d=${d#+}; d=${d%%/*}; [[ "${d^^}" == "${dgn^^}" ]] && fra_files=$((fra_files + ${l##*:})); done < <(loc_list | grep '^+')
+    local sd=${SRL_LOC#+}; sd=${sd%%/*}; [[ "$SRL_LOC" == +* && "${sd^^}" == "${dgn^^}" ]] && fra_files=$((fra_files + SRL_MB))
   elif [[ -n "$FRA_LOC" && -d "$FRA_LOC" ]]; then
-    fra_total=$(df -m --output=size -- "$FRA_LOC" 2>/dev/null | tail -n 1 | tr -d ' ')
+    fra_free=$(free_mb_of "$FRA_LOC")
+    fmnt=$(mnt_of "$FRA_LOC")
+    while IFS= read -r l; do [[ "$(mnt_of "${l%%:*}")" == "$fmnt" ]] && fra_files=$((fra_files + ${l##*:})); done < <(loc_list | grep '^/')
+    [[ "$SRL_LOC" == /* && "$(mnt_of "$SRL_LOC")" == "$fmnt" ]] && fra_files=$((fra_files + SRL_MB))
   fi
-  num "$fra_total" || fra_total=0
-  if [[ $rfs -gt 0 && $fra_total -gt 0 && $(( rfs / 1048576 )) -gt $(( fra_total * 90 / 100 )) ]]; then
-    DUP_EXTRA+="      set db_recovery_file_dest_size='$(( fra_total * 90 / 100 ))M'"$'\n'
-    PRE_INFO+="The recovery area size of the primary ($(human_mb $(( rfs / 1048576 )))) is bigger than $FRA_LOC here ($(human_mb "$fra_total"))."$'\n'"The standby gets $(human_mb $(( fra_total * 90 / 100 )))."$'\n'
+  num "$fra_free" || fra_free=0
+  local fra_cap=$(( (fra_free - fra_files) * 90 / 100 ))
+  if [[ $rfs -gt 0 && $fra_free -gt 0 && $fra_cap -lt 2048 ]]; then
+    PRE_FIX="The recovery area $FRA_LOC has too little free space: $(human_mb "$fra_free") free, and the copy itself puts $(human_mb "$fra_files") there."$'\n'"The standby needs room there for archived logs. Add space to $FRA_LOC first."
+    return 1
+  fi
+  if [[ $rfs -gt 0 && $fra_free -gt 0 && $(( rfs / 1048576 )) -gt $fra_cap ]]; then
+    DUP_EXTRA+="      set db_recovery_file_dest_size='${fra_cap}M'"$'\n'
+    PRE_INFO+="The recovery area size of the primary ($(human_mb $(( rfs / 1048576 )))) is more than the free space for it in $FRA_LOC here."$'\n'"The standby gets $(human_mb "$fra_cap") (90% of what stays free after the copy)."$'\n'
   fi
   # control files: same disk group (new OMF names) or the same path (an OMF file name becomes controlNN.ctl)
   prim_sql "select name from v\$controlfile;" || { PRE_FIX="Cannot read the control files of the primary"; return 1; }

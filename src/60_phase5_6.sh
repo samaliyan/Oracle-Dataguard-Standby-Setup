@@ -9,11 +9,19 @@ static_entry_state() {
   local f; f=$(lsnr_file)
   [[ -f "$f" ]] || return 1
   local flat seg found=1 sidn homen
+  STATIC_WHY=""
   flat=$(norm "$(sed 's/#.*//' "$f")")
   sidn="(SID_NAME=${STANDBY_SID^^})"; homen="(ORACLE_HOME=${DB_HOME^^})"
   while IFS= read -r seg || [[ -n "$seg" ]]; do
     if [[ "$seg" == *"$sidn"* ]]; then
-      [[ "$seg" == *"$homen"* || "$seg" == *"(ORACLE_HOME=${DB_HOME^^}/)"* ]] && return 0
+      # the home and the service name (GLOBAL_DBNAME) the copy connects to must both be right
+      local hok=0 gok=0
+      [[ "$seg" == *"$homen"* || "$seg" == *"(ORACLE_HOME=${DB_HOME^^}/)"* ]] && hok=1
+      [[ "$seg" == *"(GLOBAL_DBNAME=${STANDBY_SERVICE^^})"* ]] && gok=1
+      [[ $hok -eq 1 && $gok -eq 1 ]] && return 0
+      STATIC_WHY=""
+      [[ $hok -eq 1 ]] || STATIC_WHY+="ORACLE_HOME is not $DB_HOME"$'\n'
+      [[ $gok -eq 1 ]] || STATIC_WHY+="GLOBAL_DBNAME is missing or not $STANDBY_SERVICE"$'\n'
       found=2
     fi
   done < <(printf '%s' "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
@@ -90,7 +98,7 @@ $(static_block)"
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
-    NOW="The static entry for $STANDBY_SID has a different ORACLE_HOME."$'\n'"Logins through the listener would fail with ORA-01017."
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
     NOW+=$'\n'"The script only adds new entries; it does not change an existing one."$'\n'"Please correct this entry by hand."
   else
     NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID."$'\n'"The script does not edit inside an existing block, so please add the entry by hand."
@@ -132,7 +140,8 @@ c_5_2() {
     PLAN="Start it:  lsnrctl start $SB_LSNR   (as $ORACLE_USER, from $DB_HOME)"
     return 1
   fi
-  if ! grep -q "(PROTOCOL=TCP)(HOST=[^)]*)(PORT=$PORT)" <<< "$(norm "$RUN_OUT")"; then
+  # an address the primary can reach: not only 127.x / localhost
+  if ! grep -oE "\(PROTOCOL=TCP\)\(HOST=[^)]*\)\(PORT=$PORT\)" <<< "$(norm "$RUN_OUT")" | grep -vqE "\(HOST=(127\.[0-9.]+|LOCALHOST|LOCALHOST\.LOCALDOMAIN|::1|\[::1\])\)"; then
     NOW="Listener $SB_LSNR does not listen on port $PORT, the port the primary uses"
     KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
     PLAN="-- Edit this file:
@@ -251,9 +260,9 @@ c_6_1() {
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
     if prim_probe statx "$t"; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
-      if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#${tmode: -1} & 2 )) -ne 0 ]]; then
+      if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#$tmode & 8#027 )) -ne 0 ]]; then
         NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
-        NOW+=$'\n'"It must be a regular file of $GRID_USER or $ORACLE_USER that others cannot write."
+        NOW+=$'\n'"It must be a regular file of $GRID_USER or $ORACLE_USER, mode 640 or stricter (it holds the password hashes)."
         KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
         PLAN="rm -f $t
 asmcmd pwcopy '$pfile' $t
@@ -308,7 +317,10 @@ fetch_primary_file() {
   # $1 file on primary, $2 private local copy. 0 only when the copy is byte-identical (md5).
   local src=$1 tmp=$2 rmd lmd
   rm -f -- "$tmp"
-  prim_scp "$src" "$tmp" || { bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"; printf 'The ssh user %s must be able to read %s on the primary.\n' "$PRIMARY_SSH_USER" "$src" | hint; return 1; }
+  # the copy is private from the first byte (password file, wallet): scp creates it under umask 077
+  local um rc=0; um=$(umask); umask 077; prim_scp "$src" "$tmp" || rc=1; umask "$um"
+  chmod 600 -- "$tmp" 2>/dev/null
+  [[ $rc -eq 0 ]] || { bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"; printf 'The ssh user %s must be able to read %s on the primary.\n' "$PRIMARY_SSH_USER" "$src" | hint; return 1; }
   [[ -s "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || { bad "The copy of $src is empty"; return 1; }
   prim_probe md5 "$src" || { bad "Cannot get the md5sum of $src on the primary. The copy is not used."; return 1; }
   rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT"); lmd=$(md5sum "$tmp" | awk '{print $1}')
@@ -333,7 +345,13 @@ c_6_2() {
   need_ssh || return 2
   local t; t=$(pw_tmp_remote)
   PRIMARY_HOW_STEP="$GRID_USER (or root)  ->  shell"
-  if ! prim_probe owner "$t"; then NOW="No temporary password file copy on the primary"; return 0; fi
+  # absence must be proven (a failed probe is not "no file": the copy holds the password hashes)
+  local ex=""; prim_probe exists "$t" && ex=$(grep -m1 -E '^(YES|NO)$' <<< "$RUN_OUT")
+  case "$ex" in
+    NO)  NOW="No temporary password file copy on the primary"; return 0 ;;
+    YES) ;;
+    *)   NOW="Cannot tell whether $t is still on the primary (the check got no answer)"; return 2 ;;
+  esac
   pwfile_ok || { NOW="Keep $t for now: the password file is not installed yet (step 6.1)"; return 2; }
   NOW="The temporary copy $t is still on the primary"
   PLAN="rm -f $t"
@@ -362,7 +380,11 @@ tde_autologin_missing() {
   [[ -n "$WALLET_ROOT" && -f "$WALLET_ROOT/tde/cwallet.sso" ]] && return 1
   return 0
 }
-sqlnet_has_wallet() { local f; f=$(sqlnet_file); [[ -f "$f" ]] && norm "$(sed 's/#.*//' "$f")" | grep -qF "(DIRECTORY=${1^^})"; }
+sqlnet_has_wallet() {
+  # the same folder with or without a final / counts
+  local f d=${1%/}; f=$(sqlnet_file); [[ -f "$f" ]] || return 1
+  norm "$(sed 's/#.*//' "$f")" | grep -qE "\(DIRECTORY=\"?$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "${d^^}")/?\"?\)"
+}
 c_6_3() {
   [[ -n "$TDE_INFO" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   if awk -F'|' 'toupper($1)!="FILE" && toupper($3)!="NOT_AVAILABLE"' <<< "$TDE_INFO" | grep -q .; then

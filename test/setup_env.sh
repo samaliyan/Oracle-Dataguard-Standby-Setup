@@ -40,7 +40,7 @@ mkdir -p "$T/state" "$T/log" "$T/rootbin" "$T/remotebin" "$T/stage" "$T/devs"
 chmod 777 "$T/state"
 for f in calls.log primary_sql.log primary_cmds.log primary_UNEXPECTED.log; do : > "$T/state/$f"; chmod 666 "$T/state/$f"; done
 cp "$TD/mock_oracle.py" "$TD/mock_root.py" "$TD/mock_ssh.py" "$TD/mock_installer.py" "$T/"; chmod 755 "$T"/mock_*.py
-for p in rpm dnf yum oracleasm parted partprobe udevadm lsblk blkid wipefs pvs systemctl chronyc uname cmp findmnt; do ln -sf "$T/mock_root.py" "$T/rootbin/$p"; done
+for p in rpm dnf yum oracleasm parted partprobe udevadm lsblk blkid wipefs pvs systemctl chronyc uname cmp findmnt firewall-cmd; do ln -sf "$T/mock_root.py" "$T/rootbin/$p"; done
 cp "$TD/mock_ip.sh" "$T/rootbin/ip"; chmod 755 "$T/rootbin/ip"
 for p in ssh scp ssh-keyscan ssh-keygen; do ln -sf "$T/mock_ssh.py" "$T/rootbin/$p"; done
 ln -sf "$T/mock_oracle.py" "$T/remotebin/sqlplus"

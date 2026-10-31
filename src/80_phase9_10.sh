@@ -33,8 +33,17 @@ c_9_1() {
     grep -qiE "^spfile:[[:space:]]*${spf}[[:space:]]*\$" <<< "$cfg" || bad_items+=" spfile"
     grep -qiE "^Database role:[[:space:]]*PHYSICAL_STANDBY" <<< "$cfg" || bad_items+=" role"
     grep -qiE "^(Database instance|Instance)( name)?:[[:space:]]*${STANDBY_SID}[[:space:]]*\$" <<< "$cfg" || bad_items+=" instance"
+    # a standby must only be mounted at boot (open would need Active Data Guard, and apply starts on a mounted one)
+    grep -qiE "^Start options:[[:space:]]*mount[[:space:]]*\$" <<< "$cfg" || bad_items+=" start-option"
     if [[ -z "$bad_items" ]]; then NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"; return 0; fi
-    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance)' <<< "$cfg")"
+    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options)' <<< "$cfg")"
+    if [[ "$bad_items" == " start-option" ]]; then
+      # only the start option: changed in place, the running standby is not stopped
+      REG_MODE=modify
+      PLAN="As $ORACLE_USER, on this server only:
+srvctl modify database -db $STANDBY_UNIQUE -startoption MOUNT"
+      return 1
+    fi
     REG_MODE=re
     PLAN="As $ORACLE_USER, on this server only:
 srvctl stop database -db $STANDBY_UNIQUE
@@ -56,6 +65,12 @@ srv_add() {
     -diskgroup "$(srv_dgs)" ${PRIMARY_DOMAIN:+-domain "$PRIMARY_DOMAIN"} || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
 }
 d_9_1() {
+  if [[ "$REG_MODE" == "modify" ]]; then
+    run_logged "srvctl modify start option" as_oracle "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" -startoption MOUNT \
+      || { bad "srvctl modify failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    journal SRVOPT "$STANDBY_UNIQUE" "start option set to MOUNT"
+    return 0
+  fi
   if [[ "$REG_MODE" == "re" ]]; then
     run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || true
     journal SRVCTL_OLD "$STANDBY_UNIQUE" "the old registration was replaced (its config is in $LOG_FILE)"
@@ -175,11 +190,15 @@ arch_service_text() {
 arch_timer_text() {
   printf '[Unit]\nDescription=Daily clean-up of applied archived logs of %s\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' "$STANDBY_UNIQUE"
 }
-arch_timer_ok() {
+arch_timer_state() {
+  # ok | files (missing or different) | off (not enabled or not running) | failed (the last clean-up run failed)
   local t="/etc/systemd/system/$(arch_timer)" sv="/etc/systemd/system/$(arch_service)"
-  [[ -f "$t" && "$(cat "$t")" == "$(arch_timer_text)" && -f "$sv" && "$(cat "$sv")" == "$(arch_service_text)" && -f "$(arch_script)" && "$(cat "$(arch_script)")" == "$(arch_script_text)" ]] \
-    && systemctl is-enabled --quiet "$(arch_timer)" 2>/dev/null
+  [[ -f "$t" && "$(cat "$t")" == "$(arch_timer_text)" && -f "$sv" && "$(cat "$sv")" == "$(arch_service_text)" && -f "$(arch_script)" && "$(cat "$(arch_script)")" == "$(arch_script_text)" ]] || { printf files; return; }
+  systemctl is-enabled --quiet "$(arch_timer)" 2>/dev/null && systemctl is-active --quiet "$(arch_timer)" 2>/dev/null || { printf off; return; }
+  systemctl is-failed --quiet "$(arch_service)" 2>/dev/null && { printf failed; return; }
+  printf ok
 }
+arch_timer_ok() { [[ "$(arch_timer_state)" == "ok" ]]; }
 ARCH_POLICY_OK=0
 c_9_8() {
   need_built || return 2
@@ -198,10 +217,19 @@ c_9_8() {
   fi
   NOW=""
   [[ $ARCH_POLICY_OK -eq 1 ]] || NOW="RMAN archivelog deletion policy of the standby: ${v/#-/not set}$([[ "$v" != "-" ]] && printf ', copied from the primary with the control file')."$'\n'"Without the right policy, applied logs are not deleted here."$'\n'"The disk fills up and redo transport stops (ORA-19809, ORA-00257)."
-  [[ $tok -eq 1 ]] || NOW+="${NOW:+$'\n'}The archive destination $ARCH_LOC is not the recovery area. Oracle deletes nothing there by itself."
+  local tst=""; [[ $tok -eq 1 ]] || tst=$(arch_timer_state)
+  case "$tst" in
+    "") ;;
+    off)    NOW+="${NOW:+$'\n'}$(arch_timer) is not running (stopped or not enabled). Applied logs in $ARCH_LOC are not deleted." ;;
+    failed) NOW+="${NOW:+$'\n'}The last run of $(arch_service) failed: $(journalctl -u "$(arch_service)" -n 20 --no-pager -o cat 2>/dev/null | grep -E 'RMAN-|ORA-' | tail -n 2 | tr '\n' ' ')"
+            NOW+=$'\n'"Applied logs in $ARCH_LOC are not deleted. To see why:  journalctl -u $(arch_service)" ;;
+    *)      NOW+="${NOW:+$'\n'}The archive destination $ARCH_LOC is not the recovery area. Oracle deletes nothing there by itself." ;;
+  esac
   PLAN=""
   [[ $ARCH_POLICY_OK -eq 1 ]] || PLAN="As $ORACLE_USER on this server:"$'\n'"  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;"
-  [[ $tok -eq 1 ]] || PLAN+="${PLAN:+$'\n'}Add a daily systemd timer $(arch_timer) at 04:30."$'\n'"It runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';"$'\n'"Logs that are not applied yet are kept."
+  [[ "$tst" == off ]] && PLAN+="${PLAN:+$'\n'}systemctl enable $(arch_timer)"$'\n'"systemctl start $(arch_timer)"
+  [[ "$tst" == failed ]] && PLAN+="${PLAN:+$'\n'}Run the clean-up once now, to see that it works again:"$'\n'"systemctl reset-failed $(arch_service)"$'\n'"systemctl start $(arch_service)"
+  [[ "$tst" == files ]] && PLAN+="${PLAN:+$'\n'}Add a daily systemd timer $(arch_timer) at 04:30."$'\n'"It runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';"$'\n'"Logs that are not applied yet are kept."
   USING="Nothing is changed on the primary. Its own policy belongs to its backups.
 To see it there:  rman target /  ->  show archivelog deletion policy;
 If RMAN backs up the primary, this policy there keeps logs until the standby has them:
@@ -220,7 +248,15 @@ d_9_8() {
     [[ $lrc -eq 0 ]] || { bad "RMAN failed ($(ora_errors "$RUN_OUT"))"; return 1; }
     journal RMANCFG "$STANDBY_SID" "old=${old// /~}"
   fi
-  if ! arch_in_fra && ! arch_timer_ok; then
+  local tst=ok; arch_in_fra || tst=$(arch_timer_state)
+  if [[ "$tst" == off ]]; then
+    run_cmds <<< "systemctl enable $(arch_timer)
+systemctl start $(arch_timer)" || return 1
+  elif [[ "$tst" == failed ]]; then
+    # the clean-up itself: deletes only logs that are applied and older than one day (as the timer does every night)
+    run_cmds <<< "systemctl reset-failed $(arch_service)
+systemctl start $(arch_service)" || { bad "The clean-up failed again. To see why:  journalctl -u $(arch_service)"; return 1; }
+  elif [[ "$tst" == files ]]; then
     install -d -m 755 /usr/local/sbin || return 1
     local f
     for f in "$(arch_script)" "/etc/systemd/system/$(arch_service)" "/etc/systemd/system/$(arch_timer)"; do
@@ -310,7 +346,9 @@ c_9_6() {
     say "Waiting for RFS ($n of 6)"; sleep 10
   done
   NOW="No RFS process on this server yet"
-  PLAN="Check step 9.5, then the alert logs:
+  PLAN="A quiet primary may send nothing for a while. To make it send redo now, on the PRIMARY (sqlplus / as sysdba):
+  alter system switch logfile;
+Then answer r. If RFS still does not start, check step 9.5 and the alert logs:
   standby: ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${STANDBY_UNIQUE,,}/$STANDBY_SID/trace/alert_$STANDBY_SID.log
   primary: ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${PRIMARY_UNIQUE,,}/$PRIMARY_SID/trace/alert_$PRIMARY_SID.log
 In the alert log of the primary, look for ORA- errors near LOG_ARCHIVE_DEST_${DEST_N:-2}"
@@ -335,12 +373,20 @@ script_text() {
     printf '    for i in $(seq 1 180); do\n'
     printf '      st=$(sql "select status from v\\$instance;" 2>/dev/null | tr -d '"'"'[:space:]'"'"')\n'
     printf '      case "$st" in MOUNTED|OPEN*) break ;; esac\n      sleep 10\n    done\n'
-    printf '    case "$st" in MOUNTED|OPEN*) ;; *) echo "standby is not mounted ($st)"; exit 1 ;; esac\n'
+    printf '    case "$st" in MOUNTED|OPEN*) ;; *) echo "DG-BOOT-ERROR: standby is not mounted ($st)"; exit 1 ;; esac\n'
   else
-    printf '    $ORACLE_HOME/bin/lsnrctl start %s\n' "$SB_LSNR"
+    printf '    # a listener that already runs is fine (lsnrctl start then fails, status works)\n'
+    printf '    $ORACLE_HOME/bin/lsnrctl start %s >/dev/null 2>&1 || $ORACLE_HOME/bin/lsnrctl status %s >/dev/null 2>&1 || echo "DG-BOOT-ERROR: listener %s did not start"\n' "$SB_LSNR" "$SB_LSNR" "$SB_LSNR"
     printf '    sql "startup mount"\n'
+    printf '    st=$(sql "select status from v\\$instance;" 2>/dev/null | tr -d '"'"'[:space:]'"'"')\n'
+    printf '    # not mounted (or open read only with Active Data Guard): the unit fails, nothing to stop cleanly\n'
+    printf '    case "$st" in MOUNTED|OPEN*) ;; *) echo "DG-BOOT-ERROR: standby is not mounted ($st)"; exit 1 ;; esac\n'
   fi
-  printf '    sql "alter database recover managed standby database disconnect from session;"\n    ;;\n  stop)\n'
+  printf '    # mounted from here on: the unit must stay active, so the shutdown stops the standby cleanly.\n'
+  printf '    # Errors go to the journal (step 9.7 shows them). ORA-01153 = apply already runs.\n'
+  printf '    out=$(sql "alter database recover managed standby database disconnect from session;" 2>&1)\n'
+  printf '    case "$out" in *ORA-01153*) ;; *ORA-*|*SP2-*) echo "DG-BOOT-ERROR: redo apply did not start: $(echo $out)" ;; esac\n'
+  printf '    ;;\n  stop)\n'
   if use_grid; then printf '    sql "alter database recover managed standby database cancel;"\n'
   else printf '    sql "shutdown immediate"\n    $ORACLE_HOME/bin/lsnrctl stop %s\n' "$SB_LSNR"; fi
   printf '    ;;\nesac\nexit 0\n'
@@ -370,10 +416,13 @@ c_9_7() {
   if [[ -f "$u" && "$(cat "$u")" == "$(unit_text)" && -f "$sc" && "$(cat "$sc")" == "$(script_text)" && $okd -eq 1 ]] && systemctl is-enabled --quiet "$(unit_name)" 2>/dev/null && ! systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
     if use_grid; then NOW="$(unit_name) is enabled."$'\n'"It starts apply after Oracle Restart mounts the standby."
     else NOW="$(unit_name) is enabled."$'\n'"At boot: listener, startup mount, apply. At shutdown: a clean stop."; fi
+    # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
+    local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
+    [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
     return 0
   fi
   if systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
-    NOW="$(unit_name) has failed: $(systemctl status "$(unit_name)" --no-pager -l 2>&1 | grep -E 'Active:|ORA-|TNS-|error' | head -n 3 | tr '\n' ' ')"
+    NOW="$(unit_name) has failed: $(systemctl status "$(unit_name)" --no-pager -l 2>&1 | grep -iE 'Active:|ORA-|TNS-|error' | head -n 3 | tr '\n' ' ')"
   elif use_grid; then NOW="After a reboot, Oracle Restart mounts the standby, but nothing starts redo apply (MRP)"
   else NOW="Nothing starts the listener and the standby after a reboot (no Oracle Restart here)"; fi
   if use_grid; then PLAN="Create this script, owned by root. It runs as $ORACLE_USER, waits for MOUNT and starts apply:"$'\n'"  $sc"

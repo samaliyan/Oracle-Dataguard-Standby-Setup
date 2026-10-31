@@ -40,8 +40,8 @@ def fix_primary(text):
     if "db_recovery_file_dest='" in text: p["db_recovery_file_dest"] = "+FRA"
     if "remote_login_passwordfile=exclusive" in text: p["remote_login_passwordfile"] = "EXCLUSIVE"
     if "alter user sys identified" in text: pri["sys_in_pwfile"] = True
-    m = re.search(r"fal_server='([^']*)'", text)
-    if m: p["fal_server"] = m.group(1)
+    m = re.search(r"fal_server=('[^;]*') scope", text)
+    if m: p["fal_server"] = m.group(1).replace("'", "")
     if "tnsnames.ora" in text and ("cat >>" in text or "entry must be" in text): pri["tns_stby"] = 1; pri.pop("tns_stby_host", None)
     if "SID_LIST_" in text and "lsnrctl reload" in text: pri["static"] = 1
     if ">> /etc/hosts" in text: pri["hosts_stby"] = 1

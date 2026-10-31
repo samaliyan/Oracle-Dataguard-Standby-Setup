@@ -123,11 +123,19 @@ def wipefs():
     return 0
 def systemctl():
     if a[:2] == ["is-active", "--quiet"]:
-        return 0 if st["services"].get(a[2]) else 3
+        return 0 if (st["services"].get(a[2]) or a[2] in st.get("active", [])) else 3
+    if a[:2] == ["is-failed", "--quiet"]:
+        return 0 if a[2] in st.get("failed", []) else 1
+    if a[:1] == ["reset-failed"]:
+        st["failed"] = [x for x in st.get("failed", []) if x != a[1]]; save(st); return 0
     if a[:2] == ["enable", "--now"]:
         st["services"][a[2]] = True; save(st); return 0
     if a[:1] == ["daemon-reload"]: return 0
-    if a[:1] == ["start"]: return 0 if os.path.exists("/etc/systemd/system/" + a[1]) else 5
+    if a[:1] == ["start"]:
+        if not os.path.exists("/etc/systemd/system/" + a[1]): return 5
+        if a[1] in st.get("fail_on_start", []): st.setdefault("failed", []).append(a[1]); save(st); return 1
+        if a[1].endswith(".timer"): st.setdefault("active", []).append(a[1]); save(st)
+        return 0
     if a[:1] == ["disable"]:
         u = a[2] if len(a) > 2 and a[1] == "--now" else a[1]
         st["enabled"] = [x for x in st.get("enabled", []) if x != u]; save(st); return 0
@@ -138,7 +146,23 @@ def systemctl():
     if a[:2] == ["is-enabled", "--quiet"]:
         return 0 if a[2] in st.get("enabled", []) else 1
     return 1
+def firewall_cmd():
+    fw = st.setdefault("fw", {"runtime": [], "permanent": []})
+    perm = "--permanent" in a
+    if "--get-default-zone" in a: print("public"); return 0
+    if any(x.startswith("--get-zone-of-interface") for x in a): return 2
+    port = [x.split("=", 1)[1] for x in a if x.startswith("--query-port=") or x.startswith("--add-port=")]
+    if any(x.startswith("--query-port=") for x in a):
+        return 0 if port[0] in fw["permanent" if perm else "runtime"] else 1
+    if any(x.startswith("--add-port=") for x in a):
+        fw["permanent" if perm else "runtime"].append(port[0]); save(st); print("success"); return 0
+    if any(x.startswith("--remove-port=") for x in a):
+        pp = [x.split("=", 1)[1] for x in a if x.startswith("--remove-port=")][0]
+        k = "permanent" if perm else "runtime"; fw[k] = [x for x in fw[k] if x != pp]; save(st); print("success"); return 0
+    if "--reload" in a: fw["runtime"] = list(fw["permanent"]); save(st); print("success"); return 0
+    return 1
 def chronyc():
+    if st["services"].get("chronyd") and st.get("chrony_unsync"): print("Leap status     : Not synchronised"); return 0
     if st["services"].get("chronyd"): print("Leap status     : Normal"); return 0
     return 1
 def udevadm():
@@ -178,4 +202,4 @@ def cmp():
     return 1 if (d.get("dirty") or d.get("fs") or d.get("pttype") or d.get("parts")) else 0
 
 sys.exit({"rpm": rpm, "dnf": dnf, "oracleasm": oracleasm, "parted": parted, "lsblk": lsblk, "blkid": blkid,
-          "systemctl": systemctl, "chronyc": chronyc, "wipefs": wipefs, "partprobe": noop, "udevadm": udevadm, "pvs": noop, "yum": dnf, "uname": uname, "cmp": cmp, "findmnt": findmnt}[prog]())
+          "systemctl": systemctl, "chronyc": chronyc, "wipefs": wipefs, "partprobe": noop, "udevadm": udevadm, "pvs": noop, "yum": dnf, "uname": uname, "cmp": cmp, "findmnt": findmnt, "firewall-cmd": firewall_cmd}[prog]())

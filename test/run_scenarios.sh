@@ -209,7 +209,7 @@ fresh
 rc=$(run $T/g.txt)
 check "exit 0" "[[ $rc -eq 0 ]]"
 check "oracle missing groups added with usermod" "grep -q 'usermod -a -G oper,backupdba,dgdba,kmdba,racdba,asmdba oracle' $T/g.txt && id -nG oracle | grep -qw kmdba"
-check "wrong static ORACLE_HOME detected, shown as manual" "grep -q 'has a different ORACLE_HOME' $T/g.txt && grep -q 'Run on this server' $T/g.txt"
+check "wrong static ORACLE_HOME detected, shown as manual" "grep -q 'ORACLE_HOME is not' $T/g.txt && grep -q 'Run on this server' $T/g.txt"
 check "5.1 recorded DONE_BY_YOU" "[[ \$(res 5.1 $T/g.txt) == DONE_BY_YOU ]]"
 check "ASM disks of an older version (DATA1) are used only after you confirm" "grep -q 'Use the existing ASM disks DATA1 for +DATA' $T/g.txt && grep -qx 'DATA1|/dev/sdb1' $T/varlib/asm_disks"
 check "existing proddb alias accepted, standby alias added" "[[ \$(res 5.3 $T/g.txt) == OK && \$(res 5.4 $T/g.txt) == DONE ]]"
@@ -356,7 +356,7 @@ check "primary SGA bigger than standby RAM -> no duplicate, clear message" "grep
 fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':'0','use_large_pages':'ONLY','db_recovery_file_dest_size':str(900*1024**3)}"
 rc=$(run $T/p6.txt)
 check "use_large_pages=ONLY without HugePages -> TRUE on standby" "grep -q \"set use_large_pages='TRUE'\" $T/log/duplicate_*.rman"
-check "recovery area size limited to the standby +FRA" "grep -q \"set db_recovery_file_dest_size='360000M'\" $T/log/duplicate_*.rman"
+check "recovery area size limited to the free space of the standby +FRA" "grep -qE \"set db_recovery_file_dest_size='[0-9]+M'\" $T/log/duplicate_*.rman && ! grep -q \"db_recovery_file_dest_size='921600M'\" $T/log/duplicate_*.rman"
 fresh; jset $P "d['params']['log_archive_dest']='/arch'; d['params'].pop('log_archive_dest_1', None)"
 rc=$(DG_TEST_NOFIX=4.4 run $T/p7.txt)
 check "old-style log_archive_dest cleared on standby" "grep -q \"set log_archive_dest=''\" $T/log/duplicate_*.rman"
@@ -886,7 +886,7 @@ fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
 
 #==============================================================================
-CUR=Z; echo "== Z. External review fixes (5.1 - 5.7)"
+CUR=Z; echo "== Z. External review fixes (5.1 - 5.8)"
 fresh
 G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
 for v in 10.0.0.5 192.168.1.20 db01 db01.example.local; do
@@ -1011,6 +1011,82 @@ p_param "x' or name='y"
 EOF
 }
 check "p_param refuses a name that is not a plain parameter name (nothing sent)" "[[ \$(ut_pparam) == FATAL ]]"
+
+# 5.8: checks that passed when they should not
+fresh; printf 'grid  soft  nofile  4096\ngrid  hard  nofile  70000\n' > /etc/security/limits.d/oracle-grid.conf
+rc=$(DG_TEST_QUIT_AT=2.5 run $T/z26.txt)
+check "2.4: only nofile set -> the other three limits are added, the admin's nofile stays" "grep -q 'Missing limits: .*grid:nproc' $T/z26.txt && ! grep -q 'grid:nofile' $T/z26.txt && grep -qE '^grid +hard +nproc' /etc/security/limits.d/oracle-grid.conf && [[ \$(grep -cE '^grid +hard +nofile' /etc/security/limits.d/oracle-grid.conf) -eq 1 ]] && grep -qE '^grid +hard +nofile +70000' /etc/security/limits.d/oracle-grid.conf"
+fresh; jset $O "d['services']['firewalld']=True; d['fw']={'runtime':['1521/tcp'],'permanent':[]}"
+rc=$(DG_TEST_QUIT_AT=2.10 run $T/z27.txt)
+check "2.9: port open only until the next reboot -> saved with --permanent" "grep -q 'not saved: it closes at the next reboot' $T/z27.txt && python3 -c \"import json;f=json.load(open('$O'))['fw'];assert '1521/tcp' in f['permanent'] and '1521/tcp' in f['runtime'],f\""
+fresh; jset $O "d['chrony_unsync']=True"
+rc=$(DG_TEST_QUIT_AT=2.11 run $T/z28.txt)
+check "2.10: chronyd runs but the clock is not in sync -> ok with a warning" "grep -q 'the clock is not in sync' $T/z28.txt && grep -q 'chronyc sources -v' $T/z28.txt && grep -qE '^    2\.10 +ok' $T/z28.txt"
+fresh empty; mkdir -p $T/u01/app/19.0.0/grid; chown root:root $T/u01/app/19.0.0/grid
+rc=$(DG_TEST_QUIT_AT=2.6 run $T/z29.txt)
+check "2.5: an EMPTY Grid home owned by root -> given to grid (the installer must write there)" "[[ \$(stat -c %U $T/u01/app/19.0.0/grid) == grid ]]"
+ut_copy_mb() { bash <<EOF
+num() { [[ -n "\${1:-}" && "\${1:-}" != *[!0-9]* ]]; }
+source <(sed -n '/^earlier_copy_mb()/,/^}/p' $T/dg_standby_setup.sh)
+d=\$(mktemp -d); FS_FILENAMES="\$d/system01.dbf"; STANDBY_UNIQUE=X; mkdir -p \$d/X/datafile \$d/OTHERDB/archivelog
+head -c 3145728 /dev/zero > \$d/system01.dbf; head -c 5242880 /dev/zero > \$d/unrelated.bin; head -c 2097152 /dev/zero > \$d/X/datafile/o1_mf_x.dbf
+head -c 4194304 /dev/zero > \$d/OTHERDB/archivelog/o1_mf_1_9.arc
+earlier_copy_mb "\$d"; rm -rf "\$d"
+EOF
+}
+check "2.14: only files of an earlier copy count as already used (not other files, not another database's OMF files)" "[[ \$(ut_copy_mb) == 5 ]]"
+fresh; jset $P "d['params']['log_archive_dest']='/arch'; d['params'].pop('log_archive_dest_1', None); d['params']['log_archive_duplex_dest']='/arch2'"
+rc=$(DG_TEST_NOFIX=4.4 DG_TEST_QUIT_AT=4.5 run $T/z30.txt)
+check "4.4: old-style log_archive_dest with a duplex folder -> the duplex goes to a free dest (3), the standby to 2" "grep -q \"log_archive_dest_3='location=/arch2'\" $T/z30.txt && grep -q \"log_archive_dest_2='service=proddb_stby\" $T/z30.txt"
+fresh; jset $P "d['params']['fal_server']='OTHERSB'"
+rc=$(DG_TEST_QUIT_AT=4.9 run $T/z31.txt)
+check "4.8: an existing fal_server is kept, the standby is added, the undo restores it" "grep -q \"alter system set fal_server='OTHERSB','proddb_stby' scope=both;\" $T/z31.txt && grep -q \"alter system set fal_server='OTHERSB' scope=both;\" $T/z31.txt"
+fresh; jset $P "d['pw_tmp']=1; d['pw_tmp_mode']='644'"
+rc=$(DG_TEST_QUIT_AT=6.2 run $T/z32.txt)
+check "6.1: a temporary password file copy that others can read is not used" "grep -q 'mode 640 or stricter' $T/z32.txt"
+ut_wallet() { bash <<EOF
+norm() { printf '%s' "\$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'; }
+sq=\$(mktemp); sqlnet_file() { echo \$sq; }
+source <(sed -n '/^sqlnet_has_wallet()/,/^}/p' $T/dg_standby_setup.sh)
+printf 'ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = /u01/wallet/tde/)))\n' > \$sq
+sqlnet_has_wallet /u01/wallet/tde && echo A; sqlnet_has_wallet /u01/wallet && echo BAD; rm -f \$sq
+EOF
+}
+check "6.3: a wallet folder written with a final / is the same folder" "[[ \$(ut_wallet) == A ]]"
+fresh; jset $S "d['sector_sizes']={'FRA':4096}"; jset $P "d['log_dgs']=['DATA','FRA']"
+rc=$(run $T/z33.txt)
+check "8.1: a log disk group (+FRA) with 4K sectors for 512-byte redo -> copy refused" "grep -q '+FRA has a sector size of 4096 bytes' $T/z33.txt && ! grep -q '^rman.*duplicate' $T/state/calls.log"
+ut_boot() { bash <<'EOF'
+source <(sed -n '/^script_text()/,/^}/p' /tmp/dgt/dg_standby_setup.sh)
+use_grid() { false; }
+d=$(mktemp -d); mkdir -p $d/bin
+printf '#!/bin/bash\nexit 0\n' > $d/bin/lsnrctl
+printf '#!/bin/bash\nq=$(cat); case "$q" in *v\\$instance*) echo MOUNTED ;; *recover*) echo "ORA-01034: ORACLE not available" ;; esac\n' > $d/bin/sqlplus
+chmod 755 $d/bin/*
+STANDBY_UNIQUE=X DB_HOME=$d ORACLE_BASE=/b STANDBY_SID=S SB_LSNR=L script_text > $d/s.sh
+out=$(bash $d/s.sh start); rc=$?
+rm -rf $d; echo "rc=$rc $out"
+EOF
+}
+check "9.7: boot script reports a failed apply (journal) and stays active, so the shutdown still stops the standby" "[[ \$(ut_boot) == 'rc=0 DG-BOOT-ERROR: redo apply did not start: ORA-01034: ORACLE not available' ]]"
+fresh empty; run $T/z34a.txt >/dev/null; jset $S "d['srvctl']['startopt']='open'"
+rc=$(DG_TEST_SKIP=9.1 DG_TEST_QUIT_AT=9.2 run $T/z34.txt --from 9.1)
+check "9.1: registration with start option open -> only the start option is changed (the standby is not stopped)" "grep -q 'these values are wrong: start-option' $T/z34.txt && grep -q 'srvctl modify database -db PRODDB_STBY -startoption MOUNT' $T/z34.txt"
+rc=$(DG_TEST_QUIT_AT=9.2 run $T/z34b.txt --from 9.1)
+check "... and with [y] the start option becomes mount" "python3 -c \"import json;assert json.load(open('$S'))['srvctl'].get('startopt')=='mount'\" && grep -q 'Done. Registered in Oracle Restart' $T/z34b.txt"
+ut_timer() { bash <<'EOF'
+source <(sed -n '/^arch_timer_state()/,/^}/p' /tmp/dgt/dg_standby_setup.sh)
+arch_timer() { echo t.timer; }; arch_service() { echo s.service; }
+d=$(mktemp -d); arch_timer_text() { echo T; }; arch_service_text() { echo S; }; arch_script_text() { echo C; }; arch_script() { echo $d/c; }
+echo T > /etc/systemd/system/t.timer; echo S > /etc/systemd/system/s.service; echo C > $d/c
+systemctl() { case "$1 $3" in "is-enabled t.timer") return 0 ;; "is-active t.timer") return $ACT ;; "is-failed s.service") return $FAIL ;; esac; return 1; }
+ACT=0 FAIL=1; a=$(arch_timer_state); ACT=3 FAIL=1; b=$(arch_timer_state); ACT=0 FAIL=0; c=$(arch_timer_state)
+rm -rf $d /etc/systemd/system/t.timer /etc/systemd/system/s.service; echo "$a $b $c"
+EOF
+}
+check "9.8: the clean-up timer must be running, and its last run must not have failed" "[[ \$(ut_timer) == 'ok off failed' ]]"
+fresh; rc=$(DG_TEST_QUIT_AT=1.3 run $T/z35.txt --from 10.0)
+check "--from 10.0 is the same as --from 10" "! grep -q 'There is no step 10.0' $T/z35.txt"
 
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
