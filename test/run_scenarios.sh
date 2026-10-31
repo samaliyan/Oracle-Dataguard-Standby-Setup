@@ -40,7 +40,7 @@ cmds_whitelisted() {
   while IFS= read -r l; do
     [[ -z "$l" ]] && continue
     l=${l#timeout 120 }
-    if [[ "$l" =~ ^\[master\ opened ]] || [[ "$l" =~ ^\[scp\ /tmp/orapw_for_standby_[A-Z_]+\]$ ]] || [[ "$l" =~ ^\[scp\ /[A-Za-z0-9_./]+orapw[A-Za-z0-9_]*\]$ ]] \
+    if [[ "$l" =~ ^\[master\ opened ]] || [[ "$l" =~ ^\[ssh-keyscan\ [0-9.]+\]$ ]] || [[ "$l" =~ ^\[scp\ /tmp/orapw_for_standby_[A-Z_]+\]$ ]] || [[ "$l" =~ ^\[scp\ /[A-Za-z0-9_./]+orapw[A-Za-z0-9_]*\]$ ]] \
        || [[ "$l" == "hostname -s; hostname -f" || "$l" == "cat /etc/oratab" || "$l" == "cat /etc/oraInst.loc" || "$l" == "cat /etc/oracle/olr.loc" ]] \
        || [[ "$l" =~ ^id\ [a-z]+\;\ id\ [a-z]+$ ]] || [[ "$l" =~ ^stat\ -c\ \'%U\ %[GY]\'\ /[A-Za-z0-9_./-]+$ ]] \
        || [[ "$l" =~ ^stat\ -c\ \'%U\|%G\|%a\|%F\|%Y\'\ /[A-Za-z0-9_./-]+$ ]] || [[ "$l" == "date +%s" ]] \
@@ -886,7 +886,7 @@ fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
 
 #==============================================================================
-CUR=Z; echo "== Z. External review fixes (5.1 - 5.6)"
+CUR=Z; echo "== Z. External review fixes (5.1 - 5.7)"
 fresh
 G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
 for v in 10.0.0.5 192.168.1.20 db01 db01.example.local; do
@@ -957,6 +957,60 @@ check "2.16: use_large_pages=ONLY without HugePages -> ok, with the HugePages no
 fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':str(7680*1024**2),'pga_aggregate_target':str(256*1024**2),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/z15.txt)
 check "2.16: memory_max_target bigger than /dev/shm -> refused, the remount command shown" "grep -q '/dev/shm is too small' $T/z15.txt && grep -q 'mount -o remount,size=9728m /dev/shm' $T/z15.txt && ! grep -qE '^    2\.16 +ok' $T/z15.txt"
+
+# 5.7: the host key of the primary is shown and must be confirmed before the password is typed
+fresh
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z16.txt)
+check "new primary: host key fingerprint shown with the command to compare, saved after y, ssh strict" "grep -q 'This server does not know the primary yet' $T/z16.txt && grep -q 'SHA256:' $T/z16.txt && grep -q 'MD5:' $T/z16.txt && grep -q 'for f in /etc/ssh/ssh_host_\*_key.pub; do ssh-keygen -lf' $T/z16.txt && [[ \$(stat -c %a $T/varlib/primary_known_hosts) == 600 ]] && grep -q '^\[master opened' $T/state/primary_cmds.log && [[ ! -s $T/state/primary_UNEXPECTED.log ]] && ! grep -q 'answer yes' $T/z16.txt"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z16b.txt)
+check "known primary: no host key question the next time" "! grep -q 'does not know the primary' $T/z16b.txt && grep -q 'Connected to' $T/z16b.txt"
+fresh; mkdir -p $T/varlib; printf '127.0.0.2 ssh-dss AAAAB3NzaC1kc3MOldKey\n' > $T/varlib/primary_known_hosts; chmod 600 $T/varlib/primary_known_hosts
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z16c.txt)
+check "only an old ssh-dss key saved -> not counted as known, the new key is shown" "grep -q 'does not know the primary' $T/z16c.txt && grep -q 'Connected to' $T/z16c.txt"
+fresh
+rc=$(DG_TEST_HOSTKEY=n DG_TEST_QUIT_AT=2.1 run $T/z17.txt)
+check "host key not confirmed -> no password, no connection, nothing saved" "grep -q 'Host key not accepted' $T/z17.txt && ! grep -q '^\[master opened' $T/state/primary_cmds.log && ! grep -q \"'s password:\" $T/z17.txt && [[ ! -e $T/varlib/primary_known_hosts ]]"
+fresh; jset $P "d['keyscan_fail']=1"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z18.txt)
+check "host key cannot be read -> stop with a clear message" "grep -q 'Cannot read the ssh host key of 127.0.0.2' $T/z18.txt && ! grep -q '^\[master opened' $T/state/primary_cmds.log"
+fresh
+rc=$(DG_TEST_QUIT_AT=1.3 run $T/z19a.txt); jset $P "d['hostkey']='AAAAC3NzaC1lZDI1NTE5AAAAIOtherMachineKey9999'"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z19.txt)
+check "host key changed -> refused, warned not to remove it unless the primary was reinstalled" "grep -q 'REMOTE HOST IDENTIFICATION HAS CHANGED' $T/z19.txt && grep -q 'Remove the saved key ONLY if' $T/z19.txt && grep -q \"ssh-keygen -R 127.0.0.2 -f $T/varlib/primary_known_hosts\" $T/z19.txt && ! grep -q 'does not know the primary' $T/z19.txt"
+
+# 5.7: --check keeps the progress and last-run files of the real runs
+fresh
+rc=$(DG_TEST_QUIT_AT=2.2 run $T/z20a.txt); m1=$(md5sum < $T/varlib/progress); m2=$(md5sum < $T/varlib/last_run)
+rc=$(run $T/z20.txt --check)
+check "--check does not change the progress or last-run files" "[[ \"$m1\" == \"\$(md5sum < $T/varlib/progress)\" && \"$m2\" == \"\$(md5sum < $T/varlib/last_run)\" ]] && grep -q 'Check mode changes nothing in Oracle, the OS or the primary' $T/z20.txt"
+
+# 5.7: small fixes
+check "run id has the process id: two runs in one second never share a log" "ls $T/log/ | grep -qE '^run_[0-9]{8}_[0-9]{6}_[0-9]+\.log$'"
+fresh; printf 'X=$(touch %s/osrel_canary)\n' "$T" >> $T/os-release
+rc=$(DG_TEST_QUIT_AT=1.3 run $T/z21.txt)
+check "os-release is read, never run as code" "[[ ! -e $T/osrel_canary ]] && grep -q 'Oracle Linux Server 8.9' $T/z21.txt"
+fresh; jset $P "d['version']='26.1.0.0.0'"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z22.txt)
+check "Oracle major newer than 23 -> refused, not guessed" "grep -q 'tested for 12.1 to 23ai only' $T/z22.txt && [[ $rc -ne 0 ]]"
+DGT_OS=10 fresh
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/z23.txt)
+check "Oracle Linux 10 -> not tested, shown as not supported" "grep -q 'Oracle Linux 10 was not tested with this script' $T/z23.txt"
+ut_guard() { bash <<EOF
+source <(sed -n '/^readonly_guard()/,/^}/p' $T/dg_standby_setup.sh)
+readonly_guard 'select "SYS"."DBMS_LOCK".sleep(1) from dual;' && echo BAD1
+readonly_guard 'select sys . dbms_x.f from dual;' && echo BAD2
+readonly_guard 'select 1 from dual;' || echo BAD3
+echo END
+EOF
+}
+check "read-only guard: quoted or spaced package names are blocked" "[[ \$(ut_guard) == END ]]"
+ut_pparam() { bash <<EOF
+fatal() { echo FATAL; exit 3; }; prim_sql() { echo SENT; }; first_line() { :; }
+source <(sed -n '/^p_param()/,/^}/p' $T/dg_standby_setup.sh)
+p_param "x' or name='y"
+EOF
+}
+check "p_param refuses a name that is not a plain parameter name (nothing sent)" "[[ \$(ut_pparam) == FATAL ]]"
 
 echo
 echo "RESULT: $PASS passed, $FAILN failed"

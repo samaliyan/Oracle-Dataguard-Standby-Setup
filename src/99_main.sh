@@ -15,10 +15,12 @@ Usage
   dg_standby_setup.sh                      Start or continue the setup
   dg_standby_setup.sh --primary 10.0.0.5   IP address or host name of the primary
   dg_standby_setup.sh --user oracle        OS user for ssh on the primary (default oracle)
-  dg_standby_setup.sh --check              Check and report only; changes nothing
+  dg_standby_setup.sh --check              Check and report only; changes nothing in Oracle,
+                                           the OS or the primary, and keeps the saved progress
                                            (still asks for the ssh and sys passwords)
   dg_standby_setup.sh --from 6.1           Continue from a step (phase 1 always runs)
-  dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check)
+  dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
+                                           phase 1 runs first, so the primary must be reachable)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
   dg_standby_setup.sh --status             Show the result of every phase and step
                                            (connects to nothing)

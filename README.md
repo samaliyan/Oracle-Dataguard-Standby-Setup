@@ -24,8 +24,15 @@ Copy the script to the **standby** server and run it as `root`:
 
 ```bash
 chmod 750 dg_standby_setup.sh
-./dg_standby_setup.sh --check            # look only, change nothing
+./dg_standby_setup.sh --check            # look only; changes nothing in Oracle, the OS or the primary
 ./dg_standby_setup.sh                    # build the standby
+```
+
+On the first connection the script shows the ssh host key fingerprints of the primary. Compare them with
+the output of this command on the primary, as root, before you answer `y`:
+
+```bash
+for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
 ```
 
 Before each step the script shows what it found and what it will do, and asks:
@@ -60,9 +67,9 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 ```
 --primary <ip>        primary IP or host name
 --user <name>         ssh user on the primary (default oracle, never root)
---check               report only; changes nothing
+--check               report only; changes nothing in Oracle, the OS or the primary
 --from <step>         continue from a step
---only <phase>        run one phase (10 = daily sync check)
+--only <phase>        run one phase (10 = daily sync check; phase 1 runs first, so the primary must be reachable)
 --settings            review or edit the saved standby values
 --status              result of every phase and step so far (connects to nothing)
 --show-changes [step] every change made on this server, with its undo
@@ -77,6 +84,7 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
   the primary. A check that times out counts as "no".
 - **Every change can be undone.** Every change on the standby is recorded in a journal
   (`/var/lib/dg_standby_setup/changes.log`) and can be undone one step at a time.
+- **Known primary only.** ssh accepts only a host key the admin has checked; a changed key stops the connection.
 - **Passwords** never appear in logs, in the process list, or in files that are left behind.
 - **Long jobs** (installers, root scripts, the RMAN copy) run in their own session. If the terminal closes,
   they keep running, and the next run of the script waits for them.
@@ -101,7 +109,7 @@ docs/DESIGN.md        design notes
 
 ## Tests
 
-`test/run_scenarios.sh` runs over 300 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
+`test/run_scenarios.sh` runs over 350 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 

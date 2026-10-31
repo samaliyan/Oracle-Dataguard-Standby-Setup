@@ -12,7 +12,7 @@ c_1_1() {
     PLAN="${PKG:-yum} install -y util-linux coreutils shadow-utils openssh-clients gawk sed grep iproute diffutils procps-ng unzip"
     return 1
   fi
-  local os="unknown"; os=$(. "$OS_RELEASE_FILE" 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")
+  local os="unknown"; os=$(os_field PRETTY_NAME); os=${os:-unknown}
   NOW="Running as root on $(hostname -s). All needed tools are present."$'\n'"$os, bash ${BASH_VERSION%%(*}, packages with $PKG"
   if ! [[ "$OS_MAJOR" =~ ^[0-9]+$ && $OS_MAJOR -ge 7 ]]; then
     NOW+=$'\n'"This is not Oracle Linux or RHEL 7 or newer. Packages and kernel settings may need work by hand."
@@ -29,6 +29,8 @@ c_1_6() {
   # the database release, and the Grid release when there is Grid (Grid may be newer)
   local -a rels=("$(want_rel)")
   [[ -n "$GRID_REL" && "$GRID_REL" != "${rels[0]}" ]] && rels+=("$GRID_REL")    # the same release is checked once
+  # Oracle Linux 10 and newer: not tested with this script (no release here was certified on it when it was made)
+  [[ $OS_MAJOR -ge 10 ]] && why+="Oracle Linux $OS_MAJOR was not tested with this script. Use Oracle Linux 7, 8 or 9 for the standby."$'\n'
   for r in "${rels[@]}"; do
     w=""
     case "$r" in
@@ -53,7 +55,7 @@ c_1_6() {
 }
 
 c_1_2() {
-  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qFw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if is_local_ip "$(ipv4_of "$PRIMARY_IP")"; then
     fatal "$PRIMARY_IP is an address of this server, but you gave it as the primary.
 Run the script on the standby server."
   fi

@@ -122,7 +122,7 @@ preinstall_pkg() {
     18) printf 'oracle-database-preinstall-18c' ;;
     19) printf 'oracle-database-preinstall-19c' ;;
     21) printf 'oracle-database-preinstall-21c' ;;
-    *)  printf 'oracle-database-preinstall-%sai' "$DB_MAJOR" ;;
+    *)  printf 'oracle-database-preinstall-23ai' ;;       # 23ai (newer majors are refused in phase 1)
   esac
 }
 need_pkgs() {
@@ -596,7 +596,7 @@ label_device() {
   [[ -n "$d" ]] || d=$( [[ -f "$(asm_disks_file)" ]] && grep -m1 "^$l|/" "$(asm_disks_file)" | cut -d'|' -f2)
   printf '%s' "$d"
 }
-label_mb() { local d; d=$(label_device "$1"); [[ -n "$d" ]] || { printf '0'; return; }; printf '%s' "$(( $(lsblk -dbn -o SIZE "$d" 2>/dev/null | head -n 1 || echo 0) / 1048576 ))"; }
+label_mb() { local d b; d=$(label_device "$1"); [[ -n "$d" ]] || { printf '0'; return; }; b=$(lsblk -dbn -o SIZE "$d" 2>/dev/null | head -n 1); b=${b//[[:space:]]/}; num "$b" || b=0; printf '%s' "$(( b / 1048576 ))"; }
 dg_have_mb() { local l t=0; while IFS= read -r l; do [[ -n "$l" ]] && t=$((t + $(label_mb "$l"))); done < <(asm_labels "$1"); printf '%s' "$t"; }
 dg_min_mb() { printf '%s' "$(( $(dg_need_mb "$1") * 11 / 10 + 1024 ))"; }
 record_label() { install -d -m 700 "$STATE_DIR"; printf '%s|%s\n' "$1" "$2" >> "$(asm_disks_file)"; chmod 600 "$(asm_disks_file)"; }

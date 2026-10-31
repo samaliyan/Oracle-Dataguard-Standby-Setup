@@ -13,6 +13,11 @@ Never changes the primary: primary work is printed, then re-checked read-only.
 - Primary environment (.bash_profile) is never relied on.
 
 ## Discovery (read-only, over one ssh connection, fixed probe list)
+Before the connection: the host key of the primary must already be known (root's known_hosts, or
+/var/lib/dg_standby_setup/primary_known_hosts). A new key is read with ssh-keyscan, its fingerprints are shown
+with the command that prints them on the primary, and it is saved only after the admin answers y. The ssh
+master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key, and a changed key stops it.
+
 1. host name
 2. processes: `ps -eo pid,user,args` -> ora_pmon_<SID>, asm_pmon_+ASM*, tnslsnr <home>/bin/tnslsnr <NAME>
 3. DB home: /etc/oratab line for the SID; else `readlink /proc/<pmon pid>/exe`; else ask the user.
@@ -92,7 +97,8 @@ Never changes the primary: primary work is printed, then re-checked read-only.
   says not to start it again, --status shows "Running now". A job that ends while no run watches is recorded
   by the next run (installer success records, root.sh, unzip, the duplicate with its pfile rename), journaled
   under the step that started it. --check while a job runs judges phase 3 (installers) or 7 (duplicate) and
-  later as WAITS. Check mode never overwrites a proven result with WAITS.
+  later as WAITS. Check mode writes nothing to the progress or last-run files (only its log): they keep the
+  results of the real runs.
 - After a failed duplicate only [q] is offered: 7.2 shows the clean-up (instance from the leftover spfile,
   files of the failed copy); 8.1 refuses a dirty auxiliary.
 - Questions: 1.2, 1.3 and 1.5 ask nothing but the passwords; the saved PRIMARY_SID is reused; the ORACLE_HOME

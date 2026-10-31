@@ -243,9 +243,9 @@ rsp_set() {
     # the same plain-text test as the replacement (no regular expression: the dots in the keys stay dots)
     if DG_K=$k awk 'BEGIN{k=ENVIRON["DG_K"]} { t=$0; sub(/^[[:space:]]*/, "", t); if (index(t, k "=") == 1) f=1 } END { exit !f }' "$f"; then
       local rc=0
-      DG_K=$k DG_V=$v awk 'BEGIN{k=ENVIRON["DG_K"]; v=ENVIRON["DG_V"]}
+      ( umask 077; DG_K=$k DG_V=$v awk 'BEGIN{k=ENVIRON["DG_K"]; v=ENVIRON["DG_V"]}
         { t=$0; sub(/^[[:space:]]*/, "", t)
-          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" > "$f.new" && cat "$f.new" > "$f" || rc=1
+          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" > "$f.new" ) && cat "$f.new" > "$f" || rc=1
       rm -f -- "$f.new"          # it may hold a password: never left behind
       return $rc
     fi

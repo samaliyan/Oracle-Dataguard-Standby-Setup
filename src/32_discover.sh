@@ -276,6 +276,8 @@ This script supports only a single-instance primary."
   [[ "$dom" == "-" ]] && dom=""; [[ -z "$dom" ]] || v_name "$dom" || dom=""; PRIMARY_DOMAIN=$dom
   DB_MAJOR=${ver%%.*}; num "$DB_MAJOR" || { bad "The primary returned an unexpected version: $ver"; return 1; }
   [[ $DB_MAJOR -ge 12 ]] || fatal "The primary runs Oracle $ver. This script supports 12.1 and newer."
+  # a newer major is not guessed at: package names, installer and parameters were checked up to 23ai only
+  [[ $DB_MAJOR -le 23 ]] || fatal "The primary runs Oracle $ver. This script was made and tested for 12.1 to 23ai only."
   PRIMARY_VERSION=$ver
   if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select version_full from v\$instance;"; then PRIMARY_VERSION=$(first_line); fi
   v_name "$PRIMARY_VERSION" || PRIMARY_VERSION=$ver

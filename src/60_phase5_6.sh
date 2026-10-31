@@ -263,7 +263,7 @@ chmod 640 $t"
         return 1
       fi
       # the age is measured with the clock of the primary
-      num "$tm" && tage=$(( RUN_START + PRIM_CLOCK_OFFSET - tm ))
+      num "$tm" && tage=$(( $(date +%s) + PRIM_CLOCK_OFFSET - tm ))
     fi
     if [[ -n "$tage" && $tage -gt 86400 ]]; then
       # a copy older than a day (from an earlier attempt) may be from before a sys password change

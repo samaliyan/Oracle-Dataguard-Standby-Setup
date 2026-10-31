@@ -45,9 +45,16 @@ EOF
 TITLE  Connect to the primary over ssh
 WHERE  This server ($S), as root
 WHY    The script opens one ssh connection and sends only read-only commands over it.
-RUN    ssh ${PRIMARY_SSH_USER:-oracle}@${PRIMARY_IP:-<primary IP>} hostname
-EXPECT The primary host name, after you type the password
-IF     "Permission denied": wrong password, or PasswordAuthentication is "no"
+       A primary it does not know yet: it shows the host key fingerprints first.
+       Compare them with the primary before you answer y.
+RUN    On the primary, as root:
+       for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "\$f"; done
+       On this server:
+       ssh ${PRIMARY_SSH_USER:-oracle}@${PRIMARY_IP:-<primary IP>} hostname
+EXPECT The same fingerprints on both sides. Then the primary host name, after
+       you type the password.
+IF     The fingerprints differ: stop. Find out why before you connect.
+       "Permission denied": wrong password, or PasswordAuthentication is "no"
        in /etc/ssh/sshd_config on the primary.
        "Connection refused" or "timed out": check sshd and the firewall (port 22)
        on the primary.

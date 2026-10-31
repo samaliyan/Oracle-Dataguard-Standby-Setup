@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.6"
+readonly SCRIPT_VERSION="5.7"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -42,7 +42,7 @@ REVIEW_SETTINGS=0
 PROMPT_IN="${DG_PROMPT_IN:-/dev/tty}"
 LOG_DIR="${DG_LOG_DIR:-/var/log/dg_standby_setup}"
 STATE_DIR="${DG_STATE_DIR:-/var/lib/dg_standby_setup}"
-RUN_ID=$(date '+%Y%m%d_%H%M%S')
+RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"      # the pid too: two runs in the same second never share files
 RUN_START=$(date +%s)
 LOG_FILE=""
 ACTIONS_FILE=""
@@ -375,10 +375,27 @@ lsnr_home() { if use_grid; then printf '%s' "$GRID_HOME"; else printf '%s' "$DB_
 lsnr_user() { if use_grid; then printf '%s' "$GRID_USER"; else printf '%s' "$ORACLE_USER"; fi; }
 as_lsnr()   { if use_grid; then as_grid "$@"; else as_oracle "$@"; fi; }
 
+ipv4_of() {
+  # $1 host name or IPv4 address -> IPv4 address (empty when the name does not resolve)
+  if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s' "$1"; return 0; fi
+  [[ -n "$1" ]] || return 0
+  getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 {print $1}'
+}
+is_local_ip() {
+  # 0 = $1 (IPv4) is an address of this server
+  [[ -n "$1" ]] && command -v ip >/dev/null 2>&1 \
+    && ip -o addr show 2>/dev/null | awk -v a="$1" '{split($4, x, "/"); if (x[1] == a) f = 1} END {exit !f}'
+}
+os_field() {
+  # $1 key -> its value in the os-release file. The file is read, never run (sourced) as root.
+  local v; v=$(sed -n "s/^$1=//p" -- "$OS_RELEASE_FILE" 2>/dev/null | head -n 1)
+  v=${v#[\"\']}; v=${v%[\"\']}
+  printf '%s' "${v//[^A-Za-z0-9 ._()\/-]/}"
+}
 os_info() {
   # OS_ID (ol, rhel, ...), OS_MAJOR (7, 8, 9), PKG (yum or dnf)
-  OS_ID=$( . "$OS_RELEASE_FILE" 2>/dev/null; printf '%s' "${ID:-unknown}")
-  OS_MAJOR=$( . "$OS_RELEASE_FILE" 2>/dev/null; v=${VERSION_ID:-0}; printf '%s' "${v%%.*}")
+  OS_ID=$(os_field ID); OS_ID=${OS_ID:-unknown}
+  OS_MAJOR=$(os_field VERSION_ID); OS_MAJOR=${OS_MAJOR%%.*}; num "$OS_MAJOR" || OS_MAJOR=0
   if command -v dnf >/dev/null 2>&1 && [[ "$OS_MAJOR" != "7" ]]; then PKG=dnf; else PKG=yum; fi
 }
 
@@ -528,18 +545,22 @@ run_long() {
     grid)   pre=(runuser -u "$GRID_USER" -- env -i "${GRID_ENV[@]}") ;;
     *)      pre=(env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C LC_ALL=C) ;;
   esac
-  rm -f -- "$out" "$out.rc" "$out.pid"
+  rm -f -- "$out" "$out.rc" "$out.pid" "$out.rc.t" "$out.pid.t"
   ( umask 077; : > "$out" ) || { bad "Cannot write $out."; return 1; }
   # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
-  setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid"; f=$1; k=$2; sp=$3; shift 3
-    "$@" > "$f" 2>&1; echo $? > "$f.rc"
+  # .pid and .rc are written to a temp name and moved: a reader never sees a half-written file
+  setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid.t" && mv -f -- "$1.pid.t" "$1.pid"; f=$1; k=$2; sp=$3; shift 3
+    "$@" > "$f" 2>&1; r=$?; echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
     kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 9>&- &
   local bg=$! n=0 jpid=""
-  while [[ ! -s "$out.pid" && $n -lt 100 ]]; do sleep 0.1; n=$((n + 1)); done
+  while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
-  num "$jpid" || jpid=$bg
-  printf '%s|%s|%s|%s|%s|%s\n' "$jpid" "$title" "$out" "$JOB_KEEP" "$(boot_id)" "${CUR_STEP:-}" > "$JOB_FILE" \
+  # Fallback only: a background job of a script is not a process group leader, so setsid does not fork
+  # and $! is already the session id that pgrep -s watches.
+  num "$jpid" || { jpid=$bg; _log JOB "no pid file after 30 s, using $bg"; }
+  { printf '%s|%s|%s|%s|%s|%s\n' "$jpid" "$title" "$out" "$JOB_KEEP" "$(boot_id)" "${CUR_STEP:-}" > "$JOB_FILE.n" \
+      && mv -f -- "$JOB_FILE.n" "$JOB_FILE"; } 2>/dev/null \
     || warn "Cannot write $JOB_FILE.
 If this run stops, the next run will not know that $title is still running."
   JOB_PID=$jpid; JOB_TITLE=$title; JOB_OUT=$out; JOB_STEP=${CUR_STEP:-}
@@ -555,9 +576,9 @@ If this run stops, the next run will not know that $title is still running."
   RL_INT=0; trap 'RL_INT=1' INT
   # the output is shown by a background pipeline; waiting for it can be interrupted by HUP/TERM at once
   if [[ -n "$filt" ]]; then
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | mask_pw | sed -u 's/^/        /'; } 9>&- &
   else
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
   fi
   TAIL_PID=$!
   local t0=$SECONDS hb=0
@@ -622,6 +643,13 @@ backup_file() {
   else cp -p --remove-destination -- "$f" "$b" || return 1; fi
   say "Backup: $b"
 }
+dir_root_only() {
+  # 0 = only root can add, remove or rename entries in the folder of $1. Root writes a file only there:
+  # in a folder another user can write to, the file could be swapped for a link between check and write.
+  local d o m; d=$(dirname -- "$1")
+  read -r o m < <(stat -c '%u %a' -- "$d" 2>/dev/null) || return 1
+  [[ "$o" == "0" ]] && (( (8#$m & 8#022) == 0 ))
+}
 append_as() {
   # $1 user (empty or root = root), $2 file; stdin = text to add at the end (a missing final newline is added first)
   local u=${1:-root} f=$2 txt before=0 after=0 lead=0
@@ -630,7 +658,10 @@ append_as() {
   if [[ -s "$f" && -n "$(tail -c 1 -- "$f")" ]]; then txt=$'\n'"$txt"; lead=1; fi
   [[ -f "$f" ]] && before=$(stat -c '%s' -- "$f")
   if [[ "$u" != "root" ]]; then printf '%s\n' "$txt" | runuser -u "$u" -- tee -a -- "$f" > /dev/null || return 1
-  else printf '%s\n' "$txt" >> "$f" || return 1; fi
+  else
+    dir_root_only "$f" || { bad "Not changed: $(dirname -- "$f") must be a folder that only root can write to."; return 1; }
+    printf '%s\n' "$txt" >> "$f" || return 1
+  fi
   after=$(stat -c '%s' -- "$f" 2>/dev/null)
   declare -F journal_file_appended >/dev/null && journal_file_appended "$f" "$before" "$txt"$'\n' "$((after - before))" "$lead"
   return 0
@@ -786,8 +817,8 @@ record() {
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}
   _log RESULT "[$1] $2  ${STEP_TITLE[$1]}"
   [[ -n "$PROGRESS_FILE" ]] || return 0
-  # check mode cannot judge a waiting step: a step proven earlier keeps its result in the progress file
-  if [[ "$MODE" == "check" && "$2" == "WAITS" ]] && grep -qE "^$1\|(OK|DONE|DONE_BY_YOU)\|" "$PROGRESS_FILE" 2>/dev/null; then return 0; fi
+  # check mode writes nothing but its log: the progress file keeps the results of the real runs
+  [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
   { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
     && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"
@@ -901,6 +932,7 @@ write_last_run() {
   # $1 how the run ended
   [[ -n "$LASTRUN_FILE" ]] || return 0
   [[ -n "${UNDO_STEP:-}" ]] && return 0     # an undo is not a run of the steps (the journal holds what it did)
+  [[ "$MODE" == "check" ]] && return 0       # check mode writes nothing but its log
   local nc=""; [[ "$MODE" == "run" ]] && nc=$(next_cmd)
   if [[ -n "$DETACHED_JOB" ]]; then
     printf '%s  mode %s  left running at step %s: %s\n' "$(ts)" "$MODE" "${CUR_STEP:-?}" "$DETACHED_JOB" > "$LASTRUN_FILE" 2>/dev/null
@@ -1027,7 +1059,7 @@ job_wait_loop() {
     fi
     case "$ANSWER" in
       w) WATCH_STOP=0; trap 'WATCH_STOP=1' INT
-         { tail -n 20 -f --pid=$$ -- "$JOB_OUT" 2>/dev/null | sed -u 's/^/        /'; } 9>&- &
+         { tail -n 20 -f --pid=$$ -- "$JOB_OUT" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
          tp=$!; TAIL_PID=$tp
          while [[ $WATCH_STOP -eq 0 ]] && job_running "$JOB_PID" && [[ ! -f "$JOB_OUT.rc" ]]; do sleep 2; done
          sleep 1; pkill -P "$tp" 2>/dev/null; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; TAIL_PID=""
@@ -1242,7 +1274,7 @@ summary() {
   printf '\n'
   if [[ "$MODE" == "check" ]]; then
     printf '  %s ok, %s to do, %s waiting, %s problems, %s warnings\n' "$n_ok" "$n_todo" "$n_wait" "$((n_prob + n_bad))" "$WARN_COUNT"
-    printf '  %sCheck mode changes nothing, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
+    printf '  %sCheck mode changes nothing in Oracle, the OS or the primary, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
     printf '  Only "problem" steps need your attention: see the Fix lines above.%s\n' "$C_N"
   else
     printf '  %s already ok, %s done in this run, %s skipped, %s not ok, %s warnings%s\n' \
@@ -1615,7 +1647,7 @@ _undo_obj_ok() {
       [[ "$kind" != DIR && -L "$obj" ]] && { bad "Not undone: $obj is now a symbolic link."; return 1; }
       case "$obj" in /|/etc|/usr|/usr/*bin|/bin|/sbin|/lib*|/var|/opt|/home|/root|/boot|/dev|/proc|/sys|/tmp|/u0[0-9]) bad "Not undone: $obj is a system folder."; return 1 ;; esac
       [[ "$kind" != DIR && -d "$obj" && ! -L "$obj" ]] && { bad "Not undone: $obj is a folder, but the journal line is for a file."; return 1; }
-      if [[ "$kind" == EDIT ]]; then x=$(detail_field "$det" bak); [[ "$x" == "-" || ( "$x" == "$obj".bak_* && "${x#"$obj".bak_}" =~ ^[0-9]{8}_?[0-9]{6}$ ) ]] || { bad "Not undone: the backup $x does not belong to $obj."; return 1; }; fi
+      if [[ "$kind" == EDIT ]]; then x=$(detail_field "$det" bak); [[ "$x" == "-" || ( "$x" == "$obj".bak_* && "${x#"$obj".bak_}" =~ ^[0-9]{8}_?[0-9]{6}(_[0-9]+)?$ ) ]] || { bad "Not undone: the backup $x does not belong to $obj."; return 1; }; fi
       if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
     FWPORT) [[ "$obj" =~ ^[A-Za-z0-9_-]+:[0-9]+/tcp$ ]] || { bad "Not undone: invalid firewall entry $obj"; return 1; } ;;
     UNIT)   [[ "$obj" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || { bad "Not undone: invalid unit name $obj"; return 1; } ;;
@@ -1696,6 +1728,7 @@ undo_one() {
 Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2; }
       fi
       u=$(stat -c '%U' -- "$obj")
+      [[ "$u" != "root" ]] || dir_root_only "$obj" || { bad "Not changed: $(dirname -- "$obj") must be a folder that only root can write to."; return 2; }
       backup_file "$obj" "$u" || return 1
       # exactly the added bytes go; text before and after them stays (the newline added in front of the block stays
       # when more text follows it, so two lines are not glued together). The file is rewritten as its owner.
@@ -1946,7 +1979,7 @@ load_settings() {
   # Keys of the 3.x settings file are converted (GRID_ZIP, DB_ZIP) or dropped; unknown keys are dropped.
   local soft=${1:-} line key val spec t
   LOAD_ERR=""; DROPPED_KEYS=""
-  [[ -f "$SETTINGS_FILE" ]] || return 1
+  [[ -f "$SETTINGS_FILE" ]] || { LOAD_ERR="$SETTINGS_FILE is missing"; return 1; }
   if ! settings_file_safe "$SETTINGS_FILE"; then
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
     [[ "$soft" == "soft" ]] && return 1; fatal "$LOAD_ERR"
@@ -2068,10 +2101,13 @@ validate_settings() {
     bad "USE_GRID must be yes, because the primary keeps files in ASM."; bad_n=1
   fi
   [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
+  # names are resolved first: a host name on one side and its address on the other is the same server
+  local sip pip; sip=$(ipv4_of "$STANDBY_IP"); pip=$(ipv4_of "$PRIMARY_IP")
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
-  [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
+  [[ "$STANDBY_IP" != "$PRIMARY_IP" && ( -z "$sip" || "$sip" != "$pip" ) ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qFw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  # an address is checked here; a name is checked by step 2.6 (/etc/hosts), which also fixes a loopback name
+  if [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && command -v ip >/dev/null 2>&1 && ! is_local_ip "$STANDBY_IP"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
   [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "STANDBY_UNIQUE must differ from the db_unique_name of the primary."; bad_n=1; }
@@ -2357,6 +2393,8 @@ readonly_guard() {
   body=${l%;}
   [[ "$body" == *";"* ]] && return 1
   [[ "$l" == *"&"* || "$l" == *"--"* || "$l" == *"/*"* || "$l" == *"@"* ]] && return 1
+  # quoted names ("SYS"."DBMS_X") and spaces around a dot (sys . x) are folded before the word test
+  l=$(sed -E 's/"//g; s/[[:space:]]*\.[[:space:]]*/./g' <<< "$l")
   if grep -Eq '(^|[^a-z0-9_$#])(insert|update|delete|merge|upsert|alter|drop|create|grant|revoke|truncate|rename|comment|begin|declare|exec|execute|call|commit|rollback|savepoint|lock|shutdown|startup|host|spool|connect|into|nextval|for[[:space:]]+update|dbms_[a-z0-9_]*|utl_[a-z0-9_]*|sys\.[a-z0-9_]*)([^a-z0-9_$#]|$)' <<< "$l"; then
     return 1
   fi
@@ -2369,7 +2407,7 @@ _prim_sqlplus() {
   v_name "$PRIMARY_SID" && v_path "$DB_HOME" && { [[ -z "$PRIMARY_TNS_ADMIN" ]] || v_path "$PRIMARY_TNS_ADMIN"; } && num "$SQL_TIMEOUT" \
     || fatal "Safety stop: invalid SID, home or TNS_ADMIN of the primary"
   # TWO_TASK / LOCAL in the profile of the primary user would send "connect / as sysdba" over the network
-  out=$(printf 'set define off\n%s\n%s\nprompt %s\n%s\nexit\n' "$1" "$SQL_HEADER" "$SQL_MARK" "$2" \
+  out=$(printf 'set define off echo off\n%s\n%s\nprompt %s\n%s\nexit\n' "$1" "$SQL_HEADER" "$SQL_MARK" "$2" \
         | PROBE_TIMEOUT=$((SQL_TIMEOUT + 30)) prim_ssh "env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME=$DB_HOME ORACLE_SID=$PRIMARY_SID TNS_ADMIN=${PRIMARY_TNS_ADMIN:-$DB_HOME/network/admin} timeout $SQL_TIMEOUT $DB_HOME/bin/sqlplus -S /nolog" 2>&1) || rc=$?
   [[ $rc -eq 124 ]] && out+=$'\n'"SP2-0000: sqlplus on primary did not answer within $SQL_TIMEOUT seconds (stopped)"
   [[ $rc -eq 255 ]] && out+=$'\n'"SP2-0000: ssh connection to primary lost (ssh exit 255)"
@@ -2424,9 +2462,11 @@ EOF
       ;;
     *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
       print_commands "Run on this server ($(hostname -s))" "root  ->  shell" <<EOF
-# The saved host key of $ip is old, for example after a reinstall. Remove it and try again:
+# The host key of $ip is not the saved one. Remove the saved key ONLY if the primary was
+# reinstalled or its ssh keys were renewed; otherwise another machine may answer for $ip.
 ssh-keygen -R $ip
-ssh $u@$ip hostname
+ssh-keygen -R $ip -f $KH_FILE
+# Then run the script again: it shows the new key to check.
 EOF
       ;;
     *"Could not resolve hostname"*)
@@ -2440,6 +2480,69 @@ EOF
   esac
 }
 
+KH_FILE="$STATE_DIR/primary_known_hosts"
+ROOT_KH="$(getent passwd root 2>/dev/null | cut -d: -f6)/.ssh/known_hosts"   # root's own file, also after su without -
+host_key_ok() {
+  # The host key of the primary must be known before the password is typed. A usable key already in root's
+  # known_hosts (or saved here by an earlier run) is used as it is. A new key is read with ssh-keyscan,
+  # its fingerprints are shown, and the admin compares them with the ones on the primary itself.
+  # Only after "y" is the key saved (in $KH_FILE; root's own known_hosts is not changed).
+  command -v ssh-keyscan >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 \
+    || { bad "ssh-keyscan and ssh-keygen are needed to check the host key of the primary (package openssh-clients)."; return 1; }
+  # host and port as ssh itself will use them (an entry in root's ~/.ssh/config may change both)
+  local host=$PRIMARY_IP port=22 cfg
+  cfg=$(ssh -G "$PRIMARY_SSH_USER@$PRIMARY_IP" 2>/dev/null)
+  [[ -n "$cfg" ]] && { host=$(awk '$1 == "hostname" {print $2; exit}' <<< "$cfg"); port=$(awk '$1 == "port" {print $2; exit}' <<< "$cfg"); }
+  [[ -n "$host" ]] || host=$PRIMARY_IP; num "$port" || port=22
+  local look=$host; [[ "$port" != "22" ]] && look="[$host]:$port"
+  local f
+  for f in "$ROOT_KH" "$KH_FILE"; do
+    # only a key type ssh still uses counts (an old ssh-dss line alone is not a known key)
+    [[ -s "$f" ]] && ssh-keygen -F "$look" -f "$f" 2>/dev/null | grep -qE '[[:space:]](ssh-ed25519|ecdsa-sha2-[a-z0-9]+|ssh-rsa)[[:space:]]' && return 0
+  done
+  local tmp; tmp=$(mktemp "$STATE_DIR/hostkey.XXXXXX") || return 1
+  CLEANUP_FILES+=("$tmp")
+  timeout 30 ssh-keyscan -T 10 -p "$port" -t ed25519,ecdsa,rsa "$host" 2>/dev/null | grep -v '^#' > "$tmp"
+  if [[ ! -s "$tmp" ]]; then
+    rm -f -- "$tmp"
+    # why: one ssh attempt that cannot log in (BatchMode, no password) and saves no key (known_hosts = /dev/null)
+    local elog="$STATE_DIR/ssh_error.log"
+    : > "$elog"; chmod 600 "$elog"
+    timeout 30 ssh -E "$elog" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null \
+      -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=15 "$PRIMARY_SSH_USER@$PRIMARY_IP" true < /dev/null > /dev/null 2>&1 9>&-
+    if grep -qiE 'refused|timed out|no route|unreachable|could not resolve' "$elog"; then
+      bad "The ssh connection to $PRIMARY_SSH_USER@$PRIMARY_IP failed."
+      { printf 'ssh said:\n'; sed 's/^/  /' "$elog"; } | hint
+      ssh_diagnose "$elog"
+    else
+      bad "Cannot read the ssh host key of $PRIMARY_IP (port $port)."
+      print_commands "Test on this server ($(hostname -s))" "root  ->  shell" <<EOF
+ssh-keyscan -p $port $host
+EOF
+    fi
+    log_block "ssh error output" < "$elog"
+    return 1
+  fi
+  local fps; fps=$(ssh-keygen -lf "$tmp" 2>/dev/null | awk '{print $2"  "$NF}'
+                   ssh-keygen -E md5 -lf "$tmp" 2>/dev/null | awk '{print $2"  "$NF}')
+  if [[ -z "$fps" ]]; then rm -f -- "$tmp"; bad "The ssh host key of $PRIMARY_IP cannot be read."; return 1; fi
+  say "This server does not know the primary yet. The primary sent these ssh host keys:"
+  printf '%s\n' "$fps" | sed 's/^/        /'
+  print_commands "Check on the PRIMARY ($PRIMARY_IP): the same values must appear" "root  ->  shell" <<'EOF'
+for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
+# An old primary (OpenSSH before 6.8) prints MD5 values: compare them with the MD5 lines above.
+EOF
+  if ! confirm "The fingerprints match the primary. Save the key and connect?"; then
+    rm -f -- "$tmp"
+    bad "Host key not accepted. Nothing was sent to $PRIMARY_IP. If the values differ, another machine may answer for this address."
+    return 1
+  fi
+  ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"
+  rm -f -- "$tmp"
+  _log SSH "host key of $look accepted by the admin: $(printf '%s' "$fps" | tr '\n' ' ')"
+  return 0
+}
+
 open_ssh() {
   install -d -m 700 "$STATE_DIR"
   SSH_CTL="$STATE_DIR/ssh_ctl"
@@ -2448,11 +2551,14 @@ open_ssh() {
   rm -f -- "$SSH_CTL"
   local elog="$STATE_DIR/ssh_error.log"
   : > "$elog"; chmod 600 "$elog"
+  host_key_ok || return 1
   say "Type the password of $PRIMARY_SSH_USER on $PRIMARY_IP when ssh asks. Only ssh sees it."
-  say "If ssh asks to accept the host key of the primary, answer yes."
   # Only options that every OpenSSH since 6.7 knows (Oracle Linux 7 has 7.4, OL8 has 8.0).
   # -E: ssh writes its own error messages to a file, so they can be shown and logged.
+  # StrictHostKeyChecking=yes: only a host key checked by the admin (saved by host_key_ok, or already
+  # in root's known_hosts) is accepted. ssh never asks to accept a new key.
   if ssh -E "$elog" -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=12h \
+         -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
          -o ServerAliveInterval=60 -o ConnectTimeout=15 -o NumberOfPasswordPrompts=3 \
          -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < "$PROMPT_IN" 9>&-; then
     SSH_OPEN=1
@@ -2747,6 +2853,8 @@ This script supports only a single-instance primary."
   [[ "$dom" == "-" ]] && dom=""; [[ -z "$dom" ]] || v_name "$dom" || dom=""; PRIMARY_DOMAIN=$dom
   DB_MAJOR=${ver%%.*}; num "$DB_MAJOR" || { bad "The primary returned an unexpected version: $ver"; return 1; }
   [[ $DB_MAJOR -ge 12 ]] || fatal "The primary runs Oracle $ver. This script supports 12.1 and newer."
+  # a newer major is not guessed at: package names, installer and parameters were checked up to 23ai only
+  [[ $DB_MAJOR -le 23 ]] || fatal "The primary runs Oracle $ver. This script was made and tested for 12.1 to 23ai only."
   PRIMARY_VERSION=$ver
   if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select version_full from v\$instance;"; then PRIMARY_VERSION=$(first_line); fi
   v_name "$PRIMARY_VERSION" || PRIMARY_VERSION=$ver
@@ -2883,7 +2991,7 @@ _sql_exec() {
   # output through a file: background processes of a started instance must not keep a pipe open
   tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) || { SQL_OUT="SP2-0000: cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
-  printf 'set define off\n%s\n%s\nprompt %s\n%s\nexit\n' "$connect" "$SQL_HEADER" "$SQL_MARK" "$sql" \
+  printf 'set define off echo off\n%s\n%s\nprompt %s\n%s\nexit\n' "$connect" "$SQL_HEADER" "$SQL_MARK" "$sql" \
     | "$runner" timeout "$tmo" "$home/bin/sqlplus" -S /nolog > "$tmp" 2>&1 || rc=$?
   out=$(cat "$tmp"); rm -f -- "$tmp"
   [[ $rc -eq 124 ]] && out+=$'\n'"SP2-0000: sqlplus did not answer within $tmo seconds (stopped)"
@@ -2949,7 +3057,7 @@ c_1_1() {
     PLAN="${PKG:-yum} install -y util-linux coreutils shadow-utils openssh-clients gawk sed grep iproute diffutils procps-ng unzip"
     return 1
   fi
-  local os="unknown"; os=$(. "$OS_RELEASE_FILE" 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")
+  local os="unknown"; os=$(os_field PRETTY_NAME); os=${os:-unknown}
   NOW="Running as root on $(hostname -s). All needed tools are present."$'\n'"$os, bash ${BASH_VERSION%%(*}, packages with $PKG"
   if ! [[ "$OS_MAJOR" =~ ^[0-9]+$ && $OS_MAJOR -ge 7 ]]; then
     NOW+=$'\n'"This is not Oracle Linux or RHEL 7 or newer. Packages and kernel settings may need work by hand."
@@ -2966,6 +3074,8 @@ c_1_6() {
   # the database release, and the Grid release when there is Grid (Grid may be newer)
   local -a rels=("$(want_rel)")
   [[ -n "$GRID_REL" && "$GRID_REL" != "${rels[0]}" ]] && rels+=("$GRID_REL")    # the same release is checked once
+  # Oracle Linux 10 and newer: not tested with this script (no release here was certified on it when it was made)
+  [[ $OS_MAJOR -ge 10 ]] && why+="Oracle Linux $OS_MAJOR was not tested with this script. Use Oracle Linux 7, 8 or 9 for the standby."$'\n'
   for r in "${rels[@]}"; do
     w=""
     case "$r" in
@@ -2990,7 +3100,7 @@ c_1_6() {
 }
 
 c_1_2() {
-  if [[ -n "$PRIMARY_IP" ]] && command -v ip >/dev/null 2>&1 && grep -qFw -- "$PRIMARY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  if is_local_ip "$(ipv4_of "$PRIMARY_IP")"; then
     fatal "$PRIMARY_IP is an address of this server, but you gave it as the primary.
 Run the script on the standby server."
   fi
@@ -3344,7 +3454,7 @@ preinstall_pkg() {
     18) printf 'oracle-database-preinstall-18c' ;;
     19) printf 'oracle-database-preinstall-19c' ;;
     21) printf 'oracle-database-preinstall-21c' ;;
-    *)  printf 'oracle-database-preinstall-%sai' "$DB_MAJOR" ;;
+    *)  printf 'oracle-database-preinstall-23ai' ;;       # 23ai (newer majors are refused in phase 1)
   esac
 }
 need_pkgs() {
@@ -3818,7 +3928,7 @@ label_device() {
   [[ -n "$d" ]] || d=$( [[ -f "$(asm_disks_file)" ]] && grep -m1 "^$l|/" "$(asm_disks_file)" | cut -d'|' -f2)
   printf '%s' "$d"
 }
-label_mb() { local d; d=$(label_device "$1"); [[ -n "$d" ]] || { printf '0'; return; }; printf '%s' "$(( $(lsblk -dbn -o SIZE "$d" 2>/dev/null | head -n 1 || echo 0) / 1048576 ))"; }
+label_mb() { local d b; d=$(label_device "$1"); [[ -n "$d" ]] || { printf '0'; return; }; b=$(lsblk -dbn -o SIZE "$d" 2>/dev/null | head -n 1); b=${b//[[:space:]]/}; num "$b" || b=0; printf '%s' "$(( b / 1048576 ))"; }
 dg_have_mb() { local l t=0; while IFS= read -r l; do [[ -n "$l" ]] && t=$((t + $(label_mb "$l"))); done < <(asm_labels "$1"); printf '%s' "$t"; }
 dg_min_mb() { printf '%s' "$(( $(dg_need_mb "$1") * 11 / 10 + 1024 ))"; }
 record_label() { install -d -m 700 "$STATE_DIR"; printf '%s|%s\n' "$1" "$2" >> "$(asm_disks_file)"; chmod 600 "$(asm_disks_file)"; }
@@ -4678,9 +4788,9 @@ rsp_set() {
     # the same plain-text test as the replacement (no regular expression: the dots in the keys stay dots)
     if DG_K=$k awk 'BEGIN{k=ENVIRON["DG_K"]} { t=$0; sub(/^[[:space:]]*/, "", t); if (index(t, k "=") == 1) f=1 } END { exit !f }' "$f"; then
       local rc=0
-      DG_K=$k DG_V=$v awk 'BEGIN{k=ENVIRON["DG_K"]; v=ENVIRON["DG_V"]}
+      ( umask 077; DG_K=$k DG_V=$v awk 'BEGIN{k=ENVIRON["DG_K"]; v=ENVIRON["DG_V"]}
         { t=$0; sub(/^[[:space:]]*/, "", t)
-          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" > "$f.new" && cat "$f.new" > "$f" || rc=1
+          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" > "$f.new" ) && cat "$f.new" > "$f" || rc=1
       rm -f -- "$f.new"          # it may hold a password: never left behind
       return $rc
     fi
@@ -5752,6 +5862,7 @@ need_ssh() {
 
 p_param() {
   # $1 name -> PVAL (upper case, quotes removed, spaces collapsed). Read-only.
+  [[ "$1" =~ ^[a-z0-9_]+$ ]] || fatal "Safety stop: invalid parameter name: $1"
   prim_sql "select nvl(value,'-') from v\$parameter where name='$1';" || return 1
   PVAL=$(first_line | tr '[:lower:]' '[:upper:]' | tr -d "\"'" | tr -s '[:space:]' ' ' | sed -E 's/ *= */=/g; s/\( */(/g; s/ *\)/)/g; s/ *, */,/g')
 }
@@ -6482,7 +6593,7 @@ chmod 640 $t"
         return 1
       fi
       # the age is measured with the clock of the primary
-      num "$tm" && tage=$(( RUN_START + PRIM_CLOCK_OFFSET - tm ))
+      num "$tm" && tage=$(( $(date +%s) + PRIM_CLOCK_OFFSET - tm ))
     fi
     if [[ -n "$tage" && $tage -gt 86400 ]]; then
       # a copy older than a day (from an earlier attempt) may be from before a sys password change
@@ -8123,9 +8234,16 @@ EOF
 TITLE  Connect to the primary over ssh
 WHERE  This server ($S), as root
 WHY    The script opens one ssh connection and sends only read-only commands over it.
-RUN    ssh ${PRIMARY_SSH_USER:-oracle}@${PRIMARY_IP:-<primary IP>} hostname
-EXPECT The primary host name, after you type the password
-IF     "Permission denied": wrong password, or PasswordAuthentication is "no"
+       A primary it does not know yet: it shows the host key fingerprints first.
+       Compare them with the primary before you answer y.
+RUN    On the primary, as root:
+       for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "\$f"; done
+       On this server:
+       ssh ${PRIMARY_SSH_USER:-oracle}@${PRIMARY_IP:-<primary IP>} hostname
+EXPECT The same fingerprints on both sides. Then the primary host name, after
+       you type the password.
+IF     The fingerprints differ: stop. Find out why before you connect.
+       "Permission denied": wrong password, or PasswordAuthentication is "no"
        in /etc/ssh/sshd_config on the primary.
        "Connection refused" or "timed out": check sshd and the firewall (port 22)
        on the primary.
@@ -9093,10 +9211,12 @@ Usage
   dg_standby_setup.sh                      Start or continue the setup
   dg_standby_setup.sh --primary 10.0.0.5   IP address or host name of the primary
   dg_standby_setup.sh --user oracle        OS user for ssh on the primary (default oracle)
-  dg_standby_setup.sh --check              Check and report only; changes nothing
+  dg_standby_setup.sh --check              Check and report only; changes nothing in Oracle,
+                                           the OS or the primary, and keeps the saved progress
                                            (still asks for the ssh and sys passwords)
   dg_standby_setup.sh --from 6.1           Continue from a step (phase 1 always runs)
-  dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check)
+  dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
+                                           phase 1 runs first, so the primary must be reachable)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
   dg_standby_setup.sh --status             Show the result of every phase and step
                                            (connects to nothing)

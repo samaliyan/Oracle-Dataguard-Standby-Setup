@@ -17,6 +17,7 @@ need_ssh() {
 
 p_param() {
   # $1 name -> PVAL (upper case, quotes removed, spaces collapsed). Read-only.
+  [[ "$1" =~ ^[a-z0-9_]+$ ]] || fatal "Safety stop: invalid parameter name: $1"
   prim_sql "select nvl(value,'-') from v\$parameter where name='$1';" || return 1
   PVAL=$(first_line | tr '[:lower:]' '[:upper:]' | tr -d "\"'" | tr -s '[:space:]' ' ' | sed -E 's/ *= */=/g; s/\( */(/g; s/ *\)/)/g; s/ *, */,/g')
 }

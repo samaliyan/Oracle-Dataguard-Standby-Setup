@@ -177,6 +177,7 @@ def main():
             if step in lst("DG_TEST_RETRY") and retries[step] <= 2: send("r"); continue
             send("s" if "[s]" in bt else "q"); continue
         if bt.endswith("[h] Help   [q] Quit") and "[r]" not in bt and "[y]" not in bt and "[s]" not in bt: send("q"); continue
+        if bt.startswith("The fingerprints match the primary"): send(E("DG_TEST_HOSTKEY", "y")); continue
         if bt.endswith("[y] Yes   [N] No"): send(E("DG_TEST_YN", "y")); continue
         if time.time() > deadline:
             print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break

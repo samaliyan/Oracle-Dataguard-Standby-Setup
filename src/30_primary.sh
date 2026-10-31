@@ -140,6 +140,8 @@ readonly_guard() {
   body=${l%;}
   [[ "$body" == *";"* ]] && return 1
   [[ "$l" == *"&"* || "$l" == *"--"* || "$l" == *"/*"* || "$l" == *"@"* ]] && return 1
+  # quoted names ("SYS"."DBMS_X") and spaces around a dot (sys . x) are folded before the word test
+  l=$(sed -E 's/"//g; s/[[:space:]]*\.[[:space:]]*/./g' <<< "$l")
   if grep -Eq '(^|[^a-z0-9_$#])(insert|update|delete|merge|upsert|alter|drop|create|grant|revoke|truncate|rename|comment|begin|declare|exec|execute|call|commit|rollback|savepoint|lock|shutdown|startup|host|spool|connect|into|nextval|for[[:space:]]+update|dbms_[a-z0-9_]*|utl_[a-z0-9_]*|sys\.[a-z0-9_]*)([^a-z0-9_$#]|$)' <<< "$l"; then
     return 1
   fi
@@ -152,7 +154,7 @@ _prim_sqlplus() {
   v_name "$PRIMARY_SID" && v_path "$DB_HOME" && { [[ -z "$PRIMARY_TNS_ADMIN" ]] || v_path "$PRIMARY_TNS_ADMIN"; } && num "$SQL_TIMEOUT" \
     || fatal "Safety stop: invalid SID, home or TNS_ADMIN of the primary"
   # TWO_TASK / LOCAL in the profile of the primary user would send "connect / as sysdba" over the network
-  out=$(printf 'set define off\n%s\n%s\nprompt %s\n%s\nexit\n' "$1" "$SQL_HEADER" "$SQL_MARK" "$2" \
+  out=$(printf 'set define off echo off\n%s\n%s\nprompt %s\n%s\nexit\n' "$1" "$SQL_HEADER" "$SQL_MARK" "$2" \
         | PROBE_TIMEOUT=$((SQL_TIMEOUT + 30)) prim_ssh "env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME=$DB_HOME ORACLE_SID=$PRIMARY_SID TNS_ADMIN=${PRIMARY_TNS_ADMIN:-$DB_HOME/network/admin} timeout $SQL_TIMEOUT $DB_HOME/bin/sqlplus -S /nolog" 2>&1) || rc=$?
   [[ $rc -eq 124 ]] && out+=$'\n'"SP2-0000: sqlplus on primary did not answer within $SQL_TIMEOUT seconds (stopped)"
   [[ $rc -eq 255 ]] && out+=$'\n'"SP2-0000: ssh connection to primary lost (ssh exit 255)"
@@ -207,9 +209,11 @@ EOF
       ;;
     *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
       print_commands "Run on this server ($(hostname -s))" "root  ->  shell" <<EOF
-# The saved host key of $ip is old, for example after a reinstall. Remove it and try again:
+# The host key of $ip is not the saved one. Remove the saved key ONLY if the primary was
+# reinstalled or its ssh keys were renewed; otherwise another machine may answer for $ip.
 ssh-keygen -R $ip
-ssh $u@$ip hostname
+ssh-keygen -R $ip -f $KH_FILE
+# Then run the script again: it shows the new key to check.
 EOF
       ;;
     *"Could not resolve hostname"*)
@@ -223,6 +227,69 @@ EOF
   esac
 }
 
+KH_FILE="$STATE_DIR/primary_known_hosts"
+ROOT_KH="$(getent passwd root 2>/dev/null | cut -d: -f6)/.ssh/known_hosts"   # root's own file, also after su without -
+host_key_ok() {
+  # The host key of the primary must be known before the password is typed. A usable key already in root's
+  # known_hosts (or saved here by an earlier run) is used as it is. A new key is read with ssh-keyscan,
+  # its fingerprints are shown, and the admin compares them with the ones on the primary itself.
+  # Only after "y" is the key saved (in $KH_FILE; root's own known_hosts is not changed).
+  command -v ssh-keyscan >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 \
+    || { bad "ssh-keyscan and ssh-keygen are needed to check the host key of the primary (package openssh-clients)."; return 1; }
+  # host and port as ssh itself will use them (an entry in root's ~/.ssh/config may change both)
+  local host=$PRIMARY_IP port=22 cfg
+  cfg=$(ssh -G "$PRIMARY_SSH_USER@$PRIMARY_IP" 2>/dev/null)
+  [[ -n "$cfg" ]] && { host=$(awk '$1 == "hostname" {print $2; exit}' <<< "$cfg"); port=$(awk '$1 == "port" {print $2; exit}' <<< "$cfg"); }
+  [[ -n "$host" ]] || host=$PRIMARY_IP; num "$port" || port=22
+  local look=$host; [[ "$port" != "22" ]] && look="[$host]:$port"
+  local f
+  for f in "$ROOT_KH" "$KH_FILE"; do
+    # only a key type ssh still uses counts (an old ssh-dss line alone is not a known key)
+    [[ -s "$f" ]] && ssh-keygen -F "$look" -f "$f" 2>/dev/null | grep -qE '[[:space:]](ssh-ed25519|ecdsa-sha2-[a-z0-9]+|ssh-rsa)[[:space:]]' && return 0
+  done
+  local tmp; tmp=$(mktemp "$STATE_DIR/hostkey.XXXXXX") || return 1
+  CLEANUP_FILES+=("$tmp")
+  timeout 30 ssh-keyscan -T 10 -p "$port" -t ed25519,ecdsa,rsa "$host" 2>/dev/null | grep -v '^#' > "$tmp"
+  if [[ ! -s "$tmp" ]]; then
+    rm -f -- "$tmp"
+    # why: one ssh attempt that cannot log in (BatchMode, no password) and saves no key (known_hosts = /dev/null)
+    local elog="$STATE_DIR/ssh_error.log"
+    : > "$elog"; chmod 600 "$elog"
+    timeout 30 ssh -E "$elog" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null \
+      -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=15 "$PRIMARY_SSH_USER@$PRIMARY_IP" true < /dev/null > /dev/null 2>&1 9>&-
+    if grep -qiE 'refused|timed out|no route|unreachable|could not resolve' "$elog"; then
+      bad "The ssh connection to $PRIMARY_SSH_USER@$PRIMARY_IP failed."
+      { printf 'ssh said:\n'; sed 's/^/  /' "$elog"; } | hint
+      ssh_diagnose "$elog"
+    else
+      bad "Cannot read the ssh host key of $PRIMARY_IP (port $port)."
+      print_commands "Test on this server ($(hostname -s))" "root  ->  shell" <<EOF
+ssh-keyscan -p $port $host
+EOF
+    fi
+    log_block "ssh error output" < "$elog"
+    return 1
+  fi
+  local fps; fps=$(ssh-keygen -lf "$tmp" 2>/dev/null | awk '{print $2"  "$NF}'
+                   ssh-keygen -E md5 -lf "$tmp" 2>/dev/null | awk '{print $2"  "$NF}')
+  if [[ -z "$fps" ]]; then rm -f -- "$tmp"; bad "The ssh host key of $PRIMARY_IP cannot be read."; return 1; fi
+  say "This server does not know the primary yet. The primary sent these ssh host keys:"
+  printf '%s\n' "$fps" | sed 's/^/        /'
+  print_commands "Check on the PRIMARY ($PRIMARY_IP): the same values must appear" "root  ->  shell" <<'EOF'
+for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
+# An old primary (OpenSSH before 6.8) prints MD5 values: compare them with the MD5 lines above.
+EOF
+  if ! confirm "The fingerprints match the primary. Save the key and connect?"; then
+    rm -f -- "$tmp"
+    bad "Host key not accepted. Nothing was sent to $PRIMARY_IP. If the values differ, another machine may answer for this address."
+    return 1
+  fi
+  ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"
+  rm -f -- "$tmp"
+  _log SSH "host key of $look accepted by the admin: $(printf '%s' "$fps" | tr '\n' ' ')"
+  return 0
+}
+
 open_ssh() {
   install -d -m 700 "$STATE_DIR"
   SSH_CTL="$STATE_DIR/ssh_ctl"
@@ -231,11 +298,14 @@ open_ssh() {
   rm -f -- "$SSH_CTL"
   local elog="$STATE_DIR/ssh_error.log"
   : > "$elog"; chmod 600 "$elog"
+  host_key_ok || return 1
   say "Type the password of $PRIMARY_SSH_USER on $PRIMARY_IP when ssh asks. Only ssh sees it."
-  say "If ssh asks to accept the host key of the primary, answer yes."
   # Only options that every OpenSSH since 6.7 knows (Oracle Linux 7 has 7.4, OL8 has 8.0).
   # -E: ssh writes its own error messages to a file, so they can be shown and logged.
+  # StrictHostKeyChecking=yes: only a host key checked by the admin (saved by host_key_ok, or already
+  # in root's known_hosts) is accepted. ssh never asks to accept a new key.
   if ssh -E "$elog" -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=12h \
+         -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
          -o ServerAliveInterval=60 -o ConnectTimeout=15 -o NumberOfPasswordPrompts=3 \
          -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < "$PROMPT_IN" 9>&-; then
     SSH_OPEN=1

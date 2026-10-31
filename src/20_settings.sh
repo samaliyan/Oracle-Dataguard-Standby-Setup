@@ -80,7 +80,7 @@ load_settings() {
   # Keys of the 3.x settings file are converted (GRID_ZIP, DB_ZIP) or dropped; unknown keys are dropped.
   local soft=${1:-} line key val spec t
   LOAD_ERR=""; DROPPED_KEYS=""
-  [[ -f "$SETTINGS_FILE" ]] || return 1
+  [[ -f "$SETTINGS_FILE" ]] || { LOAD_ERR="$SETTINGS_FILE is missing"; return 1; }
   if ! settings_file_safe "$SETTINGS_FILE"; then
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
     [[ "$soft" == "soft" ]] && return 1; fatal "$LOAD_ERR"
@@ -202,10 +202,13 @@ validate_settings() {
     bad "USE_GRID must be yes, because the primary keeps files in ASM."; bad_n=1
   fi
   [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
+  # names are resolved first: a host name on one side and its address on the other is the same server
+  local sip pip; sip=$(ipv4_of "$STANDBY_IP"); pip=$(ipv4_of "$PRIMARY_IP")
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
-  [[ "$STANDBY_IP" != "$PRIMARY_IP" ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
+  [[ "$STANDBY_IP" != "$PRIMARY_IP" && ( -z "$sip" || "$sip" != "$pip" ) ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  if [[ "$STANDBY_IP" =~ ^[0-9.]+$ ]] && command -v ip >/dev/null 2>&1 && ! grep -qFw -- "$STANDBY_IP" <<< "$(ip -o addr show 2>/dev/null)"; then
+  # an address is checked here; a name is checked by step 2.6 (/etc/hosts), which also fixes a loopback name
+  if [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && command -v ip >/dev/null 2>&1 && ! is_local_ip "$STANDBY_IP"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
   [[ "${PRIMARY_UNIQUE^^}" != "${STANDBY_UNIQUE^^}" ]] || { bad "STANDBY_UNIQUE must differ from the db_unique_name of the primary."; bad_n=1; }

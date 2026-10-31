@@ -79,8 +79,8 @@ record() {
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}
   _log RESULT "[$1] $2  ${STEP_TITLE[$1]}"
   [[ -n "$PROGRESS_FILE" ]] || return 0
-  # check mode cannot judge a waiting step: a step proven earlier keeps its result in the progress file
-  if [[ "$MODE" == "check" && "$2" == "WAITS" ]] && grep -qE "^$1\|(OK|DONE|DONE_BY_YOU)\|" "$PROGRESS_FILE" 2>/dev/null; then return 0; fi
+  # check mode writes nothing but its log: the progress file keeps the results of the real runs
+  [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
   { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
     && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"
@@ -194,6 +194,7 @@ write_last_run() {
   # $1 how the run ended
   [[ -n "$LASTRUN_FILE" ]] || return 0
   [[ -n "${UNDO_STEP:-}" ]] && return 0     # an undo is not a run of the steps (the journal holds what it did)
+  [[ "$MODE" == "check" ]] && return 0       # check mode writes nothing but its log
   local nc=""; [[ "$MODE" == "run" ]] && nc=$(next_cmd)
   if [[ -n "$DETACHED_JOB" ]]; then
     printf '%s  mode %s  left running at step %s: %s\n' "$(ts)" "$MODE" "${CUR_STEP:-?}" "$DETACHED_JOB" > "$LASTRUN_FILE" 2>/dev/null
@@ -320,7 +321,7 @@ job_wait_loop() {
     fi
     case "$ANSWER" in
       w) WATCH_STOP=0; trap 'WATCH_STOP=1' INT
-         { tail -n 20 -f --pid=$$ -- "$JOB_OUT" 2>/dev/null | sed -u 's/^/        /'; } 9>&- &
+         { tail -n 20 -f --pid=$$ -- "$JOB_OUT" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
          tp=$!; TAIL_PID=$tp
          while [[ $WATCH_STOP -eq 0 ]] && job_running "$JOB_PID" && [[ ! -f "$JOB_OUT.rc" ]]; do sleep 2; done
          sleep 1; pkill -P "$tp" 2>/dev/null; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; TAIL_PID=""
@@ -535,7 +536,7 @@ summary() {
   printf '\n'
   if [[ "$MODE" == "check" ]]; then
     printf '  %s ok, %s to do, %s waiting, %s problems, %s warnings\n' "$n_ok" "$n_todo" "$n_wait" "$((n_prob + n_bad))" "$WARN_COUNT"
-    printf '  %sCheck mode changes nothing, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
+    printf '  %sCheck mode changes nothing in Oracle, the OS or the primary, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
     printf '  Only "problem" steps need your attention: see the Fix lines above.%s\n' "$C_N"
   else
     printf '  %s already ok, %s done in this run, %s skipped, %s not ok, %s warnings%s\n' \

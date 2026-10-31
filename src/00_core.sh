@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.6"
+readonly SCRIPT_VERSION="5.7"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -42,7 +42,7 @@ REVIEW_SETTINGS=0
 PROMPT_IN="${DG_PROMPT_IN:-/dev/tty}"
 LOG_DIR="${DG_LOG_DIR:-/var/log/dg_standby_setup}"
 STATE_DIR="${DG_STATE_DIR:-/var/lib/dg_standby_setup}"
-RUN_ID=$(date '+%Y%m%d_%H%M%S')
+RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"      # the pid too: two runs in the same second never share files
 RUN_START=$(date +%s)
 LOG_FILE=""
 ACTIONS_FILE=""
@@ -375,10 +375,27 @@ lsnr_home() { if use_grid; then printf '%s' "$GRID_HOME"; else printf '%s' "$DB_
 lsnr_user() { if use_grid; then printf '%s' "$GRID_USER"; else printf '%s' "$ORACLE_USER"; fi; }
 as_lsnr()   { if use_grid; then as_grid "$@"; else as_oracle "$@"; fi; }
 
+ipv4_of() {
+  # $1 host name or IPv4 address -> IPv4 address (empty when the name does not resolve)
+  if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s' "$1"; return 0; fi
+  [[ -n "$1" ]] || return 0
+  getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 {print $1}'
+}
+is_local_ip() {
+  # 0 = $1 (IPv4) is an address of this server
+  [[ -n "$1" ]] && command -v ip >/dev/null 2>&1 \
+    && ip -o addr show 2>/dev/null | awk -v a="$1" '{split($4, x, "/"); if (x[1] == a) f = 1} END {exit !f}'
+}
+os_field() {
+  # $1 key -> its value in the os-release file. The file is read, never run (sourced) as root.
+  local v; v=$(sed -n "s/^$1=//p" -- "$OS_RELEASE_FILE" 2>/dev/null | head -n 1)
+  v=${v#[\"\']}; v=${v%[\"\']}
+  printf '%s' "${v//[^A-Za-z0-9 ._()\/-]/}"
+}
 os_info() {
   # OS_ID (ol, rhel, ...), OS_MAJOR (7, 8, 9), PKG (yum or dnf)
-  OS_ID=$( . "$OS_RELEASE_FILE" 2>/dev/null; printf '%s' "${ID:-unknown}")
-  OS_MAJOR=$( . "$OS_RELEASE_FILE" 2>/dev/null; v=${VERSION_ID:-0}; printf '%s' "${v%%.*}")
+  OS_ID=$(os_field ID); OS_ID=${OS_ID:-unknown}
+  OS_MAJOR=$(os_field VERSION_ID); OS_MAJOR=${OS_MAJOR%%.*}; num "$OS_MAJOR" || OS_MAJOR=0
   if command -v dnf >/dev/null 2>&1 && [[ "$OS_MAJOR" != "7" ]]; then PKG=dnf; else PKG=yum; fi
 }
 
@@ -528,18 +545,22 @@ run_long() {
     grid)   pre=(runuser -u "$GRID_USER" -- env -i "${GRID_ENV[@]}") ;;
     *)      pre=(env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C LC_ALL=C) ;;
   esac
-  rm -f -- "$out" "$out.rc" "$out.pid"
+  rm -f -- "$out" "$out.rc" "$out.pid" "$out.rc.t" "$out.pid.t"
   ( umask 077; : > "$out" ) || { bad "Cannot write $out."; return 1; }
   # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
-  setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid"; f=$1; k=$2; sp=$3; shift 3
-    "$@" > "$f" 2>&1; echo $? > "$f.rc"
+  # .pid and .rc are written to a temp name and moved: a reader never sees a half-written file
+  setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid.t" && mv -f -- "$1.pid.t" "$1.pid"; f=$1; k=$2; sp=$3; shift 3
+    "$@" > "$f" 2>&1; r=$?; echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
     kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 9>&- &
   local bg=$! n=0 jpid=""
-  while [[ ! -s "$out.pid" && $n -lt 100 ]]; do sleep 0.1; n=$((n + 1)); done
+  while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
-  num "$jpid" || jpid=$bg
-  printf '%s|%s|%s|%s|%s|%s\n' "$jpid" "$title" "$out" "$JOB_KEEP" "$(boot_id)" "${CUR_STEP:-}" > "$JOB_FILE" \
+  # Fallback only: a background job of a script is not a process group leader, so setsid does not fork
+  # and $! is already the session id that pgrep -s watches.
+  num "$jpid" || { jpid=$bg; _log JOB "no pid file after 30 s, using $bg"; }
+  { printf '%s|%s|%s|%s|%s|%s\n' "$jpid" "$title" "$out" "$JOB_KEEP" "$(boot_id)" "${CUR_STEP:-}" > "$JOB_FILE.n" \
+      && mv -f -- "$JOB_FILE.n" "$JOB_FILE"; } 2>/dev/null \
     || warn "Cannot write $JOB_FILE.
 If this run stops, the next run will not know that $title is still running."
   JOB_PID=$jpid; JOB_TITLE=$title; JOB_OUT=$out; JOB_STEP=${CUR_STEP:-}
@@ -555,9 +576,9 @@ If this run stops, the next run will not know that $title is still running."
   RL_INT=0; trap 'RL_INT=1' INT
   # the output is shown by a background pipeline; waiting for it can be interrupted by HUP/TERM at once
   if [[ -n "$filt" ]]; then
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | mask_pw | sed -u 's/^/        /'; } 9>&- &
   else
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
   fi
   TAIL_PID=$!
   local t0=$SECONDS hb=0
@@ -622,6 +643,13 @@ backup_file() {
   else cp -p --remove-destination -- "$f" "$b" || return 1; fi
   say "Backup: $b"
 }
+dir_root_only() {
+  # 0 = only root can add, remove or rename entries in the folder of $1. Root writes a file only there:
+  # in a folder another user can write to, the file could be swapped for a link between check and write.
+  local d o m; d=$(dirname -- "$1")
+  read -r o m < <(stat -c '%u %a' -- "$d" 2>/dev/null) || return 1
+  [[ "$o" == "0" ]] && (( (8#$m & 8#022) == 0 ))
+}
 append_as() {
   # $1 user (empty or root = root), $2 file; stdin = text to add at the end (a missing final newline is added first)
   local u=${1:-root} f=$2 txt before=0 after=0 lead=0
@@ -630,7 +658,10 @@ append_as() {
   if [[ -s "$f" && -n "$(tail -c 1 -- "$f")" ]]; then txt=$'\n'"$txt"; lead=1; fi
   [[ -f "$f" ]] && before=$(stat -c '%s' -- "$f")
   if [[ "$u" != "root" ]]; then printf '%s\n' "$txt" | runuser -u "$u" -- tee -a -- "$f" > /dev/null || return 1
-  else printf '%s\n' "$txt" >> "$f" || return 1; fi
+  else
+    dir_root_only "$f" || { bad "Not changed: $(dirname -- "$f") must be a folder that only root can write to."; return 1; }
+    printf '%s\n' "$txt" >> "$f" || return 1
+  fi
   after=$(stat -c '%s' -- "$f" 2>/dev/null)
   declare -F journal_file_appended >/dev/null && journal_file_appended "$f" "$before" "$txt"$'\n' "$((after - before))" "$lead"
   return 0

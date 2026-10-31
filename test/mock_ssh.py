@@ -224,6 +224,8 @@ def remote(cmd, stdin_data):
 def ssh():
     if a == ["-V"]:
         print("OpenSSH_7.4p1, OpenSSL 1.0.2k-fips  26 Jan 2017", file=sys.stderr); return 0
+    if a and a[0] == "-G":
+        dest = a[1]; print(f"user {dest.partition('@')[0]}"); print(f"hostname {dest.partition('@')[2]}"); print("port 22"); return 0
     o, rest = opts(a)
     # behave like OpenSSH 7.4 (Oracle Linux 7): option values it does not know stop ssh at once
     if o.get("StrictHostKeyChecking") == "accept-new":
@@ -244,6 +246,16 @@ def ssh():
             if o.get("_E"): open(o["_E"], "a").write(msg + "\n")
             else: print(msg, file=sys.stderr)
             return 255
+        # the script must check the host key itself: ssh may not ask, and only a known key is accepted
+        k = known(o)
+        if o.get("StrictHostKeyChecking") != "yes" or k != "ok":
+            msg = ("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                   "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+                   "Host key verification failed.") if k == "changed" else "Host key verification failed."
+            if o.get("StrictHostKeyChecking") != "yes": log(BAD, "[master without StrictHostKeyChecking=yes]")
+            if o.get("_E"): open(o["_E"], "a").write(msg + "\n")
+            else: print(msg, file=sys.stderr)
+            return 255
         for _ in range(3):
             sys.stderr.write(f"{dest}'s password: "); sys.stderr.flush()
             pw = sys.stdin.readline().rstrip("\n")
@@ -256,6 +268,12 @@ def ssh():
         else: print(msg, file=sys.stderr)
         return 255
     dest, cmd = rest[0], " ".join(rest[1:])
+    if not ctl:
+        # a plain connection test (no master): it never logs in; with known_hosts /dev/null it stops at the host key
+        msg = "Host key verification failed." if target_ok(dest) else f"ssh: connect to host {dest.split('@')[1]} port 22: Connection refused"
+        if o.get("_E"): open(o["_E"], "a").write(msg + "\n")
+        else: print(msg, file=sys.stderr)
+        return 255
     if not ctl or not os.path.exists(ctl) or o.get("BatchMode") != "yes":
         print("Permission denied (publickey,password).", file=sys.stderr); return 255
     data = sys.stdin.read() if "sqlplus" in cmd else ""
@@ -279,4 +297,51 @@ def scp():
     with open(dst, "w") as f: f.write(fs[path])
     return 0
 
-sys.exit({"ssh": ssh, "scp": scp}[prog]())
+def hostkey():
+    return "ssh-ed25519 " + pri.get("hostkey", "AAAAC3NzaC1lZDI1NTE5AAAAIMockPrimaryHostKey0001")
+
+def keyscan():
+    # ssh-keyscan [-T n] [-t types] host
+    host = a[-1]
+    log(CMDLOG, f"[ssh-keyscan {host}]")
+    if host != pri["ip"] or pri.get("keyscan_fail"): return 1
+    print(f"# {host}:22 SSH-2.0-OpenSSH_7.4", file=sys.stderr)
+    print(f"{host} {hostkey()}")
+    return 0
+
+def keygen():
+    # ssh-keygen -F host -f file  |  ssh-keygen -lf file  |  ssh-keygen -R host [-f file]
+    if "-F" in a:
+        host = a[a.index("-F") + 1]; f = a[a.index("-f") + 1]
+        try: lines = open(f).read().splitlines()
+        except Exception: return 1
+        hit = [l for l in lines if l.split(" ")[0] == host]   # (plain names only; hashed lines are not mocked)
+        [print(l) for l in hit]
+        return 0 if hit else 1
+    if "-lf" in a:
+        f = a[a.index("-lf") + 1]
+        try: lines = [l for l in open(f).read().splitlines() if l and not l.startswith("#")]
+        except Exception: return 1
+        for l in lines:
+            h, t, k = l.split(" ")[:3]
+            if "md5" in a: print(f"256 MD5:{':'.join(md5(k)[i:i+2] for i in range(0, 32, 2))} {h} ({t.replace('ssh-', '').upper()})")
+            else: print(f"256 SHA256:{md5(k)[:43]} {h} ({t.replace('ssh-', '').upper()})")
+        return 0 if lines else 1
+    return 1
+
+def known(o):
+    """the primary's current host key is in one of the known_hosts files ssh was given"""
+    # like ssh: only lines of the same key type count; another key of that type means "changed"
+    t, k = hostkey().split(" ")
+    res = "unknown"
+    for f in o.get("UserKnownHostsFile", "").split():
+        try:
+            for l in open(f).read().splitlines():
+                x = l.split(" ")
+                if len(x) >= 3 and x[0] == pri["ip"] and x[1] == t:
+                    if x[2] == k: return "ok"
+                    res = "changed"
+        except Exception: pass
+    return res
+
+sys.exit({"ssh": ssh, "scp": scp, "ssh-keyscan": keyscan, "ssh-keygen": keygen}[prog]())
