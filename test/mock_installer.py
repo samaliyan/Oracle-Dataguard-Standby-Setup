@@ -84,6 +84,10 @@ def grid_install(home, rsp, staged):
         for k in ("oracle.install.asm.diskGroup.disks", "oracle.install.asm.diskGroup.disksWithFailureGroupNames"):
             if k in d: f.write(f"{k}={d[k]}\n")
     prereq_check("grid")
+    inv = d.get("INVENTORY_LOCATION", "")
+    if not os.path.exists("/etc/oraInst.loc") and inv and os.path.isdir(inv) and os.listdir(inv):
+        os.makedirs(os.path.join(inv, "logs"), exist_ok=True)
+        fatal(f"[INS-32035] The location ({inv}) specified for the central inventory is not empty.")
     if staged:
         if not opt("-waitforcompletion"):
             print("Launching Oracle Grid Infrastructure Setup Wizard..."); sys.exit(0)   # returns at once, does nothing yet

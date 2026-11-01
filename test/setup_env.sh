@@ -43,6 +43,8 @@ cp "$TD/mock_oracle.py" "$TD/mock_root.py" "$TD/mock_ssh.py" "$TD/mock_installer
 for p in rpm dnf yum oracleasm parted partprobe udevadm lsblk blkid wipefs pvs systemctl chronyc uname cmp findmnt firewall-cmd; do ln -sf "$T/mock_root.py" "$T/rootbin/$p"; done
 cp "$TD/mock_ip.sh" "$T/rootbin/ip"; chmod 755 "$T/rootbin/ip"
 for p in ssh scp ssh-keyscan ssh-keygen; do ln -sf "$T/mock_ssh.py" "$T/rootbin/$p"; done
+cp "$TD/mock_shm.py" "$T/"; chmod 755 "$T/mock_shm.py"; for p in df mount; do ln -sf "$T/mock_shm.py" "$T/rootbin/$p"; done
+printf '/dev/mapper/ol-root  /  xfs  defaults  0 0\ntmpfs  /dev/shm  tmpfs  defaults,nodev  0 0\n' > "$T/fstab"
 ln -sf "$T/mock_oracle.py" "$T/remotebin/sqlplus"
 cat > "$T/os-release" <<EOF
 NAME="Oracle Linux Server"
@@ -56,7 +58,7 @@ EOF
 db_payload() {   # $1 dir
   local d=$1 p
   mkdir -p "$d/bin" "$d/OPatch" "$d/network/admin" "$d/dbs"
-  for p in sqlplus srvctl rman tnsping orapwd oraversion lsnrctl; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
+  for p in sqlplus srvctl rman tnsping orapwd oraversion lsnrctl orapki; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
   if [[ $MAJ -ge 18 ]]; then cp "$TD/mock_oracle.py" "$d/bin/orabasehome"; cp "$TD/mock_oracle.py" "$d/bin/roohctl"; fi
   cp "$TD/mock_oracle.py" "$d/OPatch/opatch"
   printf 'mock\n' > "$d/bin/oracle"; printf 'mock\n' > "$d/bin/oradism"

@@ -18,7 +18,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_TEST_OUT=$out \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -796,8 +796,11 @@ rc=$(DG_TEST_QUIT_AT=6.2 run $T/x14.txt --from 6.1)
 check "12.1: password file copied (no 'format' column needed)" "grep -qE '^    6\.1 +done' $T/x14.txt"
 # X15 TDE without an auto-login keystore: 6.3 asks for it, 8.1 refuses the copy until it exists
 fresh; jset $P "d['tde']=['FILE|$T/pwallet/|OPEN']; d['files']={'$T/pwallet/ewallet.p12':'EWALLET\\n'}"
-rc=$(DG_TEST_NOFIX=6.3 DG_TEST_QUIT_AT=8.2 run $T/x15.txt --from 6.1)
-check "TDE without cwallet.sso -> orapki auto_login asked; 8.1 blocked" "grep -q 'orapki wallet create -wallet .* -auto_login' $T/x15.txt && grep -q 'no auto-login file (cwallet.sso)' $T/x15.txt && ! grep -q '^rman ' $T/state/calls.log"
+rc=$(DG_TEST_TDEPW=Wrong_pw9 DG_TEST_QUIT_AT=8.2 run $T/x15.txt --from 6.1)
+check "TDE without cwallet.sso, wrong keystore password -> orapki fails, the command is shown; 8.1 blocked" "grep -q 'orapki did not make' $T/x15.txt && grep -q 'orapki wallet create -wallet .* -auto_login' $T/x15.txt && grep -q 'no auto-login file (cwallet.sso)' $T/x15.txt && ! grep -q '^rman ' $T/state/calls.log && ! grep -q 'Wrong_pw9' $T/x15.txt $T/log/run_*.log"
+fresh; jset $P "d['tde']=['FILE|$T/pwallet/|OPEN']; d['files']={'$T/pwallet/ewallet.p12':'EWALLET\\n'}"
+rc=$(DG_TEST_QUIT_AT=7.1 run $T/x15b.txt --from 6.1)
+check "TDE without cwallet.sso -> made here with orapki after one password question, 6.3 done, password not logged" "grep -q 'MOCK-ORAPKI -auto_login' $T/pwallet/cwallet.sso && grep -qE '^    6\.3 +done' $T/x15b.txt && ! grep -q 'Wallet_pw1' $T/x15b.txt $T/log/run_*.log"
 # X16 Standard Edition primary -> stop at 1.3, nothing installed
 fresh empty; jset $P "d['banner']='Oracle Database 19c Standard Edition 2 Release 19.0.0.0.0 - Production'"
 rc=$(run $T/x16.txt)
@@ -879,14 +882,14 @@ rc=$(DG_TEST_NOFIX=4.7 run $T/y9.txt --only 4)
 check "primary without password file: 4.7 prints orapwd, not alter user" "grep -q 'orapwd file=' $T/y9.txt"
 # Y10 LOCAL auto-login wallet: cwallet.sso is not copied, made here with -auto_login_local
 fresh; jset $P "d['tde']=['FILE|$T/pwallet/|OPEN|LOCAL_AUTOLOGIN']; d['files']={'$T/pwallet/ewallet.p12':'EWALLET\\n','$T/pwallet/cwallet.sso':'LOCALSSO\\n'}"
-rc=$(DG_TEST_NOFIX=6.3 DG_TEST_QUIT_AT=7.1 run $T/y10.txt --from 6.1)
-check "LOCAL auto-login wallet: not copied, orapki -auto_login_local shown" "grep -q -- '-auto_login_local' $T/y10.txt && [[ ! -f $T/pwallet/cwallet.sso ]] && [[ -f $T/pwallet/ewallet.p12 ]]"
+rc=$(DG_TEST_QUIT_AT=7.1 run $T/y10.txt --from 6.1)
+check "LOCAL auto-login wallet: not copied, made here with orapki -auto_login_local" "grep -q 'MOCK-ORAPKI -auto_login_local' $T/pwallet/cwallet.sso && [[ -f $T/pwallet/ewallet.p12 ]]"
 # Y11 typed word: an Enter by mistake asks again
 fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
 
 #==============================================================================
-CUR=Z; echo "== Z. External review fixes (5.1 - 5.8)"
+CUR=Z; echo "== Z. External review fixes (5.1 - 5.10)"
 fresh
 G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
 for v in 10.0.0.5 192.168.1.20 db01 db01.example.local; do
@@ -956,7 +959,7 @@ check "2.16: use_large_pages=ONLY without HugePages -> ok, with the HugePages no
 
 fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':str(7680*1024**2),'pga_aggregate_target':str(256*1024**2),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/z15.txt)
-check "2.16: memory_max_target bigger than /dev/shm -> refused, the remount command shown" "grep -q '/dev/shm is too small' $T/z15.txt && grep -q 'mount -o remount,size=9728m /dev/shm' $T/z15.txt && ! grep -qE '^    2\.16 +ok' $T/z15.txt"
+check "2.16: memory_max_target bigger than /dev/shm -> made bigger by the script (remount + fstab, other options kept)" "grep -q '/dev/shm is too small' $T/z15.txt && grep -q 'mount -o remount,size=9728m /dev/shm' $T/z15.txt && grep -qE '^    2\.16 +done' $T/z15.txt && grep -qE '^tmpfs +/dev/shm +tmpfs +defaults,nodev,size=9728m' $T/fstab && grep -q '^/dev/mapper/ol-root' $T/fstab && ls $T/fstab.bak_* >/dev/null 2>&1"
 
 # 5.7: the host key of the primary is shown and must be confirmed before the password is typed
 fresh
@@ -1087,6 +1090,79 @@ EOF
 check "9.8: the clean-up timer must be running, and its last run must not have failed" "[[ \$(ut_timer) == 'ok off failed' ]]"
 fresh; rc=$(DG_TEST_QUIT_AT=1.3 run $T/z35.txt --from 10.0)
 check "--from 10.0 is the same as --from 10" "! grep -q 'There is no step 10.0' $T/z35.txt"
+
+# 5.9
+fresh; jset $P "d['mem']={'sga_target':'0','sga_max_size':'0','memory_target':'0','memory_max_target':'0','pga_aggregate_target':str(256*1024**2),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}; d['sgainfo']=7*1024**3"
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z36.txt)
+check "2.16: manual SGA (both targets 0) -> the real size from v\$sgainfo is checked: not enough RAM" "grep -q 'Not enough RAM' $T/z36.txt && ! grep -qE '^    2\.16 +ok' $T/z36.txt"
+fresh; jset $T/state/env.json "d['rman_error_after_finish']=1"
+rc=$(run $T/z37.txt)
+check "8.2: RMAN printed Finished but ended with an error stack and exit code 1 -> the copy is NOT recorded as done" "grep -q 'The copy did not finish' $T/z37.txt && ! grep -q 'The database was copied' $T/z37.txt"
+fresh; jset $P "d['tns_stby']=1; d['stby_fw_drop']=1"
+rc=$(DG_TEST_QUIT_AT=4.10 run $T/z38.txt)
+check "4.9: a timeout (firewall drop) is not 'no listener yet' -> warned" "grep -q 'no answer at all' $T/z38.txt && grep -q 'firewall between the servers' $T/z38.txt"
+fresh; jset $P "d['blocksize']='x'"
+rc=$(run $T/z39.txt)
+check "8.1: redo block size of the primary unreadable -> copy refused (not assumed 512)" "grep -q 'redo block size of the primary could not be read' $T/z39.txt && ! grep -q 'The database was copied' $T/z39.txt"
+ut_settings() { bash <<EOF
+num() { [[ -n "\${1:-}" && "\${1:-}" != *[!0-9]* ]]; }
+source <(sed -n '/^load_settings()/,/^}/p' $T/dg_standby_setup.sh)
+SETTINGS_FILE=\$(mktemp); settings_file_safe() { return 0; }; SETTING_SPECS="PORT:num"; OLD_KEYS=" "; DERIVED_KEYS=" "
+valid_value() { return 0; }; is_standby_key() { return 0; }; assumed_key() { return 1; }; fatal() { echo "FATAL \$*"; exit 3; }
+printf 'PORT=1521\nPORT=1522\n' > \$SETTINGS_FILE; load_settings soft; echo "[\$LOAD_ERR]"; rm -f \$SETTINGS_FILE
+EOF
+}
+check "settings: a key set twice is an error, not a silent last-wins" "[[ \$(ut_settings) == '[PORT is set twice. Keep one line.]' ]]"
+ut_alias() { bash <<EOF
+tf=\$(mktemp); tns_file() { echo \$tf; }
+source <(sed -n '/^tns_alias_present()/,/^}/p' $T/dg_standby_setup.sh)
+printf 'myXdb = (DESCRIPTION=)\n' > \$tf; tns_alias_present my.db && echo BAD; printf 'my.db = (DESCRIPTION=)\n' > \$tf; tns_alias_present my.db && echo OK; rm -f \$tf
+EOF
+}
+check "tns alias with a dot is matched as text (my.db does not match myXdb)" "[[ \$(ut_alias) == OK ]]"
+ut_sidlist() { bash <<EOF
+source <(sed -n '/^sidlist_of()/,/^}/p' $T/dg_standby_setup.sh)
+SB_LSNR=LISTENER; sidlist_of 'SID_LIST_LISTENER_OTHER=(SID_LIST=(SID_DESC=(SID_NAME=A)))SID_LIST_LISTENER=(SID_LIST=(SID_DESC=(SID_NAME=B)))'
+EOF
+}
+check "5.1: only the SID_LIST of this listener counts" "[[ \$(ut_sidlist) == '(SID_LIST=(SID_DESC=(SID_NAME=B)))' ]]"
+fresh empty; run $T/z40a.txt >/dev/null; jset $S "d['srvctl']['pwfile']='/tmp/old_orapw'"
+rc=$(DG_TEST_SKIP=9.1 DG_TEST_QUIT_AT=9.2 run $T/z40.txt --from 9.1)
+check "9.1: a registration with another password file is found and changed in place (no stop)" "grep -q 'these values are wrong: password-file' $T/z40.txt && grep -q 'srvctl modify database -db PRODDB_STBY -pwfile' $T/z40.txt && ! grep -q 'srvctl remove database' $T/z40.txt"
+
+# 5.9: files of an earlier, failed Grid installer run in the inventory folder (no /etc/oraInst.loc): INS-32035 before
+fresh empty; rc=$(DG_TEST_QUIT_AT=3.2 run $T/z41a.txt)
+mkdir -p $T/u01/app/oraInventory/logs; echo old > $T/u01/app/oraInventory/logs/GridSetupActions.log; chown -R grid:oinstall $T/u01/app/oraInventory; rm -f /etc/oraInst.loc
+rc=$(DG_TEST_QUIT_AT=3.3 run $T/z41.txt)
+check "3.2: leftover inventory of a failed Grid run -> moved aside (nothing deleted), Grid installs, no INS-32035" "grep -q 'no Oracle home is registered in it' $T/z41.txt && ls -d $T/u01/app/oraInventory.old_* >/dev/null 2>&1 && [[ -f \$(ls -d $T/u01/app/oraInventory.old_* | head -n 1)/logs/GridSetupActions.log ]] && ! grep -qF '[INS-32035]' $T/z41.txt && grep -q 'Successfully Setup Software' $T/log/Grid_installer_*.log"
+
+# 5.10: fewer questions
+fresh
+rc=$(DG_TEST_QUIT_AT=4.1 run $T/z42.txt --yes)
+check "--yes: actions on this server run without the [y] question (phase 2 and 3), shown as 'Yes (--yes)'" "grep -q 'Yes (--yes)' $T/z42.txt && ! grep -E '^  Step 2\.' -A30 $T/z42.txt | grep -q '\[y\] Yes, do it' && grep -q 'without asking' $T/z42.txt"
+fresh
+rc=$(DG_TEST_BATCH=q run $T/z43.txt)
+check "phase 4: the file changes on the primary (4.9 4.10 4.11) are in the same batch, as shell commands" "grep -q 'Then, in a shell on the PRIMARY' $T/z43.txt && grep -q '# Step 4.9' $T/z43.txt"
+fresh empty; run $T/z44a.txt >/dev/null; jset $S "d['instances']['PRODDB_STBY']['state']='idle'; d['srvctl']['running']=0"
+rc=$(DG_TEST_QUIT_AT=9.3 run $T/z44.txt --from 7.3)
+check "a built standby that is down: logins 'not tested now' in phase 7, then tested after 9.2 starts it" "grep -q 'Not tested now' $T/z44.txt && grep -q 'The logins of steps 7.3, 7.4 and 7.6 work now' $T/z44.txt"
+fresh; jset $O "d['shm_mb']=2048"; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':str(3*1024**3),'memory_max_target':str(3*1024**3),'pga_aggregate_target':'0','use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}"
+rc=$(DG_TEST_QUIT_AT=3.1 run $T/z45.txt)
+check "2.16: AMM primary, /dev/shm too small here -> the script makes it bigger (remount, fstab), then ok" "grep -qE '^    2\.16 +done' $T/z45.txt && python3 -c \"import json;assert json.load(open('$O'))['shm_mb']==5120\" && grep -q 'size=5120m' $T/fstab"
+ut_restore() { bash <<EOF
+source <(sed -n '/^_cfgv()/p;/^srv_add_cmd_from()/,/^}/p' $T/dg_standby_setup.sh)
+f=\$(mktemp); DB_HOME=/u01/db; STANDBY_UNIQUE=X_STBY
+printf 'Database unique name: X_STBY\nDatabase name: x\nOracle home: /u01/db\nSpfile: /u01/db/dbs/spfileX.ora\nPassword file: \nStart options: open\nDatabase role: PHYSICAL_STANDBY\nDatabase instance: X\nDisk Groups: DATA,FRA\n' > \$f
+srv_add_cmd_from \$f; rm -f \$f
+EOF
+}
+check "9.1: the old registration can be put back from its saved config (exact srvctl add)" "[[ \"\$(ut_restore)\" == \"/u01/db/bin/srvctl add database -db X_STBY -oraclehome /u01/db -spfile /u01/db/dbs/spfileX.ora -role PHYSICAL_STANDBY -startoption 'open' -dbname x -instance X -diskgroup DATA,FRA\" ]]"
+ut_sidlast() { bash <<EOF
+source <(sed -n '/^sidlist_of()/,/^}/p' $T/dg_standby_setup.sh)
+SB_LSNR=L; sidlist_of 'SID_LIST_L=(SID_LIST=(SID_DESC=(SID_NAME=OLD)))SID_LIST_L=(SID_LIST=(SID_DESC=(SID_NAME=NEW)))'
+EOF
+}
+check "5.1: of two SID_LIST blocks of one listener, the last one counts (as in Oracle)" "[[ \$(ut_sidlast) == '(SID_LIST=(SID_DESC=(SID_NAME=NEW)))' ]]"
 
 echo
 echo "RESULT: $PASS passed, $FAILN failed"

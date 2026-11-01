@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.8"
+readonly SCRIPT_VERSION="5.10"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -72,6 +72,7 @@ SQL_TIMEOUT=${DG_SQL_TIMEOUT:-600}
 num "$SQL_TIMEOUT" && (( 10#$SQL_TIMEOUT >= 10 && 10#$SQL_TIMEOUT <= 86400 )) || SQL_TIMEOUT=600
 SQL_TIMEOUT=$((10#$SQL_TIMEOUT))
 OS_RELEASE_FILE=${DG_OS_RELEASE_FILE:-/etc/os-release}
+FSTAB_FILE=${DG_FSTAB_FILE:-/etc/fstab}
 OS_ID=""; OS_MAJOR=""; PKG=""
 
 #------------------------------------------------------------------------------
@@ -399,6 +400,12 @@ os_info() {
   if command -v dnf >/dev/null 2>&1 && [[ "$OS_MAJOR" != "7" ]]; then PKG=dnf; else PKG=yum; fi
 }
 
+dup_log_ok() {
+  # $1 RMAN output, $2 its exit code. The copy counts only with exit code 0, "Finished Duplicate Db", and no error
+  # stack (RMAN prints "ERROR MESSAGE STACK FOLLOWS" / RMAN-00569 before any error that stops a command)
+  [[ "${2:-}" == "0" ]] && grep -q 'Finished Duplicate Db' "$1" \
+    && ! grep -qE '^RMAN-0(0569|3002|3009|3015)|ERROR MESSAGE STACK FOLLOWS' "$1"
+}
 run_logged() {
   # $1 = title; rest = command. Output -> RUN_OUT and log. Returns command rc. stdin is not passed on.
   # The output goes through a file: a daemon the command starts (lsnrctl start -> tnslsnr) may keep
@@ -480,7 +487,7 @@ job_finish_late() {
   local jok=0; [[ "$rc" == "0" || ( "$rc" == "6" && ( "$JOB_TITLE" == *installer* || "$JOB_TITLE" == "Grid configuration tools"* ) ) ]] && jok=1
   case "$JOB_TITLE" in
     "RMAN duplicate")
-      if grep -q 'Finished Duplicate Db' "$JOB_OUT" && ! grep -qE '^RMAN-0(3002|3009|3015)' "$JOB_OUT" && declare -F dup_success_record >/dev/null; then
+      if dup_log_ok "$JOB_OUT" "$rc" && declare -F dup_success_record >/dev/null; then
         dup_success_record; say "The RMAN copy had finished. Its result is recorded."; jok=1
       else
         jok=0; install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
@@ -641,6 +648,8 @@ backup_file() {
   [[ -e "$b" || -L "$b" ]] && return 0
   if [[ -n "$u" && "$u" != "root" ]]; then runuser -u "$u" -- cp -p -- "$f" "$b" || return 1
   else cp -p --remove-destination -- "$f" "$b" || return 1; fi
+  # a backup is never readable by everyone, even when the old file was (a password file or wallet with a bad mode)
+  chmod o-rwx -- "$b" 2>/dev/null
   say "Backup: $b"
 }
 dir_root_only() {
@@ -773,6 +782,13 @@ JOB_BUSY_PHASE=""        # check mode with a long job running: steps of this pha
 declare -A AUTO_WAIT=()   # "step X" / "phase N" -> 1: not done in this run and you went on (its waiters are not asked again)
 # steps that only the script can do: there is no [s] skip for them
 readonly NO_SKIP_STEPS=" 1.2 1.3 1.4 "
+# --yes answers "y" for the actions on this server. Never for: steps that stop or restart a running standby
+# (9.1 9.2 9.3 9.7), questions inside an action (disk erasure, CLEAN, DELETE, DUPLICATE, the host key, passwords),
+# and anything on the primary (printed only, as always).
+YES_MODE=0
+readonly YES_ASK_STEPS=" 3.10 9.1 9.2 9.3 9.7 9.8 "     # 3.10 restarts the listener, 9.8 sets deletion of archived logs
+YES_HOLD=0          # a check sets it when its action would erase something (a half-unpacked software folder)
+yes_auto() { [[ $YES_MODE -eq 1 && $YES_HOLD -eq 0 && "$YES_ASK_STEPS" != *" $1 "* ]]; }
 no_skip() { [[ "$NO_SKIP_STEPS" == *" $1 "* ]]; }
 NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; KIND_NOW=""; NEED_SYS=0; MANUAL_WHERE=""
 
@@ -819,6 +835,8 @@ record() {
   # the result of a step: in memory, in the log, and in the progress file (so the next run can show
   # how far the last run got, and which steps are done)
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}
+  # the step a "Next" line pointed to is done now: the pointer would only mislead later
+  [[ "$RESUME_STEP" == "$1" && ( "$2" == OK || "$2" == DONE || "$2" == DONE_BY_YOU ) ]] && RESUME_STEP=""
   _log RESULT "[$1] $2  ${STEP_TITLE[$1]}"
   [[ -n "$PROGRESS_FILE" ]] || return 0
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
@@ -1091,6 +1109,7 @@ run_step() {
     wait_msg "$NOW"; STEP_NOW[$id]=$NOW; record "$id" WAITS; return 0
   fi
   while true; do
+    YES_HOLD=0
     NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""
     "$checkfn"; rc=$?
     kind=${KIND_NOW:-$kind0}
@@ -1192,7 +1211,9 @@ run_step() {
     printf '%s\n' "$PLAN" | block "Plan:"
     [[ -n "$USING" ]] && printf '%s\n' "$USING" | block "Using:"
     if [[ "$MODE" == "check" ]]; then todo "To do in a normal run"; record "$id" TODO; return 0; fi
-    if [[ "$kind" != "ask" ]]; then
+    if [[ "$kind" != "ask" ]] && yes_auto "$id"; then
+      printf '    %s%s Yes (--yes)%s\n' "$C_D" "$S_ASK" "$C_N"; _log ASK "[$id] y (--yes)"; ANSWER=y
+    elif [[ "$kind" != "ask" ]]; then
       ask_choice "[y] Yes, do it   [s] Skip   [h] Help   [q] Quit" "yshq"
       case "$ANSWER" in
         y) ;;
@@ -1342,6 +1363,8 @@ batch_primary_steps() {
   # ones that were done pass at once, the others ask again one by one.
   [[ "$MODE" == "run" ]] || return 0
   local id cf rc all="" n=0 how="" BATCH_ERR
+  # file changes (tnsnames.ora, listener.ora, .bash_profile) are shell commands: a second box per user
+  local -a fhow=() fplan=()
   # the connection is opened visibly first: the checks below run quietly
   need_ssh || return 0
   BATCH_ERR=$(mktemp /tmp/dg_batch.XXXXXX) && CLEANUP_FILES+=("$BATCH_ERR") || BATCH_ERR=/dev/null
@@ -1357,6 +1380,15 @@ batch_primary_steps() {
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"
     [[ $rc -eq 1 && -n "$PLAN" && "${KIND_NOW:-primary}" == "primary" ]] || continue
     primary_pending_add "$id" "$PLAN_UNDO"
+    # file changes in a shell, not SQL, grouped by the user; only plans that are commands (an entry to edit by
+    # hand follows on its own)
+    if [[ " 4.9 4.11 " == *" $id "* ]]; then
+      [[ "$PLAN" == *"cat >>"* ]] || { primary_pending_del "$id"; continue; }
+      n=$((n + 1)); fhow+=("${PRIMARY_HOW_STEP%%  ->  *}  ->  shell")
+      # comment lines of a plan are shell comments in this box
+      fplan+=("# Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$(sed 's/^-- /# /' <<< "$PLAN")"$'\n'"${PLAN_UNDO:+# Undo, if ever needed: $PLAN_UNDO}")
+      continue
+    fi
     [[ "$id" == "4.1" ]] && in41=1; [[ "$id" == "4.7" ]] && in47=1
     n=$((n + 1))
     [[ -n "$how" ]] || how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
@@ -1378,12 +1410,22 @@ batch_primary_steps() {
     printf '\n    %s%s Step 4.1 restarts the primary database (shutdown immediate, startup mount).%s\n' "$C_Y" "$S_WARN" "$C_N"
     printf '      %sPlan a short downtime, or choose [o] and run the steps one at a time.%s\n\n' "$C_Y" "$C_N"
   fi
-  say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
-  say "Afterwards the script checks every step again."
-  say "Changes to files on the primary (steps 4.9 to 4.11, if needed) follow one by one."
   CUR_STEP="${1%%.*}.x"
-  printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
+  if [[ -n "$all" ]]; then
+    say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
+    printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
+  fi
+  # the file changes, in a shell, grouped by the user they run as
+  local fi2 fj u done_u=" "
+  for ((fi2 = 0; fi2 < ${#fhow[@]}; fi2++)); do
+    u=${fhow[$fi2]}; [[ "$done_u" == *"|$u|"* ]] && continue; done_u+="|$u|"
+    local fb=""
+    for ((fj = fi2; fj < ${#fhow[@]}; fj++)); do [[ "${fhow[$fj]}" == "$u" ]] && fb+="${fplan[$fj]}"$'\n\n'; done
+    printf '%s' "${fb%$'\n\n'}" | print_commands "Then, in a shell on the PRIMARY ($PRIMARY_HOST)" "$u"
+  done
+  say "Edits of a file by hand (the static listener entry of 4.10, a changed alias in 4.9), if needed, follow on their own."
   CUR_STEP=""
+  say "Afterwards the script checks every step again."
   PRIMARY_BOX_NOTE=1; say "${C_D}The same commands are saved in $ACTIONS_FILE${C_N}"
   if [[ $in41 -eq 1 && $in47 -eq 1 ]]; then
     if grep -q 'create spfile from memory' <<< "$all"; then say "Run step 4.1 first, with its restart. The scope=spfile lines of the other steps need the spfile."
@@ -1560,8 +1602,19 @@ undo_text() {
     UNIT)       if [[ "$obj" == *.timer ]]; then printf 'auto: systemctl disable --now %s   (the nightly clean-up stops)' "$obj"
                 else printf 'auto: systemctl disable %s   (a running standby keeps running)' "$obj"; fi ;;
     OPATCH)     printf 'by hand, only if wanted: rm -rf %s ; mv %s %s   (puts back the OPatch of the media)' "$obj" "$(detail_field "$det" old)" "$obj" ;;
-    SRVOPT)     printf 'by hand, usually not wanted: srvctl modify database -db %s -startoption <the old one>   (it is in the log of that run)' "$obj" ;;
-    SRVCTL_OLD) printf 'by hand: the old registration of %s is in the log of that run (srvctl config). Add it again with srvctl add database.' "$obj" ;;
+    SHM)        b=$(detail_field "$det" old)
+                if [[ -n "$b" && "$b" != "-" ]]; then printf 'by hand, usually not wanted: mount -o remount,size=%s /dev/shm   (the fstab line has its own backup)' "$b"
+                else printf 'by hand, usually not wanted: the old size of /dev/shm is not known; the fstab line has its own backup'; fi ;;
+    SRVOPT)     local so oh op; so=$(detail_field "$det" old | tr '_' ' '); oh=$(detail_field "$det" oldhome); op=$(detail_field "$det" oldpw)
+                printf 'by hand, usually not wanted: srvctl modify database -db %s' "$obj"
+                [[ -n "$so" ]] && { [[ "$so" == unknown ]] && printf ' -startoption <the old option>' || printf ' -startoption "%s"' "$so"; }
+                [[ -n "$oh" && "$oh" != "-" ]] && printf ' -oraclehome %s' "$oh"
+                [[ -n "$op" && "$op" != "-" ]] && printf ' -pwfile %s' "$op"
+                [[ "$op" == "-" ]] && printf '   (there was no password file in the registration)'
+                true ;;
+    SRVCTL_OLD) b=$(detail_field "$det" file)
+                if [[ -n "$b" ]]; then printf 'by hand: the old registration of %s is saved in %s (srvctl config). Add it again with srvctl add database.' "$obj" "$b"
+                else printf 'by hand: the old registration of %s is in the log of that run (srvctl config). Add it again with srvctl add database.' "$obj"; fi ;;
     RMANCFG)    local ov; ov=$(detail_field "$det" old); ov=${ov//\~/ }
                 if [[ -z "$ov" || "$ov" == "-" ]]; then printf 'by hand, usually not wanted: as %s  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY CLEAR;' "$ORACLE_USER"
                 else printf 'by hand, usually not wanted: as %s  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY %s;' "$ORACLE_USER" "$ov"; fi ;;
@@ -1758,7 +1811,7 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       say "Put back $obj from $b"; _hint_after_restore "$obj"; return 0 ;;
     RENAME)
       local to; to=$(detail_field "$det" to)
-      [[ -f "$to" ]] || { say "$to is gone. Nothing to rename back."; return 0; }
+      [[ -e "$to" ]] || { say "$to is gone. Nothing to rename back."; return 0; }
       [[ -e "$obj" ]] && { say "$obj exists again. The renamed copy $to is left as it is."; return 2; }
       mv -f -- "$to" "$obj" || return 1
       say "Renamed $to back to $obj"; return 0 ;;
@@ -1989,15 +2042,22 @@ load_settings() {
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
     [[ "$soft" == "soft" ]] && return 1; fatal "$LOAD_ERR"
   fi
+  local seen_keys=" "
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line=${line%%#*}; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    # a comment is a line that starts with #, or # after a space: a # inside a value is kept (and then checked)
+    line="${line#"${line%%[![:space:]]*}"}"; [[ "$line" == "#"* ]] && continue
+    line=${line%%[[:space:]]#*}; line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
     if [[ "$line" != *=* ]]; then LOAD_ERR="This line is not KEY=VALUE: $line"; break; fi
     key=${line%%=*}; val=${line#*=}
+    local rawkey=$key
     case "$key" in
       GRID_ZIP) key=GRID_MEDIA; SETTINGS_UPGRADED=1 ;;
       DB_ZIP)   key=DB_MEDIA;   SETTINGS_UPGRADED=1 ;;
     esac
+    # the same key twice (also under its old name, GRID_ZIP and GRID_MEDIA): which one counts would be a guess
+    if [[ "$seen_keys" == *" $key "* ]]; then LOAD_ERR="$key is set twice$([[ "$rawkey" != "$key" ]] && printf ' (also as %s)' "$rawkey"). Keep one line."; break; fi
+    seen_keys+="$key "
     if [[ "$OLD_KEYS" == *" $key "* ]]; then DROPPED_KEYS+=" $key"; SETTINGS_UPGRADED=1; continue; fi
     spec=""
     for t in $SETTING_SPECS; do [[ "${t%%:*}" == "$key" ]] && spec=${t#*:}; done
@@ -2108,10 +2168,11 @@ validate_settings() {
   [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
   # names are resolved first: a host name on one side and its address on the other is the same server
   local sip pip; sip=$(ipv4_of "$STANDBY_IP"); pip=$(ipv4_of "$PRIMARY_IP")
+  [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { bad "STANDBY_IP must be an IPv4 address (it is used as an address in the firewall and listener steps)."; bad_n=1; }
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
   [[ "$STANDBY_IP" != "$PRIMARY_IP" && ( -z "$sip" || "$sip" != "$pip" ) ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  # an address is checked here; a name is checked by step 2.6 (/etc/hosts), which also fixes a loopback name
+  # STANDBY_IP is an IPv4 address (checked above): it must be one of this server
   if [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && command -v ip >/dev/null 2>&1 && ! is_local_ip "$STANDBY_IP"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
@@ -2874,9 +2935,9 @@ This script supports only a single-instance primary."
   [[ -n "$LOCS" ]] || { bad "Unexpected answer for the file locations: $(head -n 3 <<< "$SQL_OUT")"; return 1; }
   PRIMARY_DB_MB=$(loc_list | awk -F: '{s+=$2} END {print s+0}')
   # block size of the online logs (512 or 4096): the standby logs and their disks must support it
-  PRIMARY_REDO_BS=512
+  PRIMARY_REDO_BS=512; PRIMARY_REDO_BS_KNOWN=0     # 512 is only the working default; 8.1 needs it proven
   prim_sql "select max(blocksize) from v\$log;" && PRIMARY_REDO_BS=$(first_line | cut -d'|' -f1)
-  num "$PRIMARY_REDO_BS" || PRIMARY_REDO_BS=512
+  if num "$PRIMARY_REDO_BS" && [[ $PRIMARY_REDO_BS -gt 0 ]]; then PRIMARY_REDO_BS_KNOWN=1; else PRIMARY_REDO_BS=512; fi
 
   # ---- recovery area, archive destination, folders used by the instance
   read_arch_params || { bad "Cannot read the parameters of the primary database."; return 1; }
@@ -3074,7 +3135,7 @@ c_1_1() {
 c_1_6() {
   # Oracle version and Oracle Linux version must be a supported pair (checked when the version is known)
   [[ $DISCOVERED -eq 1 ]] || { NOW="Primary configuration not read (step 1.3)"; return 2; }
-  [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] || { NOW="Operating system version unknown; not checked"; return 0; }
+  [[ "$OS_MAJOR" =~ ^[0-9]+$ && $OS_MAJOR -gt 0 ]] || { NOW="Operating system version unknown; not checked"; warn "The version of this operating system cannot be read (/etc/os-release). Oracle and Oracle Linux versions are not checked against each other."; return 0; }
   local v=$PRIMARY_VERSION why="" r w
   # the database release, and the Grid release when there is Grid (Grid may be newer)
   local -a rels=("$(want_rel)")
@@ -3571,6 +3632,7 @@ make_dir() {
       [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo. It is not used."; return 1; }
     fi
     if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
+    [[ -d "$p" ]] || { bad "$p exists, but it is not a folder. It is not changed."; return 1; }
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
   if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
@@ -3742,6 +3804,8 @@ c_2_9() {
   [[ -n "$FW_ZONE" ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=public
+  # the zone of the interface is the right one; a guess is said
+  [[ -z "$ifc" ]] && warn "No interface here has the address $STANDBY_IP, so the firewall zone is a guess: $FW_ZONE."$'\n'"Check:  firewall-cmd --get-active-zones"
   # open now AND after a reboot: the running rules and the saved (permanent) ones are both checked
   local rt=0 pm=0
   firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && rt=1
@@ -3950,7 +4014,8 @@ asm_labels() {
   while IFS= read -r l; do [[ -n "$l" ]] && asm_label_known "$l" && printf '%s\n' "$l"; done < <(asm_labels_any "$1")
   return 0
 }
-asm_foreign() { local l; while IFS= read -r l; do [[ -n "$l" ]] && ! asm_label_known "$l" && ! asm_label_declined "$l" && printf '%s\n' "$l"; done < <(asm_labels_any "$1"); return 0; }
+ASM_DEFERRED=" "    # disks not used in THIS run (Grid not installed yet, or wrong sector size): offered again in a later run
+asm_foreign() { local l; while IFS= read -r l; do [[ -n "$l" ]] && ! asm_label_known "$l" && ! asm_label_declined "$l" && [[ "$ASM_DEFERRED" != *" $l "* ]] && printf '%s\n' "$l"; done < <(asm_labels_any "$1"); return 0; }
 asm_label_exists() {
   if [[ "$(asm_method)" == "asmlib" ]]; then oracleasm listdisks 2>/dev/null | grep -qx -- "$1"; else [[ -e "/dev/oraasm/$1" ]]; fi
 }
@@ -4029,6 +4094,8 @@ c_2_13() {
   done
   A213_FOREIGN=${foreign%$'\n'}
   if [[ -z "$miss$short$foreign" ]]; then NOW="ASM disks are ready for:$ready"$'\n'"${have%$'\n'}"; return 0; fi
+  # new disks must fit the redo block size of the primary: it must be known, not assumed
+  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the right disks cannot be chosen. Run the script again."; return 2; }
   local fd; fd=$(free_disks)
   NOW=""
   if [[ -n "$miss" ]]; then
@@ -4136,6 +4203,27 @@ asm_header_group() {
 }
 asm_group_mounted_here() { use_grid && grid_sw_ok && sql_asm "select name from v\$asm_diskgroup where state in ('MOUNTED','CONNECTED');" && grep -qix -- "$1" <<< "$SQL_OUT"; }
 
+disk_sector_ok() {
+  # $1 disk. Online logs with 4096-byte blocks need 4K physical sectors; 512-byte redo cannot go on a 4K-native disk
+  # (else ORA-01378 for the standby logs). Sectors that cannot be read are a warning: step 8.1 checks the disk group.
+  local d=$1 sb pbs lbs n; SECTOR_WHY=""
+  # a partition (ASMLib disks, sdb1) has no queue of its own: the sizes are those of its disk
+  n=$(basename "$(readlink -f "$d")"); sb="/sys/class/block/$n"
+  [[ -e "$sb/partition" ]] && sb=$(dirname "$(readlink -f "$sb")")
+  sb="$sb/queue"
+  pbs=$(cat "$sb/physical_block_size" 2>/dev/null); lbs=$(cat "$sb/logical_block_size" 2>/dev/null)
+  if ! num "$pbs" || ! num "$lbs"; then
+    warn "The sector size of $d cannot be read here. Step 8.1 checks the sector size of the disk group before the copy."
+    return 0
+  fi
+  if [[ "${PRIMARY_REDO_BS:-512}" == "4096" && $pbs -lt 4096 ]]; then
+    SECTOR_WHY="The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors."$'\n'"The standby logs could not be created (ORA-01378). Use disks with 4K sectors."; return 1
+  fi
+  if [[ "${PRIMARY_REDO_BS:-512}" != "4096" && $lbs -ge 4096 ]]; then
+    SECTOR_WHY="$d is a 4K-native disk, but the redo logs of the primary use 512-byte blocks."$'\n'"The standby and online logs could not be created (ORA-01378). Use disks with 512-byte or 512e sectors."; return 1
+  fi
+  return 0
+}
 d_2_13() {
   local fd dg i min have total pick n sel=() used=" " def nums l
   # 1) disks that exist but were not made by this script: use them only when you say so
@@ -4153,16 +4241,29 @@ d_2_13() {
       else ok_l+=" $i"; fi
     done <<< "$l"
     if [[ -n "$refused" ]]; then
-      warn "These existing ASM disks are not used:$refused"$'\n'"They may belong to another server, for example the primary."
-      install -d -m 700 "$STATE_DIR"; for i in $reflab; do printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
+      if grid_sw_ok; then
+        # ASM runs here and does not mount that disk group: remembered as "not used"
+        warn "These existing ASM disks are not used:$refused"$'\n'"They may belong to another server, for example the primary."$'\n'"To be asked again later, remove their lines (label|-) from $(asm_disks_file)."
+        install -d -m 700 "$STATE_DIR"; for i in $reflab; do printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
+      else
+        # no Grid yet: nothing here can mount a disk group, so this is not a decision; asked again in a later run
+        for i in $reflab; do ASM_DEFERRED+="$i "; done
+        warn "These existing ASM disks are not used now:$refused"$'\n'"Grid is not installed yet, so it cannot be seen whether this server owns them."$'\n'"They may belong to another server, for example the primary. They are offered again in a later run, once Grid is installed."
+      fi
     fi
     [[ -n "$ok_l" ]] || continue
+    # existing disks get the same sector test as new ones
+    local okl2=""
+    for i in $ok_l; do
+      if disk_sector_ok "$(label_device "$i")"; then okl2+=" $i"; else warn "ASM disk $i is not used: $SECTOR_WHY"; ASM_DEFERRED+="$i "; fi
+    done
+    ok_l=$okl2; [[ -n "$ok_l" ]] || continue
     say "Answer y only if no other database uses$ok_l."
     if confirm "Use the existing ASM disks$ok_l for +$dg"; then
       for i in $ok_l; do record_label "$i" "$(label_device "$i")"; done
     else
       for i in $ok_l; do install -d -m 700 "$STATE_DIR"; printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
-      say "Not used:$ok_l. This answer is remembered."
+      say "Not used:$ok_l. This answer is remembered (to change it, remove the lines label|- from $(asm_disks_file))."
       say "New disks are chosen for +$dg instead."
     fi
   done
@@ -4188,8 +4289,13 @@ d_2_13() {
       bad "The empty disks left have $(human_mb "$left") in total, but +$dg needs $(human_mb "$need_more") more."$'\n'"Add disks to this server. Nothing was erased."
       return 1
     fi
+    # only one empty disk is left and it is big enough: there is nothing to choose (its erasure is still asked)
+    local nfree=0; for i in "${!disks[@]}"; do [[ "$used" == *" ${disks[$i]%% *} "* ]] || nfree=$((nfree + 1)); done
+    local auto1=0; [[ $nfree -eq 1 && ${disks[$((def - 1))]##* } -ge $need_more ]] && auto1=1
+    [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
     while true; do
-      ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"
+      if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
+      else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""
       local -a picks=(); read -ra picks <<< "$ANSWER"
@@ -4216,14 +4322,7 @@ d_2_13() {
   for p in "${sel[@]}"; do
     d=${p#*|}
     disk_is_free "$d" || { bad "$d cannot be used: $DISK_WHY. Nothing was erased."; return 1; }
-    # online logs with 4096-byte blocks need disks with 4096-byte physical sectors (else ORA-01378 for the standby logs)
-    local sb="/sys/block/$(basename "$(readlink -f "$d")")/queue" pbs lbs
-    pbs=$(cat "$sb/physical_block_size" 2>/dev/null); lbs=$(cat "$sb/logical_block_size" 2>/dev/null)
-    if [[ "${PRIMARY_REDO_BS:-512}" == "4096" ]]; then
-      [[ -n "$pbs" && "$pbs" -lt 4096 ]] && { bad "The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors."$'\n'"The standby logs could not be created (ORA-01378). Use disks with 4K sectors."$'\n'"Nothing was erased."; return 1; }
-    else
-      [[ -n "$lbs" && "$lbs" -ge 4096 ]] && { bad "$d is a 4K-native disk, but the redo logs of the primary use 512-byte blocks."$'\n'"The standby and online logs could not be created (ORA-01378)."$'\n'"Use disks with 512-byte or 512e sectors. Nothing was erased."; return 1; }
-    fi
+    disk_sector_ok "$d" || { bad "$SECTOR_WHY"$'\n'"Nothing was erased."; return 1; }
   done
   for p in "${sel[@]}"; do
     d=${p#*|}
@@ -4499,6 +4598,12 @@ mem_probe() {
       db_recovery_file_dest_size) num "$pv" && MEM_RFS=$pv ;;
     esac
   done <<< "$SQL_OUT"
+  # the SGA as the instance really has it: with a manual SGA (sga_target and memory_target 0) the parameters say
+  # nothing, the sizes of its parts (shared_pool_size, db_cache_size, ...) add up to "Maximum SGA Size"
+  local smax=""
+  prim_sql "select bytes from v\$sgainfo where name='Maximum SGA Size';" && smax=$(first_line)
+  if num "$smax"; then [[ $smax -gt $MEM_SGA ]] && MEM_SGA=$smax
+  elif [[ $MEM_SGA -eq 0 && $MEM_MT -eq 0 ]]; then return 2; fi
   local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); num "$kb" || kb=0
   MEM_RAM_MB=$(( kb / 1024 ))
   local sga_mb=$(( MEM_SGA / 1048576 )) pga_mb=$(( MEM_PGA / 1048576 )) mt_mb=$(( MEM_MT / 1048576 )) mmt_mb=$(( mmt / 1048576 )) need_mb shm_need=0
@@ -4562,15 +4667,13 @@ c_2_16() {
     return 0
   fi
   NOW="$MEM_FAIL"$'\n'"$MEM_INFO"
-  KIND_NOW=manual
   if [[ $MEM_SHM_MB -gt 0 ]]; then
-    MANUAL_HOW="root  ->  shell"
-    PLAN="mount -o remount,size=${MEM_SHM_MB}m /dev/shm
--- (the size needed, plus 1 GB more room)
--- Keep it after a reboot: in /etc/fstab, the /dev/shm line gets size=${MEM_SHM_MB}m
--- tmpfs  /dev/shm  tmpfs  defaults,size=${MEM_SHM_MB}m  0 0
--- Then answer r."
+    # done by the script: /dev/shm is a memory file system of this server, nothing on it is lost by a larger size
+    PLAN="Make /dev/shm ${MEM_SHM_MB} MB now (the size needed, plus 1 GB more room):
+  mount -o remount,size=${MEM_SHM_MB}m /dev/shm
+Keep it after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}m (a backup is kept)"
   else
+    KIND_NOW=manual
     MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
     PLAN="-- Add RAM to the standby, then restart it and answer r.
 -- A standby that may become the primary needs as much memory as the primary.
@@ -4579,6 +4682,28 @@ c_2_16() {
   return 1
 }
 
+d_2_16() {
+  [[ $MEM_SHM_MB -gt 0 ]] || return 1
+  local old; old=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$old" && old="${old}m" || old="-"
+  run_cmds <<< "mount -o remount,size=${MEM_SHM_MB}m /dev/shm" || return 1
+  journal SHM /dev/shm "old=$old new=${MEM_SHM_MB}m"
+  # a new fstab line keeps the protections /dev/shm has now (nosuid, nodev, noexec): "defaults" would drop them
+  local keep="" o; for o in $(findmnt -n -o OPTIONS /dev/shm 2>/dev/null | tr ',' ' '); do
+    case "$o" in nosuid|nodev|noexec) keep+=",$o" ;; esac; done
+  [[ -e /etc/systemd/system/dev-shm.mount ]] && warn "/etc/systemd/system/dev-shm.mount sets /dev/shm too and wins over fstab at boot. Set size=${MEM_SHM_MB}m there as well."
+  # /etc/fstab: the size option of the /dev/shm line is set (other options stay), or such a line is added
+  local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  awk -v sz="size=${MEM_SHM_MB}m" -v keep="$keep" '
+    !/^[[:space:]]*#/ && $2 == "/dev/shm" && NF >= 4 {
+      n = split($4, o, ","); opts = ""
+      for (i = 1; i <= n; i++) if (o[i] !~ /^size=/) opts = opts (opts ? "," : "") o[i]
+      $4 = (opts ? opts "," : "") sz; done = 1 }
+    { print }
+    END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE" > "$tmp" || return 1
+  backup_file "$FSTAB_FILE" || return 1
+  write_as root "$FSTAB_FILE" 644 < "$tmp" || return 1
+  say "/dev/shm is ${MEM_SHM_MB} MB now, also after a reboot ($FSTAB_FILE)."
+}
 phase_2() {
   phase_header 2 "Prepare this server"
   run_step 2.1  auto    "Groups (same names and ids as primary)" c_2_1 d_2_1
@@ -4596,7 +4721,7 @@ phase_2() {
   run_step 2.13 auto    "ASM disks" c_2_13 d_2_13
   run_step 2.14 auto    "Database folders and free space (file system)" c_2_14 d_2_14
   run_step 2.15 check   "Database folders are not shared with the primary" c_2_15 d_2_15
-  run_step 2.16 check   "Memory (RAM) for the database" c_2_16
+  run_step 2.16 auto    "Memory (RAM) for the database" c_2_16 d_2_16
   build_envs_if_possible
 }
 
@@ -4734,6 +4859,19 @@ media_ok() {
   [[ ${#_mf[@]} -gt 0 ]] || return 1
   for f in "${_mf[@]}"; do [[ -f "$f" ]] && media_trusted "$f" || return 1; done
 }
+media_matches() {
+  # $1 comma list, $2 grid | db -> the first file is an installer of that kind and of the release needed
+  # (a gold image whose release cannot be read is accepted, as in the scan)
+  # (the main file of a staged pair may be listed second: _2of2 first)
+  local f k mj; IFS=',' read -ra _mm <<< "$1"
+  for f in "${_mm[@]}"; do
+    k=$(media_kind "$f")
+    [[ "$k" == "${2}_image" || "$k" == "${2}_staged" ]] || continue
+    mj=$(media_major "$f")
+    [[ -z "$mj" || "$mj" == "$(want_rel "$2")" ]] && return 0
+  done
+  return 1
+}
 media_is_staged() { local k; k=$(media_kind "${1%%,*}"); [[ "$k" == *_staged ]]; }
 
 # ---- 3.1 installer files ----
@@ -4744,12 +4882,16 @@ c_3_1() {
   if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; fi
   db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1
   if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
-  if { [[ $need_g -eq 0 ]] || media_ok "$GRID_MEDIA"; } && { [[ $need_d -eq 0 ]] || media_ok "$DB_MEDIA"; }; then
+  # files already named in the settings are checked like found ones: right kind (Grid / database) and release
+  if { [[ $need_g -eq 0 ]] || { media_ok "$GRID_MEDIA" && media_matches "$GRID_MEDIA" grid; }; } \
+     && { [[ $need_d -eq 0 ]] || { media_ok "$DB_MEDIA" && media_matches "$DB_MEDIA" db; }; }; then
     NOW="Installer files are known"
     [[ -n "$GRID_MEDIA" ]] && NOW+=$'\n'"Grid:      $GRID_MEDIA"
     [[ -n "$DB_MEDIA" ]] && NOW+=$'\n'"Database:  $DB_MEDIA"
     return 0
   fi
+  [[ $need_g -eq 1 && -n "$GRID_MEDIA" ]] && media_ok "$GRID_MEDIA" && ! media_matches "$GRID_MEDIA" grid && warn "GRID_MEDIA ($GRID_MEDIA) is not a Grid $(want_rel grid) installer. The folders are searched instead."
+  [[ $need_d -eq 1 && -n "$DB_MEDIA" ]] && media_ok "$DB_MEDIA" && ! media_matches "$DB_MEDIA" db && warn "DB_MEDIA ($DB_MEDIA) is not a database $(want_rel) installer. The folders are searched instead."
   scan_media
   F_GRID=""; F_DB=""
   [[ $need_g -eq 1 ]] && F_GRID=$(pick_media grid)
@@ -4942,7 +5084,10 @@ run_installer() {
       printf 'Cause: /etc/oraInst.loc is missing, so the installer tried to create a new inventory in a
 folder that already has files (%s).
 ' "$INVENTORY_DIR" | hint
-      if use_grid; then printf 'Fix: finish Grid first. Its root scripts (step 3.3) create /etc/oraInst.loc.
+      if [[ "$who" == grid ]]; then printf 'Fix: answer r. The step then moves the files of the earlier attempt aside
+(nothing is deleted) and starts the installer again.
+' | hint
+      elif use_grid; then printf 'Fix: finish Grid first. Its root scripts (step 3.3) create /etc/oraInst.loc.
 Answer q, then run the script again: it continues with the Grid steps.
 ' | hint
       else printf 'Fix: answer q and run the script again: step 3.6 then shows what to do with that folder.
@@ -5310,6 +5455,43 @@ write_grid_rsp() {
 
 # ---- 3.2 Grid software ----
 SW_FIX=""; SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+inventory_state() {
+  # ok        : /etc/oraInst.loc is there, or the inventory folder is missing or empty (the installer makes it)
+  # registered: the folder holds a real inventory (Oracle homes are listed in it), but /etc/oraInst.loc is missing
+  # leftover  : the folder only has what a failed installer left (logs, an empty inventory): no home is listed
+  [[ -f /etc/oraInst.loc ]] && { printf ok; return; }
+  [[ -d "$INVENTORY_DIR" ]] && ! dir_empty "$INVENTORY_DIR" || { printf ok; return; }
+  if grep -qs '<HOME ' "$INVENTORY_DIR/ContentsXML/inventory.xml"; then printf registered; else printf leftover; fi
+}
+inventory_fix_plan() {
+  # $1 owner of the inventory. Sets NOW and PLAN for a state that is not ok (INS-32035 otherwise).
+  case "$(inventory_state)" in
+    leftover)
+      NOW+="${NOW:+$'\n'}$INVENTORY_DIR is not empty, but no Oracle home is registered in it and /etc/oraInst.loc is missing."
+      NOW+=$'\n'"These are files of an earlier installer run that did not finish. The installer would stop with INS-32035."
+      PLAN="Move $INVENTORY_DIR aside to $INVENTORY_DIR.old_$RUN_ID (nothing is deleted),"$'\n'"and create it again empty, owner $1, group $INSTALL_GROUP."$'\n'"${PLAN}" ;;
+    registered)
+      NOW+="${NOW:+$'\n'}$INVENTORY_DIR holds an inventory with Oracle homes, but /etc/oraInst.loc is missing."
+      PLAN="Write /etc/oraInst.loc (inventory_loc=$INVENTORY_DIR, inst_group=$INSTALL_GROUP), so the installer uses it."$'\n'"${PLAN}" ;;
+  esac
+}
+inventory_fix() {
+  # $1 owner. Puts the inventory folder in a state the installer accepts (see inventory_state).
+  case "$(inventory_state)" in
+    ok) return 0 ;;
+    leftover)
+      local old="$INVENTORY_DIR.old_$RUN_ID"
+      [[ -e "$old" ]] && { bad "$old already exists. Nothing is moved."; return 1; }
+      mv -T -- "$INVENTORY_DIR" "$old" || { bad "Cannot move $INVENTORY_DIR aside."; return 1; }
+      journal RENAME "$INVENTORY_DIR" "to=$old"
+      say "Moved the files of the earlier attempt to $old"
+      make_dir "$INVENTORY_DIR" "$1" || return 1 ;;
+    registered)
+      printf 'inventory_loc=%s\ninst_group=%s\n' "$INVENTORY_DIR" "$INSTALL_GROUP" | write_as root /etc/oraInst.loc 644 || return 1
+      say "Wrote /etc/oraInst.loc" ;;
+  esac
+  [[ "$(inventory_state)" == ok ]]
+}
 grid_ready() {
   # what the install needs (NOW says what is missing)
   [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 1; }
@@ -5331,10 +5513,12 @@ c_3_2() {
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     HALF_INSTALLED) half_installed_plan "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done"; return 1 ;;
   esac
-  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; return 1; fi
+  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   grid_ready || return 2
   NOW="Grid is not installed yet"
   PLAN=""
+  # an inventory folder that an earlier, failed installer run left behind is moved aside first (else INS-32035)
+  [[ "$(inventory_state)" != ok ]] && SW_FIX=inv
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$GRID_MEDIA"; then PLAN="Unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid), as $GRID_USER"$'\n'
     else PLAN="Unzip $GRID_MEDIA into $GRID_HOME, as $GRID_USER"$'\n'; fi
@@ -5346,6 +5530,7 @@ ${RU_DIR:+  with the Release Update in $RU_DIR}
   Inventory $INVENTORY_DIR
 Ask you for a new ASM password for SYS and ASMSNMP (used only on this server)"
   USING="Same paths and disk group name as the primary."$'\n'"The response file is made from the template in the media."
+  [[ "$SW_FIX" == inv ]] && inventory_fix_plan "$GRID_USER"
   return 1
 }
 d_3_2() {
@@ -5354,6 +5539,7 @@ d_3_2() {
     half)  sw_half_fix "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done" "$(stage_dir grid)" grid || fx=$?
            [[ $fx -eq 10 ]] || return $fx ;;
     unzip) sw_unzip_fix || return 1 ;;
+    inv)   inventory_fix "$GRID_USER" || return 1 ;;
   esac
   if [[ -n "$SW_FIX" ]]; then
     SW_FIX=""; grid_state
@@ -5470,8 +5656,18 @@ d_3_4() {
       return $crc ;;
     HAS_DOWN)
       run_logged "crsctl start has" timeout 300 "$GRID_HOME/bin/crsctl" start has || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-      local n=0; say "Waiting for ASM to come online ..."
-      until grid_state; [[ "$GSTATE" == "DONE" || $n -ge 12 ]]; do sleep 5; n=$((n + 1)); done ;;
+      # ASM may take minutes after the stack starts (many disks): up to 5 minutes, then a clear failure
+      # measured in time (each check itself may take a while), with a line every minute
+      local t0 last=0 el; t0=$(date +%s); say "Waiting for ASM to come online (up to 5 minutes) ..."
+      until grid_state; [[ "$GSTATE" == "DONE" || "$GSTATE" == "ASM_DOWN" ]] || (( $(date +%s) - t0 >= 300 )); do
+        sleep 5; el=$(( ($(date +%s) - t0) / 60 )); [[ $el -gt $last ]] && { last=$el; say "Still waiting ($el min, state $GSTATE)"; }
+      done
+      # the stack is up but ASM was not started with it (not set to start by itself): started here
+      if [[ "$GSTATE" == "ASM_DOWN" ]]; then
+        run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+        t0=$(date +%s); until grid_state; [[ "$GSTATE" == "DONE" ]] || (( $(date +%s) - t0 >= 120 )); do sleep 5; done
+      fi
+      [[ "$GSTATE" == "DONE" ]] || { bad "Oracle Restart started, but ASM did not come online in time (state $GSTATE)."; return 1; } ;;
     ASM_DOWN) run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; } ;;
   esac
 }
@@ -5491,8 +5687,12 @@ c_3_5() {
   local list=$SQL_OUT ca="" cr=""
   dg_field "$DATA_DG"
   if [[ "$DG_S" == "MOUNTED" || "$DG_S" == "CONNECTED" ]]; then
+    # the new disk groups take these values from +DATA: a failed query is not passed over silently
     sql_asm "select max(decode(a.name,'compatible.asm',a.value))||'|'||max(decode(a.name,'compatible.rdbms',a.value)) from v\$asm_attribute a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name='$DATA_DG';" \
-      && IFS='|' read -r ca cr <<< "$(first_line)"
+      || { NOW="Cannot read compatible.asm and compatible.rdbms of +$DATA_DG ($(ora_errors "$SQL_OUT"))"; return 2; }
+    IFS='|' read -r ca cr <<< "$(first_line)"
+    # a disk group made with the old 10.1 defaults has no attribute rows: the new ones get the defaults too
+    [[ "$ca" =~ ^[0-9.]+$ && "$cr" =~ ^[0-9.]+$ ]] || warn "+$DATA_DG does not show both compatible.asm and compatible.rdbms. A value it does not show is the default of this ASM in the new disk groups."
   elif [[ -z "$DG_S" ]]; then
     # the Grid configuration created ASM but not +DATA (it stopped half-way): created here like the others
     warn "+$DATA_DG does not exist, although ASM is running. The Grid configuration did not
@@ -5523,13 +5723,17 @@ alter diskgroup $dg mount;"
       else ver_lt "${ca2:-0}" 11.2 && ca2=11.2.0.0.0; fi
       ver_lt "${cr2:-0}" 11.2 && cr2=11.2.0.0.0
     fi
-    [[ "$ca2" =~ ^[0-9.]+$ && "$cr2" =~ ^[0-9.]+$ ]] && attrs+="'compatible.asm'='$ca2', 'compatible.rdbms'='$cr2'"
+    # each value that is known is used (one can be missing on an old disk group)
+    # compatible.asm alone is fine; compatible.rdbms only together with it (rdbms may not be above asm)
+    [[ "$ca2" =~ ^[0-9.]+$ ]] && attrs+="'compatible.asm'='$ca2'"
+    [[ "$ca2" =~ ^[0-9.]+$ && "$cr2" =~ ^[0-9.]+$ ]] && attrs+=", 'compatible.rdbms'='$cr2'"
     [[ "${PRIMARY_REDO_BS:-${SRL_BLOCKSIZE:-512}}" == "4096" ]] && attrs+="${attrs:+, }'sector_size'='4096'"
     [[ -n "$attrs" ]] && c+=" attribute $attrs"
     DG_TODO+="$c;"$'\n'; todo+=" +$dg"
   done
   DG_TODO=${DG_TODO%$'\n'}
   if [[ -z "$DG_TODO" ]]; then NOW="${info%$'\n'}"; return 0; fi
+  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the sector size of the new disk groups is not known. Run the script again."; return 2; }
   NOW="Disk groups to create:$todo"
   PLAN="As $GRID_USER:  export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM ; \$ORACLE_HOME/bin/sqlplus / as sysasm
 $DG_TODO"
@@ -5647,7 +5851,7 @@ c_3_6() {
     HALF_INSTALLED) half_installed_plan "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done"; return 1 ;;
   esac
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
-  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; return 1; fi
+  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   inventory_ready || return $?
   db_ready || return 2
   NOW="Database software is not installed yet"
@@ -5736,6 +5940,7 @@ c_3_8() {
   PLAN+=$'\n'"Then the spfile, password file and tnsnames.ora are kept inside $DB_HOME."
   return 1
 }
+# journaled first: a roohctl that stops half-way has still changed the home, and the undo must be listed
 d_3_8() { journal ROOHCTL "$DB_HOME"; run_logged "roohctl -disable" as_oracle "$DB_HOME/bin/roohctl" -disable || { bad "roohctl failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }; }
 rw_home_ok() {
   db_sw_ok || return 1
@@ -5827,7 +6032,7 @@ primary_patches() {
 local_release() {
   # base release of the installed database software, from sqlplus -V ("Release 19.0.0.0.0", "Version 19.21.0.0.0")
   run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V || return 1
-  grep -oE 'Release [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
+  grep -oE '(Release|Version) [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
 }
 c_3_11() {
   db_sw_ok || { NOW="Database software is not installed yet (step 3.6)"; return 2; }
@@ -5835,6 +6040,7 @@ c_3_11() {
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
   local rel want h pp lp missing extra report="" bad_rel=""
   rel=$(local_release || true); want=$(want_rel)
+  [[ -n "$rel" ]] || { NOW="The release of the database software here cannot be read (sqlplus -V)"; return 2; }
   if [[ -n "$rel" ]]; then
     if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$want" ]] || bad_rel="release $rel here, release $want on the primary"
     else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="release $rel here, release $DB_MAJOR on the primary"; fi
@@ -5947,7 +6153,7 @@ c_4_1() {
 create spfile from memory;
 -- Then restart the primary once (shutdown immediate; startup) at a quiet time.
 -- After the restart it uses the spfile. The other changes of this phase need it."
-    PLAN_UNDO="delete \$ORACLE_HOME/dbs/spfile${PRIMARY_SID}.ora, then restart with:  startup pfile='\$ORACLE_HOME/dbs/init${PRIMARY_SID}_before_dg.ora'"
+    PLAN_UNDO="delete \$ORACLE_HOME/dbs/spfile${PRIMARY_SID}.ora, then restart with:  startup pfile='?/dbs/init${PRIMARY_SID}_before_dg.ora'"
     return 1
   fi
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
@@ -6100,7 +6306,14 @@ c_4_4() {
   if [[ -n "$OLD_ARCH_DEST" ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
   find_dest || { NOW="No free log_archive_dest_N on the primary"; return 2; }
   p_param "log_archive_dest_$DEST_N" || { NOW="Query on the primary failed"; return 2; }
-  if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"; return 0; fi
+  if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then
+    NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"
+    # an existing destination is kept as it is; a mode other than the script's own is said
+    if [[ "$PVAL" == *SYNC* && "$PVAL" != *ASYNC* ]] || [[ "$PVAL" != *"VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE)"* ]]; then
+      warn "log_archive_dest_$DEST_N is kept as it is, but it differs from what this script sets"$'\n'"(async valid_for=(online_logfiles,primary_role)). SYNC slows down commits on the primary."
+    fi
+    return 0
+  fi
   NOW="log_archive_dest_$DEST_N = $(disp_val "$PVAL")"
   [[ "$DEST_N" != "2" ]] && NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"
   PLAN=""
@@ -6293,9 +6506,11 @@ tns_desc_ok() {
   return 0
 }
 tnsping_class() {
-  # $1 tnsping output -> OK | NOLISTENER (alias resolved, nothing answers there yet) | MISSING | OTHER
+  # $1 tnsping output -> OK | NOLISTENER (alias resolved, the server says nothing listens there yet) |
+  # BLOCKED (alias resolved, no answer at all: a timeout, usually a firewall that drops) | MISSING | OTHER
   if grep -q '^OK' <<< "$1"; then printf 'OK'
-  elif grep -qE 'TNS-12541|TNS-12543|TNS-12535|TNS-12170|TNS-12560|TNS-12547' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'NOLISTENER'
+  elif grep -qE 'TNS-12541|TNS-12543|TNS-12560|TNS-12547' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'NOLISTENER'
+  elif grep -qE 'TNS-12535|TNS-12170' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'BLOCKED'
   elif grep -qE 'TNS-03505|TNS-12154' <<< "$1" || ! grep -qi 'adapter' <<< "$1"; then printf 'MISSING'
   else printf 'OTHER'; fi
 }
@@ -6307,10 +6522,11 @@ c_4_9() {
   [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="tnsping on the primary gave no answer within 120 seconds. Answer r to check again."; return 2; }
   cls=$(tnsping_class "$RUN_OUT")
   PLAN_UNDO="remove the $STANDBY_TNS entry from $PRIMARY_TNS_ADMIN/tnsnames.ora, or put back the backup if you changed an existing entry"
-  if [[ "$cls" == "OK" || "$cls" == "NOLISTENER" ]] && grep -qi 'TNSNAMES adapter' <<< "$RUN_OUT"; then
+  if [[ "$cls" == "OK" || "$cls" == "NOLISTENER" || "$cls" == "BLOCKED" ]] && grep -qi 'TNSNAMES adapter' <<< "$RUN_OUT"; then
     if tns_desc_ok "$RUN_OUT" "$STANDBY_HOST" "$STANDBY_SERVICE"; then
       NOW="tnsnames.ora on the primary has $STANDBY_TNS = $STANDBY_HOST:$PORT/$STANDBY_SERVICE (UR=A)"
       [[ "$cls" == "NOLISTENER" ]] && NOW+=$'\n'"The alias is right. Nothing answers on this server yet: the listener comes in phase 5."
+      [[ "$cls" == "BLOCKED" ]] && warn "The alias is right, but the primary got no answer at all from $STANDBY_HOST:$PORT (timeout)."$'\n'"A firewall between the servers probably drops the connection. Step 2.9 opens the port on this server;"$'\n'"a network firewall must allow port $PORT from the primary too. Step 7.6 tests it, and step 8.1 again before the copy."
       return 0
     fi
     NOW="The alias $STANDBY_TNS on the primary is different: $TNS_WHY"
@@ -6343,10 +6559,17 @@ c_4_10() {
     NOW="The primary listener has a static entry for $PRIMARY_SID"; return 0
   fi
   NOW="The primary listener has no static entry for $PRIMARY_SID."
-  PLAN="-- Edit this file (or the listener.ora in its TNS_ADMIN, if set):
---   $PRIMARY_LISTENER_HOME/network/admin/listener.ora
--- Add this inside SID_LIST_$LISTENER_NAME, or create the block if it is missing.
--- ORACLE_HOME must be the database home, not the Grid home.
+  local lf="${PRIMARY_LISTENER_TNS_ADMIN:-$PRIMARY_LISTENER_HOME/network/admin}/listener.ora"
+  PLAN="-- Edit this file:
+--   $lf
+-- If it already has a block SID_LIST_$LISTENER_NAME, add ONLY this SID_DESC inside its (SID_LIST = ...).
+-- Do not paste a second SID_LIST_$LISTENER_NAME block: the last one would replace the first.
+    (SID_DESC =
+      (GLOBAL_DBNAME = $PRIMARY_SERVICE)
+      (SID_NAME = $PRIMARY_SID)
+      (ORACLE_HOME = $DB_HOME)
+    )
+-- If there is no such block yet, add the whole block:
 SID_LIST_$LISTENER_NAME =
   (SID_LIST =
     (SID_DESC =
@@ -6355,6 +6578,7 @@ SID_LIST_$LISTENER_NAME =
       (ORACLE_HOME = $DB_HOME)
     )
   )
+-- ORACLE_HOME must be the database home, not the Grid home.
 -- Then reload the listener:
 ORACLE_HOME=$PRIMARY_LISTENER_HOME $PRIMARY_LISTENER_HOME/bin/lsnrctl reload $LISTENER_NAME"
   PLAN_UNDO="remove that SID_DESC block from listener.ora, then run lsnrctl reload $LISTENER_NAME"
@@ -6388,8 +6612,8 @@ EOF"
 phase_4() {
   phase_header 4 "Prepare the primary"
   say "The script only reads the primary. You run the changes it shows."
-  STEP_TITLE_HINT=([4.1]="ARCHIVELOG and FORCE LOGGING" [4.2]="Standby redo logs" [4.3]="Data Guard names (log_archive_config)" [4.4]="Redo transport to the standby (log_archive_dest_N)" [4.5]="Automatic standby files (standby_file_management)" [4.6]="Archive destination and recovery area" [4.7]="Password file and SYS" [4.8]="fal_server (optional, for switchover)")
-  batch_primary_steps 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8
+  STEP_TITLE_HINT=([4.1]="ARCHIVELOG and FORCE LOGGING" [4.2]="Standby redo logs" [4.3]="Data Guard names (log_archive_config)" [4.4]="Redo transport to the standby (log_archive_dest_N)" [4.5]="Automatic standby files (standby_file_management)" [4.6]="Archive destination and recovery area" [4.7]="Password file and SYS" [4.8]="fal_server (optional, for switchover)" [4.9]="Standby alias in the primary tnsnames.ora" [4.11]="Environment of $ORACLE_USER on the primary")
+  batch_primary_steps 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.11
   run_step 4.1  primary "ARCHIVELOG and FORCE LOGGING" c_4_1
   run_step 4.2  primary "Standby redo logs on the primary" c_4_2
   run_step 4.3  primary "Data Guard names (log_archive_config)" c_4_3
@@ -6429,8 +6653,18 @@ static_entry_state() {
       [[ $gok -eq 1 ]] || STATIC_WHY+="GLOBAL_DBNAME is missing or not $STANDBY_SERVICE"$'\n'
       found=2
     fi
-  done < <(printf '%s' "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
+  done < <(sidlist_of "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
   return $found
+}
+sidlist_of() {
+  # $1 listener.ora flattened by norm -> only the (...) that belongs to SID_LIST_<this listener>
+  # (an entry under another listener's SID_LIST is not served by this one)
+  # the LAST block counts: listener.ora with two blocks of one name uses the last one
+  awk -v key="SID_LIST_${SB_LSNR^^}=" '{
+    t = $0; i = 0; while ((j = index(t, key)) > 0) { i += j; t = substr(t, j + 1) }; if (!i) exit
+    s = substr($0, i + length(key)); d = 0; out = ""
+    for (j = 1; j <= length(s); j++) { c = substr(s, j, 1); out = out c; if (c == "(") d++; else if (c == ")") { d--; if (d == 0) break } }
+    print out }' <<< "$1"
 }
 lsnr_has_sidlist() { local f; f=$(lsnr_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$f"; }
 static_block() {
@@ -6571,7 +6805,12 @@ d_5_2() {
 
 # ---- 5.3 / 5.4 ----
 T_ALIAS=""; T_HOST=""; T_SVC=""
-tns_alias_present() { local f; f=$(tns_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*$1[[:space:]]*=" "$f"; }
+tns_alias_present() {
+  # the alias as plain text (a . in my.db is a dot, not "any character")
+  local f a; f=$(tns_file); [[ -f "$f" ]] || return 1
+  a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$1")
+  grep -qiE "^[[:space:]]*$a[[:space:]]*=" "$f"
+}
 c_tns() {
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
@@ -6589,6 +6828,10 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
   fi
   if tns_alias_present "$T_ALIAS"; then
     case "$(tnsping_class "$RUN_OUT")" in
+      BLOCKED)
+        if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then
+          NOW="The alias $T_ALIAS is right, but $T_HOST:$PORT gives no answer at all (timeout)."$'\n'"A firewall on $T_HOST or between the servers probably drops port $PORT."; return 2
+        fi ;;
       NOLISTENER)
         if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then
           NOW="The alias $T_ALIAS is right, but nothing answers at $T_HOST:$PORT yet: $(grep -oE 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
@@ -6663,7 +6906,8 @@ c_6_1() {
   if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
-    if prim_probe statx "$t"; then
+    # no answer from stat (the file is not there) is "no copy yet", not a copy with an empty owner and mode
+    if prim_probe statx "$t" && [[ -n "$(head -n 1 <<< "$RUN_OUT")" ]]; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
       if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#$tmode & 8#027 )) -ne 0 ]]; then
         NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
@@ -6708,6 +6952,16 @@ chgrp $INSTALL_GROUP $t
 chmod 640 $t"
         PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
     USING="After you run the commands below, the script copies the file to this server."$'\n'"Step 6.2 then asks you to delete it on the primary."
+    return 1
+  fi
+  # can the ssh user read it? (md5sum reads the file; a copy would fail the same way)
+  if ! prim_probe md5 "$pfile" || ! [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" =~ ^[0-9a-f]{32}$ ]]; then
+    NOW+=$'\n'"The ssh user $PRIMARY_SSH_USER cannot read $pfile on the primary."
+    KIND_NOW=primary; PRIMARY_HOW_STEP="root  ->  shell"
+    PLAN="-- Let the ssh user read it (it is in the group $INSTALL_GROUP, or use the oracle user for ssh):
+ls -l $pfile
+chmod g+r $pfile"
+    PLAN_UNDO="chmod g-r $pfile"
     return 1
   fi
   PW_SRC=$pfile
@@ -6817,7 +7071,10 @@ c_6_3() {
       # a LOCAL auto-login wallet of the primary does not open here: it is made again on this server (orapki)
       if [[ "$f" == cwallet.sso ]] && tde_local_autologin; then continue; fi
       if [[ ! -f "$d/$f" ]]; then miss+=" $d/$f"; TDE_TODO+=("$d/$f"); continue; fi
-      if prim_probe md5 "$d/$f" && [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" == "$(md5sum "$d/$f" | awk '{print $1}')" ]]; then have+=" $d/$f"
+      # a checksum the primary cannot give (the ssh user cannot read the file) is not "different": it is not known
+      local rmd=""; prim_probe md5 "$d/$f" && rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT")
+      [[ "$rmd" =~ ^[0-9a-f]{32}$ ]] || { NOW="Cannot read $d/$f on the primary (md5sum). The ssh user $PRIMARY_SSH_USER must be able to read it."; return 2; }
+      if [[ "$rmd" == "$(md5sum "$d/$f" | awk '{print $1}')" ]]; then have+=" $d/$f"
       else diff+=" $d/$f"; TDE_TODO+=("$d/$f"); fi
     done <<< "$RUN_OUT"
     [[ $found -eq 1 ]] || { NOW="No ewallet.p12 or cwallet.sso in $d on the primary"; return 2; }
@@ -6839,13 +7096,21 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
       TDE_SQLNET=1
     fi
   fi
-  TDE_NO_AUTOLOGIN=0; [[ "$have$miss$diff" == *"cwallet.sso"* ]] || TDE_NO_AUTOLOGIN=1
-  if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 && -f "${dirs[0]}/cwallet.sso" ]]; then TDE_NO_AUTOLOGIN=0; fi
+  # every keystore folder needs its own auto-login file here (CDB and PDB wallets are separate folders);
+  # the tde_seps folder holds only the external-store password and is copied as it is
+  local nocw=()
+  for d in "${dirs[@]}"; do
+    [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]] && continue
+    [[ -f "$d/cwallet.sso" ]] && continue
+    [[ " ${TDE_TODO[*]+"${TDE_TODO[*]}"} " == *" $d/cwallet.sso "* ]] && continue
+    nocw+=("$d")
+  done
+  TDE_NO_AUTOLOGIN=0; [[ ${#nocw[@]} -gt 0 ]] && TDE_NO_AUTOLOGIN=1
+  TDE_CW_TODO=("${nocw[@]+"${nocw[@]}"}")
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 ]]; then
-    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here."$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
+    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
     tde_local_autologin && NOW+=$'\n'"The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is made again here."
-    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"
-    PLAN=$(orapki_plan "${dirs[0]}")
+    PLAN="Make cwallet.sso here with orapki, as $ORACLE_USER, in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"You type the keystore (wallet) password once. It is passed to orapki and not kept anywhere."
     return 1
   fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
@@ -6858,12 +7123,10 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   PLAN=""
   [[ ${#TDE_TODO[@]} -gt 0 ]] && PLAN="Copy these files from the primary to the same path here (scp, checked with md5sum):"$'\n'"$(printf '  %s\n' "${TDE_TODO[@]}")"$'\n'"Owner $ORACLE_USER:$INSTALL_GROUP, mode 600. Old files are kept as .bak_$RUN_ID."$'\n'
   [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add this to sqlnet.ora (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
-  TDE_NO_AUTOLOGIN=0
-  if [[ " ${have} ${TDE_TODO[*]+"${TDE_TODO[*]}"} " != *"cwallet.sso"* ]]; then
-    TDE_NO_AUTOLOGIN=1
+  if [[ $TDE_NO_AUTOLOGIN -eq 1 ]]; then
     if tde_local_autologin; then PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
     else PLAN+="The primary has no auto-login keystore (cwallet.sso)."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'; fi
-    PLAN+="After the copy, this step shows the orapki command that makes cwallet.sso on this server."$'\n'
+    PLAN+="After the copy, cwallet.sso is made on this server with orapki (you type the keystore password once)."$'\n'
   fi
   PLAN=${PLAN%$'\n'}
   return 1
@@ -6880,6 +7143,12 @@ d_6_3() {
     backup_file "$f" "$ORACLE_USER" || return 1
     install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 600 "$tmp" "$f" || return 1
     rm -f "$tmp"; say "Installed $f"; journal_file_written "$f" "$existed"
+    # a new ewallet.p12 (for example after a new master key) makes an auto-login file that was made HERE
+    # outdated (ORA-28374): it is moved aside and made again. One that comes from the primary is copied anyway.
+    if [[ "$f" == */ewallet.p12 && -f "$d/cwallet.sso" && " ${TDE_TODO[*]} " != *" $d/cwallet.sso "* ]]; then
+      runuser -u "$ORACLE_USER" -- mv -f -- "$d/cwallet.sso" "$d/cwallet.sso.old_$RUN_ID" \
+        && { journal RENAME "$d/cwallet.sso" "to=$d/cwallet.sso.old_$RUN_ID"; say "The old auto-login file of $d is kept as cwallet.sso.old_$RUN_ID. It is made again."; }
+    fi
   done
   if [[ $TDE_SQLNET -eq 1 ]]; then
     local s; s=$(sqlnet_file)
@@ -6888,6 +7157,32 @@ d_6_3() {
       | append_as "$ORACLE_USER" "$s" || return 1
     say "Added ENCRYPTION_WALLET_LOCATION to $s"
   fi
+  # the auto-login keystore: worked out again after the copy (the copied files may have brought one)
+  need_ssh || return 1            # a lost connection is opened again on the screen, not in the quiet check
+  c_6_3 >/dev/null 2>&1 || true
+  [[ ${#TDE_CW_TODO[@]} -gt 0 ]] || return 0
+  tde_make_autologin
+}
+TDE_CW_TODO=()
+tde_make_autologin() {
+  # cwallet.sso for every keystore folder in TDE_CW_TODO. The password goes to orapki on its input
+  # (never on its command line, never in a file or the log). If orapki does not take it, the command is shown.
+  local d out rc=0 opt; opt=$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')
+  ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${TDE_CW_TODO[*]})"
+  local pw=$SECRET; SECRET=""
+  for d in "${TDE_CW_TODO[@]}"; do
+    out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || rc=1
+    out=${out//"$pw"/*****}
+    printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
+    if [[ -f "$d/cwallet.sso" ]]; then
+      say "Made $d/cwallet.sso"; journal_file_written "$d/cwallet.sso" 0
+    else
+      pw=""; bad "orapki did not make $d/cwallet.sso: $(grep -m1 -iE 'PKI-|error|incorrect' <<< "$out")"
+      { printf 'Run it by hand, as %s (orapki asks for the password):\n' "$ORACLE_USER"; orapki_plan "$d"; } | hint
+      return 1
+    fi
+  done
+  pw=""; return $rc
 }
 
 phase_6() {
@@ -7159,7 +7454,11 @@ touch $STATE_DIR/existing_files_ok"
     MOUNTED|OPEN)
       sql_local "select database_role from v\$database;" || { NOW="Cannot read the database role ($(ora_errors "$SQL_OUT"))"; return 2; }
       local role; role=$(first_line)
-      [[ "$role" == "PHYSICAL STANDBY" ]] || fatal "Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby, so the script stops."
+      if [[ "$role" != "PHYSICAL STANDBY" ]]; then
+        # check mode only reports (the other phases are still shown); a real run stops here
+        [[ "$MODE" == "check" ]] && { NOW="Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby: nothing here may touch it."; return 2; }
+        fatal "Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby, so the script stops."
+      fi
       local sc=0; standby_complete || sc=$?
       if [[ $sc -eq 0 ]]; then STANDBY_BUILT=1; NOW="The standby database already exists ($LSTATE, PHYSICAL STANDBY). No copy is needed."; return 0; fi
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
@@ -7308,7 +7607,7 @@ c_7_3() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   if sql_local "select status from v\$instance;"; then NOW="Login works. Instance status: $(first_line)"; return 0; fi
   if grep -qE 'ORA-01034|idle instance' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists but is not started. The logins are tested after step 9.2 starts it."; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists but is not started. The logins are tested after step 9.2 starts it."; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Local login failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" local); return 1
@@ -7318,12 +7617,12 @@ c_7_4() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   local_state
   if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   if sql_standby_tns "select instance_name||' '||status from v\$instance;"; then NOW="Login works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Login sys@$STANDBY_TNS failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" standby-tns); return 1
@@ -7341,18 +7640,48 @@ c_7_6() {
   # the login goes to the standby instance through its listener: before 7.2 there is nothing to reach
   local_state
   if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   need_ssh || return 2
   if prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;"; then NOW="Login from the primary works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Login from the primary to sys@$STANDBY_TNS failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" standby-tns); return 1
 }
 
+LOGINS_DEFERRED=0
+logins_flag() { printf '%s/logins_deferred' "$STATE_DIR"; }
+logins_defer() {
+  # phase 7 could not test the logins (the built standby was down): remembered, also for a later run
+  LOGINS_DEFERRED=1
+  [[ "$MODE" == "run" && -n "$STATE_DIR" ]] && { install -d -m 700 "$STATE_DIR"; : > "$(logins_flag)"; }
+  return 0
+}
+logins_after_start() {
+  # the logins of 7.3, 7.4 and 7.6 that could not be tested in phase 7 (the standby was down) are tested now.
+  # 0 = all work, or nothing was deferred, or a test cannot run now (a warning); 1 = one fails (NOW and PLAN say why)
+  [[ $LOGINS_DEFERRED -eq 1 || -f "$(logins_flag)" ]] || return 0
+  need_ssh || { warn "The logins of steps 7.3, 7.4 and 7.6 are tested in a later run (no connection to the primary now)."; return 0; }
+  local f rc keep_now=$NOW sid
+  for f in c_7_3 c_7_4 c_7_6; do
+    NOW=""; PLAN=""; rc=0; "$f" >/dev/null || rc=$?
+    sid=${f#c_}; sid=${sid/_/.}
+    if [[ $rc -eq 2 ]]; then warn "Step $sid cannot be tested now (${NOW%%$'\n'*}). It is tested in a later run."; NOW=$keep_now; return 0; fi
+    if [[ $rc -ne 0 ]]; then
+      local why=$PLAN
+      NOW="The standby is running, but the login of step $sid fails: $NOW"
+      # the explanation is text, not commands: shown as comments
+      PLAN=$(printf '%s\n' "${why:-See:  $SELF --help-step $sid}" | sed 's/^/-- /')$'\n'"-- Then answer r."
+      return 1
+    fi
+  done
+  LOGINS_DEFERRED=0; rm -f -- "$(logins_flag)"
+  NOW="$keep_now"$'\n'"The logins of steps 7.3, 7.4 and 7.6 work now."
+  return 0
+}
 phase_7() {
   phase_header 7 "Start the empty instance (NOMOUNT)"
   run_step 7.1 auto  "Folders for the instance (audit, diagnostics)" c_7_1 d_7_1
@@ -7451,17 +7780,28 @@ dup_prechecks() {
   if use_grid && grid_sw_ok; then
     # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
     # the primary's online log members, and db_create_online_log_dest_1..5 (the standby uses the same names)
+    # not proven = not passed: an unread block size, an unread list of disk groups, an unread sector size
+    [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { PRE_FIX="The redo block size of the primary could not be read, so the disk groups for the logs cannot be checked"; return 1; }
     local ldg ldgs="$DATA_DG"; [[ "$CFD" == +* ]] && { ldg=$(norm_loc "$CFD"); ldgs=${ldg#+}; }
-    if prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
-      ldgs+=" $(grep -E '^[A-Z0-9_$#]+$' <<< "$SQL_OUT" | tr '\n' ' ')"
+    if ! prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
+      PRE_FIX="Cannot read on the primary which disk groups hold its logs"; return 1
     fi
+    ldgs+=" $(grep -E '^[A-Z0-9_$#]+$' <<< "$SQL_OUT" | tr '\n' ' ')"
     local ss seen=" "
     for ldg in $ldgs; do
       ldg=${ldg^^}; [[ "$seen" == *" $ldg "* ]] && continue; seen+="$ldg "
-      sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)" || continue
+      if ! sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" || ! num "$(first_line)"; then
+        PRE_FIX="Cannot read the sector size of +$ldg here (log files go there). Is the disk group mounted (step 3.5)?"; return 1
+      fi
       ss=$(first_line)
-      if [[ "${PRIMARY_REDO_BS:-512}" == "4096" && "$ss" != "4096" ]] || [[ "${PRIMARY_REDO_BS:-512}" == "512" && "$ss" == "4096" ]]; then
-        PRE_FIX="+$ldg has a sector size of $ss bytes, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"Log files go there, so after the copy they could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
+      [[ $ss -gt 0 ]] || { PRE_FIX="+$ldg reports a sector size of 0 (not mounted?). Log files go there. Mount it first (step 3.5)."; return 1; }
+      # 12.2+: a 512e disk group (sector_size 4096, logical_sector_size 512) takes 512-byte redo
+      local lss="$ss" lnote=""
+      if sql_asm "select logical_sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)" && [[ "$(first_line)" -gt 0 ]]; then lss=$(first_line)
+      else lnote=" (its logical sector size cannot be read in this ASM version, so the physical one is used)"; fi
+      # redo blocks must not be smaller than the (logical) sector, and 4K redo needs a 4K disk group
+      if [[ $PRIMARY_REDO_BS -lt $lss ]] || [[ $PRIMARY_REDO_BS -eq 4096 && $ss -ne 4096 ]]; then
+        PRE_FIX="+$ldg has a sector size of $ss bytes$lnote, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"Log files go there, so after the copy they could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
         return 1
       fi
       PRE_INFO+="+$ldg: sector size $ss bytes fits the redo block size ${PRIMARY_REDO_BS:-512}"$'\n'
@@ -7519,6 +7859,10 @@ dup_prechecks() {
     PRE_FIX="Alias $STANDBY_TNS does not reach the NOMOUNT instance on this server. It reaches: $ti, host $th, $ts"; return 1
   fi
   PRE_INFO+="$STANDBY_TNS reaches $ti (NOMOUNT) on this server"$'\n'
+  # and the other way: redo goes from the primary to this listener after the copy (a firewall shows only here)
+  prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;" \
+    || { PRE_FIX="The primary cannot reach the standby through $STANDBY_TNS: $(ora_errors "$SQL_OUT") (step 7.6)"$'\n'"$(golden_text "$SQL_OUT" standby-tns)"; return 1; }
+  PRE_INFO+="The primary reaches $STANDBY_TNS too"$'\n'
   # memory: the spfile of primary is copied; the standby must be able to start with it (same rules as step 2.16)
   local mrc=0 rfs; mem_probe || mrc=$?
   [[ $mrc -eq 2 ]] && { PRE_FIX="Cannot read the memory parameters of the primary"; return 1; }
@@ -7799,7 +8143,7 @@ d_8_2() {
     printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"
     cat "$rmanfile"
     printf 'exit\n') || rc=$?
-  if grep -q 'Finished Duplicate Db' "$rlog" && ! grep -qE '^RMAN-0(3002|3009|3015)' "$rlog"; then
+  if dup_log_ok "$rlog" "$rc"; then
     dup_success_record
     DONE_MSG="The database was copied (RMAN: Finished Duplicate Db)"
     return 0
@@ -7839,7 +8183,7 @@ phase_8() {
 #------------------------------------------------------------------------------
 # PHASE 9  Oracle Restart registration, standby redo logs, apply, shipping
 #------------------------------------------------------------------------------
-REG_MODE=""
+REG_MODE=""; REG_OLD_OPT=""; REG_OLD_HOME=""; REG_OLD_PW=""; REG_MOD_ARGS=()
 
 need_built() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 1; }
@@ -7873,13 +8217,24 @@ c_9_1() {
     grep -qiE "^(Database instance|Instance)( name)?:[[:space:]]*${STANDBY_SID}[[:space:]]*\$" <<< "$cfg" || bad_items+=" instance"
     # a standby must only be mounted at boot (open would need Active Data Guard, and apply starts on a mounted one)
     grep -qiE "^Start options:[[:space:]]*mount[[:space:]]*\$" <<< "$cfg" || bad_items+=" start-option"
+    # the home and the password file it starts with (a stale one fails only at the next start)
+    local oh pw; oh=$(sed -n 's/^Oracle home:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -s '/'); oh=${oh%/}; REG_OLD_HOME=$oh
+    [[ "$oh" == "$(tr -s '/' <<< "${DB_HOME%/}")" ]] || bad_items+=" oracle-home"
+    # an empty password file is right too: the instance then uses dbs/orapw<SID> of its home
+    pw=$(sed -n 's/^Password file:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -s '/'); pw=${pw%"${pw##*[![:space:]]}"}; REG_OLD_PW=$pw
+    [[ -z "$pw" || "$pw" == "$(pw_dest | tr -s '/')" ]] || bad_items+=" password-file"
     if [[ -z "$bad_items" ]]; then NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"; return 0; fi
-    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options)' <<< "$cfg")"
-    if [[ "$bad_items" == " start-option" ]]; then
-      # only the start option: changed in place, the running standby is not stopped
-      REG_MODE=modify
+    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options|oracle home|password file)' <<< "$cfg")"
+    REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
+    # start option, home and password file are changed in place (the running standby is not stopped);
+    # a wrong spfile, role or instance needs a new registration
+    if [[ "$bad_items" != *spfile* && "$bad_items" != *role* && "$bad_items" != *instance* ]]; then
+      REG_MODE=modify; REG_MOD_ARGS=()
+      [[ "$bad_items" == *start-option* ]] && REG_MOD_ARGS+=(-startoption MOUNT)
+      [[ "$bad_items" == *oracle-home* ]] && REG_MOD_ARGS+=(-oraclehome "$DB_HOME")
+      [[ "$bad_items" == *password-file* ]] && REG_MOD_ARGS+=(-pwfile "$(pw_dest)")
       PLAN="As $ORACLE_USER, on this server only:
-srvctl modify database -db $STANDBY_UNIQUE -startoption MOUNT"
+srvctl modify database -db $STANDBY_UNIQUE ${REG_MOD_ARGS[*]}"
       return 1
     fi
     REG_MODE=re
@@ -7896,6 +8251,25 @@ $add"
   USING="-instance must be exactly $STANDBY_SID, or sqlplus shows 'Connected to an idle instance'"
   return 1
 }
+_cfgv() { sed -n "s/^$2:[[:space:]]*//Ip" "$1" | head -n 1 | sed 's/[[:space:]]*$//'; }   # $1 file, $2 label
+srv_add_cmd_from() {
+  # $1 saved "srvctl config database" output -> the srvctl add command that makes the same registration
+  local f=$1 c
+  [[ -s "$f" ]] || return 0
+  local oh sp pw rl so dn inst dg
+  oh=$(_cfgv "$f" 'Oracle home'); sp=$(_cfgv "$f" 'Spfile'); pw=$(_cfgv "$f" 'Password file'); rl=$(_cfgv "$f" 'Database role')
+  so=$(_cfgv "$f" 'Start options'); dn=$(_cfgv "$f" 'Database name'); dg=$(_cfgv "$f" 'Disk Groups')
+  inst=$(_cfgv "$f" 'Database instance'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance name'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance')
+  local dm mp sto; dm=$(_cfgv "$f" 'Domain'); mp=$(_cfgv "$f" 'Management policy'); sto=$(_cfgv "$f" 'Stop options')
+  [[ -n "$oh" ]] || return 0
+  c="$DB_HOME/bin/srvctl add database -db $STANDBY_UNIQUE -oraclehome $oh"
+  [[ -n "$sp" ]] && c+=" -spfile $sp"; [[ -n "$pw" ]] && c+=" -pwfile $pw"; [[ -n "$rl" ]] && c+=" -role $rl"
+  [[ -n "$so" ]] && c+=" -startoption '$so'"; [[ -n "$dn" ]] && c+=" -dbname $dn"; [[ -n "$inst" ]] && c+=" -instance $inst"
+  [[ -n "$dg" ]] && c+=" -diskgroup $dg"
+  [[ -n "$dm" ]] && c+=" -domain $dm"; [[ -n "$mp" ]] && c+=" -policy $mp"; [[ -n "$sto" ]] && c+=" -stopoption '$sto'"
+  # only plain values (paths, names, lists) are put into the command
+  [[ "$c" =~ ^[A-Za-z0-9_./,\'\ +-]+$ ]] && printf '%s' "$c"
+}
 srv_add() {
   run_logged "srvctl add database" as_oracle "$DB_HOME/bin/srvctl" add database -db "$STANDBY_UNIQUE" \
     -oraclehome "$DB_HOME" -spfile "$(spfile_path)" -pwfile "$(pw_dest)" \
@@ -7904,16 +8278,39 @@ srv_add() {
 }
 d_9_1() {
   if [[ "$REG_MODE" == "modify" ]]; then
-    run_logged "srvctl modify start option" as_oracle "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" -startoption MOUNT \
+    run_logged "srvctl modify database" as_oracle "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" "${REG_MOD_ARGS[@]}" \
       || { bad "srvctl modify failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-    journal SRVOPT "$STANDBY_UNIQUE" "start option set to MOUNT"
+    # the old values, so --undo can say exactly how to put them back
+    local od=""
+    [[ " ${REG_MOD_ARGS[*]} " == *" -startoption "* ]] && od+="old=${REG_OLD_OPT:-unknown} "
+    [[ " ${REG_MOD_ARGS[*]} " == *" -oraclehome "* ]] && od+="oldhome=${REG_OLD_HOME:--} "
+    [[ " ${REG_MOD_ARGS[*]} " == *" -pwfile "* ]] && od+="oldpw=${REG_OLD_PW:--} "
+    journal SRVOPT "$STANDBY_UNIQUE" "${od% }"
     return 0
   fi
   if [[ "$REG_MODE" == "re" ]]; then
-    run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || true
-    journal SRVCTL_OLD "$STANDBY_UNIQUE" "the old registration was replaced (its config is in $LOG_FILE)"
+    # the old registration is kept in a file first: if the new one cannot be added, it is there to put back
+    local old="$STATE_DIR/srvctl_old_${STANDBY_UNIQUE}_$RUN_ID.txt"
+    run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
+    ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
     run_logged "srvctl stop" as_oracle "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    if ! srv_add; then
+      bad "The new registration failed. The old one is put back."
+      local radd; radd=$(srv_add_cmd_from "$old")
+      if [[ -n "$radd" ]] && run_logged "srvctl add (the old registration)" as_oracle bash -c "$radd"; then
+        say "The old registration is back (the values srvctl config showed). The standby is not started: step 9.2 starts it."
+      else
+        journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
+        { printf 'The old registration could not be put back. It is saved in:  %s\n' "$old"
+          [[ -n "$radd" ]] && printf 'As %s:  %s\n' "$ORACLE_USER" "$radd"
+          printf 'Or start the standby by hand (as %s):  sqlplus / as sysdba  ->  startup mount\n' "$ORACLE_USER"; } | hint
+      fi
+      return 1
+    fi
+    journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
+    journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
+    return 0
   fi
   srv_add || return 1
   journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
@@ -7926,7 +8323,8 @@ c_9_2() {
     # no Oracle Restart: the instance only has to be mounted as a standby
     local_state
     case "$LSTATE" in
-      MOUNTED|OPEN) adg_note "$LSTATE"; NOW="Instance $STANDBY_SID is $LSTATE (no Oracle Restart on this server)"; return 0 ;;
+      MOUNTED|OPEN) adg_note "$LSTATE"; NOW="Instance $STANDBY_SID is $LSTATE (no Oracle Restart on this server)"
+                    logins_after_start || { KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To check on this server ($(hostname -s))"; return 1; }; return 0 ;;
       IDLE) NOW="The standby instance is not running"; PLAN="As $ORACLE_USER:  sqlplus / as sysdba  ->  startup mount"; return 1 ;;
       STARTED) NOW="The instance is in NOMOUNT (started with the first pfile)"; PLAN="As $ORACLE_USER, on this server (standby instance $STANDBY_SID only):"$'\n'"  sqlplus / as sysdba  ->  shutdown immediate ; startup mount"$'\n'"The new start uses the spfile"; return 1 ;;
       *) NOW="Instance state: $LSTATE ($(ora_errors "$SQL_OUT"))"; return 2 ;;
@@ -7938,7 +8336,9 @@ c_9_2() {
   if sql_local "select i.instance_name||'|'||i.status||'|'||d.database_role from v\$instance i, v\$database d;"; then
     local iname ist irole; IFS='|' read -r iname ist irole <<< "$(first_line)"
     if [[ $srv_on -eq 1 && "$iname" == "$STANDBY_SID" && "$irole" == "PHYSICAL STANDBY" && ( "$ist" == "MOUNTED" || "$ist" == "OPEN" ) ]]; then
-      adg_note "$ist"; NOW="Running under Oracle Restart: instance $iname, $ist, $irole"; return 0
+      adg_note "$ist"; NOW="Running under Oracle Restart: instance $iname, $ist, $irole"
+      logins_after_start || { KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To check on this server ($(hostname -s))"; return 1; }
+      return 0
     fi
     if [[ $srv_on -eq 0 ]]; then
       NOW="Instance $iname is $ist, but it was started by RMAN, not by Oracle Restart"
@@ -7966,7 +8366,10 @@ d_9_2() {
   local_state
   if [[ "$LSTATE" != "IDLE" && "$LSTATE" != "NOSW" ]]; then
     say "Stopping the instance that RMAN started on this server"
+    # it must really be down: srvctl start on an instance that still runs would not put it under Oracle Restart
     sql_local_long "shutdown immediate" || true
+    local_state
+    [[ "$LSTATE" == "IDLE" ]] || { bad "The instance did not stop (state $LSTATE; $(ora_errors "$SQL_OUT")). Oracle Restart cannot take it over."; return 1; }
   fi
   run_logged "srvctl start" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" start database -db "$STANDBY_UNIQUE" || { bad "srvctl start failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   journal INSTANCE "$STANDBY_SID" "srvctl start database (MOUNT)"
@@ -7988,13 +8391,19 @@ $SRL_SQL"
 }
 d_9_3() {
   local before after new
+  # what is needed is worked out again now: logs added by hand since the check are not added a second time
+  local rc=0; srl_statements sql_local || rc=$?
+  [[ $rc -eq 2 ]] && { bad "Cannot read the redo logs of the standby ($(ora_errors "$SQL_OUT"))"; return 1; }
+  [[ $rc -eq 0 ]] && { say "The standby logs are already there."; return 0; }
+  SRL_SQL="alter system set standby_file_management=manual scope=memory;"$'\n'"$SRL_STMTS"$'\n'"alter system set standby_file_management=auto scope=memory;"
   # without the list of groups before, the new groups could not be told apart (the undo would drop them all)
   sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby logs ($(ora_errors "$SQL_OUT"))"; return 1; }
   before=$(tr -d ' ' <<< "$SQL_OUT")
   if mrp_running; then sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop apply"; return 1; }; fi
   if ! sql_local "$SRL_SQL"; then
     local eo=$SQL_OUT
-    sql_local "alter system set standby_file_management=auto scope=memory;" || true
+    sql_local "alter system set standby_file_management=auto scope=memory;" \
+      || warn "standby_file_management could not be set back to AUTO. Set it by hand:  alter system set standby_file_management=auto scope=memory;"
     # groups that were added before the error are recorded too (they are undone with the step)
     sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
     new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
@@ -8090,6 +8499,7 @@ d_9_8() {
   if [[ "$tst" == off ]]; then
     run_cmds <<< "systemctl enable $(arch_timer)
 systemctl start $(arch_timer)" || return 1
+    journal UNIT "$(arch_timer)" "enabled and started again (it was off)"
   elif [[ "$tst" == failed ]]; then
     # the clean-up itself: deletes only logs that are applied and older than one day (as the timer does every night)
     run_cmds <<< "systemctl reset-failed $(arch_service)
@@ -8134,8 +8544,10 @@ d_9_4() {
     grep -q 'ORA-01154' <<< "$SQL_OUT" && printf 'ORA-01154: the database is OPEN or opening. This script only mounts a physical standby.\n' | hint
     return 1
   fi
+  # the command ran, so its undo (cancel) is recorded now; success needs an MRP process
   journal MRP "$STANDBY_SID" "redo apply started"
-  local n=0; until mrp_running || [[ $n -ge 6 ]]; do sleep 5; n=$((n + 1)); done
+  local n=0; until mrp_running || [[ $n -ge 12 ]]; do sleep 5; n=$((n + 1)); done
+  mrp_running || { bad "The start command was accepted, but no MRP process appeared within 60 seconds. See the alert log of $STANDBY_SID."; return 1; }
 }
 
 # ---- 9.5 ----
@@ -8257,6 +8669,11 @@ c_9_7() {
     # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
     local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
     [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
+    # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here
+    local_state
+    if [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] && ! mrp_running; then
+      warn "Redo apply is not running now, although $(unit_name) is active."$'\n'"Start it with step 9.4:  $SELF --from 9.4"
+    fi
     return 0
   fi
   if systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
@@ -8705,7 +9122,8 @@ EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
        (the PGA is a target, not taken at startup).
        With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB.
 IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
-       /dev/shm too small: mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
+       /dev/shm too small: the script does it (answer y). By hand:
+       mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
 EOF
   ;;
   3.1)
@@ -9078,8 +9496,8 @@ RUN    On the primary:
        scp ${PRIMARY_SSH_USER:-oracle}@$P:<folder>/ewallet.p12 <folder>/
        scp ${PRIMARY_SSH_USER:-oracle}@$P:<folder>/cwallet.sso <folder>/
        chown $OU:$IG <folder>/* ; chmod 600 <folder>/*
-       No cwallet.sso, or a LOCAL one on the primary: create it here as $OU
-       (orapki asks for the keystore password; LOCAL on the primary: use -auto_login_local):
+       No cwallet.sso, or a LOCAL one on the primary: the script makes it (it asks for the
+       keystore password once). By hand, as $OU (LOCAL on the primary: -auto_login_local):
        $DBH/bin/orapki wallet create -wallet <folder> -auto_login
        No WALLET_ROOT on the primary (12c, or the old setup):
        add this line to $DBH/network/admin/sqlnet.ora:
@@ -9413,6 +9831,10 @@ Usage
   dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
                                            phase 1 runs first, so the primary must be reachable)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
+  dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
+                                           that erases (disks, leftovers, a half-unpacked software folder),
+                                           the copy, the host key, passwords, the listener restart (3.10),
+                                           the standby restart steps (9.1 9.2 9.3 9.7) and log deletion (9.8)
   dg_standby_setup.sh --status             Show the result of every phase and step
                                            (connects to nothing)
   dg_standby_setup.sh --show-changes       Changes made by the setup, and how to undo them
@@ -9462,6 +9884,7 @@ parse_args() {
       --check) MODE="check" ;;
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
+      --yes) YES_MODE=1 ;;
       --show-changes) SHOW_CHANGES=all; [[ $# -ge 2 && "$2" =~ ^[0-9]+\.[0-9]+$ ]] && { SHOW_CHANGES=$2; shift; } ;;
       --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
       --from)
@@ -9622,7 +10045,7 @@ main() {
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
   printf '  %s\n' "$(rule 70)"
   printf '  This server   %s (the new standby)\n' "$(hostname -s 2>/dev/null)"
-  printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup')"
+  printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup%s' "$([[ $YES_MODE -eq 1 ]] && printf ', --yes: actions on this server without asking')")"
   printf '  Log           %s\n' "$LOG_FILE"
   printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
   printf '  the commands are shown for you to run, and the script then checks the result.\n'

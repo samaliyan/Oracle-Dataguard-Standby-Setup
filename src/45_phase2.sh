@@ -234,6 +234,7 @@ make_dir() {
       [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo. It is not used."; return 1; }
     fi
     if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
+    [[ -d "$p" ]] || { bad "$p exists, but it is not a folder. It is not changed."; return 1; }
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
   if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
@@ -405,6 +406,8 @@ c_2_9() {
   [[ -n "$FW_ZONE" ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null)
   [[ "$FW_ZONE" =~ ^[A-Za-z0-9_-]+$ ]] || FW_ZONE=public
+  # the zone of the interface is the right one; a guess is said
+  [[ -z "$ifc" ]] && warn "No interface here has the address $STANDBY_IP, so the firewall zone is a guess: $FW_ZONE."$'\n'"Check:  firewall-cmd --get-active-zones"
   # open now AND after a reboot: the running rules and the saved (permanent) ones are both checked
   local rt=0 pm=0
   firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && rt=1
@@ -613,7 +616,8 @@ asm_labels() {
   while IFS= read -r l; do [[ -n "$l" ]] && asm_label_known "$l" && printf '%s\n' "$l"; done < <(asm_labels_any "$1")
   return 0
 }
-asm_foreign() { local l; while IFS= read -r l; do [[ -n "$l" ]] && ! asm_label_known "$l" && ! asm_label_declined "$l" && printf '%s\n' "$l"; done < <(asm_labels_any "$1"); return 0; }
+ASM_DEFERRED=" "    # disks not used in THIS run (Grid not installed yet, or wrong sector size): offered again in a later run
+asm_foreign() { local l; while IFS= read -r l; do [[ -n "$l" ]] && ! asm_label_known "$l" && ! asm_label_declined "$l" && [[ "$ASM_DEFERRED" != *" $l "* ]] && printf '%s\n' "$l"; done < <(asm_labels_any "$1"); return 0; }
 asm_label_exists() {
   if [[ "$(asm_method)" == "asmlib" ]]; then oracleasm listdisks 2>/dev/null | grep -qx -- "$1"; else [[ -e "/dev/oraasm/$1" ]]; fi
 }
@@ -692,6 +696,8 @@ c_2_13() {
   done
   A213_FOREIGN=${foreign%$'\n'}
   if [[ -z "$miss$short$foreign" ]]; then NOW="ASM disks are ready for:$ready"$'\n'"${have%$'\n'}"; return 0; fi
+  # new disks must fit the redo block size of the primary: it must be known, not assumed
+  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the right disks cannot be chosen. Run the script again."; return 2; }
   local fd; fd=$(free_disks)
   NOW=""
   if [[ -n "$miss" ]]; then
@@ -799,6 +805,27 @@ asm_header_group() {
 }
 asm_group_mounted_here() { use_grid && grid_sw_ok && sql_asm "select name from v\$asm_diskgroup where state in ('MOUNTED','CONNECTED');" && grep -qix -- "$1" <<< "$SQL_OUT"; }
 
+disk_sector_ok() {
+  # $1 disk. Online logs with 4096-byte blocks need 4K physical sectors; 512-byte redo cannot go on a 4K-native disk
+  # (else ORA-01378 for the standby logs). Sectors that cannot be read are a warning: step 8.1 checks the disk group.
+  local d=$1 sb pbs lbs n; SECTOR_WHY=""
+  # a partition (ASMLib disks, sdb1) has no queue of its own: the sizes are those of its disk
+  n=$(basename "$(readlink -f "$d")"); sb="/sys/class/block/$n"
+  [[ -e "$sb/partition" ]] && sb=$(dirname "$(readlink -f "$sb")")
+  sb="$sb/queue"
+  pbs=$(cat "$sb/physical_block_size" 2>/dev/null); lbs=$(cat "$sb/logical_block_size" 2>/dev/null)
+  if ! num "$pbs" || ! num "$lbs"; then
+    warn "The sector size of $d cannot be read here. Step 8.1 checks the sector size of the disk group before the copy."
+    return 0
+  fi
+  if [[ "${PRIMARY_REDO_BS:-512}" == "4096" && $pbs -lt 4096 ]]; then
+    SECTOR_WHY="The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors."$'\n'"The standby logs could not be created (ORA-01378). Use disks with 4K sectors."; return 1
+  fi
+  if [[ "${PRIMARY_REDO_BS:-512}" != "4096" && $lbs -ge 4096 ]]; then
+    SECTOR_WHY="$d is a 4K-native disk, but the redo logs of the primary use 512-byte blocks."$'\n'"The standby and online logs could not be created (ORA-01378). Use disks with 512-byte or 512e sectors."; return 1
+  fi
+  return 0
+}
 d_2_13() {
   local fd dg i min have total pick n sel=() used=" " def nums l
   # 1) disks that exist but were not made by this script: use them only when you say so
@@ -816,16 +843,29 @@ d_2_13() {
       else ok_l+=" $i"; fi
     done <<< "$l"
     if [[ -n "$refused" ]]; then
-      warn "These existing ASM disks are not used:$refused"$'\n'"They may belong to another server, for example the primary."
-      install -d -m 700 "$STATE_DIR"; for i in $reflab; do printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
+      if grid_sw_ok; then
+        # ASM runs here and does not mount that disk group: remembered as "not used"
+        warn "These existing ASM disks are not used:$refused"$'\n'"They may belong to another server, for example the primary."$'\n'"To be asked again later, remove their lines (label|-) from $(asm_disks_file)."
+        install -d -m 700 "$STATE_DIR"; for i in $reflab; do printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
+      else
+        # no Grid yet: nothing here can mount a disk group, so this is not a decision; asked again in a later run
+        for i in $reflab; do ASM_DEFERRED+="$i "; done
+        warn "These existing ASM disks are not used now:$refused"$'\n'"Grid is not installed yet, so it cannot be seen whether this server owns them."$'\n'"They may belong to another server, for example the primary. They are offered again in a later run, once Grid is installed."
+      fi
     fi
     [[ -n "$ok_l" ]] || continue
+    # existing disks get the same sector test as new ones
+    local okl2=""
+    for i in $ok_l; do
+      if disk_sector_ok "$(label_device "$i")"; then okl2+=" $i"; else warn "ASM disk $i is not used: $SECTOR_WHY"; ASM_DEFERRED+="$i "; fi
+    done
+    ok_l=$okl2; [[ -n "$ok_l" ]] || continue
     say "Answer y only if no other database uses$ok_l."
     if confirm "Use the existing ASM disks$ok_l for +$dg"; then
       for i in $ok_l; do record_label "$i" "$(label_device "$i")"; done
     else
       for i in $ok_l; do install -d -m 700 "$STATE_DIR"; printf '%s|-\n' "$i" >> "$(asm_disks_file)"; done; chmod 600 "$(asm_disks_file)"
-      say "Not used:$ok_l. This answer is remembered."
+      say "Not used:$ok_l. This answer is remembered (to change it, remove the lines label|- from $(asm_disks_file))."
       say "New disks are chosen for +$dg instead."
     fi
   done
@@ -851,8 +891,13 @@ d_2_13() {
       bad "The empty disks left have $(human_mb "$left") in total, but +$dg needs $(human_mb "$need_more") more."$'\n'"Add disks to this server. Nothing was erased."
       return 1
     fi
+    # only one empty disk is left and it is big enough: there is nothing to choose (its erasure is still asked)
+    local nfree=0; for i in "${!disks[@]}"; do [[ "$used" == *" ${disks[$i]%% *} "* ]] || nfree=$((nfree + 1)); done
+    local auto1=0; [[ $nfree -eq 1 && ${disks[$((def - 1))]##* } -ge $need_more ]] && auto1=1
+    [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
     while true; do
-      ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"
+      if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
+      else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""
       local -a picks=(); read -ra picks <<< "$ANSWER"
@@ -879,14 +924,7 @@ d_2_13() {
   for p in "${sel[@]}"; do
     d=${p#*|}
     disk_is_free "$d" || { bad "$d cannot be used: $DISK_WHY. Nothing was erased."; return 1; }
-    # online logs with 4096-byte blocks need disks with 4096-byte physical sectors (else ORA-01378 for the standby logs)
-    local sb="/sys/block/$(basename "$(readlink -f "$d")")/queue" pbs lbs
-    pbs=$(cat "$sb/physical_block_size" 2>/dev/null); lbs=$(cat "$sb/logical_block_size" 2>/dev/null)
-    if [[ "${PRIMARY_REDO_BS:-512}" == "4096" ]]; then
-      [[ -n "$pbs" && "$pbs" -lt 4096 ]] && { bad "The redo logs of the primary use 4096-byte blocks, but $d has $pbs-byte sectors."$'\n'"The standby logs could not be created (ORA-01378). Use disks with 4K sectors."$'\n'"Nothing was erased."; return 1; }
-    else
-      [[ -n "$lbs" && "$lbs" -ge 4096 ]] && { bad "$d is a 4K-native disk, but the redo logs of the primary use 512-byte blocks."$'\n'"The standby and online logs could not be created (ORA-01378)."$'\n'"Use disks with 512-byte or 512e sectors. Nothing was erased."; return 1; }
-    fi
+    disk_sector_ok "$d" || { bad "$SECTOR_WHY"$'\n'"Nothing was erased."; return 1; }
   done
   for p in "${sel[@]}"; do
     d=${p#*|}
@@ -1162,6 +1200,12 @@ mem_probe() {
       db_recovery_file_dest_size) num "$pv" && MEM_RFS=$pv ;;
     esac
   done <<< "$SQL_OUT"
+  # the SGA as the instance really has it: with a manual SGA (sga_target and memory_target 0) the parameters say
+  # nothing, the sizes of its parts (shared_pool_size, db_cache_size, ...) add up to "Maximum SGA Size"
+  local smax=""
+  prim_sql "select bytes from v\$sgainfo where name='Maximum SGA Size';" && smax=$(first_line)
+  if num "$smax"; then [[ $smax -gt $MEM_SGA ]] && MEM_SGA=$smax
+  elif [[ $MEM_SGA -eq 0 && $MEM_MT -eq 0 ]]; then return 2; fi
   local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); num "$kb" || kb=0
   MEM_RAM_MB=$(( kb / 1024 ))
   local sga_mb=$(( MEM_SGA / 1048576 )) pga_mb=$(( MEM_PGA / 1048576 )) mt_mb=$(( MEM_MT / 1048576 )) mmt_mb=$(( mmt / 1048576 )) need_mb shm_need=0
@@ -1225,15 +1269,13 @@ c_2_16() {
     return 0
   fi
   NOW="$MEM_FAIL"$'\n'"$MEM_INFO"
-  KIND_NOW=manual
   if [[ $MEM_SHM_MB -gt 0 ]]; then
-    MANUAL_HOW="root  ->  shell"
-    PLAN="mount -o remount,size=${MEM_SHM_MB}m /dev/shm
--- (the size needed, plus 1 GB more room)
--- Keep it after a reboot: in /etc/fstab, the /dev/shm line gets size=${MEM_SHM_MB}m
--- tmpfs  /dev/shm  tmpfs  defaults,size=${MEM_SHM_MB}m  0 0
--- Then answer r."
+    # done by the script: /dev/shm is a memory file system of this server, nothing on it is lost by a larger size
+    PLAN="Make /dev/shm ${MEM_SHM_MB} MB now (the size needed, plus 1 GB more room):
+  mount -o remount,size=${MEM_SHM_MB}m /dev/shm
+Keep it after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}m (a backup is kept)"
   else
+    KIND_NOW=manual
     MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
     PLAN="-- Add RAM to the standby, then restart it and answer r.
 -- A standby that may become the primary needs as much memory as the primary.
@@ -1242,6 +1284,28 @@ c_2_16() {
   return 1
 }
 
+d_2_16() {
+  [[ $MEM_SHM_MB -gt 0 ]] || return 1
+  local old; old=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$old" && old="${old}m" || old="-"
+  run_cmds <<< "mount -o remount,size=${MEM_SHM_MB}m /dev/shm" || return 1
+  journal SHM /dev/shm "old=$old new=${MEM_SHM_MB}m"
+  # a new fstab line keeps the protections /dev/shm has now (nosuid, nodev, noexec): "defaults" would drop them
+  local keep="" o; for o in $(findmnt -n -o OPTIONS /dev/shm 2>/dev/null | tr ',' ' '); do
+    case "$o" in nosuid|nodev|noexec) keep+=",$o" ;; esac; done
+  [[ -e /etc/systemd/system/dev-shm.mount ]] && warn "/etc/systemd/system/dev-shm.mount sets /dev/shm too and wins over fstab at boot. Set size=${MEM_SHM_MB}m there as well."
+  # /etc/fstab: the size option of the /dev/shm line is set (other options stay), or such a line is added
+  local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
+  awk -v sz="size=${MEM_SHM_MB}m" -v keep="$keep" '
+    !/^[[:space:]]*#/ && $2 == "/dev/shm" && NF >= 4 {
+      n = split($4, o, ","); opts = ""
+      for (i = 1; i <= n; i++) if (o[i] !~ /^size=/) opts = opts (opts ? "," : "") o[i]
+      $4 = (opts ? opts "," : "") sz; done = 1 }
+    { print }
+    END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE" > "$tmp" || return 1
+  backup_file "$FSTAB_FILE" || return 1
+  write_as root "$FSTAB_FILE" 644 < "$tmp" || return 1
+  say "/dev/shm is ${MEM_SHM_MB} MB now, also after a reboot ($FSTAB_FILE)."
+}
 phase_2() {
   phase_header 2 "Prepare this server"
   run_step 2.1  auto    "Groups (same names and ids as primary)" c_2_1 d_2_1
@@ -1259,6 +1323,6 @@ phase_2() {
   run_step 2.13 auto    "ASM disks" c_2_13 d_2_13
   run_step 2.14 auto    "Database folders and free space (file system)" c_2_14 d_2_14
   run_step 2.15 check   "Database folders are not shared with the primary" c_2_15 d_2_15
-  run_step 2.16 check   "Memory (RAM) for the database" c_2_16
+  run_step 2.16 auto    "Memory (RAM) for the database" c_2_16 d_2_16
   build_envs_if_possible
 }

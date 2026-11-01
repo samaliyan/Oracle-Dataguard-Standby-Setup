@@ -71,6 +71,8 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 --from <step>         continue from a step
 --only <phase>        run one phase (10 = daily sync check; phase 1 runs first, so the primary must be reachable)
 --settings            review or edit the saved standby values
+--yes                 answer y for the actions on this server; disk erasure, clean-up, the copy, the
+                      host key, passwords and the restart steps (9.1-9.3, 9.7) are still asked
 --status              result of every phase and step so far (connects to nothing)
 --show-changes [step] every change made on this server, with its undo
 --undo <step>         undo the changes of a step (asks before each one)
@@ -109,7 +111,7 @@ docs/DESIGN.md        design notes
 
 ## Tests
 
-`test/run_scenarios.sh` runs over 350 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
+`test/run_scenarios.sh` runs over 380 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 

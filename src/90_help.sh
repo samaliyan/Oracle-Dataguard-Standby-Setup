@@ -323,7 +323,8 @@ EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
        (the PGA is a target, not taken at startup).
        With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB.
 IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
-       /dev/shm too small: mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
+       /dev/shm too small: the script does it (answer y). By hand:
+       mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
 EOF
   ;;
   3.1)
@@ -696,8 +697,8 @@ RUN    On the primary:
        scp ${PRIMARY_SSH_USER:-oracle}@$P:<folder>/ewallet.p12 <folder>/
        scp ${PRIMARY_SSH_USER:-oracle}@$P:<folder>/cwallet.sso <folder>/
        chown $OU:$IG <folder>/* ; chmod 600 <folder>/*
-       No cwallet.sso, or a LOCAL one on the primary: create it here as $OU
-       (orapki asks for the keystore password; LOCAL on the primary: use -auto_login_local):
+       No cwallet.sso, or a LOCAL one on the primary: the script makes it (it asks for the
+       keystore password once). By hand, as $OU (LOCAL on the primary: -auto_login_local):
        $DBH/bin/orapki wallet create -wallet <folder> -auto_login
        No WALLET_ROOT on the primary (12c, or the old setup):
        add this line to $DBH/network/admin/sqlnet.ora:

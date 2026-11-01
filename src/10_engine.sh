@@ -31,6 +31,13 @@ JOB_BUSY_PHASE=""        # check mode with a long job running: steps of this pha
 declare -A AUTO_WAIT=()   # "step X" / "phase N" -> 1: not done in this run and you went on (its waiters are not asked again)
 # steps that only the script can do: there is no [s] skip for them
 readonly NO_SKIP_STEPS=" 1.2 1.3 1.4 "
+# --yes answers "y" for the actions on this server. Never for: steps that stop or restart a running standby
+# (9.1 9.2 9.3 9.7), questions inside an action (disk erasure, CLEAN, DELETE, DUPLICATE, the host key, passwords),
+# and anything on the primary (printed only, as always).
+YES_MODE=0
+readonly YES_ASK_STEPS=" 3.10 9.1 9.2 9.3 9.7 9.8 "     # 3.10 restarts the listener, 9.8 sets deletion of archived logs
+YES_HOLD=0          # a check sets it when its action would erase something (a half-unpacked software folder)
+yes_auto() { [[ $YES_MODE -eq 1 && $YES_HOLD -eq 0 && "$YES_ASK_STEPS" != *" $1 "* ]]; }
 no_skip() { [[ "$NO_SKIP_STEPS" == *" $1 "* ]]; }
 NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; KIND_NOW=""; NEED_SYS=0; MANUAL_WHERE=""
 
@@ -77,6 +84,8 @@ record() {
   # the result of a step: in memory, in the log, and in the progress file (so the next run can show
   # how far the last run got, and which steps are done)
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}
+  # the step a "Next" line pointed to is done now: the pointer would only mislead later
+  [[ "$RESUME_STEP" == "$1" && ( "$2" == OK || "$2" == DONE || "$2" == DONE_BY_YOU ) ]] && RESUME_STEP=""
   _log RESULT "[$1] $2  ${STEP_TITLE[$1]}"
   [[ -n "$PROGRESS_FILE" ]] || return 0
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
@@ -349,6 +358,7 @@ run_step() {
     wait_msg "$NOW"; STEP_NOW[$id]=$NOW; record "$id" WAITS; return 0
   fi
   while true; do
+    YES_HOLD=0
     NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""
     "$checkfn"; rc=$?
     kind=${KIND_NOW:-$kind0}
@@ -450,7 +460,9 @@ run_step() {
     printf '%s\n' "$PLAN" | block "Plan:"
     [[ -n "$USING" ]] && printf '%s\n' "$USING" | block "Using:"
     if [[ "$MODE" == "check" ]]; then todo "To do in a normal run"; record "$id" TODO; return 0; fi
-    if [[ "$kind" != "ask" ]]; then
+    if [[ "$kind" != "ask" ]] && yes_auto "$id"; then
+      printf '    %s%s Yes (--yes)%s\n' "$C_D" "$S_ASK" "$C_N"; _log ASK "[$id] y (--yes)"; ANSWER=y
+    elif [[ "$kind" != "ask" ]]; then
       ask_choice "[y] Yes, do it   [s] Skip   [h] Help   [q] Quit" "yshq"
       case "$ANSWER" in
         y) ;;
@@ -600,6 +612,8 @@ batch_primary_steps() {
   # ones that were done pass at once, the others ask again one by one.
   [[ "$MODE" == "run" ]] || return 0
   local id cf rc all="" n=0 how="" BATCH_ERR
+  # file changes (tnsnames.ora, listener.ora, .bash_profile) are shell commands: a second box per user
+  local -a fhow=() fplan=()
   # the connection is opened visibly first: the checks below run quietly
   need_ssh || return 0
   BATCH_ERR=$(mktemp /tmp/dg_batch.XXXXXX) && CLEANUP_FILES+=("$BATCH_ERR") || BATCH_ERR=/dev/null
@@ -615,6 +629,15 @@ batch_primary_steps() {
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"
     [[ $rc -eq 1 && -n "$PLAN" && "${KIND_NOW:-primary}" == "primary" ]] || continue
     primary_pending_add "$id" "$PLAN_UNDO"
+    # file changes in a shell, not SQL, grouped by the user; only plans that are commands (an entry to edit by
+    # hand follows on its own)
+    if [[ " 4.9 4.11 " == *" $id "* ]]; then
+      [[ "$PLAN" == *"cat >>"* ]] || { primary_pending_del "$id"; continue; }
+      n=$((n + 1)); fhow+=("${PRIMARY_HOW_STEP%%  ->  *}  ->  shell")
+      # comment lines of a plan are shell comments in this box
+      fplan+=("# Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$(sed 's/^-- /# /' <<< "$PLAN")"$'\n'"${PLAN_UNDO:+# Undo, if ever needed: $PLAN_UNDO}")
+      continue
+    fi
     [[ "$id" == "4.1" ]] && in41=1; [[ "$id" == "4.7" ]] && in47=1
     n=$((n + 1))
     [[ -n "$how" ]] || how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
@@ -636,12 +659,22 @@ batch_primary_steps() {
     printf '\n    %s%s Step 4.1 restarts the primary database (shutdown immediate, startup mount).%s\n' "$C_Y" "$S_WARN" "$C_N"
     printf '      %sPlan a short downtime, or choose [o] and run the steps one at a time.%s\n\n' "$C_Y" "$C_N"
   fi
-  say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
-  say "Afterwards the script checks every step again."
-  say "Changes to files on the primary (steps 4.9 to 4.11, if needed) follow one by one."
   CUR_STEP="${1%%.*}.x"
-  printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
+  if [[ -n "$all" ]]; then
+    say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
+    printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
+  fi
+  # the file changes, in a shell, grouped by the user they run as
+  local fi2 fj u done_u=" "
+  for ((fi2 = 0; fi2 < ${#fhow[@]}; fi2++)); do
+    u=${fhow[$fi2]}; [[ "$done_u" == *"|$u|"* ]] && continue; done_u+="|$u|"
+    local fb=""
+    for ((fj = fi2; fj < ${#fhow[@]}; fj++)); do [[ "${fhow[$fj]}" == "$u" ]] && fb+="${fplan[$fj]}"$'\n\n'; done
+    printf '%s' "${fb%$'\n\n'}" | print_commands "Then, in a shell on the PRIMARY ($PRIMARY_HOST)" "$u"
+  done
+  say "Edits of a file by hand (the static listener entry of 4.10, a changed alias in 4.9), if needed, follow on their own."
   CUR_STEP=""
+  say "Afterwards the script checks every step again."
   PRIMARY_BOX_NOTE=1; say "${C_D}The same commands are saved in $ACTIONS_FILE${C_N}"
   if [[ $in41 -eq 1 && $in47 -eq 1 ]]; then
     if grep -q 'create spfile from memory' <<< "$all"; then say "Run step 4.1 first, with its restart. The scope=spfile lines of the other steps need the spfile."

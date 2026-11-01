@@ -1,7 +1,7 @@
 #------------------------------------------------------------------------------
 # PHASE 9  Oracle Restart registration, standby redo logs, apply, shipping
 #------------------------------------------------------------------------------
-REG_MODE=""
+REG_MODE=""; REG_OLD_OPT=""; REG_OLD_HOME=""; REG_OLD_PW=""; REG_MOD_ARGS=()
 
 need_built() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 1; }
@@ -35,13 +35,24 @@ c_9_1() {
     grep -qiE "^(Database instance|Instance)( name)?:[[:space:]]*${STANDBY_SID}[[:space:]]*\$" <<< "$cfg" || bad_items+=" instance"
     # a standby must only be mounted at boot (open would need Active Data Guard, and apply starts on a mounted one)
     grep -qiE "^Start options:[[:space:]]*mount[[:space:]]*\$" <<< "$cfg" || bad_items+=" start-option"
+    # the home and the password file it starts with (a stale one fails only at the next start)
+    local oh pw; oh=$(sed -n 's/^Oracle home:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -s '/'); oh=${oh%/}; REG_OLD_HOME=$oh
+    [[ "$oh" == "$(tr -s '/' <<< "${DB_HOME%/}")" ]] || bad_items+=" oracle-home"
+    # an empty password file is right too: the instance then uses dbs/orapw<SID> of its home
+    pw=$(sed -n 's/^Password file:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -s '/'); pw=${pw%"${pw##*[![:space:]]}"}; REG_OLD_PW=$pw
+    [[ -z "$pw" || "$pw" == "$(pw_dest | tr -s '/')" ]] || bad_items+=" password-file"
     if [[ -z "$bad_items" ]]; then NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"; return 0; fi
-    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options)' <<< "$cfg")"
-    if [[ "$bad_items" == " start-option" ]]; then
-      # only the start option: changed in place, the running standby is not stopped
-      REG_MODE=modify
+    NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options|oracle home|password file)' <<< "$cfg")"
+    REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
+    # start option, home and password file are changed in place (the running standby is not stopped);
+    # a wrong spfile, role or instance needs a new registration
+    if [[ "$bad_items" != *spfile* && "$bad_items" != *role* && "$bad_items" != *instance* ]]; then
+      REG_MODE=modify; REG_MOD_ARGS=()
+      [[ "$bad_items" == *start-option* ]] && REG_MOD_ARGS+=(-startoption MOUNT)
+      [[ "$bad_items" == *oracle-home* ]] && REG_MOD_ARGS+=(-oraclehome "$DB_HOME")
+      [[ "$bad_items" == *password-file* ]] && REG_MOD_ARGS+=(-pwfile "$(pw_dest)")
       PLAN="As $ORACLE_USER, on this server only:
-srvctl modify database -db $STANDBY_UNIQUE -startoption MOUNT"
+srvctl modify database -db $STANDBY_UNIQUE ${REG_MOD_ARGS[*]}"
       return 1
     fi
     REG_MODE=re
@@ -58,6 +69,25 @@ $add"
   USING="-instance must be exactly $STANDBY_SID, or sqlplus shows 'Connected to an idle instance'"
   return 1
 }
+_cfgv() { sed -n "s/^$2:[[:space:]]*//Ip" "$1" | head -n 1 | sed 's/[[:space:]]*$//'; }   # $1 file, $2 label
+srv_add_cmd_from() {
+  # $1 saved "srvctl config database" output -> the srvctl add command that makes the same registration
+  local f=$1 c
+  [[ -s "$f" ]] || return 0
+  local oh sp pw rl so dn inst dg
+  oh=$(_cfgv "$f" 'Oracle home'); sp=$(_cfgv "$f" 'Spfile'); pw=$(_cfgv "$f" 'Password file'); rl=$(_cfgv "$f" 'Database role')
+  so=$(_cfgv "$f" 'Start options'); dn=$(_cfgv "$f" 'Database name'); dg=$(_cfgv "$f" 'Disk Groups')
+  inst=$(_cfgv "$f" 'Database instance'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance name'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance')
+  local dm mp sto; dm=$(_cfgv "$f" 'Domain'); mp=$(_cfgv "$f" 'Management policy'); sto=$(_cfgv "$f" 'Stop options')
+  [[ -n "$oh" ]] || return 0
+  c="$DB_HOME/bin/srvctl add database -db $STANDBY_UNIQUE -oraclehome $oh"
+  [[ -n "$sp" ]] && c+=" -spfile $sp"; [[ -n "$pw" ]] && c+=" -pwfile $pw"; [[ -n "$rl" ]] && c+=" -role $rl"
+  [[ -n "$so" ]] && c+=" -startoption '$so'"; [[ -n "$dn" ]] && c+=" -dbname $dn"; [[ -n "$inst" ]] && c+=" -instance $inst"
+  [[ -n "$dg" ]] && c+=" -diskgroup $dg"
+  [[ -n "$dm" ]] && c+=" -domain $dm"; [[ -n "$mp" ]] && c+=" -policy $mp"; [[ -n "$sto" ]] && c+=" -stopoption '$sto'"
+  # only plain values (paths, names, lists) are put into the command
+  [[ "$c" =~ ^[A-Za-z0-9_./,\'\ +-]+$ ]] && printf '%s' "$c"
+}
 srv_add() {
   run_logged "srvctl add database" as_oracle "$DB_HOME/bin/srvctl" add database -db "$STANDBY_UNIQUE" \
     -oraclehome "$DB_HOME" -spfile "$(spfile_path)" -pwfile "$(pw_dest)" \
@@ -66,16 +96,39 @@ srv_add() {
 }
 d_9_1() {
   if [[ "$REG_MODE" == "modify" ]]; then
-    run_logged "srvctl modify start option" as_oracle "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" -startoption MOUNT \
+    run_logged "srvctl modify database" as_oracle "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" "${REG_MOD_ARGS[@]}" \
       || { bad "srvctl modify failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-    journal SRVOPT "$STANDBY_UNIQUE" "start option set to MOUNT"
+    # the old values, so --undo can say exactly how to put them back
+    local od=""
+    [[ " ${REG_MOD_ARGS[*]} " == *" -startoption "* ]] && od+="old=${REG_OLD_OPT:-unknown} "
+    [[ " ${REG_MOD_ARGS[*]} " == *" -oraclehome "* ]] && od+="oldhome=${REG_OLD_HOME:--} "
+    [[ " ${REG_MOD_ARGS[*]} " == *" -pwfile "* ]] && od+="oldpw=${REG_OLD_PW:--} "
+    journal SRVOPT "$STANDBY_UNIQUE" "${od% }"
     return 0
   fi
   if [[ "$REG_MODE" == "re" ]]; then
-    run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || true
-    journal SRVCTL_OLD "$STANDBY_UNIQUE" "the old registration was replaced (its config is in $LOG_FILE)"
+    # the old registration is kept in a file first: if the new one cannot be added, it is there to put back
+    local old="$STATE_DIR/srvctl_old_${STANDBY_UNIQUE}_$RUN_ID.txt"
+    run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
+    ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
     run_logged "srvctl stop" as_oracle "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    if ! srv_add; then
+      bad "The new registration failed. The old one is put back."
+      local radd; radd=$(srv_add_cmd_from "$old")
+      if [[ -n "$radd" ]] && run_logged "srvctl add (the old registration)" as_oracle bash -c "$radd"; then
+        say "The old registration is back (the values srvctl config showed). The standby is not started: step 9.2 starts it."
+      else
+        journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
+        { printf 'The old registration could not be put back. It is saved in:  %s\n' "$old"
+          [[ -n "$radd" ]] && printf 'As %s:  %s\n' "$ORACLE_USER" "$radd"
+          printf 'Or start the standby by hand (as %s):  sqlplus / as sysdba  ->  startup mount\n' "$ORACLE_USER"; } | hint
+      fi
+      return 1
+    fi
+    journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
+    journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
+    return 0
   fi
   srv_add || return 1
   journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
@@ -88,7 +141,8 @@ c_9_2() {
     # no Oracle Restart: the instance only has to be mounted as a standby
     local_state
     case "$LSTATE" in
-      MOUNTED|OPEN) adg_note "$LSTATE"; NOW="Instance $STANDBY_SID is $LSTATE (no Oracle Restart on this server)"; return 0 ;;
+      MOUNTED|OPEN) adg_note "$LSTATE"; NOW="Instance $STANDBY_SID is $LSTATE (no Oracle Restart on this server)"
+                    logins_after_start || { KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To check on this server ($(hostname -s))"; return 1; }; return 0 ;;
       IDLE) NOW="The standby instance is not running"; PLAN="As $ORACLE_USER:  sqlplus / as sysdba  ->  startup mount"; return 1 ;;
       STARTED) NOW="The instance is in NOMOUNT (started with the first pfile)"; PLAN="As $ORACLE_USER, on this server (standby instance $STANDBY_SID only):"$'\n'"  sqlplus / as sysdba  ->  shutdown immediate ; startup mount"$'\n'"The new start uses the spfile"; return 1 ;;
       *) NOW="Instance state: $LSTATE ($(ora_errors "$SQL_OUT"))"; return 2 ;;
@@ -100,7 +154,9 @@ c_9_2() {
   if sql_local "select i.instance_name||'|'||i.status||'|'||d.database_role from v\$instance i, v\$database d;"; then
     local iname ist irole; IFS='|' read -r iname ist irole <<< "$(first_line)"
     if [[ $srv_on -eq 1 && "$iname" == "$STANDBY_SID" && "$irole" == "PHYSICAL STANDBY" && ( "$ist" == "MOUNTED" || "$ist" == "OPEN" ) ]]; then
-      adg_note "$ist"; NOW="Running under Oracle Restart: instance $iname, $ist, $irole"; return 0
+      adg_note "$ist"; NOW="Running under Oracle Restart: instance $iname, $ist, $irole"
+      logins_after_start || { KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To check on this server ($(hostname -s))"; return 1; }
+      return 0
     fi
     if [[ $srv_on -eq 0 ]]; then
       NOW="Instance $iname is $ist, but it was started by RMAN, not by Oracle Restart"
@@ -128,7 +184,10 @@ d_9_2() {
   local_state
   if [[ "$LSTATE" != "IDLE" && "$LSTATE" != "NOSW" ]]; then
     say "Stopping the instance that RMAN started on this server"
+    # it must really be down: srvctl start on an instance that still runs would not put it under Oracle Restart
     sql_local_long "shutdown immediate" || true
+    local_state
+    [[ "$LSTATE" == "IDLE" ]] || { bad "The instance did not stop (state $LSTATE; $(ora_errors "$SQL_OUT")). Oracle Restart cannot take it over."; return 1; }
   fi
   run_logged "srvctl start" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" start database -db "$STANDBY_UNIQUE" || { bad "srvctl start failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   journal INSTANCE "$STANDBY_SID" "srvctl start database (MOUNT)"
@@ -150,13 +209,19 @@ $SRL_SQL"
 }
 d_9_3() {
   local before after new
+  # what is needed is worked out again now: logs added by hand since the check are not added a second time
+  local rc=0; srl_statements sql_local || rc=$?
+  [[ $rc -eq 2 ]] && { bad "Cannot read the redo logs of the standby ($(ora_errors "$SQL_OUT"))"; return 1; }
+  [[ $rc -eq 0 ]] && { say "The standby logs are already there."; return 0; }
+  SRL_SQL="alter system set standby_file_management=manual scope=memory;"$'\n'"$SRL_STMTS"$'\n'"alter system set standby_file_management=auto scope=memory;"
   # without the list of groups before, the new groups could not be told apart (the undo would drop them all)
   sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby logs ($(ora_errors "$SQL_OUT"))"; return 1; }
   before=$(tr -d ' ' <<< "$SQL_OUT")
   if mrp_running; then sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop apply"; return 1; }; fi
   if ! sql_local "$SRL_SQL"; then
     local eo=$SQL_OUT
-    sql_local "alter system set standby_file_management=auto scope=memory;" || true
+    sql_local "alter system set standby_file_management=auto scope=memory;" \
+      || warn "standby_file_management could not be set back to AUTO. Set it by hand:  alter system set standby_file_management=auto scope=memory;"
     # groups that were added before the error are recorded too (they are undone with the step)
     sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
     new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
@@ -252,6 +317,7 @@ d_9_8() {
   if [[ "$tst" == off ]]; then
     run_cmds <<< "systemctl enable $(arch_timer)
 systemctl start $(arch_timer)" || return 1
+    journal UNIT "$(arch_timer)" "enabled and started again (it was off)"
   elif [[ "$tst" == failed ]]; then
     # the clean-up itself: deletes only logs that are applied and older than one day (as the timer does every night)
     run_cmds <<< "systemctl reset-failed $(arch_service)
@@ -296,8 +362,10 @@ d_9_4() {
     grep -q 'ORA-01154' <<< "$SQL_OUT" && printf 'ORA-01154: the database is OPEN or opening. This script only mounts a physical standby.\n' | hint
     return 1
   fi
+  # the command ran, so its undo (cancel) is recorded now; success needs an MRP process
   journal MRP "$STANDBY_SID" "redo apply started"
-  local n=0; until mrp_running || [[ $n -ge 6 ]]; do sleep 5; n=$((n + 1)); done
+  local n=0; until mrp_running || [[ $n -ge 12 ]]; do sleep 5; n=$((n + 1)); done
+  mrp_running || { bad "The start command was accepted, but no MRP process appeared within 60 seconds. See the alert log of $STANDBY_SID."; return 1; }
 }
 
 # ---- 9.5 ----
@@ -419,6 +487,11 @@ c_9_7() {
     # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
     local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
     [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
+    # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here
+    local_state
+    if [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] && ! mrp_running; then
+      warn "Redo apply is not running now, although $(unit_name) is active."$'\n'"Start it with step 9.4:  $SELF --from 9.4"
+    fi
     return 0
   fi
   if systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then

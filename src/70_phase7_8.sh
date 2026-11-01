@@ -260,7 +260,11 @@ touch $STATE_DIR/existing_files_ok"
     MOUNTED|OPEN)
       sql_local "select database_role from v\$database;" || { NOW="Cannot read the database role ($(ora_errors "$SQL_OUT"))"; return 2; }
       local role; role=$(first_line)
-      [[ "$role" == "PHYSICAL STANDBY" ]] || fatal "Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby, so the script stops."
+      if [[ "$role" != "PHYSICAL STANDBY" ]]; then
+        # check mode only reports (the other phases are still shown); a real run stops here
+        [[ "$MODE" == "check" ]] && { NOW="Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby: nothing here may touch it."; return 2; }
+        fatal "Database $STANDBY_SID on this server is $LSTATE with role '$role'. It is not a standby, so the script stops."
+      fi
       local sc=0; standby_complete || sc=$?
       if [[ $sc -eq 0 ]]; then STANDBY_BUILT=1; NOW="The standby database already exists ($LSTATE, PHYSICAL STANDBY). No copy is needed."; return 0; fi
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
@@ -409,7 +413,7 @@ c_7_3() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   if sql_local "select status from v\$instance;"; then NOW="Login works. Instance status: $(first_line)"; return 0; fi
   if grep -qE 'ORA-01034|idle instance' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists but is not started. The logins are tested after step 9.2 starts it."; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists but is not started. The logins are tested after step 9.2 starts it."; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Local login failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" local); return 1
@@ -419,12 +423,12 @@ c_7_4() {
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
   local_state
   if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   if sql_standby_tns "select instance_name||' '||status from v\$instance;"; then NOW="Login works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Login sys@$STANDBY_TNS failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" standby-tns); return 1
@@ -442,18 +446,48 @@ c_7_6() {
   # the login goes to the standby instance through its listener: before 7.2 there is nothing to reach
   local_state
   if [[ "$LSTATE" == "IDLE" ]]; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   need_ssh || return 2
   if prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;"; then NOW="Login from the primary works: sys@$STANDBY_TNS reaches $(first_line)"; return 0; fi
   if grep -q 'ORA-01034' <<< "$SQL_OUT"; then
-    built_offline && { NOW="The standby exists and is not started; tested after step 9.2"; return 0; }
+    built_offline && { logins_defer; NOW="Not tested now: the standby exists and is not started (tested after step 9.2)"; return 0; }
     NOW="The instance is not started (step 7.2)"; return 2
   fi
   NOW="Login from the primary to sys@$STANDBY_TNS failed ($(ora_errors "$SQL_OUT"))"; PLAN=$(golden_text "$SQL_OUT" standby-tns); return 1
 }
 
+LOGINS_DEFERRED=0
+logins_flag() { printf '%s/logins_deferred' "$STATE_DIR"; }
+logins_defer() {
+  # phase 7 could not test the logins (the built standby was down): remembered, also for a later run
+  LOGINS_DEFERRED=1
+  [[ "$MODE" == "run" && -n "$STATE_DIR" ]] && { install -d -m 700 "$STATE_DIR"; : > "$(logins_flag)"; }
+  return 0
+}
+logins_after_start() {
+  # the logins of 7.3, 7.4 and 7.6 that could not be tested in phase 7 (the standby was down) are tested now.
+  # 0 = all work, or nothing was deferred, or a test cannot run now (a warning); 1 = one fails (NOW and PLAN say why)
+  [[ $LOGINS_DEFERRED -eq 1 || -f "$(logins_flag)" ]] || return 0
+  need_ssh || { warn "The logins of steps 7.3, 7.4 and 7.6 are tested in a later run (no connection to the primary now)."; return 0; }
+  local f rc keep_now=$NOW sid
+  for f in c_7_3 c_7_4 c_7_6; do
+    NOW=""; PLAN=""; rc=0; "$f" >/dev/null || rc=$?
+    sid=${f#c_}; sid=${sid/_/.}
+    if [[ $rc -eq 2 ]]; then warn "Step $sid cannot be tested now (${NOW%%$'\n'*}). It is tested in a later run."; NOW=$keep_now; return 0; fi
+    if [[ $rc -ne 0 ]]; then
+      local why=$PLAN
+      NOW="The standby is running, but the login of step $sid fails: $NOW"
+      # the explanation is text, not commands: shown as comments
+      PLAN=$(printf '%s\n' "${why:-See:  $SELF --help-step $sid}" | sed 's/^/-- /')$'\n'"-- Then answer r."
+      return 1
+    fi
+  done
+  LOGINS_DEFERRED=0; rm -f -- "$(logins_flag)"
+  NOW="$keep_now"$'\n'"The logins of steps 7.3, 7.4 and 7.6 work now."
+  return 0
+}
 phase_7() {
   phase_header 7 "Start the empty instance (NOMOUNT)"
   run_step 7.1 auto  "Folders for the instance (audit, diagnostics)" c_7_1 d_7_1
@@ -552,17 +586,28 @@ dup_prechecks() {
   if use_grid && grid_sw_ok; then
     # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
     # the primary's online log members, and db_create_online_log_dest_1..5 (the standby uses the same names)
+    # not proven = not passed: an unread block size, an unread list of disk groups, an unread sector size
+    [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { PRE_FIX="The redo block size of the primary could not be read, so the disk groups for the logs cannot be checked"; return 1; }
     local ldg ldgs="$DATA_DG"; [[ "$CFD" == +* ]] && { ldg=$(norm_loc "$CFD"); ldgs=${ldg#+}; }
-    if prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
-      ldgs+=" $(grep -E '^[A-Z0-9_$#]+$' <<< "$SQL_OUT" | tr '\n' ' ')"
+    if ! prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
+      PRE_FIX="Cannot read on the primary which disk groups hold its logs"; return 1
     fi
+    ldgs+=" $(grep -E '^[A-Z0-9_$#]+$' <<< "$SQL_OUT" | tr '\n' ' ')"
     local ss seen=" "
     for ldg in $ldgs; do
       ldg=${ldg^^}; [[ "$seen" == *" $ldg "* ]] && continue; seen+="$ldg "
-      sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)" || continue
+      if ! sql_asm "select sector_size from v\$asm_diskgroup where name=upper('$ldg');" || ! num "$(first_line)"; then
+        PRE_FIX="Cannot read the sector size of +$ldg here (log files go there). Is the disk group mounted (step 3.5)?"; return 1
+      fi
       ss=$(first_line)
-      if [[ "${PRIMARY_REDO_BS:-512}" == "4096" && "$ss" != "4096" ]] || [[ "${PRIMARY_REDO_BS:-512}" == "512" && "$ss" == "4096" ]]; then
-        PRE_FIX="+$ldg has a sector size of $ss bytes, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"Log files go there, so after the copy they could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
+      [[ $ss -gt 0 ]] || { PRE_FIX="+$ldg reports a sector size of 0 (not mounted?). Log files go there. Mount it first (step 3.5)."; return 1; }
+      # 12.2+: a 512e disk group (sector_size 4096, logical_sector_size 512) takes 512-byte redo
+      local lss="$ss" lnote=""
+      if sql_asm "select logical_sector_size from v\$asm_diskgroup where name=upper('$ldg');" && num "$(first_line)" && [[ "$(first_line)" -gt 0 ]]; then lss=$(first_line)
+      else lnote=" (its logical sector size cannot be read in this ASM version, so the physical one is used)"; fi
+      # redo blocks must not be smaller than the (logical) sector, and 4K redo needs a 4K disk group
+      if [[ $PRIMARY_REDO_BS -lt $lss ]] || [[ $PRIMARY_REDO_BS -eq 4096 && $ss -ne 4096 ]]; then
+        PRE_FIX="+$ldg has a sector size of $ss bytes$lnote, but the primary's redo logs use ${PRIMARY_REDO_BS}-byte blocks."$'\n'"Log files go there, so after the copy they could not be created (ORA-01378)."$'\n'"First create a disk group with sector_size ${PRIMARY_REDO_BS} for the logs. Help: --help-step 3.5"
         return 1
       fi
       PRE_INFO+="+$ldg: sector size $ss bytes fits the redo block size ${PRIMARY_REDO_BS:-512}"$'\n'
@@ -620,6 +665,10 @@ dup_prechecks() {
     PRE_FIX="Alias $STANDBY_TNS does not reach the NOMOUNT instance on this server. It reaches: $ti, host $th, $ts"; return 1
   fi
   PRE_INFO+="$STANDBY_TNS reaches $ti (NOMOUNT) on this server"$'\n'
+  # and the other way: redo goes from the primary to this listener after the copy (a firewall shows only here)
+  prim_sql_as_sys "$STANDBY_TNS" "select instance_name||' '||status from v\$instance;" \
+    || { PRE_FIX="The primary cannot reach the standby through $STANDBY_TNS: $(ora_errors "$SQL_OUT") (step 7.6)"$'\n'"$(golden_text "$SQL_OUT" standby-tns)"; return 1; }
+  PRE_INFO+="The primary reaches $STANDBY_TNS too"$'\n'
   # memory: the spfile of primary is copied; the standby must be able to start with it (same rules as step 2.16)
   local mrc=0 rfs; mem_probe || mrc=$?
   [[ $mrc -eq 2 ]] && { PRE_FIX="Cannot read the memory parameters of the primary"; return 1; }
@@ -900,7 +949,7 @@ d_8_2() {
     printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"
     cat "$rmanfile"
     printf 'exit\n') || rc=$?
-  if grep -q 'Finished Duplicate Db' "$rlog" && ! grep -qE '^RMAN-0(3002|3009|3015)' "$rlog"; then
+  if dup_log_ok "$rlog" "$rc"; then
     dup_success_record
     DONE_MSG="The database was copied (RMAN: Finished Duplicate Db)"
     return 0

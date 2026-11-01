@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.8"
+readonly SCRIPT_VERSION="5.10"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -72,6 +72,7 @@ SQL_TIMEOUT=${DG_SQL_TIMEOUT:-600}
 num "$SQL_TIMEOUT" && (( 10#$SQL_TIMEOUT >= 10 && 10#$SQL_TIMEOUT <= 86400 )) || SQL_TIMEOUT=600
 SQL_TIMEOUT=$((10#$SQL_TIMEOUT))
 OS_RELEASE_FILE=${DG_OS_RELEASE_FILE:-/etc/os-release}
+FSTAB_FILE=${DG_FSTAB_FILE:-/etc/fstab}
 OS_ID=""; OS_MAJOR=""; PKG=""
 
 #------------------------------------------------------------------------------
@@ -399,6 +400,12 @@ os_info() {
   if command -v dnf >/dev/null 2>&1 && [[ "$OS_MAJOR" != "7" ]]; then PKG=dnf; else PKG=yum; fi
 }
 
+dup_log_ok() {
+  # $1 RMAN output, $2 its exit code. The copy counts only with exit code 0, "Finished Duplicate Db", and no error
+  # stack (RMAN prints "ERROR MESSAGE STACK FOLLOWS" / RMAN-00569 before any error that stops a command)
+  [[ "${2:-}" == "0" ]] && grep -q 'Finished Duplicate Db' "$1" \
+    && ! grep -qE '^RMAN-0(0569|3002|3009|3015)|ERROR MESSAGE STACK FOLLOWS' "$1"
+}
 run_logged() {
   # $1 = title; rest = command. Output -> RUN_OUT and log. Returns command rc. stdin is not passed on.
   # The output goes through a file: a daemon the command starts (lsnrctl start -> tnslsnr) may keep
@@ -480,7 +487,7 @@ job_finish_late() {
   local jok=0; [[ "$rc" == "0" || ( "$rc" == "6" && ( "$JOB_TITLE" == *installer* || "$JOB_TITLE" == "Grid configuration tools"* ) ) ]] && jok=1
   case "$JOB_TITLE" in
     "RMAN duplicate")
-      if grep -q 'Finished Duplicate Db' "$JOB_OUT" && ! grep -qE '^RMAN-0(3002|3009|3015)' "$JOB_OUT" && declare -F dup_success_record >/dev/null; then
+      if dup_log_ok "$JOB_OUT" "$rc" && declare -F dup_success_record >/dev/null; then
         dup_success_record; say "The RMAN copy had finished. Its result is recorded."; jok=1
       else
         jok=0; install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
@@ -641,6 +648,8 @@ backup_file() {
   [[ -e "$b" || -L "$b" ]] && return 0
   if [[ -n "$u" && "$u" != "root" ]]; then runuser -u "$u" -- cp -p -- "$f" "$b" || return 1
   else cp -p --remove-destination -- "$f" "$b" || return 1; fi
+  # a backup is never readable by everyone, even when the old file was (a password file or wallet with a bad mode)
+  chmod o-rwx -- "$b" 2>/dev/null
   say "Backup: $b"
 }
 dir_root_only() {

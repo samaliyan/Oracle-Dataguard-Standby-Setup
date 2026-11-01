@@ -22,6 +22,10 @@ Usage
   dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
                                            phase 1 runs first, so the primary must be reachable)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
+  dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
+                                           that erases (disks, leftovers, a half-unpacked software folder),
+                                           the copy, the host key, passwords, the listener restart (3.10),
+                                           the standby restart steps (9.1 9.2 9.3 9.7) and log deletion (9.8)
   dg_standby_setup.sh --status             Show the result of every phase and step
                                            (connects to nothing)
   dg_standby_setup.sh --show-changes       Changes made by the setup, and how to undo them
@@ -71,6 +75,7 @@ parse_args() {
       --check) MODE="check" ;;
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
+      --yes) YES_MODE=1 ;;
       --show-changes) SHOW_CHANGES=all; [[ $# -ge 2 && "$2" =~ ^[0-9]+\.[0-9]+$ ]] && { SHOW_CHANGES=$2; shift; } ;;
       --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
       --from)
@@ -231,7 +236,7 @@ main() {
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
   printf '  %s\n' "$(rule 70)"
   printf '  This server   %s (the new standby)\n' "$(hostname -s 2>/dev/null)"
-  printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup')"
+  printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup%s' "$([[ $YES_MODE -eq 1 ]] && printf ', --yes: actions on this server without asking')")"
   printf '  Log           %s\n' "$LOG_FILE"
   printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
   printf '  the commands are shown for you to run, and the script then checks the result.\n'

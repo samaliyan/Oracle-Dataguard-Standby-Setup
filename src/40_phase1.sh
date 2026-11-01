@@ -24,7 +24,7 @@ c_1_1() {
 c_1_6() {
   # Oracle version and Oracle Linux version must be a supported pair (checked when the version is known)
   [[ $DISCOVERED -eq 1 ]] || { NOW="Primary configuration not read (step 1.3)"; return 2; }
-  [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] || { NOW="Operating system version unknown; not checked"; return 0; }
+  [[ "$OS_MAJOR" =~ ^[0-9]+$ && $OS_MAJOR -gt 0 ]] || { NOW="Operating system version unknown; not checked"; warn "The version of this operating system cannot be read (/etc/os-release). Oracle and Oracle Linux versions are not checked against each other."; return 0; }
   local v=$PRIMARY_VERSION why="" r w
   # the database release, and the Grid release when there is Grid (Grid may be newer)
   local -a rels=("$(want_rel)")

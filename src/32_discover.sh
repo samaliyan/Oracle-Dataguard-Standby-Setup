@@ -292,9 +292,9 @@ This script supports only a single-instance primary."
   [[ -n "$LOCS" ]] || { bad "Unexpected answer for the file locations: $(head -n 3 <<< "$SQL_OUT")"; return 1; }
   PRIMARY_DB_MB=$(loc_list | awk -F: '{s+=$2} END {print s+0}')
   # block size of the online logs (512 or 4096): the standby logs and their disks must support it
-  PRIMARY_REDO_BS=512
+  PRIMARY_REDO_BS=512; PRIMARY_REDO_BS_KNOWN=0     # 512 is only the working default; 8.1 needs it proven
   prim_sql "select max(blocksize) from v\$log;" && PRIMARY_REDO_BS=$(first_line | cut -d'|' -f1)
-  num "$PRIMARY_REDO_BS" || PRIMARY_REDO_BS=512
+  if num "$PRIMARY_REDO_BS" && [[ $PRIMARY_REDO_BS -gt 0 ]]; then PRIMARY_REDO_BS_KNOWN=1; else PRIMARY_REDO_BS=512; fi
 
   # ---- recovery area, archive destination, folders used by the instance
   read_arch_params || { bad "Cannot read the parameters of the primary database."; return 1; }

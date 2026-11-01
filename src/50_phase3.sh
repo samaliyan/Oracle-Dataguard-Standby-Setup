@@ -132,6 +132,19 @@ media_ok() {
   [[ ${#_mf[@]} -gt 0 ]] || return 1
   for f in "${_mf[@]}"; do [[ -f "$f" ]] && media_trusted "$f" || return 1; done
 }
+media_matches() {
+  # $1 comma list, $2 grid | db -> the first file is an installer of that kind and of the release needed
+  # (a gold image whose release cannot be read is accepted, as in the scan)
+  # (the main file of a staged pair may be listed second: _2of2 first)
+  local f k mj; IFS=',' read -ra _mm <<< "$1"
+  for f in "${_mm[@]}"; do
+    k=$(media_kind "$f")
+    [[ "$k" == "${2}_image" || "$k" == "${2}_staged" ]] || continue
+    mj=$(media_major "$f")
+    [[ -z "$mj" || "$mj" == "$(want_rel "$2")" ]] && return 0
+  done
+  return 1
+}
 media_is_staged() { local k; k=$(media_kind "${1%%,*}"); [[ "$k" == *_staged ]]; }
 
 # ---- 3.1 installer files ----
@@ -142,12 +155,16 @@ c_3_1() {
   if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; fi
   db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1
   if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
-  if { [[ $need_g -eq 0 ]] || media_ok "$GRID_MEDIA"; } && { [[ $need_d -eq 0 ]] || media_ok "$DB_MEDIA"; }; then
+  # files already named in the settings are checked like found ones: right kind (Grid / database) and release
+  if { [[ $need_g -eq 0 ]] || { media_ok "$GRID_MEDIA" && media_matches "$GRID_MEDIA" grid; }; } \
+     && { [[ $need_d -eq 0 ]] || { media_ok "$DB_MEDIA" && media_matches "$DB_MEDIA" db; }; }; then
     NOW="Installer files are known"
     [[ -n "$GRID_MEDIA" ]] && NOW+=$'\n'"Grid:      $GRID_MEDIA"
     [[ -n "$DB_MEDIA" ]] && NOW+=$'\n'"Database:  $DB_MEDIA"
     return 0
   fi
+  [[ $need_g -eq 1 && -n "$GRID_MEDIA" ]] && media_ok "$GRID_MEDIA" && ! media_matches "$GRID_MEDIA" grid && warn "GRID_MEDIA ($GRID_MEDIA) is not a Grid $(want_rel grid) installer. The folders are searched instead."
+  [[ $need_d -eq 1 && -n "$DB_MEDIA" ]] && media_ok "$DB_MEDIA" && ! media_matches "$DB_MEDIA" db && warn "DB_MEDIA ($DB_MEDIA) is not a database $(want_rel) installer. The folders are searched instead."
   scan_media
   F_GRID=""; F_DB=""
   [[ $need_g -eq 1 ]] && F_GRID=$(pick_media grid)
@@ -340,7 +357,10 @@ run_installer() {
       printf 'Cause: /etc/oraInst.loc is missing, so the installer tried to create a new inventory in a
 folder that already has files (%s).
 ' "$INVENTORY_DIR" | hint
-      if use_grid; then printf 'Fix: finish Grid first. Its root scripts (step 3.3) create /etc/oraInst.loc.
+      if [[ "$who" == grid ]]; then printf 'Fix: answer r. The step then moves the files of the earlier attempt aside
+(nothing is deleted) and starts the installer again.
+' | hint
+      elif use_grid; then printf 'Fix: finish Grid first. Its root scripts (step 3.3) create /etc/oraInst.loc.
 Answer q, then run the script again: it continues with the Grid steps.
 ' | hint
       else printf 'Fix: answer q and run the script again: step 3.6 then shows what to do with that folder.
@@ -708,6 +728,43 @@ write_grid_rsp() {
 
 # ---- 3.2 Grid software ----
 SW_FIX=""; SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
+inventory_state() {
+  # ok        : /etc/oraInst.loc is there, or the inventory folder is missing or empty (the installer makes it)
+  # registered: the folder holds a real inventory (Oracle homes are listed in it), but /etc/oraInst.loc is missing
+  # leftover  : the folder only has what a failed installer left (logs, an empty inventory): no home is listed
+  [[ -f /etc/oraInst.loc ]] && { printf ok; return; }
+  [[ -d "$INVENTORY_DIR" ]] && ! dir_empty "$INVENTORY_DIR" || { printf ok; return; }
+  if grep -qs '<HOME ' "$INVENTORY_DIR/ContentsXML/inventory.xml"; then printf registered; else printf leftover; fi
+}
+inventory_fix_plan() {
+  # $1 owner of the inventory. Sets NOW and PLAN for a state that is not ok (INS-32035 otherwise).
+  case "$(inventory_state)" in
+    leftover)
+      NOW+="${NOW:+$'\n'}$INVENTORY_DIR is not empty, but no Oracle home is registered in it and /etc/oraInst.loc is missing."
+      NOW+=$'\n'"These are files of an earlier installer run that did not finish. The installer would stop with INS-32035."
+      PLAN="Move $INVENTORY_DIR aside to $INVENTORY_DIR.old_$RUN_ID (nothing is deleted),"$'\n'"and create it again empty, owner $1, group $INSTALL_GROUP."$'\n'"${PLAN}" ;;
+    registered)
+      NOW+="${NOW:+$'\n'}$INVENTORY_DIR holds an inventory with Oracle homes, but /etc/oraInst.loc is missing."
+      PLAN="Write /etc/oraInst.loc (inventory_loc=$INVENTORY_DIR, inst_group=$INSTALL_GROUP), so the installer uses it."$'\n'"${PLAN}" ;;
+  esac
+}
+inventory_fix() {
+  # $1 owner. Puts the inventory folder in a state the installer accepts (see inventory_state).
+  case "$(inventory_state)" in
+    ok) return 0 ;;
+    leftover)
+      local old="$INVENTORY_DIR.old_$RUN_ID"
+      [[ -e "$old" ]] && { bad "$old already exists. Nothing is moved."; return 1; }
+      mv -T -- "$INVENTORY_DIR" "$old" || { bad "Cannot move $INVENTORY_DIR aside."; return 1; }
+      journal RENAME "$INVENTORY_DIR" "to=$old"
+      say "Moved the files of the earlier attempt to $old"
+      make_dir "$INVENTORY_DIR" "$1" || return 1 ;;
+    registered)
+      printf 'inventory_loc=%s\ninst_group=%s\n' "$INVENTORY_DIR" "$INSTALL_GROUP" | write_as root /etc/oraInst.loc 644 || return 1
+      say "Wrote /etc/oraInst.loc" ;;
+  esac
+  [[ "$(inventory_state)" == ok ]]
+}
 grid_ready() {
   # what the install needs (NOW says what is missing)
   [[ -n "$(asm_labels "$DATA_DG")" ]] || { NOW="No ASM disks for +$DATA_DG yet (step 2.13)"; return 1; }
@@ -729,10 +786,12 @@ c_3_2() {
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     HALF_INSTALLED) half_installed_plan "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done"; return 1 ;;
   esac
-  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; return 1; fi
+  if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   grid_ready || return 2
   NOW="Grid is not installed yet"
   PLAN=""
+  # an inventory folder that an earlier, failed installer run left behind is moved aside first (else INS-32035)
+  [[ "$(inventory_state)" != ok ]] && SW_FIX=inv
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$GRID_MEDIA"; then PLAN="Unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid), as $GRID_USER"$'\n'
     else PLAN="Unzip $GRID_MEDIA into $GRID_HOME, as $GRID_USER"$'\n'; fi
@@ -744,6 +803,7 @@ ${RU_DIR:+  with the Release Update in $RU_DIR}
   Inventory $INVENTORY_DIR
 Ask you for a new ASM password for SYS and ASMSNMP (used only on this server)"
   USING="Same paths and disk group name as the primary."$'\n'"The response file is made from the template in the media."
+  [[ "$SW_FIX" == inv ]] && inventory_fix_plan "$GRID_USER"
   return 1
 }
 d_3_2() {
@@ -752,6 +812,7 @@ d_3_2() {
     half)  sw_half_fix "$GRID_HOME" "$GRID_USER" "$STATE_DIR/grid_install.done" "$(stage_dir grid)" grid || fx=$?
            [[ $fx -eq 10 ]] || return $fx ;;
     unzip) sw_unzip_fix || return 1 ;;
+    inv)   inventory_fix "$GRID_USER" || return 1 ;;
   esac
   if [[ -n "$SW_FIX" ]]; then
     SW_FIX=""; grid_state
@@ -868,8 +929,18 @@ d_3_4() {
       return $crc ;;
     HAS_DOWN)
       run_logged "crsctl start has" timeout 300 "$GRID_HOME/bin/crsctl" start has || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-      local n=0; say "Waiting for ASM to come online ..."
-      until grid_state; [[ "$GSTATE" == "DONE" || $n -ge 12 ]]; do sleep 5; n=$((n + 1)); done ;;
+      # ASM may take minutes after the stack starts (many disks): up to 5 minutes, then a clear failure
+      # measured in time (each check itself may take a while), with a line every minute
+      local t0 last=0 el; t0=$(date +%s); say "Waiting for ASM to come online (up to 5 minutes) ..."
+      until grid_state; [[ "$GSTATE" == "DONE" || "$GSTATE" == "ASM_DOWN" ]] || (( $(date +%s) - t0 >= 300 )); do
+        sleep 5; el=$(( ($(date +%s) - t0) / 60 )); [[ $el -gt $last ]] && { last=$el; say "Still waiting ($el min, state $GSTATE)"; }
+      done
+      # the stack is up but ASM was not started with it (not set to start by itself): started here
+      if [[ "$GSTATE" == "ASM_DOWN" ]]; then
+        run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+        t0=$(date +%s); until grid_state; [[ "$GSTATE" == "DONE" ]] || (( $(date +%s) - t0 >= 120 )); do sleep 5; done
+      fi
+      [[ "$GSTATE" == "DONE" ]] || { bad "Oracle Restart started, but ASM did not come online in time (state $GSTATE)."; return 1; } ;;
     ASM_DOWN) run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; } ;;
   esac
 }
@@ -889,8 +960,12 @@ c_3_5() {
   local list=$SQL_OUT ca="" cr=""
   dg_field "$DATA_DG"
   if [[ "$DG_S" == "MOUNTED" || "$DG_S" == "CONNECTED" ]]; then
+    # the new disk groups take these values from +DATA: a failed query is not passed over silently
     sql_asm "select max(decode(a.name,'compatible.asm',a.value))||'|'||max(decode(a.name,'compatible.rdbms',a.value)) from v\$asm_attribute a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name='$DATA_DG';" \
-      && IFS='|' read -r ca cr <<< "$(first_line)"
+      || { NOW="Cannot read compatible.asm and compatible.rdbms of +$DATA_DG ($(ora_errors "$SQL_OUT"))"; return 2; }
+    IFS='|' read -r ca cr <<< "$(first_line)"
+    # a disk group made with the old 10.1 defaults has no attribute rows: the new ones get the defaults too
+    [[ "$ca" =~ ^[0-9.]+$ && "$cr" =~ ^[0-9.]+$ ]] || warn "+$DATA_DG does not show both compatible.asm and compatible.rdbms. A value it does not show is the default of this ASM in the new disk groups."
   elif [[ -z "$DG_S" ]]; then
     # the Grid configuration created ASM but not +DATA (it stopped half-way): created here like the others
     warn "+$DATA_DG does not exist, although ASM is running. The Grid configuration did not
@@ -921,13 +996,17 @@ alter diskgroup $dg mount;"
       else ver_lt "${ca2:-0}" 11.2 && ca2=11.2.0.0.0; fi
       ver_lt "${cr2:-0}" 11.2 && cr2=11.2.0.0.0
     fi
-    [[ "$ca2" =~ ^[0-9.]+$ && "$cr2" =~ ^[0-9.]+$ ]] && attrs+="'compatible.asm'='$ca2', 'compatible.rdbms'='$cr2'"
+    # each value that is known is used (one can be missing on an old disk group)
+    # compatible.asm alone is fine; compatible.rdbms only together with it (rdbms may not be above asm)
+    [[ "$ca2" =~ ^[0-9.]+$ ]] && attrs+="'compatible.asm'='$ca2'"
+    [[ "$ca2" =~ ^[0-9.]+$ && "$cr2" =~ ^[0-9.]+$ ]] && attrs+=", 'compatible.rdbms'='$cr2'"
     [[ "${PRIMARY_REDO_BS:-${SRL_BLOCKSIZE:-512}}" == "4096" ]] && attrs+="${attrs:+, }'sector_size'='4096'"
     [[ -n "$attrs" ]] && c+=" attribute $attrs"
     DG_TODO+="$c;"$'\n'; todo+=" +$dg"
   done
   DG_TODO=${DG_TODO%$'\n'}
   if [[ -z "$DG_TODO" ]]; then NOW="${info%$'\n'}"; return 0; fi
+  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the sector size of the new disk groups is not known. Run the script again."; return 2; }
   NOW="Disk groups to create:$todo"
   PLAN="As $GRID_USER:  export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM ; \$ORACLE_HOME/bin/sqlplus / as sysasm
 $DG_TODO"
@@ -1045,7 +1124,7 @@ c_3_6() {
     HALF_INSTALLED) half_installed_plan "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done"; return 1 ;;
   esac
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
-  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; return 1; fi
+  if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   inventory_ready || return $?
   db_ready || return 2
   NOW="Database software is not installed yet"
@@ -1134,6 +1213,7 @@ c_3_8() {
   PLAN+=$'\n'"Then the spfile, password file and tnsnames.ora are kept inside $DB_HOME."
   return 1
 }
+# journaled first: a roohctl that stops half-way has still changed the home, and the undo must be listed
 d_3_8() { journal ROOHCTL "$DB_HOME"; run_logged "roohctl -disable" as_oracle "$DB_HOME/bin/roohctl" -disable || { bad "roohctl failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }; }
 rw_home_ok() {
   db_sw_ok || return 1
@@ -1225,7 +1305,7 @@ primary_patches() {
 local_release() {
   # base release of the installed database software, from sqlplus -V ("Release 19.0.0.0.0", "Version 19.21.0.0.0")
   run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V || return 1
-  grep -oE 'Release [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
+  grep -oE '(Release|Version) [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
 }
 c_3_11() {
   db_sw_ok || { NOW="Database software is not installed yet (step 3.6)"; return 2; }
@@ -1233,6 +1313,7 @@ c_3_11() {
   primary_edition || { NOW="Cannot read the edition of the primary"; return 2; }
   local rel want h pp lp missing extra report="" bad_rel=""
   rel=$(local_release || true); want=$(want_rel)
+  [[ -n "$rel" ]] || { NOW="The release of the database software here cannot be read (sqlplus -V)"; return 2; }
   if [[ -n "$rel" ]]; then
     if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$want" ]] || bad_rel="release $rel here, release $want on the primary"
     else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="release $rel here, release $DB_MAJOR on the primary"; fi

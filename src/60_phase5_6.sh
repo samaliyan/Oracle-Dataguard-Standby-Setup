@@ -24,8 +24,18 @@ static_entry_state() {
       [[ $gok -eq 1 ]] || STATIC_WHY+="GLOBAL_DBNAME is missing or not $STANDBY_SERVICE"$'\n'
       found=2
     fi
-  done < <(printf '%s' "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
+  done < <(sidlist_of "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
   return $found
+}
+sidlist_of() {
+  # $1 listener.ora flattened by norm -> only the (...) that belongs to SID_LIST_<this listener>
+  # (an entry under another listener's SID_LIST is not served by this one)
+  # the LAST block counts: listener.ora with two blocks of one name uses the last one
+  awk -v key="SID_LIST_${SB_LSNR^^}=" '{
+    t = $0; i = 0; while ((j = index(t, key)) > 0) { i += j; t = substr(t, j + 1) }; if (!i) exit
+    s = substr($0, i + length(key)); d = 0; out = ""
+    for (j = 1; j <= length(s); j++) { c = substr(s, j, 1); out = out c; if (c == "(") d++; else if (c == ")") { d--; if (d == 0) break } }
+    print out }' <<< "$1"
 }
 lsnr_has_sidlist() { local f; f=$(lsnr_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$f"; }
 static_block() {
@@ -166,7 +176,12 @@ d_5_2() {
 
 # ---- 5.3 / 5.4 ----
 T_ALIAS=""; T_HOST=""; T_SVC=""
-tns_alias_present() { local f; f=$(tns_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*$1[[:space:]]*=" "$f"; }
+tns_alias_present() {
+  # the alias as plain text (a . in my.db is a dot, not "any character")
+  local f a; f=$(tns_file); [[ -f "$f" ]] || return 1
+  a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$1")
+  grep -qiE "^[[:space:]]*$a[[:space:]]*=" "$f"
+}
 c_tns() {
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
@@ -184,6 +199,10 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
   fi
   if tns_alias_present "$T_ALIAS"; then
     case "$(tnsping_class "$RUN_OUT")" in
+      BLOCKED)
+        if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then
+          NOW="The alias $T_ALIAS is right, but $T_HOST:$PORT gives no answer at all (timeout)."$'\n'"A firewall on $T_HOST or between the servers probably drops port $PORT."; return 2
+        fi ;;
       NOLISTENER)
         if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then
           NOW="The alias $T_ALIAS is right, but nothing answers at $T_HOST:$PORT yet: $(grep -oE 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
@@ -258,7 +277,8 @@ c_6_1() {
   if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
-    if prim_probe statx "$t"; then
+    # no answer from stat (the file is not there) is "no copy yet", not a copy with an empty owner and mode
+    if prim_probe statx "$t" && [[ -n "$(head -n 1 <<< "$RUN_OUT")" ]]; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
       if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#$tmode & 8#027 )) -ne 0 ]]; then
         NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
@@ -303,6 +323,16 @@ chgrp $INSTALL_GROUP $t
 chmod 640 $t"
         PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
     USING="After you run the commands below, the script copies the file to this server."$'\n'"Step 6.2 then asks you to delete it on the primary."
+    return 1
+  fi
+  # can the ssh user read it? (md5sum reads the file; a copy would fail the same way)
+  if ! prim_probe md5 "$pfile" || ! [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" =~ ^[0-9a-f]{32}$ ]]; then
+    NOW+=$'\n'"The ssh user $PRIMARY_SSH_USER cannot read $pfile on the primary."
+    KIND_NOW=primary; PRIMARY_HOW_STEP="root  ->  shell"
+    PLAN="-- Let the ssh user read it (it is in the group $INSTALL_GROUP, or use the oracle user for ssh):
+ls -l $pfile
+chmod g+r $pfile"
+    PLAN_UNDO="chmod g-r $pfile"
     return 1
   fi
   PW_SRC=$pfile
@@ -412,7 +442,10 @@ c_6_3() {
       # a LOCAL auto-login wallet of the primary does not open here: it is made again on this server (orapki)
       if [[ "$f" == cwallet.sso ]] && tde_local_autologin; then continue; fi
       if [[ ! -f "$d/$f" ]]; then miss+=" $d/$f"; TDE_TODO+=("$d/$f"); continue; fi
-      if prim_probe md5 "$d/$f" && [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" == "$(md5sum "$d/$f" | awk '{print $1}')" ]]; then have+=" $d/$f"
+      # a checksum the primary cannot give (the ssh user cannot read the file) is not "different": it is not known
+      local rmd=""; prim_probe md5 "$d/$f" && rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT")
+      [[ "$rmd" =~ ^[0-9a-f]{32}$ ]] || { NOW="Cannot read $d/$f on the primary (md5sum). The ssh user $PRIMARY_SSH_USER must be able to read it."; return 2; }
+      if [[ "$rmd" == "$(md5sum "$d/$f" | awk '{print $1}')" ]]; then have+=" $d/$f"
       else diff+=" $d/$f"; TDE_TODO+=("$d/$f"); fi
     done <<< "$RUN_OUT"
     [[ $found -eq 1 ]] || { NOW="No ewallet.p12 or cwallet.sso in $d on the primary"; return 2; }
@@ -434,13 +467,21 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
       TDE_SQLNET=1
     fi
   fi
-  TDE_NO_AUTOLOGIN=0; [[ "$have$miss$diff" == *"cwallet.sso"* ]] || TDE_NO_AUTOLOGIN=1
-  if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 && -f "${dirs[0]}/cwallet.sso" ]]; then TDE_NO_AUTOLOGIN=0; fi
+  # every keystore folder needs its own auto-login file here (CDB and PDB wallets are separate folders);
+  # the tde_seps folder holds only the external-store password and is copied as it is
+  local nocw=()
+  for d in "${dirs[@]}"; do
+    [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]] && continue
+    [[ -f "$d/cwallet.sso" ]] && continue
+    [[ " ${TDE_TODO[*]+"${TDE_TODO[*]}"} " == *" $d/cwallet.sso "* ]] && continue
+    nocw+=("$d")
+  done
+  TDE_NO_AUTOLOGIN=0; [[ ${#nocw[@]} -gt 0 ]] && TDE_NO_AUTOLOGIN=1
+  TDE_CW_TODO=("${nocw[@]+"${nocw[@]}"}")
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 ]]; then
-    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here."$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
+    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
     tde_local_autologin && NOW+=$'\n'"The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is made again here."
-    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"
-    PLAN=$(orapki_plan "${dirs[0]}")
+    PLAN="Make cwallet.sso here with orapki, as $ORACLE_USER, in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"You type the keystore (wallet) password once. It is passed to orapki and not kept anywhere."
     return 1
   fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
@@ -453,12 +494,10 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   PLAN=""
   [[ ${#TDE_TODO[@]} -gt 0 ]] && PLAN="Copy these files from the primary to the same path here (scp, checked with md5sum):"$'\n'"$(printf '  %s\n' "${TDE_TODO[@]}")"$'\n'"Owner $ORACLE_USER:$INSTALL_GROUP, mode 600. Old files are kept as .bak_$RUN_ID."$'\n'
   [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add this to sqlnet.ora (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
-  TDE_NO_AUTOLOGIN=0
-  if [[ " ${have} ${TDE_TODO[*]+"${TDE_TODO[*]}"} " != *"cwallet.sso"* ]]; then
-    TDE_NO_AUTOLOGIN=1
+  if [[ $TDE_NO_AUTOLOGIN -eq 1 ]]; then
     if tde_local_autologin; then PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
     else PLAN+="The primary has no auto-login keystore (cwallet.sso)."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'; fi
-    PLAN+="After the copy, this step shows the orapki command that makes cwallet.sso on this server."$'\n'
+    PLAN+="After the copy, cwallet.sso is made on this server with orapki (you type the keystore password once)."$'\n'
   fi
   PLAN=${PLAN%$'\n'}
   return 1
@@ -475,6 +514,12 @@ d_6_3() {
     backup_file "$f" "$ORACLE_USER" || return 1
     install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 600 "$tmp" "$f" || return 1
     rm -f "$tmp"; say "Installed $f"; journal_file_written "$f" "$existed"
+    # a new ewallet.p12 (for example after a new master key) makes an auto-login file that was made HERE
+    # outdated (ORA-28374): it is moved aside and made again. One that comes from the primary is copied anyway.
+    if [[ "$f" == */ewallet.p12 && -f "$d/cwallet.sso" && " ${TDE_TODO[*]} " != *" $d/cwallet.sso "* ]]; then
+      runuser -u "$ORACLE_USER" -- mv -f -- "$d/cwallet.sso" "$d/cwallet.sso.old_$RUN_ID" \
+        && { journal RENAME "$d/cwallet.sso" "to=$d/cwallet.sso.old_$RUN_ID"; say "The old auto-login file of $d is kept as cwallet.sso.old_$RUN_ID. It is made again."; }
+    fi
   done
   if [[ $TDE_SQLNET -eq 1 ]]; then
     local s; s=$(sqlnet_file)
@@ -483,6 +528,32 @@ d_6_3() {
       | append_as "$ORACLE_USER" "$s" || return 1
     say "Added ENCRYPTION_WALLET_LOCATION to $s"
   fi
+  # the auto-login keystore: worked out again after the copy (the copied files may have brought one)
+  need_ssh || return 1            # a lost connection is opened again on the screen, not in the quiet check
+  c_6_3 >/dev/null 2>&1 || true
+  [[ ${#TDE_CW_TODO[@]} -gt 0 ]] || return 0
+  tde_make_autologin
+}
+TDE_CW_TODO=()
+tde_make_autologin() {
+  # cwallet.sso for every keystore folder in TDE_CW_TODO. The password goes to orapki on its input
+  # (never on its command line, never in a file or the log). If orapki does not take it, the command is shown.
+  local d out rc=0 opt; opt=$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')
+  ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${TDE_CW_TODO[*]})"
+  local pw=$SECRET; SECRET=""
+  for d in "${TDE_CW_TODO[@]}"; do
+    out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || rc=1
+    out=${out//"$pw"/*****}
+    printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
+    if [[ -f "$d/cwallet.sso" ]]; then
+      say "Made $d/cwallet.sso"; journal_file_written "$d/cwallet.sso" 0
+    else
+      pw=""; bad "orapki did not make $d/cwallet.sso: $(grep -m1 -iE 'PKI-|error|incorrect' <<< "$out")"
+      { printf 'Run it by hand, as %s (orapki asks for the password):\n' "$ORACLE_USER"; orapki_plan "$d"; } | hint
+      return 1
+    fi
+  done
+  pw=""; return $rc
 }
 
 phase_6() {

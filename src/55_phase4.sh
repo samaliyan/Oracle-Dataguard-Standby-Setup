@@ -45,7 +45,7 @@ c_4_1() {
 create spfile from memory;
 -- Then restart the primary once (shutdown immediate; startup) at a quiet time.
 -- After the restart it uses the spfile. The other changes of this phase need it."
-    PLAN_UNDO="delete \$ORACLE_HOME/dbs/spfile${PRIMARY_SID}.ora, then restart with:  startup pfile='\$ORACLE_HOME/dbs/init${PRIMARY_SID}_before_dg.ora'"
+    PLAN_UNDO="delete \$ORACLE_HOME/dbs/spfile${PRIMARY_SID}.ora, then restart with:  startup pfile='?/dbs/init${PRIMARY_SID}_before_dg.ora'"
     return 1
   fi
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
@@ -198,7 +198,14 @@ c_4_4() {
   if [[ -n "$OLD_ARCH_DEST" ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
   find_dest || { NOW="No free log_archive_dest_N on the primary"; return 2; }
   p_param "log_archive_dest_$DEST_N" || { NOW="Query on the primary failed"; return 2; }
-  if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"; return 0; fi
+  if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then
+    NOW="log_archive_dest_$DEST_N points to the standby:"$'\n'"  $PVAL"
+    # an existing destination is kept as it is; a mode other than the script's own is said
+    if [[ "$PVAL" == *SYNC* && "$PVAL" != *ASYNC* ]] || [[ "$PVAL" != *"VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE)"* ]]; then
+      warn "log_archive_dest_$DEST_N is kept as it is, but it differs from what this script sets"$'\n'"(async valid_for=(online_logfiles,primary_role)). SYNC slows down commits on the primary."
+    fi
+    return 0
+  fi
   NOW="log_archive_dest_$DEST_N = $(disp_val "$PVAL")"
   [[ "$DEST_N" != "2" ]] && NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"
   PLAN=""
@@ -391,9 +398,11 @@ tns_desc_ok() {
   return 0
 }
 tnsping_class() {
-  # $1 tnsping output -> OK | NOLISTENER (alias resolved, nothing answers there yet) | MISSING | OTHER
+  # $1 tnsping output -> OK | NOLISTENER (alias resolved, the server says nothing listens there yet) |
+  # BLOCKED (alias resolved, no answer at all: a timeout, usually a firewall that drops) | MISSING | OTHER
   if grep -q '^OK' <<< "$1"; then printf 'OK'
-  elif grep -qE 'TNS-12541|TNS-12543|TNS-12535|TNS-12170|TNS-12560|TNS-12547' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'NOLISTENER'
+  elif grep -qE 'TNS-12541|TNS-12543|TNS-12560|TNS-12547' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'NOLISTENER'
+  elif grep -qE 'TNS-12535|TNS-12170' <<< "$1" && grep -qi 'Attempting to contact' <<< "$1"; then printf 'BLOCKED'
   elif grep -qE 'TNS-03505|TNS-12154' <<< "$1" || ! grep -qi 'adapter' <<< "$1"; then printf 'MISSING'
   else printf 'OTHER'; fi
 }
@@ -405,10 +414,11 @@ c_4_9() {
   [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="tnsping on the primary gave no answer within 120 seconds. Answer r to check again."; return 2; }
   cls=$(tnsping_class "$RUN_OUT")
   PLAN_UNDO="remove the $STANDBY_TNS entry from $PRIMARY_TNS_ADMIN/tnsnames.ora, or put back the backup if you changed an existing entry"
-  if [[ "$cls" == "OK" || "$cls" == "NOLISTENER" ]] && grep -qi 'TNSNAMES adapter' <<< "$RUN_OUT"; then
+  if [[ "$cls" == "OK" || "$cls" == "NOLISTENER" || "$cls" == "BLOCKED" ]] && grep -qi 'TNSNAMES adapter' <<< "$RUN_OUT"; then
     if tns_desc_ok "$RUN_OUT" "$STANDBY_HOST" "$STANDBY_SERVICE"; then
       NOW="tnsnames.ora on the primary has $STANDBY_TNS = $STANDBY_HOST:$PORT/$STANDBY_SERVICE (UR=A)"
       [[ "$cls" == "NOLISTENER" ]] && NOW+=$'\n'"The alias is right. Nothing answers on this server yet: the listener comes in phase 5."
+      [[ "$cls" == "BLOCKED" ]] && warn "The alias is right, but the primary got no answer at all from $STANDBY_HOST:$PORT (timeout)."$'\n'"A firewall between the servers probably drops the connection. Step 2.9 opens the port on this server;"$'\n'"a network firewall must allow port $PORT from the primary too. Step 7.6 tests it, and step 8.1 again before the copy."
       return 0
     fi
     NOW="The alias $STANDBY_TNS on the primary is different: $TNS_WHY"
@@ -441,10 +451,17 @@ c_4_10() {
     NOW="The primary listener has a static entry for $PRIMARY_SID"; return 0
   fi
   NOW="The primary listener has no static entry for $PRIMARY_SID."
-  PLAN="-- Edit this file (or the listener.ora in its TNS_ADMIN, if set):
---   $PRIMARY_LISTENER_HOME/network/admin/listener.ora
--- Add this inside SID_LIST_$LISTENER_NAME, or create the block if it is missing.
--- ORACLE_HOME must be the database home, not the Grid home.
+  local lf="${PRIMARY_LISTENER_TNS_ADMIN:-$PRIMARY_LISTENER_HOME/network/admin}/listener.ora"
+  PLAN="-- Edit this file:
+--   $lf
+-- If it already has a block SID_LIST_$LISTENER_NAME, add ONLY this SID_DESC inside its (SID_LIST = ...).
+-- Do not paste a second SID_LIST_$LISTENER_NAME block: the last one would replace the first.
+    (SID_DESC =
+      (GLOBAL_DBNAME = $PRIMARY_SERVICE)
+      (SID_NAME = $PRIMARY_SID)
+      (ORACLE_HOME = $DB_HOME)
+    )
+-- If there is no such block yet, add the whole block:
 SID_LIST_$LISTENER_NAME =
   (SID_LIST =
     (SID_DESC =
@@ -453,6 +470,7 @@ SID_LIST_$LISTENER_NAME =
       (ORACLE_HOME = $DB_HOME)
     )
   )
+-- ORACLE_HOME must be the database home, not the Grid home.
 -- Then reload the listener:
 ORACLE_HOME=$PRIMARY_LISTENER_HOME $PRIMARY_LISTENER_HOME/bin/lsnrctl reload $LISTENER_NAME"
   PLAN_UNDO="remove that SID_DESC block from listener.ora, then run lsnrctl reload $LISTENER_NAME"
@@ -486,8 +504,8 @@ EOF"
 phase_4() {
   phase_header 4 "Prepare the primary"
   say "The script only reads the primary. You run the changes it shows."
-  STEP_TITLE_HINT=([4.1]="ARCHIVELOG and FORCE LOGGING" [4.2]="Standby redo logs" [4.3]="Data Guard names (log_archive_config)" [4.4]="Redo transport to the standby (log_archive_dest_N)" [4.5]="Automatic standby files (standby_file_management)" [4.6]="Archive destination and recovery area" [4.7]="Password file and SYS" [4.8]="fal_server (optional, for switchover)")
-  batch_primary_steps 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8
+  STEP_TITLE_HINT=([4.1]="ARCHIVELOG and FORCE LOGGING" [4.2]="Standby redo logs" [4.3]="Data Guard names (log_archive_config)" [4.4]="Redo transport to the standby (log_archive_dest_N)" [4.5]="Automatic standby files (standby_file_management)" [4.6]="Archive destination and recovery area" [4.7]="Password file and SYS" [4.8]="fal_server (optional, for switchover)" [4.9]="Standby alias in the primary tnsnames.ora" [4.11]="Environment of $ORACLE_USER on the primary")
+  batch_primary_steps 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.11
   run_step 4.1  primary "ARCHIVELOG and FORCE LOGGING" c_4_1
   run_step 4.2  primary "Standby redo logs on the primary" c_4_2
   run_step 4.3  primary "Data Guard names (log_archive_config)" c_4_3

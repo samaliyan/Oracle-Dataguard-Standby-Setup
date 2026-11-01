@@ -160,8 +160,19 @@ undo_text() {
     UNIT)       if [[ "$obj" == *.timer ]]; then printf 'auto: systemctl disable --now %s   (the nightly clean-up stops)' "$obj"
                 else printf 'auto: systemctl disable %s   (a running standby keeps running)' "$obj"; fi ;;
     OPATCH)     printf 'by hand, only if wanted: rm -rf %s ; mv %s %s   (puts back the OPatch of the media)' "$obj" "$(detail_field "$det" old)" "$obj" ;;
-    SRVOPT)     printf 'by hand, usually not wanted: srvctl modify database -db %s -startoption <the old one>   (it is in the log of that run)' "$obj" ;;
-    SRVCTL_OLD) printf 'by hand: the old registration of %s is in the log of that run (srvctl config). Add it again with srvctl add database.' "$obj" ;;
+    SHM)        b=$(detail_field "$det" old)
+                if [[ -n "$b" && "$b" != "-" ]]; then printf 'by hand, usually not wanted: mount -o remount,size=%s /dev/shm   (the fstab line has its own backup)' "$b"
+                else printf 'by hand, usually not wanted: the old size of /dev/shm is not known; the fstab line has its own backup'; fi ;;
+    SRVOPT)     local so oh op; so=$(detail_field "$det" old | tr '_' ' '); oh=$(detail_field "$det" oldhome); op=$(detail_field "$det" oldpw)
+                printf 'by hand, usually not wanted: srvctl modify database -db %s' "$obj"
+                [[ -n "$so" ]] && { [[ "$so" == unknown ]] && printf ' -startoption <the old option>' || printf ' -startoption "%s"' "$so"; }
+                [[ -n "$oh" && "$oh" != "-" ]] && printf ' -oraclehome %s' "$oh"
+                [[ -n "$op" && "$op" != "-" ]] && printf ' -pwfile %s' "$op"
+                [[ "$op" == "-" ]] && printf '   (there was no password file in the registration)'
+                true ;;
+    SRVCTL_OLD) b=$(detail_field "$det" file)
+                if [[ -n "$b" ]]; then printf 'by hand: the old registration of %s is saved in %s (srvctl config). Add it again with srvctl add database.' "$obj" "$b"
+                else printf 'by hand: the old registration of %s is in the log of that run (srvctl config). Add it again with srvctl add database.' "$obj"; fi ;;
     RMANCFG)    local ov; ov=$(detail_field "$det" old); ov=${ov//\~/ }
                 if [[ -z "$ov" || "$ov" == "-" ]]; then printf 'by hand, usually not wanted: as %s  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY CLEAR;' "$ORACLE_USER"
                 else printf 'by hand, usually not wanted: as %s  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY %s;' "$ORACLE_USER" "$ov"; fi ;;
@@ -358,7 +369,7 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       say "Put back $obj from $b"; _hint_after_restore "$obj"; return 0 ;;
     RENAME)
       local to; to=$(detail_field "$det" to)
-      [[ -f "$to" ]] || { say "$to is gone. Nothing to rename back."; return 0; }
+      [[ -e "$to" ]] || { say "$to is gone. Nothing to rename back."; return 0; }
       [[ -e "$obj" ]] && { say "$obj exists again. The renamed copy $to is left as it is."; return 2; }
       mv -f -- "$to" "$obj" || return 1
       say "Renamed $to back to $obj"; return 0 ;;

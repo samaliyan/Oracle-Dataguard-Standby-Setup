@@ -65,6 +65,10 @@ def primary_sql(q, pri):
         d0 = pri["locs"][0].split(":")[0]
         rows.append(f"T|1|{d0}/PRODDB/TEMPFILE/temp.300.1" if d0.startswith("+") else f"T|1|{d0}/temp01.dbf")
         return "\n".join(rows)
+    if "from v$sgainfo where name='maximum sga size'" in l:
+        m = pri.get("mem", {})
+        if "sgainfo" in pri: return str(pri["sgainfo"])
+        return str(max(int(m.get("sga_target", 0) or 0), int(m.get("sga_max_size", 0) or 0), 1024**3) if m else 1024**3)
     if "from v$logfile where member like '+%'" in l:
         dgs = pri.get("log_dgs")
         if dgs is None: dgs = sorted({loc.split(":")[0].lstrip("+").split("/")[0].upper() for loc in pri["locs"] if loc.startswith("+")})
@@ -369,6 +373,8 @@ def srvctl():
         if not reg: print("PRCD-1120"); return 1
         d = dict(zip(a[2::2], a[3::2]))
         if "-startoption" in d: reg["startopt"] = d["-startoption"].lower()
+        if "-pwfile" in d: reg["pwfile"] = d["-pwfile"]
+        if "-oraclehome" in d: reg["home"] = d["-oraclehome"]
         save(STB, st); return 0
     if a[:2] == ["status", "database"]:
         if not reg: print("PRCD-1120"); return 1
@@ -431,7 +437,11 @@ def rman():
     spf = os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora")
     open(spf, "w").write("mock spfile\n")
     st["duplicated"] = st.get("duplicated", 0) + 1
-    save(STB, st); return 0
+    save(STB, st)
+    if cfg.get("rman_error_after_finish"):
+        print("RMAN-00571: ===========================================================\nRMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============\nRMAN-05158: WARNING: auxiliary file conversion failed")
+        return 1
+    return 0
 
 def lsnrctl():
     st = load(STB)
@@ -457,6 +467,18 @@ def lsnrctl():
             print(f'Service "{cfg["stby_svc"]}" has 1 instance(s).\n  Instance "{cfg["sid"]}", status UNKNOWN, has 1 handler(s) for this service...')
         print("The command completed successfully"); return 0
     return 1
+
+def orapki():
+    # orapki wallet create -wallet <dir> -auto_login|-auto_login_local ; the password comes on stdin
+    with open(os.path.join(STATE_DIR, "calls.log"), "a") as f: f.write(f"orapki args={args}\n")
+    if args[:2] != ["wallet", "create"] or "-wallet" not in args: print("PKI-01001: bad arguments"); return 1
+    d = args[args.index("-wallet") + 1]
+    pw = sys.stdin.readline().rstrip("\n")
+    print("Oracle PKI Tool Release 19.0.0.0.0"); print("Enter wallet password:")
+    if pw != load(PRI).get("tde_pw", "Wallet_pw1"): print("PKI-03001: The password is incorrect."); return 1
+    opt = "-auto_login_local" if "-auto_login_local" in args else "-auto_login"
+    open(os.path.join(d, "cwallet.sso"), "w").write(f"MOCK-ORAPKI {opt}\n")
+    print("Operation is successfully completed."); return 0
 
 def tnsping():
     alias = args[0]
@@ -531,5 +553,5 @@ def setasmgidwrap():
         os.system(f"chgrp asmadmin {args[0][2:]}"); return 0
     return 1
 
-sys.exit({"opatch": opatch, "sqlplus": sqlplus, "srvctl": srvctl, "rman": rman, "lsnrctl": lsnrctl, "tnsping": tnsping,
+sys.exit({"opatch": opatch, "sqlplus": sqlplus, "srvctl": srvctl, "rman": rman, "lsnrctl": lsnrctl, "tnsping": tnsping, "orapki": orapki,
           "crsctl": crsctl, "orapwd": orapwd, "oraversion": oraversion, "orabasehome": orabasehome, "roohctl": roohctl, "asmcmd": asmcmd, "setasmgidwrap": setasmgidwrap}[prog]() or 0)

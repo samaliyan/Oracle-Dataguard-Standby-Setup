@@ -201,6 +201,7 @@ def remote(cmd, stdin_data):
             h = P.get("tns_stby_host", P["stby_host"])
             print("Used TNSNAMES adapter to resolve the alias")
             print(f"Attempting to contact (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = {h})(PORT = {P.get('port', 1521)})) (CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = {P['stby_service']})(UR = A)))")
+            if P.get("stby_fw_drop"): print("TNS-12535: TNS:operation timed out"); return 1
             if P.get("stby_lsnr_down"): print("TNS-12541: TNS:no listener"); return 1
             print("OK (10 msec)"); return 0
         print("TNS-03505: Failed to resolve name"); return 1

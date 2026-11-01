@@ -138,6 +138,7 @@ def main():
             pw_asked[0] += 1
             if pw_asked[0] == 1 and E("DG_TEST_PW1"): send(E("DG_TEST_PW1")); continue
             send(E("DG_TEST_PW", "Welcome_123")); continue
+        if bt.startswith("TDE keystore password"): send(E("DG_TEST_TDEPW", "Wallet_pw1")); continue
         if bt.startswith("New ASM password for SYS and ASMSNMP"): send(E("DG_TEST_ASMPW", "Asm_Pass123")); continue
         if bt == "Type it again": send(E("DG_TEST_ASMPW2", E("DG_TEST_ASMPW", "Asm_Pass123"))); continue
         if "Number of the database" in bt: send(E("DG_TEST_DBPICK", "1")); continue

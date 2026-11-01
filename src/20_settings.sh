@@ -85,15 +85,22 @@ load_settings() {
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
     [[ "$soft" == "soft" ]] && return 1; fatal "$LOAD_ERR"
   fi
+  local seen_keys=" "
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line=${line%%#*}; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    # a comment is a line that starts with #, or # after a space: a # inside a value is kept (and then checked)
+    line="${line#"${line%%[![:space:]]*}"}"; [[ "$line" == "#"* ]] && continue
+    line=${line%%[[:space:]]#*}; line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
     if [[ "$line" != *=* ]]; then LOAD_ERR="This line is not KEY=VALUE: $line"; break; fi
     key=${line%%=*}; val=${line#*=}
+    local rawkey=$key
     case "$key" in
       GRID_ZIP) key=GRID_MEDIA; SETTINGS_UPGRADED=1 ;;
       DB_ZIP)   key=DB_MEDIA;   SETTINGS_UPGRADED=1 ;;
     esac
+    # the same key twice (also under its old name, GRID_ZIP and GRID_MEDIA): which one counts would be a guess
+    if [[ "$seen_keys" == *" $key "* ]]; then LOAD_ERR="$key is set twice$([[ "$rawkey" != "$key" ]] && printf ' (also as %s)' "$rawkey"). Keep one line."; break; fi
+    seen_keys+="$key "
     if [[ "$OLD_KEYS" == *" $key "* ]]; then DROPPED_KEYS+=" $key"; SETTINGS_UPGRADED=1; continue; fi
     spec=""
     for t in $SETTING_SPECS; do [[ "${t%%:*}" == "$key" ]] && spec=${t#*:}; done
@@ -204,10 +211,11 @@ validate_settings() {
   [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
   # names are resolved first: a host name on one side and its address on the other is the same server
   local sip pip; sip=$(ipv4_of "$STANDBY_IP"); pip=$(ipv4_of "$PRIMARY_IP")
+  [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { bad "STANDBY_IP must be an IPv4 address (it is used as an address in the firewall and listener steps)."; bad_n=1; }
   [[ -n "$STANDBY_IP" && "$STANDBY_IP" != 127.* ]] || { bad "STANDBY_IP must be the network address of this server. It cannot be empty or 127.x."; bad_n=1; }
   [[ "$STANDBY_IP" != "$PRIMARY_IP" && ( -z "$sip" || "$sip" != "$pip" ) ]] || { bad "STANDBY_IP is the IP address of the primary."; bad_n=1; }
   [[ "${STANDBY_HOST,,}" != "${PRIMARY_HOST,,}" ]] || { bad "STANDBY_HOST must differ from the host name of the primary."; bad_n=1; }
-  # an address is checked here; a name is checked by step 2.6 (/etc/hosts), which also fixes a loopback name
+  # STANDBY_IP is an IPv4 address (checked above): it must be one of this server
   if [[ "$STANDBY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && command -v ip >/dev/null 2>&1 && ! is_local_ip "$STANDBY_IP"; then
     bad "STANDBY_IP $STANDBY_IP is not an address of this server."; bad_n=1
   fi
