@@ -161,6 +161,8 @@ RUN    Add these lines for each owner:
        <user> soft stack 10240     <user> hard stack 32768
        <user> soft memlock unlimited   <user> hard memlock unlimited
 EXPECT As <user>, after a new login:  ulimit -Hn  shows 65536
+       A limit set by you counts when its hard value is at least the one above
+       (memlock: any value). A lower value is reported, and the lines above are added.
 EOF
   ;;
   2.5)
@@ -212,6 +214,9 @@ RUN    firewall-cmd --get-active-zones
        <zone> is the zone of the network interface, from the first command.
 EXPECT firewall-cmd --zone=<zone> --query-port=$PO/tcp  shows yes
        (or firewalld is not running)
+       The script then lets the primary try a connection to port $PO here (nothing is sent).
+       "Connection refused" is fine at this point (no listener yet); no answer at all
+       means a firewall in the network blocks the port.
 EOF
   ;;
   2.10) cat <<EOF
@@ -321,10 +326,15 @@ RUN    On the primary, as oracle in sqlplus:
        free -g
 EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
        (the PGA is a target, not taken at startup).
-       With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB.
+       With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB,
+       now and after a reboot (the size= option of the /dev/shm line in /etc/fstab, or of the
+       Options line in /etc/systemd/system/dev-shm.mount when that file exists, or of a drop-in
+       dev-shm.mount.d/*.conf that sets Options; no size = half the RAM). A size that cannot be
+       read (for example 1.5G, which tmpfs does not take) counts as too small.
 IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
        /dev/shm too small: the script does it (answer y). By hand:
-       mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab.
+       mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab
+       (and in dev-shm.mount, if it exists; then systemctl daemon-reload).
 EOF
   ;;
   3.1)
@@ -345,6 +355,8 @@ EOF
     printf '       chmod 644 /stage/*.zip\n'
     printf '       The owner must be root, %s or %s. Nobody else may be able to change the files.\n' "$OU" "$GU"
     printf 'EXPECT The script finds them. It searches: %s\n' "${ZIP_DIRS[*]}"
+    printf '       With RU_DIR in the settings: one of its patch folders (the numbered folders) must be\n'
+    printf '       a patch of the primary (opatch lspatches on the primary). Otherwise this step stops.\n'
   ;;
   3.2) cat <<EOF
 TITLE  Grid Infrastructure software (Oracle Restart)
@@ -628,6 +640,8 @@ EOF
     [[ $G -eq 0 ]] && printf 'RUN    Without Grid, define the listener as well:\n       %s = (DESCRIPTION_LIST = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = %s)(PORT = %s))))\n       Add this entry:\n' "$SL" "$S" "$PO"
     [[ $G -eq 1 ]] && printf 'RUN    Add this entry:\n'
     printf '       SID_LIST_%s =\n         (SID_LIST =\n           (SID_DESC =\n             (GLOBAL_DBNAME = %s)\n             (SID_NAME = %s)\n             (ORACLE_HOME = %s)\n           )\n         )\n' "$SL" "$SSV" "$SID" "$DBH"
+    printf '       If SID_LIST_%s is already there without this SID, the entry goes inside it\n' "$SL"
+    printf '       (the script does that, with a backup). A wrong existing entry is corrected by hand.\n'
     printf 'EXPECT Step 5.2 checks it.\n'
   ;;
   5.2) cat <<EOF
@@ -836,6 +850,8 @@ RUN    $SSQL
        (this form is for OMF or ASM; otherwise add a file name)
        alter system set standby_file_management=auto scope=memory;
 EXPECT Per thread: online groups + 1
+       If apply ran before, it is started again afterwards:
+       alter database recover managed standby database disconnect from session;
 EOF
   ;;
   9.4) cat <<EOF
@@ -900,6 +916,10 @@ EOF
       printf '       systemctl enable <unit>\n'
     fi
     printf 'EXPECT After a reboot the standby is MOUNTED and MRP runs.\n'
+    printf '       When the unit is in place, the step also checks what it started: a stopped listener\n'
+    printf '       or apply is started again (asked first); a database that is not a physical standby\n'
+    printf '       is only reported. A standby that is down is started through the unit (no Grid),\n'
+    printf '       or the step waits for Oracle Restart to mount it (Grid).\n'
   ;;
   9.8) cat <<EOF
 TITLE  Clean-up of archived logs on the standby
@@ -938,18 +958,21 @@ WHERE  This server ($S), SQL*Plus as sysdba
 RUN    $SSQL
        select * from v\$archive_gap;
 EXPECT no rows selected
+       A gap is checked again 6 times (2 minutes) before it is reported:
+       fal_server usually fetches the missing logs in that time.
 EOF
   ;;
   10.3) cat <<EOF
 TITLE  Last log: primary and standby
 WHERE  Both servers, as $OU, sqlplus / as sysdba
 RUN    On the primary:
-       select max(sequence#) from v\$archived_log where standby_dest='NO' and thread#=1
-         and resetlogs_change#=(select resetlogs_change# from v\$database);
+       select thread#, max(sequence#) from v\$archived_log where standby_dest='NO'
+         and resetlogs_change#=(select resetlogs_change# from v\$database) group by thread#;
        On this server:
-       select max(sequence#) from v\$archived_log where applied in ('YES','IN-MEMORY') and thread#=1
-         and resetlogs_change#=(select resetlogs_change# from v\$database);
-EXPECT Equal, or the standby is 1 lower
+       select thread#, max(sequence#) from v\$archived_log where applied in ('YES','IN-MEMORY')
+         and resetlogs_change#=(select resetlogs_change# from v\$database) group by thread#;
+EXPECT For every thread: equal, or the standby is 1 lower
+       A standby that is behind is checked again 6 times (2 minutes) before it is reported.
 EOF
   ;;
   10.4) cat <<EOF
@@ -960,9 +983,12 @@ RUN    $SSQL
        select count(*) from v\$standby_log where status='ACTIVE';
        (1 or more: real-time apply gets redo)
        select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;
-EXPECT MRP0 runs (the step fails only if it does not).
-       No ACTIVE standby log, or errors of the last 24 hours, are shown as
-       warnings: apply still runs, but they need a look.
+EXPECT MRP0 runs, at least one standby log is ACTIVE, and no Error or Fatal
+       message is newer than 15 minutes. Otherwise the step is "waiting":
+       run the script again in a few minutes. Older errors (24 hours) are
+       shown as a warning.
+       Right after the setup, a few messages from the start of transport are
+       normal (for example ORA-16401). New ones that keep coming are not.
 EOF
   ;;
   *) return 1 ;;

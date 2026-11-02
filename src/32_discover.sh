@@ -223,6 +223,13 @@ Data Guard needs Enterprise Edition, so this script cannot build a standby for i
   prim_probe orainst && INVENTORY_DIR=$(sed -n 's/^inventory_loc=//p' <<< "$RUN_OUT" | head -n 1)
   INVENTORY_DIR=${INVENTORY_DIR%/}
   v_path "$INVENTORY_DIR" || INVENTORY_DIR="$(dirname "$(dirname "$DB_HOME")")/oraInventory"
+  # an inventory this server already has (/etc/oraInst.loc) is the one every installer here uses: the checks,
+  # the response files and the hints name that one, not the primary's path
+  local linv; linv=$(sed -n 's/^inventory_loc=//p' /etc/oraInst.loc 2>/dev/null | head -n 1); linv=${linv%/}
+  if [[ -n "$linv" && "$linv" != "$INVENTORY_DIR" ]] && v_path "$linv"; then
+    _log INFO "inventory: this server uses $linv (/etc/oraInst.loc), the primary $INVENTORY_DIR"
+    INVENTORY_DIR=$linv
+  fi
 
   # ---- owners, ids, groups
   ORACLE_USER=""; GRID_USER=""
@@ -295,6 +302,7 @@ This script supports only a single-instance primary."
   PRIMARY_REDO_BS=512; PRIMARY_REDO_BS_KNOWN=0     # 512 is only the working default; 8.1 needs it proven
   prim_sql "select max(blocksize) from v\$log;" && PRIMARY_REDO_BS=$(first_line | cut -d'|' -f1)
   if num "$PRIMARY_REDO_BS" && [[ $PRIMARY_REDO_BS -gt 0 ]]; then PRIMARY_REDO_BS_KNOWN=1; else PRIMARY_REDO_BS=512; fi
+  REDO_BS_NOTED=0; REDO_BS_RETRIED=0
 
   # ---- recovery area, archive destination, folders used by the instance
   read_arch_params || { bad "Cannot read the parameters of the primary database."; return 1; }
@@ -404,3 +412,22 @@ inventory_homes() {
 }
 LSNR_ASSUMED=0; PRIMARY_LISTENER_TNS_ADMIN=""
 assumed_key() { [[ $LSNR_ASSUMED -eq 1 && ( "$1" == PORT || "$1" == LISTENER_NAME || "$1" == PRIMARY_SERVICE ) ]]; }
+REDO_BS_NOTED=0
+redo_bs_known() {
+  # 0 when the redo block size of the primary is known: read in step 1.3, or set by hand (REDO_BLOCKSIZE in the
+  # settings, used only when it could not be read). Step 8.1 accepts only the value read from the primary.
+  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] && return 0
+  # not read in step 1.3 (a timeout, for example): read once more now
+  if [[ ${REDO_BS_RETRIED:-0} -eq 0 ]] && need_ssh; then
+    REDO_BS_RETRIED=1
+    # the caller may still need what it read before (3.5 keeps the disk group list in SQL_OUT)
+    local v="" keep_sql=$SQL_OUT keep_run=$RUN_OUT
+    prim_sql "select max(blocksize) from v\$log;" && v=$(first_line | cut -d'|' -f1)
+    SQL_OUT=$keep_sql; RUN_OUT=$keep_run
+    if num "$v" && [[ $v -gt 0 ]]; then PRIMARY_REDO_BS=$v; PRIMARY_REDO_BS_KNOWN=1; return 0; fi
+  fi
+  [[ "${REDO_BLOCKSIZE:-}" == 512 || "${REDO_BLOCKSIZE:-}" == 4096 ]] || return 1
+  PRIMARY_REDO_BS=$REDO_BLOCKSIZE
+  [[ $REDO_BS_NOTED -eq 1 ]] || { warn "The redo block size of the primary could not be read. REDO_BLOCKSIZE=$REDO_BLOCKSIZE from the settings is used."$'\n'"Step 8.1 checks the real value before the copy."; REDO_BS_NOTED=1; }
+  return 0
+}

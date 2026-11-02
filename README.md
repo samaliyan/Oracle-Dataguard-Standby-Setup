@@ -35,6 +35,17 @@ the output of this command on the primary, as root, before you answer `y`:
 for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
 ```
 
+Run without options, the script first shows a menu: the full setup, or one part only (OS preparation,
+Grid, the database software, the primary changes, chosen steps, the daily check). It stops after the last
+step of that part. The same parts work from the command line:
+
+```bash
+./dg_standby_setup.sh --only os          # phase 2
+./dg_standby_setup.sh --only grid        # steps 3.1 - 3.5
+./dg_standby_setup.sh --only db          # steps 3.6 - 3.11
+./dg_standby_setup.sh --only 2.1-2.4     # chosen steps
+```
+
 Before each step the script shows what it found and what it will do, and asks:
 
 ```
@@ -69,7 +80,8 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 --user <name>         ssh user on the primary (default oracle, never root)
 --check               report only; changes nothing in Oracle, the OS or the primary
 --from <step>         continue from a step
---only <phase>        run one phase (10 = daily sync check; phase 1 runs first, so the primary must be reachable)
+--only <part>         run one part, then stop: a phase (10 = daily sync check), os, grid, db, primary,
+                      or steps such as 2.1-2.4 (phase 1 runs first, so the primary must be reachable)
 --settings            review or edit the saved standby values
 --yes                 answer y for the actions on this server; disk erasure, clean-up, the copy, the
                       host key, passwords and the restart steps (9.1-9.3, 9.7) are still asked
@@ -90,6 +102,8 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 - **Passwords** never appear in logs, in the process list, or in files that are left behind.
 - **Long jobs** (installers, root scripts, the RMAN copy) run in their own session. If the terminal closes,
   they keep running, and the next run of the script waits for them.
+- **Never a false ok.** A step that could not be checked (database down, no access, no answer) is shown as
+  `waiting`, `problem` or `skipped (optional)`, never as `ok`.
 - **Always shows where you are.** Every run starts with a progress board and ends with one "Next" line.
 
 Files:
@@ -111,7 +125,7 @@ docs/DESIGN.md        design notes
 
 ## Tests
 
-`test/run_scenarios.sh` runs over 380 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
+`test/run_scenarios.sh` runs over 440 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 

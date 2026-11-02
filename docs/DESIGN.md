@@ -93,6 +93,18 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
 - Waiting steps: when a step (or phase) is not done in this run and the admin goes on, every step that waits
   for it records WAITS without asking again (AUTO_WAIT). A step that names an earlier step which IS done is
   treated as its own problem, not as a wait.
+- A step that could not do its check is never OK (5.12): the check sets CHECK_WAITS=1 (recorded WAITS, checked
+  again later, for example the logins of a built standby that is down) or, for an optional step, CHECK_WAITS=2
+  (recorded skipped, optional; on a step that is not optional it is WAITS, 5.13); otherwise it returns 2 ("cannot
+  be checked"), which asks [r]/[s] in a run and is a PROBLEM in --check. The check after an action follows the same
+  rule. A step whose own subject is fine but which tests something it depends on (9.2 / 9.4 testing the deferred
+  logins) waits while that test cannot run.
+- What a step set up is also checked for what it started (5.13): 9.7 starts a stopped listener or apply as its
+  action (asked first); a wrong role is only reported. 9.3 starts apply again when it stopped it. 8.2 looks at the
+  new standby after RMAN reports success. 10.2 and 10.3 check again 6 times (DG_POLL_WAIT seconds, default 20).
+- Edits inside existing files (5.13): only when the structure is unambiguous (one entry or block, parentheses that
+  close), always with a backup and a journal entry; otherwise the plan is manual. listener.ora: a SID_DESC is put
+  inside SID_LIST_<listener>; sqlnet.ora: the one ENCRYPTION_WALLET_LOCATION entry is replaced.
 - Long jobs: Ctrl+C asks [w] keep watching / [d] leave it running; the step is recorded RUNNING, the stop text
   says not to start it again, --status shows "Running now". A job that ends while no run watches is recorded
   by the next run (installer success records, root.sh, unzip, the duplicate with its pfile rename), journaled

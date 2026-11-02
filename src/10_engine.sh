@@ -37,6 +37,8 @@ readonly NO_SKIP_STEPS=" 1.2 1.3 1.4 "
 YES_MODE=0
 readonly YES_ASK_STEPS=" 3.10 9.1 9.2 9.3 9.7 9.8 "     # 3.10 restarts the listener, 9.8 sets deletion of archived logs
 YES_HOLD=0          # a check sets it when its action would erase something (a half-unpacked software folder)
+CHECK_WAITS=0       # a check sets it when nothing is wrong but it could not really check: 1 = waiting (checked again
+                    # later), 2 = it cannot be checked at all (skipped (optional) for an optional step, else waiting). Never OK.
 yes_auto() { [[ $YES_MODE -eq 1 && $YES_HOLD -eq 0 && "$YES_ASK_STEPS" != *" $1 "* ]]; }
 no_skip() { [[ "$NO_SKIP_STEPS" == *" $1 "* ]]; }
 NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; KIND_NOW=""; NEED_SYS=0; MANUAL_WHERE=""
@@ -46,6 +48,7 @@ step_num() { local a=${1%%.*} b=${1#*.}; printf '%d' $(( 10#$a * 1000 + 10#$b ))
 step_in_range() {
   local id=$1
   [[ "${id%%.*}" == "1" ]] && return 0          # phase 1 (connect/settings) always runs
+  [[ -n "$TO_STEP" && $(step_num "$id") -gt $(step_num "$TO_STEP") ]] && return 1
   if [[ -n "$ONLY_PHASE" ]]; then [[ "${id%%.*}" == "$ONLY_PHASE" ]]; return; fi
   [[ -z "$FROM_STEP" ]] && return 0
   [[ $(step_num "$id") -ge $(step_num "$FROM_STEP") ]]
@@ -86,7 +89,7 @@ record() {
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}
   # the step a "Next" line pointed to is done now: the pointer would only mislead later
   [[ "$RESUME_STEP" == "$1" && ( "$2" == OK || "$2" == DONE || "$2" == DONE_BY_YOU ) ]] && RESUME_STEP=""
-  _log RESULT "[$1] $2  ${STEP_TITLE[$1]}"
+  _log RESULT "[$1] $2  ${STEP_TITLE[$1]:-}"
   [[ -n "$PROGRESS_FILE" ]] || return 0
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
@@ -189,7 +192,13 @@ next_cmd() {
   done
   [[ -n "$RESUME_STEP" && "$RESUME_STEP" != 1.* ]] && nx=$RESUME_STEP
   [[ -n "$nx" ]] || return 0
-  if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "$ONLY_PHASE"; return 0; fi
+  if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
+  # a range (--only 2.1-2.4, grid, db): the same range again, from the step that is not done
+  if [[ -n "$TO_STEP" && "$nx" == *.* ]] && [[ $(step_num "$nx") -ge $(step_num "$FROM_STEP") && $(step_num "$nx") -le $(step_num "$TO_STEP") ]]; then
+    if [[ "$nx" == "${FROM_STEP%.0}" || "$nx" == "$FROM_STEP" ]]; then printf '%s --only %s' "$SELF" "$ONLY_TEXT"
+    else printf '%s --only %s-%s' "$SELF" "$nx" "$TO_TEXT"; fi
+    return 0
+  fi
   local lim; lim=$(step_num "$([[ "$nx" == *.* ]] && printf '%s' "$nx" || printf '%s.0' "$nx")")
   for id in "${HELP_IDS[@]}"; do
     [[ "$id" == 1.* ]] && continue
@@ -359,9 +368,18 @@ run_step() {
   fi
   while true; do
     YES_HOLD=0
-    NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""
+    NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""; CHECK_WAITS=0
     "$checkfn"; rc=$?
     kind=${KIND_NOW:-$kind0}
+    # nothing is wrong, but the check itself could not be done now (NOW says when it is): waiting, never OK.
+    # 2: an optional step that cannot be checked at all: skipped (optional), never OK
+    if [[ $rc -eq 0 && $CHECK_WAITS -eq 1 ]]; then
+      wait_msg "$NOW"; record "$id" WAITS; return 0
+    fi
+    if [[ $rc -eq 0 && $CHECK_WAITS -eq 2 ]]; then
+      # only an optional step can be left out; any other step that cannot be checked waits
+      wait_msg "$NOW"; if is_optional "$id"; then record "$id" SKIPPED_OPTIONAL; else record "$id" WAITS; fi; return 0
+    fi
     if [[ $rc -eq 0 ]]; then
       local pend; pend=$(primary_pending_get "$id")
       if [[ $acted -eq 1 || -n "$pend" ]]; then
@@ -401,9 +419,9 @@ run_step() {
         if [[ $NEED_SYS -eq 1 ]]; then say "This step needs the sys password. Answer p to type it now."
         elif [[ "$w" == step* && "$wid" == 1.* ]]; then say "Only the script can do step $wid. Answer q and run the script again."
         elif [[ "$w" == step* && -n "${STEP_RESULT[$wid]:-}" ]]; then say "Step $wid is not done in this run (result: $(result_label "${STEP_RESULT[$wid]}")). Do it first, then answer r. Or answer s to go on without it."
-        elif [[ "$w" == step* ]] && ! step_in_range "$wid"; then say "Step $wid is not done and is not part of this run. Answer q, then run:  $SELF --from $wid"
+        elif [[ "$w" == step* ]] && ! step_in_range "$wid"; then say "Step $wid is not done and is not part of this run. Answer q, then run:  $(go_on_cmd "$wid")"
         elif [[ "$w" == step* ]]; then say "Step $wid must be done first. Then answer r. Or answer s to go on without it."
-        else say "Phase $wid is not done. Answer s to go on (steps that need it will wait), or q and run:  $SELF --from $wid"; fi
+        else say "Phase $wid is not done. Answer s to go on (steps that need it will wait), or q and run:  $(go_on_cmd "$wid")"; fi
       else
         bad "This cannot be done automatically. ${NOW:-}"
         if [[ -n "$PLAN" ]]; then printf '%s\n' "$PLAN" | print_commands "${MANUAL_WHERE:-Run on this server ($(hostname -s))}" "${MANUAL_HOW:-root}"
@@ -476,7 +494,9 @@ run_step() {
     drc=0; "$dofn" || drc=$?
     if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $SELF --from $id"; return 0; fi
     if [[ $drc -eq 0 ]]; then
-      NOW=""; "$checkfn"; rc=$?
+      NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
+      # done, but the result cannot really be checked yet: waiting (checked again in a later run)
+      if [[ $rc -eq 0 && $CHECK_WAITS -ne 0 ]]; then wait_msg "Done, not checked yet. $NOW"; record "$id" WAITS; return 0; fi
       if [[ $rc -eq 0 ]]; then
         ok_lines "Done. ${DONE_MSG:-$NOW}"
         record "$id" DONE
@@ -624,7 +644,7 @@ batch_primary_steps() {
     cf="c_${id//./_}"; declare -F "$cf" >/dev/null || continue
     # a lost connection is opened again here, on the screen (the checks below run quietly)
     need_ssh || break
-    NOW=""; PLAN=""; PLAN_UNDO=""; USING=""; KIND_NOW=""; PRIMARY_HOW_STEP=""; NEED_SYS=0; CUR_STEP=$id
+    NOW=""; PLAN=""; PLAN_UNDO=""; USING=""; KIND_NOW=""; PRIMARY_HOW_STEP=""; NEED_SYS=0; CHECK_WAITS=0; CUR_STEP=$id
     "$cf" >/dev/null 2>"$BATCH_ERR"; rc=$?
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"
     [[ $rc -eq 1 && -n "$PLAN" && "${KIND_NOW:-primary}" == "primary" ]] || continue
@@ -682,7 +702,7 @@ batch_primary_steps() {
   fi
   ask_choice "[r] Done, check all steps   [o] Show the steps one at a time   [q] Quit" "roq"
   case "$ANSWER" in
-    q) [[ $PHASE4_FIRST -eq 0 && -z "$ONLY_PHASE" ]] && RESUME_STEP=$1; user_stop "Stopped by you" ;;
+    q) [[ $PHASE4_FIRST -eq 0 && -z "$ONLY_PHASE" && -z "$TO_STEP" ]] && RESUME_STEP=$1; user_stop "Stopped by you" ;;
   esac
   return 0
 }

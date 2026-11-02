@@ -31,13 +31,17 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.10"
+readonly SCRIPT_VERSION="5.13"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 MODE="run"                     # run | check
 FROM_STEP=""
 ONLY_PHASE=""
+TO_STEP=""                     # last step of a range (--only 2.1-2.4, grid, db, or the menu)
+TO_TEXT=""                     # the same as typed: 3 for the end of phase 3
+ONLY_TEXT=""                   # the --only value as given (for the "Next" line)
+MENU_OK=0                      # no options given: the start menu is shown
 REVIEW_SETTINGS=0
 PROMPT_IN="${DG_PROMPT_IN:-/dev/tty}"
 LOG_DIR="${DG_LOG_DIR:-/var/log/dg_standby_setup}"
@@ -71,8 +75,13 @@ unset DG_SYS_PASSWORD DG_ASM_PASSWORD
 SQL_TIMEOUT=${DG_SQL_TIMEOUT:-600}
 num "$SQL_TIMEOUT" && (( 10#$SQL_TIMEOUT >= 10 && 10#$SQL_TIMEOUT <= 86400 )) || SQL_TIMEOUT=600
 SQL_TIMEOUT=$((10#$SQL_TIMEOUT))
+# seconds between the re-checks of steps 10.2 and 10.3 (6 checks)
+POLL_WAIT=${DG_POLL_WAIT:-20}
+num "$POLL_WAIT" && (( 10#$POLL_WAIT >= 1 && 10#$POLL_WAIT <= 300 )) || POLL_WAIT=20
+POLL_WAIT=$((10#$POLL_WAIT))
 OS_RELEASE_FILE=${DG_OS_RELEASE_FILE:-/etc/os-release}
 FSTAB_FILE=${DG_FSTAB_FILE:-/etc/fstab}
+SHM_UNIT_FILE=${DG_SHM_UNIT_FILE:-/etc/systemd/system/dev-shm.mount}   # when it exists, it sets /dev/shm at boot (not fstab)
 OS_ID=""; OS_MAJOR=""; PKG=""
 
 #------------------------------------------------------------------------------
@@ -181,6 +190,23 @@ primary_note() {
   else printf 'The script itself changed nothing on the primary.'; fi
 }
 
+go_on_cmd() {
+  # the command that goes on at step (or phase) $1 and stays inside the part of this run (--only, a range, the menu)
+  local s=$1 lo
+  if [[ -n "$TO_STEP" ]]; then
+    # a bare phase N starts at N.0. Inside the range, or before it: from there up to the end of the range (the
+    # same range when it starts there), so the waited-for step and the rest of the range run in one go (on
+    # purpose: the steps between them are checked, which is quick when they are done). After the range: --from
+    if [[ "$s" == *.* ]]; then lo=$(step_num "$s"); else lo=$(step_num "$s.0"); fi
+    if [[ $lo -le $(step_num "$TO_STEP") ]]; then
+      if [[ $lo -eq $(step_num "$FROM_STEP") ]]; then printf '%s --only %s' "$SELF" "$ONLY_TEXT"
+      else printf '%s --only %s-%s' "$SELF" "$s" "$TO_TEXT"; fi
+      return 0
+    fi
+  fi
+  if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != 1 && "${s%%.*}" == "$ONLY_PHASE" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
+  printf '%s --from %s' "$SELF" "$s"
+}
 user_stop() {
   # the user chose to stop: not an error (fatal prints "Stopped by you." once at the end)
   [[ "$*" == "Stopped by you" ]] || printf '      %s\n' "$*"
@@ -213,9 +239,9 @@ fatal() {
     printf '  When it has ended:  %s   (records the result and continues)\n' "$SELF"
   elif [[ ${NEXT_PRINTED:-0} -eq 1 ]]; then :
   elif [[ -n "$rs" && "$rs" != 1.* && "$rs" != *.* ]]; then
-    printf '  To continue later:   %s --from %s\n' "$SELF" "$rs"
+    printf '  To continue later:   %s\n' "$(go_on_cmd "$rs")"
   elif [[ -n "$rs" && "$rs" != 1.* ]]; then
-    printf '  To continue later:   %s --from %s\n  To do it by hand:    %s --help-step %s\n' "$SELF" "$rs" "$SELF" "$rs"
+    printf '  To continue later:   %s\n  To do it by hand:    %s --help-step %s\n' "$(go_on_cmd "$rs")" "$SELF" "$rs"
   elif [[ -n "$rs" ]]; then
     printf '  To do it by hand:    %s --help-step %s\n' "$SELF" "$rs"
   fi
@@ -488,7 +514,9 @@ job_finish_late() {
   case "$JOB_TITLE" in
     "RMAN duplicate")
       if dup_log_ok "$JOB_OUT" "$rc" && declare -F dup_success_record >/dev/null; then
-        dup_success_record; say "The RMAN copy had finished. Its result is recorded."; jok=1
+        # nobody watched the end of the copy: recorded as finished but not checked ("copied"); the next look at
+        # the mounted standby compares it with the primary
+        dup_success_record copied; say "The RMAN copy had finished. Its result is recorded; the standby is compared with the primary next."; jok=1
       else
         jok=0; install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
         say "The RMAN copy did NOT finish: $(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')"

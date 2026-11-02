@@ -174,6 +174,13 @@ def remote(cmd, stdin_data):
         lines = P.get("profile", [f"export ORACLE_HOME={P['db_home']}", f"export ORACLE_SID={P['sid']}"])
         for l in lines: print(f"/home/oracle/.bash_profile:{l}")
         return 0 if lines else 1
+    if cmd.startswith("sh -c 'e=$(LC_ALL=C timeout 8 bash -c \"exec 3<>/dev/tcp/"):
+        print("TIMEOUT" if P.get("stby_fw_drop") else P.get("tcpto", "REFUSED")); return 0
+    if cmd.startswith("sh -c 'f=~") and "echo NOREAD" in cmd:
+        if P.get("profile_noread"): print("NOREAD"); return 0
+        lines = P.get("profile", [f"export ORACLE_HOME={P['db_home']}", f"export ORACLE_SID={P['sid']}"])
+        for l in lines: print(f"/home/oracle/.bash_profile:{l}")
+        return 0
     m = re.fullmatch(r"env ORACLE_HOME=(\S+) (\S+)/OPatch/opatch lspatches", cmd)
     if m:
         for x in P.get("patches", ["35643107;Database Release Update : 19.21.0.0.231017 (35643107)"]): print(x)

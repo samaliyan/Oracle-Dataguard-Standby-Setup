@@ -58,12 +58,19 @@ prim_probe() {
     md5)         cmd="md5sum $1" ;;
     lsdir)       cmd="ls -1A $1" ;;
     profile)     cmd="grep -sE '^[[:space:]]*(export[[:space:]]+)?(ORACLE_HOME|ORACLE_SID|ORACLE_BASE|TNS_ADMIN)=' \$HOME/.bash_profile \$HOME/.bashrc" ;;
+    # the same for another user ($1): only when this ssh user can read the file; "NOREAD" when it cannot
+    # (in sh -c: the login shell of the ssh user may be csh)
+    profile_of)  cmd="sh -c 'f=~$1/.bash_profile; if [ -r \"\$f\" ]; then grep -sE \"^[[:space:]]*(export[[:space:]]+)?(ORACLE_HOME|ORACLE_SID|ORACLE_BASE|TNS_ADMIN)=\" \"\$f\" ~$1/.bashrc; true; else echo NOREAD; fi'" ;;
     orabase)     cmd="env ORACLE_HOME=$1 $1/bin/orabase" ;;
     orabasehome) cmd="env ORACLE_HOME=$1 $1/bin/orabasehome" ;;
     lsnr)        cmd="env ORACLE_HOME=$1${3:+ TNS_ADMIN=$3} timeout 120 $1/bin/lsnrctl status $2" ;;
     invxml)      cmd="cat $1/ContentsXML/inventory.xml" ;;
     tnsping)     cmd="env ORACLE_HOME=$1 TNS_ADMIN=$2 $1/bin/tnsping $3 1" ;;
     hosts)       cmd="getent ahostsv4 $1" ;;
+    # can the primary open a TCP connection to $1:$2 (this server)? Only a connect, nothing is sent.
+    # OPEN, REFUSED (the network lets it through, nothing listens yet), TIMEOUT or BLOCKED (dropped or rejected)
+    tcpto)       num "$2" || fatal "Safety stop: invalid port $2"
+                 cmd="sh -c 'e=\$(LC_ALL=C timeout 8 bash -c \"exec 3<>/dev/tcp/$1/$2\" 2>&1); r=\$?; case \"\$r:\$e\" in 0:*) echo OPEN;; 124:*) echo TIMEOUT;; *refused*) echo REFUSED;; *) echo BLOCKED;; esac'" ;;
     *) fatal "Safety stop: unknown primary check $p" ;;
   esac
   # commands that read files or devices end on the primary itself after 120 s (a hung NFS path must not leave

@@ -43,6 +43,40 @@ static_block() {
     "$SB_LSNR" "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
 }
 
+sid_desc_block() {
+  printf '    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n    )\n' "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
+}
+sidlist_insert() {
+  # $1 listener.ora -> the file with the SID_DESC of this standby put just before the closing parenthesis of
+  # (SID_LIST = ...) in SID_LIST_<listener>. 1 when there is not exactly one such block, or it does not close.
+  local n; n=$(grep -ciE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$1")
+  [[ "$n" == 1 ]] || return 1
+  # only the usual form SID_LIST_<listener> = (SID_LIST = (SID_DESC = ...) ...): the entry goes into (SID_LIST
+  [[ "$(sidlist_of "$(norm "$(sed 's/#.*//' "$1")")")" == "(SID_LIST="* ]] || return 1
+  awk -v key="SID_LIST_${SB_LSNR^^}" -v desc="$(sid_desc_block)" '
+    function cl(s) { t = s; sub(/#.*/, "", t); return t }
+    !inb && !done && toupper($0) ~ ("^[[:space:]]*" key "[[:space:]]*=") { inb = 1; d = 0; opened = 0 }
+    inb {
+      line = $0; code = cl(line); out = ""
+      for (j = 1; j <= length(code); j++) {
+        c = substr(code, j, 1)
+        if (c == "(") { d++; opened = 1 }
+        else if (c == ")") {
+          if (d == 1) {   # this closes (SID_LIST = ...): the new entry goes in front of it
+            # a line that starts in column 1 is a new parameter in listener.ora: the rest stays indented
+            pre = substr(line, 1, j - 1)
+            if (pre ~ /^[[:space:]]*$/) { print desc; print line }
+            else { print pre; print desc; print "  " substr(line, j) }
+            inb = 0; done = 1; next
+          }
+          d--
+        }
+      }
+      print line; next
+    }
+    { print }
+    END { if (!done) exit 1 }' "$1"
+}
 lsnr_desc_block() {
   printf '%s =\n  (DESCRIPTION_LIST =\n    (DESCRIPTION =\n      (ADDRESS = (PROTOCOL = TCP)(HOST = %s)(PORT = %s))\n    )\n  )\n' \
     "$SB_LSNR" "$STANDBY_HOST" "$PORT"
@@ -106,12 +140,22 @@ $(lsnr_desc_block)"
 $(static_block)"
     return 1
   fi
+  # the block is there, without this SID: the entry is put inside it (one block of that name, written the usual
+  # way; a backup is kept). The address of the listener is added too when it is missing (no Grid).
+  if [[ $st -eq 1 ]] && sidlist_insert "$f" >/dev/null 2>&1; then
+    L51_MODE=insert; ! use_grid && ! lsnr_has_desc && L51_MODE=insert_desc
+    NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID:"$'\n'"  $f"
+    PLAN="Add this entry inside SID_LIST_$SB_LSNR (owner $(lsnr_user); a backup is kept; the other entries stay):
+$(sid_desc_block)"
+    [[ "$L51_MODE" == insert_desc ]] && PLAN+=$'\n'"and this listener address:"$'\n'"$(lsnr_desc_block)"
+    return 1
+  fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
     NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
     NOW+=$'\n'"The script only adds new entries; it does not change an existing one."$'\n'"Please correct this entry by hand."
   else
-    NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID."$'\n'"The script does not edit inside an existing block, so please add the entry by hand."
+    NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID, written in a form the script does not change"$'\n'"(more than one such block, or its parentheses do not close). Please add the entry by hand."
   fi
   PLAN="-- Edit this file:
 --   $f
@@ -129,6 +173,12 @@ d_5_1() {
   backup_file "$f" "$u" || return 1
   txt="# Added by dg_standby_setup.sh $RUN_ID"$'\n'
   case "$L51_MODE" in
+    insert|insert_desc)
+      local new; new=$(sidlist_insert "$f") || { bad "The entry could not be put into SID_LIST_$SB_LSNR of $f. Add it by hand."; return 1; }
+      printf '%s\n' "$new" | write_as "$u" "$f" "$(stat -c '%a' -- "$f")" || return 1
+      sid_desc_block | log_block "added inside SID_LIST_$SB_LSNR of $f"
+      [[ "$L51_MODE" == insert ]] && return 0
+      txt+="$(lsnr_desc_block)" ;;
     both)   txt+="$(lsnr_desc_block)"$'\n'"$(static_block)" ;;
     desc)   txt+="$(lsnr_desc_block)" ;;
     *)      txt+="$(static_block)" ;;
@@ -142,7 +192,7 @@ L52_START=0
 c_5_2() {
   lsnr_sw_ok || { NOW="The listener software is not installed yet (phase 3)"; return 2; }
   static_entry_state || { NOW="The static entry is not correct yet (step 5.1)"; return 2; }
-  L52_START=0
+  L52_START=0; L52_GRIDPORT=0
   if ! run_logged "lsnrctl status" as_lsnr timeout 60 "$(lsnr_home)/bin/lsnrctl" status "$SB_LSNR"; then
     if use_grid; then NOW="Listener $SB_LSNR is not running. It is an Oracle Restart resource, set up in step 3.9."; return 2; fi
     L52_START=1
@@ -158,8 +208,15 @@ c_5_2() {
 --   $(lsnr_file)
 -- Set (PORT = $PORT) in the $SB_LSNR address, then restart the listener:
 $(lsnr_home)/bin/lsnrctl stop $SB_LSNR ; $(lsnr_home)/bin/lsnrctl start $SB_LSNR"
-    use_grid && { MANUAL_HOW="$GRID_USER  ->  shell"; PLAN="srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
-srvctl stop listener -listener $SB_LSNR ; srvctl start listener -listener $SB_LSNR"; }
+    if use_grid; then
+      # an Oracle Restart listener: the same change as step 3.10 (asked first, also with --yes: it restarts the listener)
+      KIND_NOW=""; L52_GRIDPORT=1; YES_HOLD=1
+      L310_CUR=$(as_grid "$GRID_HOME/bin/srvctl" config listener -listener "$SB_LSNR" 2>/dev/null | sed -n 's/.*End points:[[:space:]]*TCP:\([0-9]*\).*/\1/Ip' | head -n 1)
+      PLAN="As $GRID_USER (the listener restarts; connections to it are cut for a moment):
+srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
+srvctl stop listener -listener $SB_LSNR
+srvctl start listener -listener $SB_LSNR"
+    fi
     return 1
   fi
   if grep -qF "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT"; then NOW="The listener shows Instance \"$STANDBY_SID\", status UNKNOWN (port $PORT)"; return 0; fi
@@ -167,7 +224,9 @@ srvctl stop listener -listener $SB_LSNR ; srvctl start listener -listener $SB_LS
   PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
   return 1
 }
+L52_GRIDPORT=0
 d_5_2() {
+  [[ $L52_GRIDPORT -eq 1 ]] && { d_3_10; return; }
   local a=reload; [[ $L52_START -eq 1 ]] && a=start
   run_logged "lsnrctl $a" as_lsnr timeout 120 "$(lsnr_home)/bin/lsnrctl" "$a" "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   [[ "$a" == "start" ]] && journal LSNRSTART "$SB_LSNR" "started from $(lsnr_home)"
@@ -278,7 +337,10 @@ c_6_1() {
   if [[ "$pfile" == +* ]]; then
     local t towner tg tm tmode ttype tage=""; t=$(pw_tmp_remote)
     # no answer from stat (the file is not there) is "no copy yet", not a copy with an empty owner and mode
-    if prim_probe statx "$t" && [[ -n "$(head -n 1 <<< "$RUN_OUT")" ]]; then
+    local sx=0; prim_probe statx "$t" || sx=1
+    # no answer in time: whether a copy is there is not known (never taken as "no copy")
+    [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="The primary did not answer in time, so it is not known whether $t is there. Answer r to check again."; return 2; }
+    if [[ $sx -eq 0 && -n "$(head -n 1 <<< "$RUN_OUT")" ]]; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
       if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#$tmode & 8#027 )) -ne 0 ]]; then
         NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
@@ -410,6 +472,19 @@ tde_autologin_missing() {
   [[ -n "$WALLET_ROOT" && -f "$WALLET_ROOT/tde/cwallet.sso" ]] && return 1
   return 0
 }
+sqlnet_wallet_replaced() {
+  # $1 sqlnet.ora, $2 wallet folder -> the file with its ENCRYPTION_WALLET_LOCATION entry (one or more lines,
+  # up to its last closing parenthesis) replaced by one line for $2. 1 when there is not exactly one entry.
+  awk -v dir="$2" '
+    function cnt(s, re,   t) { t = s; sub(/#.*/, "", t); return gsub(re, "", t) }
+    !ine && toupper($0) ~ /^[[:space:]]*ENCRYPTION_WALLET_LOCATION/ {
+      c0 = $0; sub(/#.*/, "", c0)
+      found++; depth = cnt($0, "[(]") - cnt($0, "[)]"); ine = (depth > 0 || c0 !~ /[)]/)
+      print "ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = " dir ")))"; next }
+    ine { c0 = $0; sub(/#.*/, "", c0); depth += cnt($0, "[(]") - cnt($0, "[)]"); if (depth <= 0 && c0 ~ /[)]/) ine = 0; next }
+    { print }
+    END { if (found != 1 || ine) exit 1 }' "$1"
+}
 sqlnet_has_wallet() {
   # the same folder with or without a final / counts
   local f d=${1%/}; f=$(sqlnet_file); [[ -f "$f" ]] || return 1
@@ -440,7 +515,8 @@ c_6_3() {
       [[ "$f" =~ ^(ewallet\.p12|cwallet\.sso)$ ]] || continue
       found=1
       # a LOCAL auto-login wallet of the primary does not open here: it is made again on this server (orapki)
-      if [[ "$f" == cwallet.sso ]] && tde_local_autologin; then continue; fi
+      # (not the tde_seps folder: it holds only the external-store password and is copied as it is)
+      if [[ "$f" == cwallet.sso ]] && tde_local_autologin && ! [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]]; then continue; fi
       if [[ ! -f "$d/$f" ]]; then miss+=" $d/$f"; TDE_TODO+=("$d/$f"); continue; fi
       # a checksum the primary cannot give (the ssh user cannot read the file) is not "different": it is not known
       local rmd=""; prim_probe md5 "$d/$f" && rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT")
@@ -455,7 +531,12 @@ c_6_3() {
   if [[ -z "$WALLET_ROOT" ]]; then
     [[ $DB_MAJOR -ge 23 ]] && { NOW="The primary ($PRIMARY_VERSION) uses TDE without WALLET_ROOT. Set WALLET_ROOT on the primary first."; return 2; }
     if ! sqlnet_has_wallet "${dirs[0]}"; then
-      if [[ -f "$(sqlnet_file)" ]] && grep -qiE '^[[:space:]]*ENCRYPTION_WALLET_LOCATION' "$(sqlnet_file)"; then
+      if [[ -f "$(sqlnet_file)" ]] && grep -qiE '^[[:space:]]*ENCRYPTION_WALLET_LOCATION' "$(sqlnet_file)" \
+         && sqlnet_wallet_replaced "$(sqlnet_file)" "${dirs[0]}" >/dev/null 2>&1; then
+        # exactly one entry, written in the usual form: it is changed by the action (a backup is kept). Asked also
+        # with --yes: another database of this home may use that wallet location
+        TDE_SQLNET=2; YES_HOLD=1
+      elif [[ -f "$(sqlnet_file)" ]] && grep -qiE '^[[:space:]]*ENCRYPTION_WALLET_LOCATION' "$(sqlnet_file)"; then
         NOW="sqlnet.ora has an ENCRYPTION_WALLET_LOCATION that is not ${dirs[0]}:"$'\n'"  $(sqlnet_file)"
         KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
         PLAN="-- Edit this file:
@@ -463,8 +544,9 @@ c_6_3() {
 -- Change the ENCRYPTION_WALLET_LOCATION line to:
 ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"
         return 1
+      else
+        TDE_SQLNET=1
       fi
-      TDE_SQLNET=1
     fi
   fi
   # every keystore folder needs its own auto-login file here (CDB and PDB wallets are separate folders);
@@ -490,10 +572,11 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
     return 0
   fi
   NOW="The primary uses TDE.${miss:+ Missing here:$miss}${diff:+ Different here:$diff}"
-  [[ $TDE_SQLNET -eq 1 ]] && NOW+=$'\n'"sqlnet.ora does not point to the wallet ${dirs[0]}:"$'\n'"  $(sqlnet_file)"
+  [[ $TDE_SQLNET -ge 1 ]] && NOW+=$'\n'"sqlnet.ora does not point to the wallet ${dirs[0]}:"$'\n'"  $(sqlnet_file)"
   PLAN=""
   [[ ${#TDE_TODO[@]} -gt 0 ]] && PLAN="Copy these files from the primary to the same path here (scp, checked with md5sum):"$'\n'"$(printf '  %s\n' "${TDE_TODO[@]}")"$'\n'"Owner $ORACLE_USER:$INSTALL_GROUP, mode 600. Old files are kept as .bak_$RUN_ID."$'\n'
   [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add this to sqlnet.ora (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
+  [[ $TDE_SQLNET -eq 2 ]] && PLAN+="Change the ENCRYPTION_WALLET_LOCATION entry of sqlnet.ora to (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
   if [[ $TDE_NO_AUTOLOGIN -eq 1 ]]; then
     if tde_local_autologin; then PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
     else PLAN+="The primary has no auto-login keystore (cwallet.sso)."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'; fi
@@ -527,6 +610,12 @@ d_6_3() {
     printf '# Added by dg_standby_setup.sh %s (TDE wallet of the standby)\nENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = %s)))\n' "$RUN_ID" "${TDE_DIRS[0]}" \
       | append_as "$ORACLE_USER" "$s" || return 1
     say "Added ENCRYPTION_WALLET_LOCATION to $s"
+  elif [[ $TDE_SQLNET -eq 2 ]]; then
+    local s txt; s=$(sqlnet_file)
+    txt=$(sqlnet_wallet_replaced "$s" "${TDE_DIRS[0]}") || { bad "The ENCRYPTION_WALLET_LOCATION entry of $s could not be changed. Edit it by hand."; return 1; }
+    backup_file "$s" "$ORACLE_USER" || return 1
+    printf '%s\n' "$txt" | write_as "$ORACLE_USER" "$s" "$(stat -c '%a' -- "$s")" || return 1
+    say "Changed ENCRYPTION_WALLET_LOCATION in $s"
   fi
   # the auto-login keystore: worked out again after the copy (the copied files may have brought one)
   need_ssh || return 1            # a lost connection is opened again on the screen, not in the quiet check
@@ -538,22 +627,22 @@ TDE_CW_TODO=()
 tde_make_autologin() {
   # cwallet.sso for every keystore folder in TDE_CW_TODO. The password goes to orapki on its input
   # (never on its command line, never in a file or the log). If orapki does not take it, the command is shown.
-  local d out rc=0 opt; opt=$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')
+  # every folder is tried (one failure does not stop the others); the result is the files that exist at the end
+  local d out failed=0 opt; opt=$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')
   ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${TDE_CW_TODO[*]})"
   local pw=$SECRET; SECRET=""
   for d in "${TDE_CW_TODO[@]}"; do
-    out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || rc=1
+    out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
     out=${out//"$pw"/*****}
     printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
     if [[ -f "$d/cwallet.sso" ]]; then
       say "Made $d/cwallet.sso"; journal_file_written "$d/cwallet.sso" 0
     else
-      pw=""; bad "orapki did not make $d/cwallet.sso: $(grep -m1 -iE 'PKI-|error|incorrect' <<< "$out")"
+      failed=1; bad "orapki did not make $d/cwallet.sso: $(grep -m1 -iE 'PKI-|error|incorrect' <<< "$out")"
       { printf 'Run it by hand, as %s (orapki asks for the password):\n' "$ORACLE_USER"; orapki_plan "$d"; } | hint
-      return 1
     fi
   done
-  pw=""; return $rc
+  pw=""; return $failed
 }
 
 phase_6() {

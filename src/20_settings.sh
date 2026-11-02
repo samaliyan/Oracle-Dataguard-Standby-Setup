@@ -9,7 +9,7 @@
 #------------------------------------------------------------------------------
 PRIMARY_HOW_STEP=""; MANUAL_HOW=""
 
-# key:type   (types: name opt_name ip path opt_path num port list locs yesno opt_paths opt_loc dbname asmmethod)
+# key:type   (types: name opt_name ip path opt_path num port list locs yesno opt_paths opt_loc dbname asmmethod redobs)
 readonly SETTING_SPECS="
 PRIMARY_IP:ip PRIMARY_SSH_USER:name PRIMARY_HOST:name PRIMARY_SID:name DB_NAME:name PRIMARY_UNIQUE:name
 PRIMARY_CDB:name PRIMARY_VERSION:name DB_MAJOR:num GRID_REL:opt_name PRIMARY_DOMAIN:opt_name PRIMARY_SERVICE:name
@@ -19,13 +19,13 @@ ORACLE_USER:name GRID_USER:name INSTALL_GROUP:name GRID_PGROUP:name ORACLE_UID:n
 ORACLE_GROUPS:list GRID_GROUPS:list GROUP_GIDS:list
 LOCS:locs DATA_DG:opt_name FRA_LOC:opt_loc FRA_MB:num ARCH_LOC:opt_loc PRIMARY_DB_MB:num
 STANDBY_HOST:name STANDBY_IP:ip STANDBY_UNIQUE:dbname STANDBY_SID:name STANDBY_SERVICE:name
-PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_MEDIA:opt_paths RU_DIR:opt_path OPATCH_ZIP:opt_path AUX_CHANNELS:num
+PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_MEDIA:opt_paths RU_DIR:opt_path OPATCH_ZIP:opt_path AUX_CHANNELS:num REDO_BLOCKSIZE:redobs
 "
 # may be empty
-readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP "
+readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
 # values the user may change (everything else is read from the primary at every run)
 readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
-readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS "
+readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
 SETTINGS_FILE=""; ACCEPTED_FILE=""
@@ -48,6 +48,7 @@ valid_value() {
     opt_name)  [[ -z "$v" || ( "$v" =~ ^[A-Za-z0-9_.-]+$ && "$v" != -* ) ]] ;;
     dbname)    [[ "$v" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ;;
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
+    redobs)    [[ -z "$v" || "$v" == "512" || "$v" == "4096" ]] ;;
     ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
                  # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
                  [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
@@ -138,6 +139,8 @@ save_settings() {
     printf '# it covers both homes). OPATCH_ZIP: the newest OPatch (p6880880_*.zip), needed with RU_DIR.\n'
     printf '# AUX_CHANNELS: 1-16 (RMAN channels of the copy). STANDBY_HOST / STANDBY_IP: this server, as the primary\n'
     printf '# must reach it. PRIMARY_TNS / STANDBY_TNS: alias names written into tnsnames.ora on both servers.\n'
+    printf '# REDO_BLOCKSIZE: 512 or 4096, normally empty. Only when the redo block size of the primary cannot be\n'
+    printf '# read: it is then used for the ASM disks (steps 2.13, 3.5). The copy (step 8.1) still needs it read.\n'
     for k in $STANDBY_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done
     printf '\n# ---- Connection (change with --primary / --user, or here between runs) ----\n'
     printf 'PRIMARY_IP=%s\nPRIMARY_SSH_USER=%s\n' "$PRIMARY_IP" "$PRIMARY_SSH_USER"
@@ -179,7 +182,8 @@ accepted_diff() {
   while IFS= read -r line; do
     k=${line%%=*}; v=${line#*=}
     old=$(grep -m1 "^$k=" "$ACCEPTED_FILE" | cut -d= -f2-)
-    if ! grep -q "^$k=" "$ACCEPTED_FILE"; then printf '%s: (new) -> %s\n' "$k" "$v"
+    # a key that a newer version added, still empty, is no change (nothing to accept again)
+    if ! grep -q "^$k=" "$ACCEPTED_FILE"; then [[ -n "$v" ]] && printf '%s: (new) -> %s\n' "$k" "$v"
     elif [[ "$old" != "$v" ]]; then printf '%s: %s -> %s\n' "$k" "${old:-<empty>}" "${v:-<empty>}"; fi
   done < <(settings_lines)
   return 0

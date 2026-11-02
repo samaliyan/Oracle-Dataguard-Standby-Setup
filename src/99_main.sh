@@ -12,7 +12,7 @@ It never changes the primary. What the primary needs is shown for you to run.
 Storage in ASM or in folders, Grid with its own user or not: all are supported.
 
 Usage
-  dg_standby_setup.sh                      Start or continue the setup
+  dg_standby_setup.sh                      Start or continue: a menu shows what can be run
   dg_standby_setup.sh --primary 10.0.0.5   IP address or host name of the primary
   dg_standby_setup.sh --user oracle        OS user for ssh on the primary (default oracle)
   dg_standby_setup.sh --check              Check and report only; changes nothing in Oracle,
@@ -21,6 +21,9 @@ Usage
   dg_standby_setup.sh --from 6.1           Continue from a step (phase 1 always runs)
   dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
                                            phase 1 runs first, so the primary must be reachable)
+  dg_standby_setup.sh --only grid          Run a part only:  os (phase 2), grid (3.1-3.5),
+                                           db (3.6-3.11), primary (phase 4), or steps such as
+                                           2.1-2.4, 3.6 or 2-3. It stops after the last one.
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
   dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
                                            that erases (disks, leftovers, a half-unpacked software folder),
@@ -40,6 +43,14 @@ How it works
   and the script checks the result.
   Installers, root scripts and the RMAN copy run in their own session. A closed terminal
   does not stop them. Run the script again and it waits for them.
+
+Few questions, not unattended
+  Run --check first, put the installer zips in place (step 3.1 shows where), then run with --yes.
+  The steps on this server then run without the [y] question. Still needed from a person:
+    - the commands on the primary (shown, never run by the script), and r when they are done
+    - the ssh and sys passwords (typed, never saved), and the host key of the primary
+    - erasing disks, moving leftovers aside, the RMAN copy (the word DUPLICATE) and the restart steps
+  The script is not meant to run without a person.
 
 Phases
    1 Connect to the primary          6 Password file and TDE wallet
@@ -67,6 +78,33 @@ EOF
 
 valid_step() { local i; for i in "${HELP_IDS[@]}"; do [[ "$i" == "$1" ]] && return 0; done; return 1; }
 
+parse_only() {
+  # $1: a phase (1-10), a named part (os grid db primary), or steps "A-B" / "A" (A, B: N or N.M).
+  # Sets ONLY_PHASE, or FROM_STEP and TO_STEP (a range). 1 = not valid (nothing is changed then).
+  local v=${1,,} a b
+  case "$v" in
+    os) v=2 ;; primary) v=4 ;; grid) v=3.1-3.5 ;; db) v=3.6-3.11 ;;
+  esac
+  if [[ "$v" =~ ^([1-9]|10)$ ]]; then ONLY_PHASE=$v; FROM_STEP=""; TO_STEP=""; TO_TEXT=""; ONLY_TEXT=${1,,}; return 0; fi
+  local re='^(([1-9]|10)(\.[0-9]{1,2})?)(-(([1-9]|10)(\.[0-9]{1,2})?))?$'
+  [[ "$v" =~ $re ]] || return 1
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[5]:-${BASH_REMATCH[1]}}
+  if [[ "$a" == *.* ]]; then valid_step "$a" || return 1; else a="$a.0"; fi
+  local bt=$b
+  if [[ "$b" == *.* ]]; then valid_step "$b" || return 1; else b="$b.99"; fi
+  [[ $(step_num "$a") -le $(step_num "$b") ]] || return 1
+  ONLY_PHASE=""; FROM_STEP=$a; TO_STEP=$b; TO_TEXT=$bt; ONLY_TEXT=${1,,}
+  return 0
+}
+range_text() {
+  # the range of this run in words, for example "steps 2.1 to 2.4", "phase 3", "step 3.6"
+  local a=${FROM_STEP%.0} b=$TO_TEXT
+  if [[ "$a" == "$b" ]]; then range_word "$a"
+  elif [[ "$a" == *.* && "$b" == *.* ]]; then printf 'steps %s to %s' "$a" "$b"
+  else printf '%s to %s' "$(range_word "$a")" "$(range_word "$b")"; fi
+}
+range_word() { [[ "$1" == *.* ]] && printf 'step %s' "$1" || printf 'phase %s' "$1"; }
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -80,19 +118,19 @@ parse_args() {
       --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
       --from)
         [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit 2; }
-        FROM_STEP=$2
+        FROM_STEP=$2; FROM_SEEN=1
         [[ "$FROM_STEP" == *.0 ]] && FROM_STEP=${FROM_STEP%.0}     # N.0 is the same as N (the start of phase N)
         if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit 2; }
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
-      --only) [[ $# -ge 2 && "$2" =~ ^([1-9]|10)$ ]] || { printf 'Use --only N, with N from 1 to 10\n'; exit 2; }; ONLY_PHASE=$2; shift ;;
+      --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit 2; }; shift ;;
       --help-step) [[ $# -ge 2 ]] || { usage; exit 2; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
       *) printf 'Unknown option: %s\n\n' "$1"; usage; exit 2 ;;
     esac
     shift
   done
-  [[ -n "$FROM_STEP" && -n "$ONLY_PHASE" ]] && { printf 'Use either --from or --only, not both.\n'; exit 2; }
+  [[ -n "$ONLY_TEXT" && -n "$FROM_SEEN" ]] && { printf 'Use either --from or --only, not both.\n'; exit 2; }
   if [[ -n "$UNDO_STEP" && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_PHASE" || $REVIEW_SETTINGS -eq 1 ) ]]; then
     printf '%s\n' '--undo cannot be combined with other options. To see first what it would do:  --show-changes STEP'; exit 2
   fi
@@ -100,7 +138,7 @@ parse_args() {
   [[ $REVIEW_SETTINGS -eq 1 && -z "$FROM_STEP" && -z "$ONLY_PHASE" ]] && ONLY_PHASE=1
   return 0
 }
-STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""
+STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""; FROM_SEEN=""
 
 dir_safe() {
   # $1 directory: owned by root, not writable by others (it holds the lock, the settings, the password file copy)
@@ -164,7 +202,120 @@ reenter_primary() {
   return 0
 }
 
+run_undo() {
+  # --undo STEP (or the menu): undo the changes of one step, then stop
+  init_settings
+  [[ -f "$SETTINGS_FILE" ]] || { printf 'There is no settings file (%s). This script has set up nothing here.\n' "$SETTINGS_FILE"; exit 1; }
+  local lerr=""; load_settings soft >/dev/null 2>&1 || lerr=${LOAD_ERR:-cannot be read}
+  if [[ -n "$lerr" || -z "$ORACLE_USER" || -z "$DB_HOME" || -z "$STANDBY_SID" ]]; then
+    printf 'The settings in %s cannot be used: %s.\nThe undo needs them to find the standby. Fix them first:  %s --settings\n' "$SETTINGS_FILE" "${lerr:-a value is missing or invalid}" "$SELF"
+    exit 1
+  fi
+  MODE=run; build_envs_if_possible
+  _log START "dg_standby_setup.sh $SCRIPT_VERSION --undo $UNDO_STEP pid=$$"
+  if undo_cli "$UNDO_STEP"; then exit 0; else exit 1; fi
+}
+
+menu_next() {
+  # for the menu: where a full run goes on (the first step after phase 1 that is not done)
+  local i
+  [[ -s "$PROGRESS_FILE" ]] || { printf 'start'; return 0; }
+  for i in "${HELP_IDS[@]}"; do
+    [[ "$i" == 1.* ]] && continue
+    is_optional "$i" && continue
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU) ;; *) printf 'next: %s' "$i"; return 0 ;; esac
+  done
+  printf 'all done'
+}
+menu_line() { printf '   %s) %-38s %s%s%s\n' "$1" "$2" "$C_D" "$3" "$C_N"; }
+menu_records() {
+  # menu item 8: status, the changes made, undo
+  local st
+  ask_choice "[s] Status of every step   [c] Changes made, with undo commands   [u] Undo a step   [b] Back   [q] Quit" "scubq"
+  case "$ANSWER" in
+    q) menu_quit ;;
+    s) print_progress_board ;;
+    c) if [[ -s "$JOURNAL_FILE" ]]; then show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
+    u) while true; do
+         ask "Step to undo, for example 2.9 (Enter = back)"
+         st=${ANSWER//[[:space:]]/}
+         [[ -z "$st" || "${st,,}" == b ]] && return 0
+         [[ "${st,,}" == q ]] && menu_quit
+         valid_step "$st" && break
+         say "There is no step $st. To list the steps:  $SELF --help-step all"
+       done
+       if [[ -z "$(journal_entries "$st")" ]]; then say "No change of step $st is recorded, so there is nothing to undo."; return 0; fi
+       say "First, what it would undo:"
+       show_changes_cli "$st"
+       confirm "Undo the changes of step $st now? Each change is asked again before it is undone." || return 0
+       UNDO_STEP=$st; run_undo ;;
+  esac
+  return 0
+}
+menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
+start_menu() {
+  # shown when the script is run without options: choose what to run (the options do the same from the command line)
+  local c yesq
+  # Ctrl+C here only leaves the menu: nothing has started, the record of the last run stays as it is
+  trap 'printf "\n"; menu_quit' INT
+  while true; do
+    load_progress
+    printf '\n  %sWhat do you want to do?%s\n\n' "$C_W" "$C_N"
+    menu_line 1 "Full setup, all phases" "($(menu_next))"
+    menu_line 2 "OS preparation only" "phase 2"
+    menu_line 3 "Grid Infrastructure and ASM only" "3.1 - 3.5"
+    menu_line 4 "Database software only" "3.6 - 3.11"
+    menu_line 5 "Primary changes for the DBA" "phase 4"
+    menu_line 6 "Choose steps" "e.g. 2.1-2.4"
+    menu_line 7 "Daily sync check" "phase 10"
+    menu_line 8 "Status, changes and undo" ""
+    printf '   q) Quit\n\n'
+    CUR_STEP=""
+    ask "Choice [1]"
+    c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=1
+    yesq=1
+    case "$c" in
+      1) break ;;
+      2) parse_only os; break ;;
+      3) parse_only grid; break ;;
+      4) parse_only db; break ;;
+      5) parse_only primary; yesq=0; break ;;        # phase 4 only shows commands for the primary
+      6) while true; do
+           ask "Steps to run, for example 2.1-2.4, 3.6 or 2-3 (Enter = back)"
+           ANSWER=${ANSWER//[[:space:]]/}
+           [[ -z "$ANSWER" || "${ANSWER,,}" == b ]] && continue 2
+           [[ "${ANSWER,,}" == q ]] && menu_quit
+           parse_only "$ANSWER" && break
+           say "This is not a step or a range of steps. Examples:  2.1-2.4   3.6-3.11   5"
+         done
+         # phase 4 (commands for the primary) and phase 10 (checks) have no action on this server: no --yes question
+         local p1 p2 pp; p1=${ONLY_PHASE:-${FROM_STEP%%.*}}; p2=${ONLY_PHASE:-${TO_STEP%%.*}}; yesq=0
+         for ((pp = p1; pp <= p2; pp++)); do [[ $pp -eq 4 || $pp -eq 10 ]] || yesq=1; done
+         break ;;
+      7) parse_only 10; yesq=0; break ;;
+      8) menu_records ;;
+      q) menu_quit ;;
+      *) say "Please type a number from 1 to 8, or q." ;;
+    esac
+  done
+  _log INFO "menu choice $c${ONLY_TEXT:+ ($ONLY_TEXT)}"
+  if [[ -n "$TO_STEP" ]]; then say "This run: $(range_text). It stops after it. Phase 1 (the primary) runs first."
+  elif [[ -n "$ONLY_PHASE" ]]; then say "This run: phase $ONLY_PHASE only. Phase 1 (the primary) runs first."; fi
+  if [[ $yesq -eq 1 && $YES_MODE -eq 0 ]]; then
+    say "${C_D}With --yes, the actions on this server are done without asking. Still asked: disk erasure,"
+    say "clean-up, the copy, the host key, passwords and the restart steps.${C_N}"
+    ask "Answer y automatically for this server (--yes)?  [y] Yes   [N] No   [q] Quit"
+    case "${ANSWER,,}" in
+      y|yes) YES_MODE=1; _log INFO "--yes chosen in the menu"; ok "Mode: setup, --yes: actions on this server without asking" ;;
+      q) menu_quit ;;
+    esac
+  fi
+  trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
+  return 0
+}
+
 main() {
+  [[ $# -eq 0 ]] && MENU_OK=1
   parse_args "$@"
   if [[ -n "$HELP_STEP" ]]; then help_cli "$HELP_STEP"; exit 0; fi
   [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit 1; }
@@ -199,18 +350,7 @@ main() {
   if ! flock -n 9; then printf 'Another run of this script is active on this server. Wait for it to end, then try again.\n'; exit 1; fi
   LOG_FILE="$LOG_DIR/run_$RUN_ID.log"; : > "$LOG_FILE" && chmod 640 "$LOG_FILE" || { LOG_FILE=""; printf 'Cannot write the log in %s. Is the file system read-only or full?\n' "$LOG_DIR"; exit 1; }
   ACTIONS_FILE="$LOG_DIR/actions_$RUN_ID.txt"; : > "$ACTIONS_FILE" && chmod 640 "$ACTIONS_FILE" || { printf 'Cannot write in %s\n' "$LOG_DIR"; exit 1; }
-  if [[ -n "$UNDO_STEP" ]]; then
-    init_settings
-    [[ -f "$SETTINGS_FILE" ]] || { printf 'There is no settings file (%s). This script has set up nothing here.\n' "$SETTINGS_FILE"; exit 1; }
-    local lerr=""; load_settings soft >/dev/null 2>&1 || lerr=${LOAD_ERR:-cannot be read}
-    if [[ -n "$lerr" || -z "$ORACLE_USER" || -z "$DB_HOME" || -z "$STANDBY_SID" ]]; then
-      printf 'The settings in %s cannot be used: %s.\nThe undo needs them to find the standby. Fix them first:  %s --settings\n' "$SETTINGS_FILE" "${lerr:-a value is missing or invalid}" "$SELF"
-      exit 1
-    fi
-    MODE=run; build_envs_if_possible
-    _log START "dg_standby_setup.sh $SCRIPT_VERSION --undo $UNDO_STEP pid=$$"
-    if undo_cli "$UNDO_STEP"; then exit 0; else exit 1; fi
-  fi
+  [[ -n "$UNDO_STEP" ]] && run_undo
 
   init_settings
   if [[ -f "$SETTINGS_FILE" ]]; then
@@ -231,7 +371,7 @@ main() {
   [[ -n "$CLI_USER" ]] && PRIMARY_SSH_USER=$CLI_USER
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
-  _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} pid=$$"
+  _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
 
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
   printf '  %s\n' "$(rule 70)"
@@ -242,6 +382,7 @@ main() {
   printf '  the commands are shown for you to run, and the script then checks the result.\n'
   printf '  %sAt each question: h shows help, q quits.%s\n' "$C_D" "$C_N"
   print_progress_board
+  [[ $MENU_OK -eq 1 && "$MODE" == "run" ]] && start_menu
   # a long job of an earlier run (installer, root script, RMAN) is waited for before anything else;
   # phase 4 alone works only with the primary and does not need to wait
   if [[ "$ONLY_PHASE" == "4" ]] && job_alive; then
@@ -272,6 +413,7 @@ main() {
   for p in 1 2 3 4 5 6 7 8 9 10; do
     if [[ $p -gt 1 && -n "$ONLY_PHASE" && "$ONLY_PHASE" != "$p" ]]; then continue; fi
     if [[ $p -gt 1 && -n "$FROM_STEP" && $p -lt ${FROM_STEP%%.*} ]]; then continue; fi
+    if [[ $p -gt 1 && -n "$TO_STEP" && $p -gt ${TO_STEP%%.*} ]]; then continue; fi
     [[ $p -eq 4 && $PHASE4_FIRST -eq 1 ]] && continue      # done right after phase 1
     "phase_$p"
     [[ $p -eq 1 && $PHASE4_FIRST -eq 1 ]] && phase_4
@@ -292,6 +434,8 @@ main() {
       fi
     elif [[ "$ONLY_PHASE" == "1" && $REVIEW_SETTINGS -eq 1 ]]; then
       printf '\n  %sSettings reviewed.%s  To continue the setup:  %s\n' "$C_G" "$C_N" "$SELF"
+    elif [[ -n "$TO_STEP" ]]; then
+      printf '\n  %sDone: %s, every step OK.%s  To run more:  %s\n' "$C_G" "$(range_text)" "$C_N" "$SELF"
     elif [[ -n "$FROM_STEP" ]]; then
       printf '\n  %sAll steps from %s are OK.%s  To check every step once more:  %s --check\n' "$C_G" "${FROM_STEP%.0}" "$C_N" "$SELF"
 

@@ -173,6 +173,27 @@ limit_users() {
   return 0
 }
 LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
+lim_min() { case "$1" in nofile) printf 65536 ;; nproc) printf 16384 ;; stack) printf 32768 ;; *) printf 0 ;; esac; }
+lim_enough() {
+  # $1 item, $2 hard value: at least the Oracle minimum (memlock: any value; its size depends on HugePages)
+  [[ "${2,,}" == unlimited || "${2,,}" == infinity || "$2" == "-1" || "$1" == memlock ]] && return 0
+  [[ "$2" =~ ^[0-9]+$ ]] && (( 10#$2 >= $(lim_min "$1") ))
+}
+lim_value() {
+  # $1 user, $2 " @group1 @group2 ", $3 item -> "value|file|priority|line" of the hard limit pam_limits uses for
+  # it (priority 3 user, 2 group, 1 *; empty = not set)
+  local fs=(); [[ -f /etc/security/limits.conf ]] && fs+=(/etc/security/limits.conf)
+  local f; for f in /etc/security/limits.d/*.conf; do [[ -f "$f" ]] && fs+=("$f"); done
+  [[ ${#fs[@]} -gt 0 ]] || return 0
+  awk -v u="$1" -v gs="$2" -v it="$3" '
+    { raw = $0; sub(/#.*/, "") }
+    NF >= 4 && ($2 == "hard" || $2 == "-") && $3 == it {
+      p = 0
+      if ($1 == u) p = 3; else if (index(gs, " " $1 " ") > 0) p = 2; else if ($1 == "*") p = 1
+      if (p > 0 && p >= best) { best = p; val = $4; wf = FILENAME; wl = raw }
+    }
+    END { if (best) print val "|" wf "|" best "|" wl }' "${fs[@]}"
+}
 lim_line() {
   # $1 user, $2 item -> the two lines (soft and hard) this script adds for it
   case "$2" in
@@ -186,21 +207,38 @@ c_2_4() {
   local u it miss=() users=()
   LIM_TODO=()
   if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
-  # every limit the script sets is checked (a hard line for each); a value set by the admin is kept as it is
-  # a limit counts when it is set for the user, one of its groups (@group) or everyone (*), as hard or - (both)
-  local who g
+  # every limit the script sets is checked: its hard value as pam_limits uses it (a line for the user beats one
+  # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
+  # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
+  local who g v over="" w wf wp wl
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
-    who="$u|\\*"; for g in $(id -nG "$u" 2>/dev/null); do [[ "$g" =~ ^[A-Za-z0-9_.-]+$ ]] && who+="|@$g"; done
+    who=" "; for g in $(id -nG "$u" 2>/dev/null); do [[ "$g" =~ ^[A-Za-z0-9_.-]+$ ]] && who+="@$g "; done
     for it in nofile nproc stack memlock; do
-      grep -qsE "^[[:space:]]*($who)[[:space:]]+(hard|-)[[:space:]]+$it[[:space:]]" /etc/security/limits.d/*.conf /etc/security/limits.conf 2>/dev/null \
-        || { LIM_TODO+=("$u $it"); miss+=("$u:$it"); }
+      w=$(lim_value "$u" "$who" "$it"); IFS='|' read -r v wf wp wl <<< "$w"
+      if [[ -z "$v" ]]; then LIM_TODO+=("$u $it"); miss+=("$u:$it")
+      elif ! lim_enough "$it" "$v"; then
+        # a line for the user in a file read after LIMITS_FILE wins over anything added there: that line is
+        # named instead (the script does not change another file)
+        if [[ "$wp" == 3 && "$wf" == /etc/security/limits.d/* && "$wf" != "$LIMITS_FILE" && "$wf" > "$LIMITS_FILE" ]]; then
+          over+="$wf:  $wl"$'\n'
+        else LIM_TODO+=("$u $it"); fi
+        miss+=("$u:$it=$v(min $(lim_min "$it"))")
+      fi
     done
   done < <(limit_users)
   if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits (nofile, nproc, stack, memlock) are set for: $(limit_users | paste -sd' ' -)"; return 0; fi
-  NOW="Missing limits: ${miss[*]}
+  if [[ -n "$over" ]]; then
+    NOW="Missing or too low limits: ${miss[*]}"$'\n'"A file read after $LIMITS_FILE sets a lower value; it would win over a line added there."
+    PLAN="-- Raise these lines to at least the minimum (or remove them):"$'\n'"$(sed '/^$/d; s/^/-- /' <<< "$over")"
+    [[ ${#LIM_TODO[@]} -gt 0 ]] && PLAN+=$'\n'"-- and add these lines to $LIMITS_FILE:"$'\n'"$(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
+    PLAN+=$'\n'"-- Then answer r."
+    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    return 1
+  fi
+  NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
-  PLAN="Add the missing limits to $LIMITS_FILE (lines set by you stay as they are):
+  PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
   [[ "$ORACLE_USER" != "oracle" ]] && ! id oracle >/dev/null 2>&1 && \
     PLAN+=$'\n'"The preinstall package may create a user named oracle (uid 54321). This standby does not use it."
@@ -396,10 +434,23 @@ A firewall on the primary, or in the network, blocks it."
   return 1
 }
 
+fw_path_note() {
+  # the port is open on this server: can the primary reach it through the network? (read-only: a connect from
+  # the primary, nothing is sent). Only a hint here: steps 4.9, 7.6 and 8.1 test the real connection.
+  [[ "$MODE" == "check" || $FW_PATH_DONE -eq 1 ]] && return 0
+  ssh_alive || return 0
+  prim_probe tcpto "$STANDBY_IP" "$PORT" || return 0
+  case "$(head -n 1 <<< "$RUN_OUT")" in
+    OPEN|REFUSED) NOW+=$'\n'"The primary reaches $STANDBY_IP:$PORT through the network." ;;
+    TIMEOUT|BLOCKED) warn "The primary cannot reach $STANDBY_IP:$PORT (no answer, or the connection is rejected)."$'\n'"Port $PORT is open in firewalld here, so another firewall blocks it: in the network, or on this server outside"$'\n'"firewalld (nftables, iptables). Check:  nft list ruleset   Then ask your network administrator to allow"$'\n'"port $PORT from $PRIMARY_IP to $STANDBY_IP." ;;
+  esac
+  return 0
+}
+FW_PATH_DONE=0      # 1 only inside 4.9 (it runs the check of 2.9 quietly, without this probe)
 # ---- 2.9 firewall here ----
 FW_ZONE=""
 c_2_9() {
-  if ! systemctl is-active --quiet firewalld 2>/dev/null; then NOW="firewalld is not active"; return 0; fi
+  if ! systemctl is-active --quiet firewalld 2>/dev/null; then NOW="firewalld is not active"; fw_path_note; return 0; fi
   local ifc; ifc=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
   FW_ZONE=""
   [[ -n "$ifc" ]] && { FW_ZONE=$(firewall-cmd --get-zone-of-interface="$ifc" 2>/dev/null) || FW_ZONE=""; }
@@ -412,7 +463,7 @@ c_2_9() {
   local rt=0 pm=0
   firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && rt=1
   firewall-cmd --permanent --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && pm=1
-  if [[ $rt -eq 1 && $pm -eq 1 ]]; then NOW="Port $PORT/tcp is open (zone $FW_ZONE), also after a reboot"; return 0; fi
+  if [[ $rt -eq 1 && $pm -eq 1 ]]; then NOW="Port $PORT/tcp is open (zone $FW_ZONE), also after a reboot"; fw_path_note; return 0; fi
   if [[ $rt -eq 1 ]]; then NOW="Port $PORT/tcp is open now, but not saved: it closes at the next reboot (zone $FW_ZONE)"
   elif [[ $pm -eq 1 ]]; then NOW="Port $PORT/tcp is saved as open, but the running firewall does not have it yet (zone $FW_ZONE)"
   else NOW="Port $PORT/tcp is closed in firewalld (zone $FW_ZONE${ifc:+, interface $ifc})"; fi
@@ -534,6 +585,13 @@ c_2_12() {
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
   local m; m=$(asm_method); A212_MODE=""
   if [[ "$m" == "udev" ]]; then
+    # the rules are applied by systemd-udevd: without it /dev/oraasm stays empty
+    if ! systemctl is-active --quiet systemd-udevd 2>/dev/null; then
+      NOW="ASM disks use udev rules, but systemd-udevd is not running. The rules would not be applied."
+      PLAN="systemctl start systemd-udevd"$'\n'"systemctl status systemd-udevd"$'\n'"-- Then answer r."
+      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      return 1
+    fi
     NOW="ASM disks use udev rules, with devices in /dev/oraasm
 Rules file: $UDEV_RULES"
     if [[ "$ASM_METHOD" != "udev" && "$MODE" == "run" ]]; then ASM_METHOD=udev; save_settings; journal SETTING ASM_METHOD "ASM_METHOD=udev"; NOW+=$'\n'"This choice is saved in the settings."; fi
@@ -632,6 +690,23 @@ label_device() {
   printf '%s' "$d"
 }
 label_mb() { local d b; d=$(label_device "$1"); [[ -n "$d" ]] || { printf '0'; return; }; b=$(lsblk -dbn -o SIZE "$d" 2>/dev/null | head -n 1); b=${b//[[:space:]]/}; num "$b" || b=0; printf '%s' "$(( b / 1048576 ))"; }
+asm_dead_labels() {
+  # the labels of disk group $1 that have no disk behind them now (a removed or failed disk): never used
+  local l d
+  while IFS= read -r l; do [[ -n "$l" ]] || continue; d=$(label_device "$l"); [[ -n "$d" && -n "$(lsblk -dn -o TYPE "$d" 2>/dev/null)" ]] || printf '%s ' "$l"; done < <(asm_labels "$1")
+  return 0
+}
+asm_dead_plan() {
+  # $1 the labels: NOW and PLAN for them (nothing is deleted by the script)
+  NOW="These ASM disk labels have no disk behind them now:  $1"$'\n'"A disk group cannot be made or used with them."
+  if [[ "$(asm_method)" == "asmlib" ]]; then
+    PLAN="oracleasm scandisks"$'\n'"oracleasm listdisks"$'\n'"-- For each label:  oracleasm querydisk -p <label>"
+  else
+    PLAN="udevadm trigger --subsystem-match=block"$'\n'"ls -l $(asm_disk_dir)/"
+  fi
+  PLAN+=$'\n'"-- If the disk was removed for good, add a new disk to this server and remove the label line from:"$'\n'"--   $(asm_disks_file)"$'\n'"-- Then answer r."
+  MANUAL_HOW="root"; MANUAL_WHERE="To check on this server ($(hostname -s))"
+}
 dg_have_mb() { local l t=0; while IFS= read -r l; do [[ -n "$l" ]] && t=$((t + $(label_mb "$l"))); done < <(asm_labels "$1"); printf '%s' "$t"; }
 dg_min_mb() { printf '%s' "$(( $(dg_need_mb "$1") * 11 / 10 + 1024 ))"; }
 record_label() { install -d -m 700 "$STATE_DIR"; printf '%s|%s\n' "$1" "$2" >> "$(asm_disks_file)"; chmod 600 "$(asm_disks_file)"; }
@@ -682,6 +757,9 @@ c_2_13() {
   use_grid || { NOW="Not needed (the primary does not use ASM)"; return 0; }
   [[ "$(asm_method)" == "udev" ]] || command -v oracleasm >/dev/null 2>&1 || { NOW="oracleasm is not installed (step 2.12)"; return 2; }
   local dg have="" miss="" short="" l foreign="" min hv ready="" x fl xm
+  local dead=""
+  for dg in $(asm_dgs); do dead+=$(asm_dead_labels "$dg"); done
+  [[ -n "$dead" ]] && { asm_dead_plan "${dead% }"; return 2; }
   for dg in $(asm_dgs); do
     ready+=" +$dg"
     l=$(asm_foreign "$dg")
@@ -697,7 +775,7 @@ c_2_13() {
   A213_FOREIGN=${foreign%$'\n'}
   if [[ -z "$miss$short$foreign" ]]; then NOW="ASM disks are ready for:$ready"$'\n'"${have%$'\n'}"; return 0; fi
   # new disks must fit the redo block size of the primary: it must be known, not assumed
-  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the right disks cannot be chosen. Run the script again."; return 2; }
+  redo_bs_known || { NOW="The redo block size of the primary could not be read (step 1.3), so the right disks cannot be chosen. Run the script again, or set REDO_BLOCKSIZE (512 or 4096) in the settings (--settings)."; return 2; }
   local fd; fd=$(free_disks)
   NOW=""
   if [[ -n "$miss" ]]; then
@@ -1146,7 +1224,7 @@ $plan}
 }
 c_2_15() {
   [[ -n "$(fs_dirs)" ]] || { NOW="Not needed: there are no database folders. ASM disks are checked in step 2.13."; return 0; }
-  [[ "$(marker_kind 2>/dev/null)" == "duplicate" ]] && { NOW="The RMAN copy already ran. The storage was checked before it started."; return 0; }
+  copy_finished 2>/dev/null && { NOW="The RMAN copy already ran. The storage was checked before it started."; return 0; }
   if [[ "$MODE" == "check" ]]; then NOW="Tested only in a normal run, because it writes a small test file"; return 2; fi
   need_ssh || return 2
   local rc=0; storage_not_shared || rc=$?
@@ -1184,10 +1262,47 @@ d_2_15() {
 # ---- 2.16 memory ----
 # The copy gives the standby the primary's memory settings. A server with too little RAM fails at
 # startup (ORA-27102, ORA-00845, ORA-04031), so this is checked here, and again just before the copy.
-MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0
+MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0 MEM_SHM_NEED=0
+# the size (MB) of a tmpfs size= value: bytes, k, m, g, t, or % of the RAM; empty when it cannot be read
+shm_size_mb() {
+  local v=${1,,}
+  case "$v" in
+    *%) v=${v%\%}; num "$v" && [[ $MEM_RAM_MB -gt 0 ]] && printf '%s' $(( MEM_RAM_MB * v / 100 )) ;;
+    *k) v=${v%k}; num "$v" && printf '%s' $(( v / 1024 )) ;;
+    *m) v=${v%m}; num "$v" && printf '%s' "$v" ;;
+    *g) v=${v%g}; num "$v" && printf '%s' $(( v * 1024 )) ;;
+    *t) v=${v%t}; num "$v" && printf '%s' $(( v * 1048576 )) ;;
+    *)  num "$v" && printf '%s' $(( v / 1048576 )) ;;
+  esac
+  return 0
+}
+SHM_BOOT_FROM="" SHM_BOOT_MB=""
+shm_boot_calc() {
+  # SHM_BOOT_MB: the size of /dev/shm after the next boot (empty when it cannot be read); SHM_BOOT_FROM: the file
+  # that sets it. A systemd unit for /dev/shm wins over fstab. No size option = the tmpfs default, half of the RAM.
+  local o sz=""
+  if [[ -f "$SHM_UNIT_FILE" ]]; then
+    SHM_BOOT_FROM=$SHM_UNIT_FILE
+    o=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$SHM_UNIT_FILE" | tail -n 1)
+  else
+    SHM_BOOT_FROM=$FSTAB_FILE
+    o=$(awk '!/^[[:space:]]*#/ && $2 == "/dev/shm" { o = $4 } END { print o }' "$FSTAB_FILE" 2>/dev/null)
+  fi
+  # a drop-in (dev-shm.mount.d/*.conf) that sets Options wins over both (systemd reads them last, in name order)
+  local f
+  for f in "$SHM_UNIT_FILE.d"/*.conf; do
+    [[ -f "$f" ]] && grep -qE '^[[:space:]]*Options[[:space:]]*=' "$f" || continue
+    SHM_BOOT_FROM=$f; o=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$f" | tail -n 1)
+  done
+  SHM_BOOT_MB=""
+  [[ ",$o," =~ ,size=([^,]+), ]] && sz=${BASH_REMATCH[1]}
+  if [[ -n "$sz" ]]; then SHM_BOOT_MB=$(shm_size_mb "$sz")
+  elif [[ $MEM_RAM_MB -gt 0 ]]; then SHM_BOOT_MB=$(( MEM_RAM_MB / 2 )); fi
+  return 0
+}
 mem_probe() {
   # 0 fits (MEM_WARN may hold a warning), 1 does not fit (MEM_FAIL), 2 the primary cannot be read
-  MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0
+  MEM_SGA=0 MEM_PGA=0 MEM_MT=0 MEM_ULP="" MEM_RFS=0 MEM_RAM_MB=0 MEM_FAIL="" MEM_WARN="" MEM_INFO="" MEM_SHM_MB=0 MEM_HP_LOW=0 MEM_SHM_NEED=0
   prim_sql "select name||'|'||nvl(value,'0') from v\$parameter where name in ('sga_target','sga_max_size','memory_target','memory_max_target','pga_aggregate_target','use_large_pages','db_recovery_file_dest_size');" || return 2
   local pn pv mmt=0
   while IFS='|' read -r pn pv; do
@@ -1239,10 +1354,25 @@ mem_probe() {
   if [[ $shm_need -gt 0 ]]; then
     # memory_target / memory_max_target live in /dev/shm (ORA-00845); ASM may use some of it too: 1 GB room
     local shm; shm=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$shm" || shm=0
-    if [[ $shm -lt $(( shm_need + 1024 )) ]]; then
-      MEM_FAIL="/dev/shm is too small: $(human_mb "$shm"). The database needs $(human_mb $(( shm_need + 1024 ))) there"
+    MEM_SHM_NEED=$(( shm_need + 1024 ))
+    if [[ $shm -lt $MEM_SHM_NEED ]]; then
+      MEM_FAIL="/dev/shm is too small: $(human_mb "$shm"). The database needs $(human_mb "$MEM_SHM_NEED") there"
       MEM_FAIL+=$'\n'"(memory_target or memory_max_target of the primary, plus room for ASM). Otherwise: ORA-00845."
       MEM_SHM_MB=$(( shm_need + 2048 ))
+      return 1
+    fi
+    # big enough now; the size it gets at the next boot must be big enough too
+    shm_boot_calc; local boot=$SHM_BOOT_MB
+    # a size that cannot be read (for example size=1.5G, which tmpfs does not take) counts as too small
+    if ! num "$boot"; then
+      MEM_FAIL="/dev/shm is big enough now ($(human_mb "$shm")), but the size it gets after a reboot cannot be read ($SHM_BOOT_FROM)."
+      MEM_FAIL+=$'\n'"The database needs $(human_mb "$MEM_SHM_NEED") there. Otherwise: ORA-00845 after the next reboot."
+      MEM_SHM_MB=$(( shm_need + 2048 )); [[ $shm -gt $MEM_SHM_MB ]] && MEM_SHM_MB=$shm
+      return 1
+    elif [[ $boot -lt $MEM_SHM_NEED ]]; then
+      MEM_FAIL="/dev/shm is big enough now ($(human_mb "$shm")), but after a reboot it gets only $(human_mb "$boot") ($SHM_BOOT_FROM)."
+      MEM_FAIL+=$'\n'"The database needs $(human_mb "$MEM_SHM_NEED") there. Otherwise: ORA-00845 after the next reboot."
+      MEM_SHM_MB=$(( shm_need + 2048 )); [[ $shm -gt $MEM_SHM_MB ]] && MEM_SHM_MB=$shm
       return 1
     fi
   fi
@@ -1259,7 +1389,7 @@ mem_probe() {
 }
 
 c_2_16() {
-  [[ "$(marker_kind 2>/dev/null)" == "duplicate" ]] && { NOW="The RMAN copy already ran. The memory was checked before it started."; return 0; }
+  copy_finished 2>/dev/null && { NOW="The RMAN copy already ran. The memory was checked before it started."; return 0; }
   need_ssh || return 2
   local rc=0; mem_probe || rc=$?
   if [[ $rc -eq 2 ]]; then local e; e=$(ora_errors "$SQL_OUT"); NOW="Cannot read the memory settings of the primary${e:+: $e}"; return 2; fi
@@ -1271,9 +1401,15 @@ c_2_16() {
   NOW="$MEM_FAIL"$'\n'"$MEM_INFO"
   if [[ $MEM_SHM_MB -gt 0 ]]; then
     # done by the script: /dev/shm is a memory file system of this server, nothing on it is lost by a larger size
-    PLAN="Make /dev/shm ${MEM_SHM_MB} MB now (the size needed, plus 1 GB more room):
+    local cur; cur=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$cur" || cur=0
+    PLAN=""
+    [[ $cur -lt $MEM_SHM_MB ]] && PLAN="Make /dev/shm ${MEM_SHM_MB} MB now ($(human_mb "$MEM_SHM_NEED") needed, plus 1 GB more room):
   mount -o remount,size=${MEM_SHM_MB}m /dev/shm
-Keep it after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}m (a backup is kept)"
+"
+    PLAN+="Keep ${MEM_SHM_MB} MB after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}m (a backup is kept)"
+    shm_boot_calc
+    [[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && PLAN+=$'\n'"$SHM_BOOT_FROM sets /dev/shm at boot: its Options line gets size=${MEM_SHM_MB}m too (a backup is kept)"
+    PLAN+=$'\n'"Then the size for the next boot is read again from these files."
   else
     KIND_NOW=manual
     MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
@@ -1286,13 +1422,37 @@ Keep it after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}
 
 d_2_16() {
   [[ $MEM_SHM_MB -gt 0 ]] || return 1
-  local old; old=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$old" && old="${old}m" || old="-"
-  run_cmds <<< "mount -o remount,size=${MEM_SHM_MB}m /dev/shm" || return 1
-  journal SHM /dev/shm "old=$old new=${MEM_SHM_MB}m"
+  local cur old; cur=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$cur" || cur=0
+  if [[ $cur -lt $MEM_SHM_MB ]]; then
+    [[ $cur -gt 0 ]] && old="${cur}m" || old="-"
+    run_cmds <<< "mount -o remount,size=${MEM_SHM_MB}m /dev/shm" || return 1
+    journal SHM /dev/shm "old=$old new=${MEM_SHM_MB}m"
+  fi
+  # a systemd mount unit for /dev/shm (or a drop-in of it) wins over fstab at boot: the size is set in the file
+  # that wins, too
+  shm_boot_calc; local uf=""
+  [[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && uf=$SHM_BOOT_FROM
+  if [[ -n "$uf" ]]; then
+    if ! grep -qE '^[[:space:]]*Options[[:space:]]*=' "$uf"; then
+      bad "$uf sets /dev/shm at boot, but has no Options line to set the size in."
+      printf 'Add size=%sm to its mount options by hand (Options=...,size=%sm), then: systemctl daemon-reload
+' "$MEM_SHM_MB" "$MEM_SHM_MB" | hint
+      return 1
+    fi
+    local ut; ut=$(mktemp) || return 1; CLEANUP_FILES+=("$ut")
+    awk -v sz="size=${MEM_SHM_MB}m" '
+      /^[[:space:]]*Options[[:space:]]*=/ { v = $0; sub(/^[[:space:]]*Options[[:space:]]*=[[:space:]]*/, "", v)
+        n = split(v, o, ","); opts = ""
+        for (i = 1; i <= n; i++) if (o[i] !~ /^size=/ && o[i] != "") opts = opts (opts ? "," : "") o[i]
+        print "Options=" (opts ? opts "," : "") sz; next }
+      { print }' "$uf" > "$ut" || return 1
+    backup_file "$uf" || return 1
+    write_as root "$uf" 644 < "$ut" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   # a new fstab line keeps the protections /dev/shm has now (nosuid, nodev, noexec): "defaults" would drop them
   local keep="" o; for o in $(findmnt -n -o OPTIONS /dev/shm 2>/dev/null | tr ',' ' '); do
     case "$o" in nosuid|nodev|noexec) keep+=",$o" ;; esac; done
-  [[ -e /etc/systemd/system/dev-shm.mount ]] && warn "/etc/systemd/system/dev-shm.mount sets /dev/shm too and wins over fstab at boot. Set size=${MEM_SHM_MB}m there as well."
   # /etc/fstab: the size option of the /dev/shm line is set (other options stay), or such a line is added
   local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
   awk -v sz="size=${MEM_SHM_MB}m" -v keep="$keep" '
@@ -1304,7 +1464,15 @@ d_2_16() {
     END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE" > "$tmp" || return 1
   backup_file "$FSTAB_FILE" || return 1
   write_as root "$FSTAB_FILE" 644 < "$tmp" || return 1
-  say "/dev/shm is ${MEM_SHM_MB} MB now, also after a reboot ($FSTAB_FILE)."
+  # what the next boot gets is read again from the files just written
+  shm_boot_calc; local boot=$SHM_BOOT_MB
+  if ! num "$boot" || [[ $boot -lt $MEM_SHM_NEED ]]; then
+    bad "After a reboot /dev/shm would get ${boot:-an unknown size} MB ($SHM_BOOT_FROM), not ${MEM_SHM_MB} MB."
+    printf 'Check the /dev/shm line in %s%s by hand.
+' "$FSTAB_FILE" "$([[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && printf ' and the Options line in %s' "$SHM_BOOT_FROM")" | hint
+    return 1
+  fi
+  say "/dev/shm is $(human_mb "$MEM_SHM_MB") now, and $(human_mb "$boot") after a reboot ($SHM_BOOT_FROM)."
 }
 phase_2() {
   phase_header 2 "Prepare this server"

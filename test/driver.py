@@ -11,6 +11,9 @@ Environment knobs:
   DG_TEST_HELP_AT=2.1      type h once at this step
   DG_TEST_CTRLC_AT=3.2     send Ctrl-C at this step
   DG_TEST_SETTINGS=a|e     answer to the settings question
+  DG_TEST_MENU=8,2         answers at the start menu, in order (default Enter = 1)
+  DG_TEST_MENU_YES=y       answer to the --yes question of the menu (default n)
+  DG_TEST_MENU_STEPS, DG_TEST_MENU_REC, DG_TEST_MENU_UNDO   menu item 6 and 8 answers
   DG_TEST_OSPW, DG_TEST_PW, DG_TEST_ASMPW, DG_TEST_ASMPW2, DG_TEST_IP, DG_TEST_DUP, DG_TEST_DISK_PICKS=1,2
 """
 import os, pty, re, sys, json, time, select
@@ -89,6 +92,8 @@ def main():
     answered = 0; helped = set(); ctrlc = set(); retries = {}
     disk_picks = [x.replace("+", " ") for x in lst("DG_TEST_DISK_PICKS")]
     settings_answers = lst("DG_TEST_SETTINGS")
+    menu_answers = E("DG_TEST_MENU", "").split(",") if E("DG_TEST_MENU") else []
+    menu_steps = lst("DG_TEST_MENU_STEPS")
     def send(s):
         nonlocal answered, buf, ctx
         if s == "<CTRL-C>": os.write(fd, b"\x03")
@@ -124,6 +129,11 @@ def main():
             if step in lst("DG_TEST_HELP_AT") and step not in helped and "[h] Help" in bt:
                 helped.add(step); send("h"); continue
         if bt.endswith("'s password:"): send(E("DG_TEST_OSPW", "Oracle_os1")); continue
+        if bt == "Choice [1]": send(menu_answers.pop(0) if menu_answers else ""); continue
+        if bt.startswith("Steps to run, for example"): send(menu_steps.pop(0) if menu_steps else ""); continue
+        if bt.startswith("Answer y automatically for this server"): send(E("DG_TEST_MENU_YES", "n")); continue
+        if bt.startswith("[s] Status of every step   [c] Changes made"): send(E("DG_TEST_MENU_REC", "b")); continue
+        if bt.startswith("Step to undo, for example"): send(E("DG_TEST_MENU_UNDO", "")); continue
         if bt.startswith("IP address or host name of the primary"): send(E("DG_TEST_IP", "127.0.0.2")); continue
         if bt.startswith("OS user for ssh on the primary"): send(E("DG_TEST_SSHUSER", "")); continue
         if "[w] Keep watching   [d] Leave it running" in bt: send("w"); continue

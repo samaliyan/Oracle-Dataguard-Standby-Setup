@@ -418,7 +418,18 @@ c_4_9() {
     if tns_desc_ok "$RUN_OUT" "$STANDBY_HOST" "$STANDBY_SERVICE"; then
       NOW="tnsnames.ora on the primary has $STANDBY_TNS = $STANDBY_HOST:$PORT/$STANDBY_SERVICE (UR=A)"
       [[ "$cls" == "NOLISTENER" ]] && NOW+=$'\n'"The alias is right. Nothing answers on this server yet: the listener comes in phase 5."
-      [[ "$cls" == "BLOCKED" ]] && warn "The alias is right, but the primary got no answer at all from $STANDBY_HOST:$PORT (timeout)."$'\n'"A firewall between the servers probably drops the connection. Step 2.9 opens the port on this server;"$'\n'"a network firewall must allow port $PORT from the primary too. Step 7.6 tests it, and step 8.1 again before the copy."
+      if [[ "$cls" == "BLOCKED" ]]; then
+        # no answer at all (a timeout): while the port is not open on this server (step 2.9) that is expected.
+        # The firewall of this server is checked now (an earlier result of 2.9 may be out of date)
+        if ! ( FW_PATH_DONE=1; c_2_9 ) >/dev/null 2>&1; then
+          NOW+=$'\n'"The primary gets no answer from $STANDBY_HOST:$PORT yet. Step 2.9 opens port $PORT on this server; the connection is tested again then (steps 7.6 and 8.1)."
+          CHECK_WAITS=1; return 0
+        fi
+        NOW="The alias $STANDBY_TNS on the primary is right, but the primary gets no answer at all from $STANDBY_HOST:$PORT (timeout)."
+        PLAN="-- A firewall between the servers probably drops the connection. Port $PORT on this server is open (checked now)."$'\n'"-- A network firewall must allow port $PORT from the primary ($PRIMARY_IP) to this server ($STANDBY_IP)."$'\n'"-- Then answer r. Steps 7.6 and 8.1 test the connection again before the copy."
+        MANUAL_WHERE="To do in the network between the servers"; MANUAL_HOW="your network administrator"
+        return 2
+      fi
       return 0
     fi
     NOW="The alias $STANDBY_TNS on the primary is different: $TNS_WHY"
@@ -480,9 +491,17 @@ ORACLE_HOME=$PRIMARY_LISTENER_HOME $PRIMARY_LISTENER_HOME/bin/lsnrctl reload $LI
 # ---- 4.11 environment of oracle on primary (information) ----
 c_4_11() {
   need_ssh || return 2
-  if [[ "$PRIMARY_SSH_USER" != "$ORACLE_USER" ]]; then NOW="Not checked: the ssh user $PRIMARY_SSH_USER is not $ORACLE_USER"; return 0; fi
   PRIMARY_HOW_STEP="$ORACLE_USER  ->  Adds 4 lines to ~/.bash_profile"
-  prim_probe profile || true
+  if [[ "$PRIMARY_SSH_USER" == "$ORACLE_USER" ]]; then prim_probe profile || true
+  else
+    # another ssh user: the file of $ORACLE_USER is read only when that user may read it (nothing else is tried)
+    prim_probe profile_of "$ORACLE_USER" || true
+    if [[ $PROBE_TIMED_OUT -ne 1 ]] && grep -qx 'NOREAD' <<< "$RUN_OUT"; then
+      NOW="Cannot be checked: the ssh user $PRIMARY_SSH_USER cannot read ~$ORACLE_USER/.bash_profile on the primary."
+      NOW+=$'\n'"Optional: as $ORACLE_USER on the primary, ~/.bash_profile should set ORACLE_SID=$PRIMARY_SID and ORACLE_HOME=$DB_HOME."
+      CHECK_WAITS=2; return 0
+    fi
+  fi
   [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="The primary did not answer in time. Answer r to check again."; return 2; }
   local sid home
   sid=$(grep -E 'ORACLE_SID=' <<< "$RUN_OUT" | tail -n 1 | sed -E 's/.*ORACLE_SID=//; s/["'"'"']//g; s/[[:space:]].*//')

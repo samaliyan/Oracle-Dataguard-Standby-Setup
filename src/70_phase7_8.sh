@@ -9,15 +9,19 @@ dup_marker() { printf '%s/dbs/.dg_duplicate_done_%s' "$DB_HOME" "$STANDBY_SID"; 
 pfile_path() { printf '%s/dbs/init%s.ora' "$DB_HOME" "$STANDBY_SID"; }
 spfile_path() { printf '%s/dbs/spfile%s.ora' "$DB_HOME" "$STANDBY_SID"; }
 set_marker() {
-  # $1 duplicate = RMAN printed "Finished Duplicate Db"; seen = a mounted standby was compared with the primary
-  # (no datafile header error). Both kinds mark a complete standby; later header errors are only reported.
+  # $1 duplicate = RMAN printed "Finished Duplicate Db" and the new standby was checked; copied = RMAN finished,
+  # not checked yet; seen = a mounted standby was compared with the primary (no datafile header error).
+  # All mark a finished copy; "copied" is compared again when the standby is mounted (then "seen").
   [[ "$MODE" == "run" ]] || return 0
-  [[ "$1" == "seen" && -e "$(dup_marker)" ]] && return 0
+  [[ "$1" == "seen" && -e "$(dup_marker)" && "$(marker_kind)" != copied ]] && return 0
   printf '%s\n' "$1" | write_as "$ORACLE_USER" "$(dup_marker)" 640 \
     || warn "Cannot write $(dup_marker)."$'\n'"While the standby is shut down, the script cannot tell that it is complete."
   return 0
 }
 marker_kind() { [[ -f "$(dup_marker)" ]] || return 0; local k; k=$(head -n 1 -- "$(dup_marker)" 2>/dev/null); printf '%s' "${k:-duplicate}"; }
+# the RMAN copy finished: "duplicate" (and the new standby was checked) or "copied" (RMAN finished, the standby
+# could not be checked yet: the next look at a mounted standby compares it with the primary, then "seen")
+copy_finished() { local k; k=$(marker_kind); [[ "$k" == duplicate || "$k" == copied ]]; }
 built_offline() {
   # a standby that is shut down: the duplicate (or a comparison) was recorded and the spfile exists
   [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]] && STANDBY_BUILT=1
@@ -84,7 +88,7 @@ orphan_leftovers() {
 }
 spfile_from_failed_copy() {
   # 0 = the instance runs from the spfile that a duplicate which did not finish left behind
-  [[ -f "$(spfile_path)" && "$(marker_kind)" != "duplicate" ]] || return 1
+  [[ -f "$(spfile_path)" ]] && ! copy_finished || return 1
   sql_local "select nvl(value,'-') from v\$parameter where name='spfile';" || return 1
   [[ "$(first_line)" != "-" ]]
 }
@@ -167,10 +171,24 @@ c_7_1() {
   if [[ ${#I71[@]} -eq 0 ]]; then NOW="The folders exist:"$'\n'"${have%$'\n'}"; return 0; fi
   I71_TODO=("${I71[@]}")
   NOW="Missing, or not writable by $ORACLE_USER:"$'\n'"$(printf '  %s\n' "${I71[@]}")"
-  PLAN="Create them with owner $ORACLE_USER:$INSTALL_GROUP"$'\n'"The paths are the same as audit_file_dest and diagnostic_dest on the primary"
+  PLAN="Create them with owner $ORACLE_USER:$INSTALL_GROUP"$'\n'"The audit folder is the one the standby uses (the copy in step 8.2 sets audit_file_dest to it);"$'\n'"the diagnostic folder is diagnostic_dest of the primary."
   return 1
 }
-d_7_1() { local d; for d in "${I71_TODO[@]}"; do make_dir "$d" "$ORACLE_USER" || return 1; done; }
+d_7_1() {
+  local d o
+  for d in "${I71_TODO[@]}"; do
+    make_dir "$d" "$ORACLE_USER" || return 1
+    # an existing folder that is not empty keeps its owner (nothing in it is changed): said here, by name
+    if ! runuser -u "$ORACLE_USER" -- test -w "$d"; then
+      o=$(stat -c '%U:%G %a' -- "$d" 2>/dev/null)
+      bad "$d is not writable by $ORACLE_USER (owner and mode: ${o:-unknown}). It is not empty, so the script does not change it."
+      printf 'Give it to %s, for example (as root):
+  chown %s:%s %s
+' "$ORACLE_USER" "$ORACLE_USER" "$INSTALL_GROUP" "$d" | hint
+      return 1
+    fi
+  done
+}
 
 # ---- 7.7 oratab ----
 c_7_7() {
@@ -180,11 +198,21 @@ c_7_7() {
     local yn; yn=$(cut -d: -f3 <<< "$cur"); [[ "$yn" =~ ^[YNyn]$ ]] || yn=N
     NOW="/etc/oratab has another home for $STANDBY_SID:"$'\n'"  $cur"
     PLAN="Change that line in /etc/oratab to (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:$yn"
+    oratab_link_plan
     return 1
   fi
   NOW="/etc/oratab has no line for $STANDBY_SID. oraenv and dbstart need it."
   PLAN="Add this line to /etc/oratab (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:N"
+  oratab_link_plan
   return 1
+}
+oratab_link_plan() {
+  # a link is never written through by the script (it could point anywhere): the line is set by hand
+  [[ -L /etc/oratab ]] || return 0
+  local t; t=$(readlink -f /etc/oratab 2>/dev/null)
+  NOW+=$'\n'"/etc/oratab is a link to ${t:-a missing file}. The script does not write through a link."
+  PLAN="-- Edit the file the link points to:  ${t:-/etc/oratab}"$'\n'"-- The line for $STANDBY_SID must be:"$'\n'"$STANDBY_SID:$DB_HOME:${yn:-N}"$'\n'"-- Then answer r."
+  KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
 }
 d_7_7() {
   local new=0; [[ -f /etc/oratab ]] || new=1
@@ -241,7 +269,7 @@ $(leftover_cleanup_plan | grep -v "rm -f $(spfile_path) ")
         return 1
       fi
       # NOMOUNT from the pfile, but a copy that did not finish left files a new copy would not overwrite
-      if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" && "$(marker_kind)" != "duplicate" ]]; then
+      if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished; then
         local ol; ol=$(orphan_leftovers)
         if [[ -n "$ol" ]]; then
           NOW="Instance $STANDBY_SID is in NOMOUNT, but files of an unfinished copy are still here:"$'\n'"$ol"
@@ -462,20 +490,33 @@ LOGINS_DEFERRED=0
 logins_flag() { printf '%s/logins_deferred' "$STATE_DIR"; }
 logins_defer() {
   # phase 7 could not test the logins (the built standby was down): remembered, also for a later run
-  LOGINS_DEFERRED=1
+  LOGINS_DEFERRED=1; CHECK_WAITS=1      # the step is waiting (not OK) until the logins are really tested
   [[ "$MODE" == "run" && -n "$STATE_DIR" ]] && { install -d -m 700 "$STATE_DIR"; : > "$(logins_flag)"; }
   return 0
 }
 logins_after_start() {
   # the logins of 7.3, 7.4 and 7.6 that could not be tested in phase 7 (the standby was down) are tested now.
-  # 0 = all work, or nothing was deferred, or a test cannot run now (a warning); 1 = one fails (NOW and PLAN say why)
+  # 0 = all work, or nothing was deferred; 0 with CHECK_WAITS=1 = a test cannot run now (the calling step waits);
+  # 1 = one fails (NOW and PLAN say why)
   [[ $LOGINS_DEFERRED -eq 1 || -f "$(logins_flag)" ]] || return 0
-  need_ssh || { warn "The logins of steps 7.3, 7.4 and 7.6 are tested in a later run (no connection to the primary now)."; return 0; }
-  local f rc keep_now=$NOW sid
+  # a test that cannot run now: this step waits (not OK), so the logins are not forgotten (the flag file stays)
+  local keep0=$NOW
+  need_ssh || { NOW=$keep0$'\n'"The logins of steps 7.3, 7.4 and 7.6 are not tested yet (no connection to the primary now)."; CHECK_WAITS=1; return 0; }
+  local f rc keep_now=$NOW sid keep_cw=$CHECK_WAITS
+  # 7.4 and 7.6 need the sys password; a run that started after phase 7 has not asked for it yet
+  if [[ -z "$SYS_PW" && "$MODE" == "run" ]]; then
+    say "The logins of steps 7.3, 7.4 and 7.6 are tested now. Steps 7.4 and 7.6 need the sys password."
+    d_1_5 && record 1.5 DONE
+  fi
+  local -A lnow=()
   for f in c_7_3 c_7_4 c_7_6; do
-    NOW=""; PLAN=""; rc=0; "$f" >/dev/null || rc=$?
+    NOW=""; PLAN=""; rc=0; CHECK_WAITS=0; "$f" >/dev/null || rc=$?
     sid=${f#c_}; sid=${sid/_/.}
-    if [[ $rc -eq 2 ]]; then warn "Step $sid cannot be tested now (${NOW%%$'\n'*}). It is tested in a later run."; NOW=$keep_now; return 0; fi
+    # not tested after all (the standby is down again): the steps stay waiting
+    if [[ $rc -eq 0 && $CHECK_WAITS -ne 0 ]]; then rc=2; fi
+    CHECK_WAITS=$keep_cw
+    if [[ $rc -eq 2 ]]; then local why1=${NOW%%$'\n'*}; NOW=$keep_now$'\n'"The logins of steps 7.3, 7.4 and 7.6 are not tested yet. Step $sid cannot be tested now: $why1"; CHECK_WAITS=1; return 0; fi
+    lnow[$sid]=$NOW
     if [[ $rc -ne 0 ]]; then
       local why=$PLAN
       NOW="The standby is running, but the login of step $sid fails: $NOW"
@@ -485,6 +526,8 @@ logins_after_start() {
     fi
   done
   LOGINS_DEFERRED=0; rm -f -- "$(logins_flag)"
+  # the three steps were recorded as waiting: they are OK now (in this run and in the progress file)
+  for sid in 7.3 7.4 7.6; do NOW=${lnow[$sid]}; record "$sid" OK; done
   NOW="$keep_now"$'\n'"The logins of steps 7.3, 7.4 and 7.6 work now."
   return 0
 }
@@ -615,7 +658,7 @@ dup_prechecks() {
   fi
   # the copy takes the spfile of the primary (duplicate ... spfile): a primary started from a pfile fails there
   prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && [[ "$(first_line)" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
-  if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" && "$(marker_kind)" != "duplicate" && -n "$(orphan_leftovers)" ]]; then
+  if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished && [[ -n "$(orphan_leftovers)" ]]; then
     PRE_FIX="Files of an unfinished copy are still on this server. Clean them up first (step 7.2)"; return 1
   fi
   PRE_INFO+="Standby instance $STANDBY_SID is in NOMOUNT"$'\n'
@@ -950,8 +993,18 @@ d_8_2() {
     cat "$rmanfile"
     printf 'exit\n') || rc=$?
   if dup_log_ok "$rlog" "$rc"; then
+    # "Finished" in the RMAN output is not the whole proof: the standby itself is looked at first. Only a
+    # verified copy gets the "duplicate" marker (otherwise later steps would take the standby as built)
+    local vr=0; dup_verify || vr=$?
+    [[ $vr -eq 1 ]] && return 1
+    if [[ $vr -eq 2 ]]; then
+      # recorded as a finished copy that is not checked yet: the next look at the mounted standby compares it
+      dup_success_record copied
+      DONE_MSG="The database was copied (RMAN: Finished Duplicate Db). The new standby could not be checked now; it is compared with the primary at the next check."
+      return 0
+    fi
     dup_success_record
-    DONE_MSG="The database was copied (RMAN: Finished Duplicate Db)"
+    DONE_MSG="The database was copied (RMAN: Finished Duplicate Db). $DUP_VERIFIED"
     return 0
   fi
   bad "The copy did not finish (exit code $rc; $(ora_errors "$(cat "$rlog")"))"
@@ -970,9 +1023,38 @@ d_8_2() {
   return 1
 }
 
+DUP_VERIFIED=""
+dup_verify() {
+  # right after the duplicate: mounted, a physical standby, no datafile header error, the datafiles of the primary.
+  # 0 = checked; 1 = something is wrong (said why; nothing is removed); 2 = it could not be checked now
+  DUP_VERIFIED=""
+  local_state
+  [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { bad "RMAN reported success, but the standby is not mounted ($LSTATE)."; printf 'See the alert log of %s and:  %s\n' "$STANDBY_SID" "$rlog" | hint; return 1; }
+  sql_local "select database_role from v\$database;" || { warn "The new standby could not be read after the copy ($(ora_errors "$SQL_OUT"))."; return 2; }
+  [[ "$(first_line)" == "PHYSICAL STANDBY" ]] || { bad "RMAN reported success, but the database role is $(first_line), not PHYSICAL STANDBY."; return 1; }
+  local sc se pc
+  sql_local "select (select count(*) from v\$datafile)||'|'||(select count(*) from v\$datafile_header where error is not null) from dual;" || { warn "The datafiles of the new standby could not be read ($(ora_errors "$SQL_OUT"))."; return 2; }
+  IFS='|' read -r sc se <<< "$(first_line)"
+  num "$sc" && num "$se" || { warn "Unexpected answer when the datafiles were counted ($sc, $se)."; return 2; }
+  # header errors are a failed copy whatever the primary says (checked before the primary is read)
+  if [[ "$se" != "0" || "$sc" -eq 0 ]]; then
+    bad "RMAN reported success, but the standby has $sc datafiles, $se of them with header errors."
+    printf 'To see them:  select file#, error from v$datafile_header where error is not null;\nNothing was removed. See the help of step 8.2 before you copy again.\n' | hint
+    return 1
+  fi
+  # the ssh connection may have closed during a long copy: opened again before the primary is read
+  need_ssh || { warn "No connection to the primary to compare the datafiles."; return 2; }
+  prim_sql "select count(*) from v\$datafile;" || { warn "The datafiles of the primary could not be counted."; return 2; }
+  pc=$(first_line); num "$pc" || { warn "Unexpected answer from the primary ($pc)."; return 2; }
+  # a different number without header errors = a datafile added or dropped on the primary during the copy;
+  # apply follows it (the same rule as for an existing standby)
+  [[ "$sc" -ne "$pc" ]] && warn "The standby has $sc datafiles, the primary $pc. A datafile was added or dropped on the primary during the copy; redo apply follows it."
+  DUP_VERIFIED="Checked: mounted, physical standby, $sc datafiles (primary $pc), no header errors."
+  return 0
+}
 dup_success_record() {
   # the duplicate finished: marker, the initial pfile out of the way, journal (also when the run was not watching)
-  set_marker duplicate
+  set_marker "${1:-duplicate}"
   rm -f -- "$STATE_DIR/dup_attempt"
   local p; p=$(pfile_path)
   [[ -f "$p" ]] && runuser -u "$ORACLE_USER" -- mv -f -- "$p" "$p.pre_duplicate_$RUN_ID" && { say "The temporary pfile ${p##*/} was renamed. The instance now uses the spfile."; journal RENAME "$p" "to=$p.pre_duplicate_$RUN_ID"; }

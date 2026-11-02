@@ -141,6 +141,8 @@ def primary_sql(q, pri):
     if "v$pwfile_users" in l: return "1" if pri["sys_in_pwfile"] else "0"
     m = re.search(r"from v\$spparameter where name='([a-z_0-9]+)'", l)
     if m: return pri.get("spparams", {}).get(m.group(1), pri["params"].get(m.group(1), "-")) or "-"
+    if "thread#||' '||max(sequence#)" in l:
+        return "\n".join(f"{t} {q}" for t, q in sorted(pri.get("seq_t", {"1": pri["seq"]}).items()))
     if "standby_dest='no'" in l: return str(pri["seq"])
     if "v$passwordfile_info" in l:
         if str(pri["version"]).startswith("12.1") and "format" in l: return "ORA-00904: \"FORMAT\": invalid identifier"
@@ -184,7 +186,7 @@ def local_sql(q, st, sid):
     if "select status from v$instance" in l:
         return {"started": "STARTED", "mounted": "MOUNTED"}[s]
     if "select database_role from v$database" in l:
-        return "ORA-01507: database not mounted" if s == "started" else "PHYSICAL STANDBY"
+        return "ORA-01507: database not mounted" if s == "started" else inst.get("role", "PHYSICAL STANDBY")
     if "i.instance_name||'|'||i.status" in l:
         return f"{sid}|MOUNTED|PHYSICAL STANDBY" if s == "mounted" else "ORA-01507: database not mounted"
     if "v$managed_standby where process like 'mrp%'" in l: return str(inst.get("mrp", 0))
@@ -194,6 +196,10 @@ def local_sql(q, st, sid):
         return inst.get("spfile_param", "-")
     if "v$standby_log where status='active'" in l:
         return str(inst.get("srl_active", 1))
+    if "select message from" in l and "v$dataguard_status" in l:
+        return "\n".join(inst.get("dg_msgs", ["ORA-16401: archive log rejected by Remote File Server (RFS)"])[:3])
+    if "from v$dataguard_status" in l and "1/96" in l:
+        return str(inst.get("dg_errors_recent", 0))
     if "from v$dataguard_status" in l:
         return str(inst.get("dg_errors", 0))
     if "v$rman_configuration" in l:
@@ -216,6 +222,9 @@ def local_sql(q, st, sid):
     if "name in ('db_create_file_dest','db_create_online_log_dest_1')" in l:
         pri = load(PRI); omf = pri["params"].get("db_create_file_dest", "+DATA") or "-"
         return f"{omf}|{pri['orl'] * pri.get('threads', 1) + inst.get('srl', 0)}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
+    if "thread#||' '||max(sequence#)" in l and "applied in" in l:
+        pri = load(PRI); seqs = pri.get("applied_t", pri.get("seq_t", {"1": pri["seq"]}))
+        return "\n".join(f"{t} {q}" for t, q in sorted(seqs.items()))
     if l.strip().startswith("select nvl(max(sequence#),0) from v$archived_log where applied"):
         return str(load(PRI)["seq"])
     if "standby_file_management=manual" in l:
@@ -363,11 +372,16 @@ def srvctl():
         if not reg: print(f"PRCD-1120 : The resource for database {a[-1]} could not be found."); return 1
         print(f"Database unique name: {a[-1]}\nDatabase name: proddb\nOracle home: {reg['home']}\nSpfile: {reg['spfile']}\n"
               f"Password file: {reg['pwfile']}\nStart options: {reg.get('startopt', 'mount')}\nDatabase role: {reg['role']}\nDatabase instance: {reg['instance']}")
+        if reg.get("policy"): print(f"Management policy: {reg['policy']}")
+        if reg.get("stopopt"): print(f"Stop options: {reg['stopopt']}")
         return 0
     if a[:2] == ["add", "database"]:
         if reg: print("PRCS-1007 : Server pool already exists"); return 1
         d = dict(zip(a[2::2], a[3::2]))
         st["srvctl"] = {"home": d["-oraclehome"], "spfile": d["-spfile"], "pwfile": d["-pwfile"], "role": d["-role"], "instance": d["-instance"], "running": 0}
+        if "-policy" in d: st["srvctl"]["policy"] = d["-policy"]
+        if "-stopoption" in d: st["srvctl"]["stopopt"] = d["-stopoption"]
+        st.setdefault("srvctl_add_args", []).append(a)
         save(STB, st); return 0
     if a[:2] == ["modify", "database"]:
         if not reg: print("PRCD-1120"); return 1

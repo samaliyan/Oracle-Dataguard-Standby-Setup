@@ -123,6 +123,7 @@ def wipefs():
     return 0
 def systemctl():
     if a[:2] == ["is-active", "--quiet"]:
+        if a[2] == "systemd-udevd": return 3 if st.get("udevd_down") else 0
         return 0 if (st["services"].get(a[2]) or a[2] in st.get("active", [])) else 3
     if a[:2] == ["is-failed", "--quiet"]:
         return 0 if a[2] in st.get("failed", []) else 1

@@ -44,6 +44,31 @@ for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
 ./dg_standby_setup.sh
 ```
 
+اگر اسکریپت بدون هیچ گزینه‌ای اجرا شود، اول یک منو نشان می‌دهد.
+در منو می‌توانید کل کار را انتخاب کنید، یا فقط یک بخش را.
+برای نمونه فقط آماده‌سازی سیستم‌عامل، فقط نصب گرید، فقط نصب نرم‌افزار دیتابیس، یا چند مرحله‌ی دلخواه.
+اسکریپت بعد از آخرین مرحله‌ی آن بخش متوقف می‌شود.
+
+```
+   1) Full setup, all phases
+   2) OS preparation only                  phase 2
+   3) Grid Infrastructure and ASM only     3.1 - 3.5
+   4) Database software only               3.6 - 3.11
+   5) Primary changes for the DBA          phase 4
+   6) Choose steps                         e.g. 2.1-2.4
+   7) Daily sync check                     phase 10
+   8) Status, changes and undo
+```
+
+همین بخش‌ها از خط فرمان هم اجرا می‌شوند:
+
+```bash
+./dg_standby_setup.sh --only os
+./dg_standby_setup.sh --only grid
+./dg_standby_setup.sh --only db
+./dg_standby_setup.sh --only 2.1-2.4
+```
+
 پیش از هر مرحله، اسکریپت نشان می‌دهد چه چیزی پیدا کرده و چه کاری می‌خواهد بکند. بعد با این گزینه‌ها از شما می‌پرسد:
 
 ```
@@ -84,7 +109,7 @@ for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
 
 ## تست‌ها
 
-بیش از ۳۸۰ سناریو روی محیط شبیه‌سازی‌شده تست شده است.
+بیش از ۴۴۰ سناریو روی محیط شبیه‌سازی‌شده تست شده است.
 تست‌ها به کاربر روت نیاز دارند و فایل میزبان‌های سیستم را تغییر می‌دهند.
 برای همین فقط باید داخل یک کانتینر یا ماشین مجازی یک‌بارمصرف اجرا شوند، هرگز روی سرور واقعی.
 

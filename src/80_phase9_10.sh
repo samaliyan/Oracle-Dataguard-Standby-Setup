@@ -30,7 +30,9 @@ c_9_1() {
   local add="srvctl add database -db $STANDBY_UNIQUE -oraclehome $DB_HOME -spfile $spf -pwfile $(pw_dest) -role PHYSICAL_STANDBY -startoption MOUNT -dbname $DB_NAME -instance $STANDBY_SID -diskgroup $(srv_dgs)${PRIMARY_DOMAIN:+ -domain $PRIMARY_DOMAIN}"
   if run_logged "srvctl config database" as_oracle "$srv" config database -db "$STANDBY_UNIQUE"; then
     local cfg=$RUN_OUT bad_items=""
-    grep -qiE "^spfile:[[:space:]]*${spf}[[:space:]]*\$" <<< "$cfg" || bad_items+=" spfile"
+    # compared as text (a path is not a pattern: a dot in it must not match any character)
+    local cspf; cspf=$(sed -n 's/^spfile:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | sed 's/[[:space:]]*$//')
+    [[ "$cspf" == "$spf" ]] || bad_items+=" spfile"
     grep -qiE "^Database role:[[:space:]]*PHYSICAL_STANDBY" <<< "$cfg" || bad_items+=" role"
     grep -qiE "^(Database instance|Instance)( name)?:[[:space:]]*${STANDBY_SID}[[:space:]]*\$" <<< "$cfg" || bad_items+=" instance"
     # a standby must only be mounted at boot (open would need Active Data Guard, and apply starts on a mounted one)
@@ -60,6 +62,7 @@ srvctl modify database -db $STANDBY_UNIQUE ${REG_MOD_ARGS[*]}"
 srvctl stop database -db $STANDBY_UNIQUE
 srvctl remove database -db $STANDBY_UNIQUE -noprompt
 $add"
+    PLAN+=$'\n'"The management policy and the stop option of the old registration are kept. The old registration is saved first."
     return 1
   fi
   REG_MODE=add
@@ -70,29 +73,59 @@ $add"
   return 1
 }
 _cfgv() { sed -n "s/^$2:[[:space:]]*//Ip" "$1" | head -n 1 | sed 's/[[:space:]]*$//'; }   # $1 file, $2 label
-srv_add_cmd_from() {
-  # $1 saved "srvctl config database" output -> the srvctl add command that makes the same registration
-  local f=$1 c
-  [[ -s "$f" ]] || return 0
-  local oh sp pw rl so dn inst dg
-  oh=$(_cfgv "$f" 'Oracle home'); sp=$(_cfgv "$f" 'Spfile'); pw=$(_cfgv "$f" 'Password file'); rl=$(_cfgv "$f" 'Database role')
-  so=$(_cfgv "$f" 'Start options'); dn=$(_cfgv "$f" 'Database name'); dg=$(_cfgv "$f" 'Disk Groups')
-  inst=$(_cfgv "$f" 'Database instance'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance name'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance')
-  local dm mp sto; dm=$(_cfgv "$f" 'Domain'); mp=$(_cfgv "$f" 'Management policy'); sto=$(_cfgv "$f" 'Stop options')
-  [[ -n "$oh" ]] || return 0
-  c="$DB_HOME/bin/srvctl add database -db $STANDBY_UNIQUE -oraclehome $oh"
-  [[ -n "$sp" ]] && c+=" -spfile $sp"; [[ -n "$pw" ]] && c+=" -pwfile $pw"; [[ -n "$rl" ]] && c+=" -role $rl"
-  [[ -n "$so" ]] && c+=" -startoption '$so'"; [[ -n "$dn" ]] && c+=" -dbname $dn"; [[ -n "$inst" ]] && c+=" -instance $inst"
-  [[ -n "$dg" ]] && c+=" -diskgroup $dg"
-  [[ -n "$dm" ]] && c+=" -domain $dm"; [[ -n "$mp" ]] && c+=" -policy $mp"; [[ -n "$sto" ]] && c+=" -stopoption '$sto'"
-  # only plain values (paths, names, lists) are put into the command
-  [[ "$c" =~ ^[A-Za-z0-9_./,\'\ +-]+$ ]] && printf '%s' "$c"
+SRV_OLD_ARGS=()
+_srv_opt() {
+  # $1 option, $2 value: added to SRV_OLD_ARGS when set. A value that starts with "-" (read as an option)
+  # or holds a line break is not used: then the whole command is not made (SRV_BAD)
+  [[ -n "$2" ]] || return 0
+  [[ "$2" == -* || "$2" == *$'\n'* ]] && SRV_BAD=1
+  SRV_OLD_ARGS+=( "$1" "$2" )
 }
+srv_old_args() {
+  # $1 saved "srvctl config database" output -> SRV_OLD_ARGS: the srvctl add command (an array, so a value
+  # with a space stays one value) that makes the same registration. 1 when it cannot be made.
+  local f=$1
+  SRV_OLD_ARGS=(); SRV_BAD=0
+  [[ -s "$f" ]] || return 1
+  local oh inst dg
+  oh=$(_cfgv "$f" 'Oracle home'); [[ -n "$oh" ]] || return 1
+  inst=$(_cfgv "$f" 'Database instance'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance name'); [[ -n "$inst" ]] || inst=$(_cfgv "$f" 'Instance')
+  dg=$(_cfgv "$f" 'Disk Groups'); dg=${dg//[[:space:]]/}      # "DATA, FRA" is the list DATA,FRA
+  SRV_OLD_ARGS=( "$DB_HOME/bin/srvctl" add database -db "$STANDBY_UNIQUE" )
+  _srv_opt -oraclehome "$oh"
+  _srv_opt -spfile "$(_cfgv "$f" 'Spfile')"; _srv_opt -pwfile "$(_cfgv "$f" 'Password file')"
+  _srv_opt -role "$(_cfgv "$f" 'Database role')"; _srv_opt -startoption "$(_cfgv "$f" 'Start options')"
+  _srv_opt -dbname "$(_cfgv "$f" 'Database name')"; _srv_opt -instance "$inst"; _srv_opt -diskgroup "$dg"
+  _srv_opt -domain "$(_cfgv "$f" 'Domain')"; _srv_opt -policy "$(_cfgv "$f" 'Management policy')"
+  _srv_opt -stopoption "$(_cfgv "$f" 'Stop options')"
+  [[ $SRV_BAD -eq 0 ]] || { SRV_OLD_ARGS=(); return 1; }
+  return 0
+}
+srv_add_cmd_from() {
+  # $1 saved "srvctl config database" output -> the same srvctl add command as text (for the screen)
+  srv_old_args "$1" || return 0
+  local a out="" q="'"
+  for a in "${SRV_OLD_ARGS[@]}"; do
+    if [[ "$a" =~ ^[A-Za-z0-9_./,:+=@-]+$ ]]; then out+="$a "; else out+="$q${a//$q/$q\\$q$q}$q "; fi
+  done
+  printf '%s' "${out% }"
+}
+srv_cfg_norm() { sed 's/[[:space:]]*$//; s/^[[:space:]]*//' | grep -v '^$'; }
 srv_add() {
+  # $1 (optional) saved "srvctl config database" of an earlier registration: its management policy and stop
+  # option are kept (a new registration would otherwise reset them to the defaults without a word)
+  local keep=() pol="" sto=""
+  if [[ -n "${1:-}" && -s "$1" ]]; then
+    pol=$(_cfgv "$1" 'Management policy'); sto=$(_cfgv "$1" 'Stop options')
+    [[ "$pol" =~ ^[A-Za-z]+$ ]] && keep+=(-policy "$pol")
+    [[ "$sto" =~ ^[A-Za-z]+$ ]] && keep+=(-stopoption "$sto")
+  fi
   run_logged "srvctl add database" as_oracle "$DB_HOME/bin/srvctl" add database -db "$STANDBY_UNIQUE" \
     -oraclehome "$DB_HOME" -spfile "$(spfile_path)" -pwfile "$(pw_dest)" \
     -role PHYSICAL_STANDBY -startoption MOUNT -dbname "$DB_NAME" -instance "$STANDBY_SID" \
-    -diskgroup "$(srv_dgs)" ${PRIMARY_DOMAIN:+-domain "$PRIMARY_DOMAIN"} || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    -diskgroup "$(srv_dgs)" ${PRIMARY_DOMAIN:+-domain "$PRIMARY_DOMAIN"} "${keep[@]}" || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+  [[ ${#keep[@]} -gt 0 ]] && say "Kept from the old registration: ${keep[*]}"
+  return 0
 }
 d_9_1() {
   if [[ "$REG_MODE" == "modify" ]]; then
@@ -113,15 +146,36 @@ d_9_1() {
     ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
     run_logged "srvctl stop" as_oracle "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-    if ! srv_add; then
-      bad "The new registration failed. The old one is put back."
-      local radd; radd=$(srv_add_cmd_from "$old")
-      if [[ -n "$radd" ]] && run_logged "srvctl add (the old registration)" as_oracle bash -c "$radd"; then
-        say "The old registration is back (the values srvctl config showed). The standby is not started: step 9.2 starts it."
+    if ! srv_add "$old"; then
+      say "The new registration failed. The old registration is now added again."
+      local radd back=0 diffl=""; radd=$(srv_add_cmd_from "$old")
+      if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle "${SRV_OLD_ARGS[@]}"; then
+        back=1
+        # the same as before? srvctl config is read again and compared, line by line, with the saved one
+        if run_logged "srvctl config (after putting the old registration back)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE"; then
+          # diff: 0 = the same, 1 = different, anything else = it could not compare (never taken as the same)
+          local dout drc=0; dout=$(diff <(srv_cfg_norm < "$old") <(printf '%s\n' "$RUN_OUT" | srv_cfg_norm) 2>&1) || drc=$?
+          if [[ $drc -eq 0 ]]; then back=2
+          elif [[ $drc -eq 1 ]]; then
+            # only lines the old one did not have (no old value missing) count as the same registration
+            diffl=$(sed -n 's/^< //p' <<< "$dout" | head -n 8); [[ -z "$diffl" ]] && back=2
+          fi
+        fi
+      fi
+      if [[ $back -eq 2 ]]; then
+        say "The old registration is back: srvctl config shows the same values as before. The standby is not started: step 9.2 starts it."
+      elif [[ $back -eq 1 ]]; then
+        journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
+        { printf 'The old registration is added again, but not every value is the same as before.\n'
+          if [[ -n "$diffl" ]]; then printf 'These values of the old registration are missing now:\n%s\n' "$(sed 's/^/  /' <<< "$diffl")"
+          else printf 'The new srvctl config could not be compared with the old one.\n'; fi
+          printf 'The old registration is saved in:  %s\n' "$old"
+          printf 'Set the missing values with srvctl modify database (as %s).\n' "$ORACLE_USER"; } | hint
       else
         journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
         { printf 'The old registration could not be put back. It is saved in:  %s\n' "$old"
-          [[ -n "$radd" ]] && printf 'As %s:  %s\n' "$ORACLE_USER" "$radd"
+          if [[ -n "$radd" ]]; then printf 'As %s:  %s\n' "$ORACLE_USER" "$radd"
+          else printf 'Its values (add them with srvctl add database, as %s):\n%s\n' "$ORACLE_USER" "$(grep -iE '^(Database name|Oracle home|Spfile|Password file|Domain|Start options|Stop options|Database role|Management policy|Disk Groups|Database instance|Instance)' "$old" | sed 's/^/  /')"; fi
           printf 'Or start the standby by hand (as %s):  sqlplus / as sysdba  ->  startup mount\n' "$ORACLE_USER"; } | hint
       fi
       return 1
@@ -150,7 +204,8 @@ c_9_2() {
   fi
   run_logged "srvctl status" as_oracle timeout 120 "$DB_HOME/bin/srvctl" status database -db "$STANDBY_UNIQUE" || true
   local srv_on=0
-  grep -qi 'is running' <<< "$RUN_OUT" && ! grep -qi 'is not running' <<< "$RUN_OUT" && srv_on=1
+  # single instance: "Database is running."; otherwise the line of this instance counts (not any other line)
+  grep -qiE "^[[:space:]]*(Database is running|Instance $STANDBY_SID is running)" <<< "$RUN_OUT" && srv_on=1
   if sql_local "select i.instance_name||'|'||i.status||'|'||d.database_role from v\$instance i, v\$database d;"; then
     local iname ist irole; IFS='|' read -r iname ist irole <<< "$(first_line)"
     if [[ $srv_on -eq 1 && "$iname" == "$STANDBY_SID" && "$irole" == "PHYSICAL STANDBY" && ( "$ist" == "MOUNTED" || "$ist" == "OPEN" ) ]]; then
@@ -217,7 +272,9 @@ d_9_3() {
   # without the list of groups before, the new groups could not be told apart (the undo would drop them all)
   sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby logs ($(ora_errors "$SQL_OUT"))"; return 1; }
   before=$(tr -d ' ' <<< "$SQL_OUT")
-  if mrp_running; then sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop apply"; return 1; }; fi
+  # apply is stopped while the logs are added, and started again afterwards (also after an error)
+  local was_mrp=0
+  if mrp_running; then sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop apply"; return 1; }; was_mrp=1; fi
   if ! sql_local "$SRL_SQL"; then
     local eo=$SQL_OUT
     sql_local "alter system set standby_file_management=auto scope=memory;" \
@@ -229,12 +286,21 @@ d_9_3() {
     SQL_OUT=$eo
     bad "Cannot add the standby redo logs ($(ora_errors "$SQL_OUT"))"
     grep -q 'ORA-01378' <<< "$SQL_OUT" && printf 'ORA-01378: the online logs of the primary use 4K blocks.\nThe disk group or file system here must have a 4K sector size.\n' | hint
+    srl_apply_back $was_mrp
     return 1
   fi
   sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
   new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
   [[ -n "$new" ]] && journal SRL "$STANDBY_SID" "$new"
+  srl_apply_back $was_mrp || return 1
   return 0
+}
+srl_apply_back() {
+  # $1 = 1: apply ran before step 9.3 stopped it; it is started again (1 when that fails)
+  [[ "$1" == 1 ]] || return 0
+  if sql_local "alter database recover managed standby database disconnect from session;"; then say "Redo apply is running again."; return 0; fi
+  bad "Redo apply was stopped to add the standby logs and could not be started again ($(ora_errors "$SQL_OUT")). Step 9.4 starts it."
+  return 1
 }
 
 # ---- 9.8 archived logs on the standby ----
@@ -349,6 +415,8 @@ c_9_4() {
     if sql_local "select nvl(max(recovery_mode),'-') from v\$archive_dest_status where recovery_mode like 'MANAGED%';" && [[ "$(first_line)" != "-" && "$(first_line)" != *"REAL TIME"* ]]; then
       warn "Redo is applied from archived logs only, not in real time (recovery_mode = $(first_line))."$'\n'"Usually the standby redo logs cannot be used. Check step 9.3, and look in the alert log for:"$'\n'"ORA-19527, ORA-15046, ORA-15173, 'No standby redo logfiles'."
     fi
+    # logins that phase 7 could not test (a run that starts after 9.2): the standby runs, so they are tested here
+    logins_after_start || { KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To check on this server ($(hostname -s))"; return 1; }
     return 0
   fi
   NOW="Redo apply (MRP) is not running"
@@ -450,8 +518,12 @@ script_text() {
     printf '    # not mounted (or open read only with Active Data Guard): the unit fails, nothing to stop cleanly\n'
     printf '    case "$st" in MOUNTED|OPEN*) ;; *) echo "DG-BOOT-ERROR: standby is not mounted ($st)"; exit 1 ;; esac\n'
   fi
-  printf '    # mounted from here on: the unit must stay active, so the shutdown stops the standby cleanly.\n'
-  printf '    # Errors go to the journal (step 9.7 shows them). ORA-01153 = apply already runs.\n'
+  printf '    # mounted from here on: the unit stays active even when something below fails, because only an active\n'
+  printf '    # unit runs its stop at shutdown (a clean stop of the standby). Errors go to the journal; step 9.7\n'
+  printf '    # shows them and reports a missing listener or apply as a problem.\n'
+  printf '    role=$(sql "select database_role from v\\$database;" 2>/dev/null | tr -s '"'"'[:space:]'"'"' '"'"' '"'"' | sed '"'"'s/^ //; s/ $//'"'"')\n'
+  printf '    if [ "$role" != "PHYSICAL STANDBY" ]; then echo "DG-BOOT-ERROR: the database role is ${role:-unknown}, not PHYSICAL STANDBY: redo apply is not started"; exit 0; fi\n'
+  printf '    # ORA-01153 = apply already runs\n'
   printf '    out=$(sql "alter database recover managed standby database disconnect from session;" 2>&1)\n'
   printf '    case "$out" in *ORA-01153*) ;; *ORA-*|*SP2-*) echo "DG-BOOT-ERROR: redo apply did not start: $(echo $out)" ;; esac\n'
   printf '    ;;\n  stop)\n'
@@ -476,7 +548,9 @@ dropin_text() {
   if [[ "$(asm_method)" == "asmlib" ]]; then printf '[Unit]\nAfter=oracleasm.service\nWants=oracleasm.service\n'
   else printf '[Unit]\nAfter=systemd-udev-settle.service\nWants=systemd-udev-settle.service\n'; fi
 }
+C97_FIX=""
 c_9_7() {
+  C97_FIX=""
   command -v systemctl >/dev/null 2>&1 || { NOW="systemd is not found. Start the standby by hand after each reboot."; return 2; }
   need_built || return 2
   local u sc okd=1; u="/etc/systemd/system/$(unit_name)"; sc=$(start_script)
@@ -487,11 +561,55 @@ c_9_7() {
     # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
     local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
     [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
-    # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here
+    # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here.
+    # A stopped listener or apply is started by the action of this step (asked first); a wrong role is not touched.
     local_state
-    if [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] && ! mrp_running; then
-      warn "Redo apply is not running now, although $(unit_name) is active."$'\n'"Start it with step 9.4:  $SELF --from 9.4"
+    case "$LSTATE" in
+      MOUNTED|OPEN) ;;
+      IDLE)
+        if use_grid; then
+          # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
+          NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
+          CHECK_WAITS=1; return 0
+        fi
+        NOW="$(unit_name) is enabled, but the standby is not running now ($LSTATE)."
+        C97_FIX=start; PLAN="systemctl restart $(unit_name)"$'\n'"-- It starts the listener, mounts the standby and starts redo apply."
+        return 1 ;;
+      *)
+        # NOMOUNT (someone works on it by hand) or a state that cannot be read: never restarted by the script
+        local oe=""; [[ "$LSTATE" == ERROR ]] && oe=$(ora_errors "$SQL_OUT")
+        NOW="$(unit_name) is enabled, but the standby is $LSTATE${oe:+ ($oe)}, not mounted."
+        PLAN="-- Find out why (alert log of $STANDBY_SID). When it is mounted again, answer r."
+        MANUAL_WHERE="To check on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER  ->  sqlplus / as sysdba"
+        return 2 ;;
+    esac
+    local role=""; sql_local "select database_role from v\$database;" && role=$(first_line)
+    if [[ "$role" != "PHYSICAL STANDBY" ]]; then
+      NOW="$(unit_name) is enabled, but the database role is ${role:-unknown}, not PHYSICAL STANDBY."
+      PLAN="-- The unit starts redo apply only on a physical standby. Check what changed the role (a failover?)."$'\n'"-- Then answer r."
+      MANUAL_WHERE="To check on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER"
+      return 2
     fi
+    if ! run_logged "lsnrctl status" as_lsnr timeout 60 "$(lsnr_home)/bin/lsnrctl" status "$SB_LSNR"; then
+      NOW="$(unit_name) is enabled, but the listener $SB_LSNR is not running. The primary cannot send redo."
+      C97_FIX=lsnr
+      if use_grid; then PLAN="As $GRID_USER:  srvctl start listener -listener $SB_LSNR"
+      else PLAN="As $ORACLE_USER:  lsnrctl start $SB_LSNR"; fi
+      return 1
+    fi
+    if ! mrp_running; then
+      NOW="$(unit_name) is enabled, but redo apply (MRP) is not running."
+      if [[ "$LSTATE" == OPEN* ]]; then
+        # apply on an open standby is Active Data Guard (a separate license): never started by the script
+        NOW+=$'\n'"The standby is OPEN. Redo apply on an open standby needs the Active Data Guard license."
+        PLAN="-- Either start apply (only with the Active Data Guard license), in sqlplus / as sysdba:"$'\n'"alter database recover managed standby database disconnect from session;"$'\n'"-- or restart the standby mounted (as $ORACLE_USER):  shutdown immediate ; startup mount"$'\n'"-- Then answer r."
+        MANUAL_WHERE="Run on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER  ->  sqlplus / as sysdba"
+        return 2
+      fi
+      C97_FIX=mrp; PLAN="On this server, in sqlplus / as sysdba:"$'\n'"alter database recover managed standby database disconnect from session;"
+      return 1
+    fi
+    adg_note "$LSTATE"
     return 0
   fi
   if systemctl is-failed --quiet "$(unit_name)" 2>/dev/null; then
@@ -502,12 +620,24 @@ c_9_7() {
   else PLAN="Create this script, owned by root. It runs as $ORACLE_USER:"$'\n'"  $sc"$'\n'"  at boot: lsnrctl start, startup mount, start apply"$'\n'"  at shutdown: shutdown immediate"; fi
   PLAN+=$'\n'"Create and enable this systemd unit:"$'\n'"  $u"$'\n'"It sets the Oracle limits (nofile, nproc, stack, memlock)."
   need_udev_dropin && PLAN+=$'\n'"Create this drop-in, so Oracle Restart starts after the ASM disks are ready:"$'\n'"  $(udev_dropin)"
-  PLAN+=$'\n'"Start the unit once now, so the next shutdown stops the standby cleanly."$'\n'"This does not change the running standby."
+  PLAN+=$'\n'"Start the unit once now, so the next shutdown stops the standby cleanly."
+  if use_grid; then PLAN+=$'\n'"It waits until Oracle Restart has mounted the standby, then starts redo apply if it is not running."
+  else PLAN+=$'\n'"A running standby stays as it is (redo apply is started if it is not running);"$'\n'"a standby that is down is started: listener, startup mount, redo apply."; fi
   USING="The standby is only mounted."$'\n'"Opening it read-only while apply runs needs the Active Data Guard license."
   return 1
 }
 d_9_7() {
   local sc u; sc=$(start_script); u="/etc/systemd/system/$(unit_name)"
+  # the unit is right, but what it starts is not running: only that is started (on this server)
+  case "$C97_FIX" in
+    start) run_cmds <<< "systemctl restart $(unit_name)" || { bad "The unit did not start. Check:  systemctl status $(unit_name)"; return 1; }; return 0 ;;
+    lsnr)
+      if use_grid; then run_logged "srvctl start listener" as_grid "$GRID_HOME/bin/srvctl" start listener -listener "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+      else run_logged "lsnrctl start" as_oracle timeout 120 "$DB_HOME/bin/lsnrctl" start "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+           journal LSNRSTART "$SB_LSNR" "started from $DB_HOME"; fi
+      return 0 ;;
+    mrp) d_9_4; return ;;
+  esac
   install -d -m 755 /usr/local/sbin || return 1
   # earlier contents are kept (the undo puts them back)
   [[ -f "$sc" && "$(cat "$sc")" != "$(script_text)" ]] && { backup_file "$sc" || return 1; }
@@ -567,7 +697,7 @@ To force a log switch, on the primary as $ORACLE_USER in sqlplus / as sysdba:
 Then answer r."
   return 1
 }
-c_10_2() {
+c_10_2_once() {
   need_built || return 2
   sql_local "select count(*) from v\$archive_gap;" || { NOW="Cannot read v\$archive_gap"; return 2; }
   num "$(first_line)" || { NOW="Unexpected answer: $(first_line)"; return 2; }
@@ -578,29 +708,73 @@ c_10_2() {
   grep -iE 'FAL|gap|ORA-' ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${STANDBY_UNIQUE,,}/$STANDBY_SID/trace/alert_$STANDBY_SID.log | tail -30"
   return 1
 }
-c_10_3() {
+c_10_3_once() {
+  # every enabled redo thread of the primary (a RAC primary has more than thread 1; a disabled thread of an
+  # old RAC sends no redo any more and is left out)
   need_built || return 2
   need_ssh || return 2
-  prim_sql "select nvl(max(sequence#),0) from v\$archived_log where standby_dest='NO' and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read the primary"; return 2; }
-  local pmax smax; pmax=$(first_line)
-  sql_local "select nvl(max(sequence#),0) from v\$archived_log where applied in ('YES','IN-MEMORY') and thread#=1 and resetlogs_change#=(select resetlogs_change# from v\$database);" || { NOW="Cannot read the standby"; return 2; }
-  smax=$(first_line)
-  num "$pmax" && num "$smax" || { NOW="Unexpected answer (primary '$pmax', standby '$smax')"; return 2; }
-  if [[ "$smax" -ge $((pmax - 1)) ]]; then NOW="Last log archived on the primary: $pmax. Applied on the standby: $smax"; return 0; fi
-  NOW="Last log archived on the primary: $pmax. Applied on the standby: only $smax"
+  prim_sql "select thread#||' '||max(sequence#) from v\$archived_log where standby_dest='NO' and resetlogs_change#=(select resetlogs_change# from v\$database) and thread# in (select thread# from v\$thread where enabled<>'DISABLED') group by thread# order by thread#;" || { NOW="Cannot read the primary"; return 2; }
+  local pout sout t p a line behind="" info=""
+  pout=$(grep -E '^[[:space:]]*[0-9]+ [0-9]+[[:space:]]*$' <<< "$SQL_OUT")
+  sql_local "select thread#||' '||max(sequence#) from v\$archived_log where applied in ('YES','IN-MEMORY') and resetlogs_change#=(select resetlogs_change# from v\$database) group by thread# order by thread#;" || { NOW="Cannot read the standby"; return 2; }
+  sout=$(grep -E '^[[:space:]]*[0-9]+ [0-9]+[[:space:]]*$' <<< "$SQL_OUT")
+  [[ -n "$pout" ]] || { NOW="The primary has no archived log yet in this incarnation"; return 2; }
+  local -A applied=()
+  while read -r t a; do [[ -n "$t" ]] && applied[$t]=$a; done <<< "$sout"
+  while read -r t p; do
+    [[ -n "$t" ]] || continue
+    a=${applied[$t]:-0}
+    line="Thread $t: last log archived on the primary $p, applied on the standby $a"
+    info+="${info:+$'\n'}$line"
+    [[ $a -ge $((p - 1)) ]] || behind+="${behind:+$'\n'}$line"
+  done <<< "$pout"
+  if [[ -z "$behind" ]]; then NOW=$info; return 0; fi
+  NOW="Apply is behind:"$'\n'"$behind"
   PLAN="Wait a few minutes for apply to catch up, then answer r."
   return 1
 }
+# a gap or a standby that is a few logs behind is often gone within a minute or two (fal_server, apply catching
+# up): checked again 6 times (every POLL_WAIT seconds, 2 minutes by default) before it is reported (not in check mode)
+poll_check() {
+  # $1 the check, $2 what is waited for (shown)
+  local rc tries=0
+  while true; do
+    rc=0; "$1" || rc=$?
+    [[ $rc -eq 1 ]] || return $rc
+    tries=$((tries + 1)); [[ $tries -ge 6 || "$MODE" == "check" ]] && return 1
+    say "${NOW%%$'\n'*}. $2 Checked again in $POLL_WAIT seconds ($tries of 6)"; sleep "$POLL_WAIT"
+  done
+}
+c_10_2() { poll_check c_10_2_once "fal_server fetches missing logs."; }
+c_10_3() { poll_check c_10_3_once "Apply catches up."; }
 c_10_4() {
   need_built || return 2
   if mrp_running; then
     NOW="Redo apply (MRP) is running"
-    # real-time apply uses a standby log that receives the redo; errors of the last day are shown
-    if sql_local "select count(*) from v\$standby_log where status='ACTIVE';" && [[ "$(first_line)" == "0" ]]; then
-      warn "No standby redo log is in use (none is ACTIVE)."$'\n'"Redo arrives only as archived logs, so the lag grows by whole log files."$'\n'"Check step 9.3 and the alert log (ORA-19527, ORA-15046)."
+    # real-time apply uses a standby log that receives the redo. None in use, or Data Guard errors of the last
+    # 15 minutes: the step waits (checked again in the next run), it is not OK. Older errors are shown.
+    local w=""
+    # no standby log at all is not a matter of waiting: step 9.3 adds them
+    if sql_local "select group# from v\$standby_log order by group#;" && [[ -z "$(grep -E '^[[:space:]]*[0-9]+' <<< "$SQL_OUT")" ]]; then
+      NOW="Redo apply (MRP) is running, but this standby has no standby redo logs. Redo is applied only from archived logs."
+      PLAN="Add them with step 9.3:  $SELF --only 9.3"; KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="Run on this server ($(hostname -s))"
+      return 1
     fi
-    if sql_local "select count(*) from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1;" && num "$(first_line)" && [[ "$(first_line)" != "0" ]]; then
-      warn "$(first_line) Data Guard error message(s) on this standby in the last 24 hours. To see them:"$'\n'"select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
+    if sql_local "select count(*) from v\$standby_log where status='ACTIVE';" && [[ "$(first_line)" == "0" ]]; then
+      w+=$'\n'"No standby redo log is in use (none is ACTIVE). Redo arrives only as archived logs,"$'\n'"so the lag grows by whole log files. Check step 9.3 and the alert log (ORA-19527, ORA-15046)."
+    fi
+    if sql_local "select count(*) from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1/96;" && num "$(first_line)" && [[ "$(first_line)" != "0" ]]; then
+      local n=$(first_line) msgs=""
+      # the messages hold ORA- codes themselves, so the query "fails" by the usual rule: its lines are shown anyway
+      sql_local "select message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1/96 order by timestamp desc) where rownum <= 3;" || true
+      msgs=$(sed 's/^[[:space:]]*//' <<< "$SQL_OUT" | grep -v '^$' | head -n 3 | sed 's/^/  /')
+      w+=$'\n'"$n Data Guard error message(s) in the last 15 minutes${msgs:+:}"${msgs:+$'\n'"$msgs"}
+    elif sql_local "select count(*) from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1;" && num "$(first_line)" && [[ "$(first_line)" != "0" ]]; then
+      warn "$(first_line) Data Guard error message(s) on this standby in the last 24 hours (none in the last 15 minutes). To see them:"$'\n'"select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
+    fi
+    if [[ -n "$w" ]]; then
+      NOW+="$w"$'\n'"Run the script again in a few minutes. If this stays, see:  $SELF --help-step 10.4"
+      CHECK_WAITS=1
     fi
     return 0
   fi

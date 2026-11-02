@@ -155,6 +155,9 @@ c_3_1() {
   if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; fi
   db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1
   if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
+  # a Release Update in RU_DIR is applied by the installer: it must be one the primary has (found now, not after
+  # two installs at step 3.11)
+  ru_matches_primary || return 1
   # files already named in the settings are checked like found ones: right kind (Grid / database) and release
   if { [[ $need_g -eq 0 ]] || { media_ok "$GRID_MEDIA" && media_matches "$GRID_MEDIA" grid; }; } \
      && { [[ $need_d -eq 0 ]] || { media_ok "$DB_MEDIA" && media_matches "$DB_MEDIA" db; }; }; then
@@ -791,7 +794,9 @@ c_3_2() {
   NOW="Grid is not installed yet"
   PLAN=""
   # an inventory folder that an earlier, failed installer run left behind is moved aside first (else INS-32035)
-  [[ "$(inventory_state)" != ok ]] && SW_FIX=inv
+  local ist; ist=$(inventory_state)
+  [[ "$ist" != ok ]] && SW_FIX=inv
+  [[ "$ist" == leftover ]] && YES_HOLD=1      # moving the inventory folder aside: asked also with --yes
   if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
     if media_is_staged "$GRID_MEDIA"; then PLAN="Unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid), as $GRID_USER"$'\n'
     else PLAN="Unzip $GRID_MEDIA into $GRID_HOME, as $GRID_USER"$'\n'; fi
@@ -972,6 +977,8 @@ c_3_5() {
 finish it. This step creates it, with default attributes."
   fi
   SQL_OUT=$list
+  # REDO_BLOCKSIZE (when the primary's value could not be read) must be in place before the plan is made
+  redo_bs_known || true
   local dg info="" todo="" disks
   DG_TODO=""
   for dg in $(asm_dgs); do
@@ -986,6 +993,7 @@ alter diskgroup $dg mount;"
       return 1
     fi
     [[ -n "$(asm_labels "$dg")" ]] || { NOW="No ASM disks for +$dg yet (step 2.13)"; return 2; }
+    local dead; dead=$(asm_dead_labels "$dg"); [[ -n "$dead" ]] && { asm_dead_plan "${dead% }"; return 2; }
     disks=$(asm_labels "$dg" | sed "s#^#'$(asm_disk_dir)/#; s#\$#'#" | paste -sd, -)
     local c="create diskgroup $dg external redundancy disk $disks" attrs=""
     local ca2=$ca cr2=$cr
@@ -1006,11 +1014,17 @@ alter diskgroup $dg mount;"
   done
   DG_TODO=${DG_TODO%$'\n'}
   if [[ -z "$DG_TODO" ]]; then NOW="${info%$'\n'}"; return 0; fi
-  [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { NOW="The redo block size of the primary could not be read (step 1.3), so the sector size of the new disk groups is not known. Run the script again."; return 2; }
+  redo_bs_known || { NOW="The redo block size of the primary could not be read (step 1.3), so the sector size of the new disk groups is not known. Run the script again, or set REDO_BLOCKSIZE (512 or 4096) in the settings (--settings)."; return 2; }
   NOW="Disk groups to create:$todo"
   PLAN="As $GRID_USER:  export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM ; \$ORACLE_HOME/bin/sqlplus / as sysasm
 $DG_TODO"
   USING="Same disk group names as the primary."$'\n'"compatible.asm and compatible.rdbms are the same as in +$DATA_DG."
+  # the sector size of a disk group cannot be changed later: a value from the settings (not read from the
+  # primary) is asked about, also with --yes
+  if [[ ${PRIMARY_REDO_BS_KNOWN:-0} -ne 1 ]]; then
+    YES_HOLD=1
+    NOW+=$'\n'"The redo block size comes from REDO_BLOCKSIZE=$REDO_BLOCKSIZE in the settings, not from the primary."$'\n'"The sector size of a disk group cannot be changed later. Answer y only if you are sure."
+  fi
   return 1
 }
 d_3_5() {
@@ -1096,15 +1110,12 @@ inventory_ready() {
     NOW="The Oracle inventory is not registered on this server yet: /etc/oraInst.loc is missing."$'\n'"The Grid root scripts create it. Grid must be installed and its root scripts run first (step 3.3)"
     return 2
   fi
-  dir_empty "$INVENTORY_DIR" && return 0      # the database installer creates it
-  NOW="$INVENTORY_DIR has files, but /etc/oraInst.loc is missing, so no installer can use it."$'\n'"The database installer would stop with INS-32035."
-  KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-  PLAN="-- If Oracle software on this server uses this inventory, register it:
-printf 'inventory_loc=$INVENTORY_DIR\ninst_group=$INSTALL_GROUP\n' > /etc/oraInst.loc
--- If it is left over from an earlier attempt and nothing uses it, move it aside instead:
-mv $INVENTORY_DIR $INVENTORY_DIR.old_\$(date +%F)
--- Then answer r."
-  return 1
+  # no Grid: the same two cases as in step 3.2 (files left by a failed installer, or an inventory that is not
+  # registered) are put right by the install action (see inventory_fix)
+  local ist; ist=$(inventory_state)
+  [[ "$ist" != ok ]] && SW_FIX=inv
+  [[ "$ist" == leftover ]] && YES_HOLD=1      # moving the inventory folder aside: asked also with --yes
+  return 0
 }
 db_ready() {
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
@@ -1137,6 +1148,7 @@ c_3_6() {
 ${RU_DIR:+  with the Release Update in $RU_DIR}
   Home $DB_HOME, base $ORACLE_BASE, OS groups as on the primary"
   USING="Same home and base as the primary."$'\n'"The response file is made from the template in the media."
+  [[ "$SW_FIX" == inv ]] && inventory_fix_plan "$ORACLE_USER"
   return 1
 }
 d_3_6() {
@@ -1145,6 +1157,7 @@ d_3_6() {
     half)  sw_half_fix "$DB_HOME" "$ORACLE_USER" "$STATE_DIR/db_install.done" "$(stage_dir db)" db || fx=$?
            [[ $fx -eq 10 ]] || return $fx ;;
     unzip) sw_unzip_fix || return 1 ;;
+    inv)   inventory_fix "$ORACLE_USER" || return 1 ;;
   esac
   if [[ -n "$SW_FIX" ]]; then
     SW_FIX=""; db_state
@@ -1288,6 +1301,33 @@ d_3_10() {
 
 # ---- 3.11 same software level as primary ----
 # The patches of a home are the folder names in <home>/inventory/oneoffs (what opatch lspatches reads).
+ru_ids() {
+  # the patch numbers of RU_DIR: the folder itself or its subfolders (a Grid RU holds the database RU as one)
+  local d id
+  for d in "$RU_DIR" "$RU_DIR"/*/; do id=$(basename "$d"); [[ "$id" =~ ^[0-9]{6,9}$ ]] && printf '%s\n' "$id"; done | sort -u
+}
+ru_matches_primary() {
+  # 0 = no RU_DIR, or one of its patches is on the primary's database home (or the primary cannot be read:
+  # step 3.11 compares later). 1 = RU_DIR is not the primary's Release Update (NOW and PLAN say why)
+  [[ -n "${RU_DIR:-}" && -d "$RU_DIR" ]] || return 0
+  local ids pp; ids=$(ru_ids)
+  if [[ -z "$ids" ]]; then
+    NOW="RU_DIR ($RU_DIR) has no patch folder (a folder named by its patch number, for example 35642822)."
+    PLAN="-- Unzip the Release Update zip so that RU_DIR is that numbered folder, or the folder that holds it."$'\n'"-- Then set RU_DIR again:  $SELF --settings  (choose e). Then answer r."
+    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    return 1
+  fi
+  need_ssh || { warn "The patches of the primary cannot be read now. Step 3.11 compares them after the install."; return 0; }
+  pp=$(primary_patches "$DB_HOME" 2>/dev/null) || { warn "The patches of the primary cannot be read ($DB_HOME/inventory). Step 3.11 compares them after the install."; return 0; }
+  [[ -n "$pp" ]] || { NOW="The primary has no patches, but RU_DIR is set ($RU_DIR)."$'\n'"The standby must have the same software level as the primary."; PLAN="-- Remove RU_DIR and OPATCH_ZIP from the settings:  $SELF --settings  (choose e). Then answer r."; KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"; return 1; }
+  if [[ -z "$(comm -12 <(printf '%s\n' "$ids") <(printf '%s\n' "$pp" | sort -u))" ]]; then
+    NOW="RU_DIR ($RU_DIR) is not the Release Update of the primary."$'\n'"Patches in RU_DIR:  $(paste -sd' ' - <<< "$ids")"$'\n'"Patches on the primary:  $(head -n 6 <<< "$pp" | paste -sd' ' -)$([[ $(wc -l <<< "$pp") -gt 6 ]] && printf ' ...')"
+    PLAN="-- Unzip the Release Update that the primary has (see:  opatch lspatches  on the primary),"$'\n'"-- then set RU_DIR to it:  $SELF --settings  (choose e). Then answer r."
+    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    return 1
+  fi
+  return 0
+}
 local_patches() { ls -1 "$1/inventory/oneoffs" 2>/dev/null | grep -E '^[0-9]{6,9}$' | sort -u; }
 primary_patches() {
   # $1 home on primary -> patch ids; rc 1 if the inventory of that home cannot be read
