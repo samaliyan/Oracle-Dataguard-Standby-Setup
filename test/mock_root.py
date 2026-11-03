@@ -132,6 +132,15 @@ def systemctl():
     if a[:2] == ["enable", "--now"]:
         st["services"][a[2]] = True; save(st); return 0
     if a[:1] == ["daemon-reload"]: return 0
+    if a[:2] == ["cat", "dev-shm.mount"]:
+        if not st.get("shm_cat"): print("No files found for dev-shm.mount.", file=sys.stderr); return 1
+        out = st["shm_cat"]
+        dn = st.get("shm_dropin_path")
+        if dn and os.path.exists(dn): out += "\n# " + dn + "\n" + open(dn).read()
+        print(out); return 0
+    if a[:2] == ["start", "systemd-udevd"]:
+        if st.get("udevd_nostart"): return 1
+        st["udevd_down"] = False; save(st); return 0
     if a[:1] == ["start"]:
         if not os.path.exists("/etc/systemd/system/" + a[1]): return 5
         if a[1] in st.get("fail_on_start", []): st.setdefault("failed", []).append(a[1]); save(st); return 1
@@ -203,4 +212,5 @@ def cmp():
     return 1 if (d.get("dirty") or d.get("fs") or d.get("pttype") or d.get("parts")) else 0
 
 sys.exit({"rpm": rpm, "dnf": dnf, "oracleasm": oracleasm, "parted": parted, "lsblk": lsblk, "blkid": blkid,
+          "nft": lambda: (print(st.get("nft_ruleset", "")), 0)[1], "iptables": lambda: (print(st.get("iptables_input", "-P INPUT ACCEPT")), 0)[1],
           "systemctl": systemctl, "chronyc": chronyc, "wipefs": wipefs, "partprobe": noop, "udevadm": udevadm, "pvs": noop, "yum": dnf, "uname": uname, "cmp": cmp, "findmnt": findmnt, "firewall-cmd": firewall_cmd}[prog]())

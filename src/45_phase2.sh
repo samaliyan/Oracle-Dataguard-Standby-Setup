@@ -173,11 +173,25 @@ limit_users() {
   return 0
 }
 LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
-lim_min() { case "$1" in nofile) printf 65536 ;; nproc) printf 16384 ;; stack) printf 32768 ;; *) printf 0 ;; esac; }
+hugepages_kb() {
+  # the HugePages set on this server, in KB (0 = none)
+  local n sz; n=$(awk '/^HugePages_Total:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); sz=$(awk '/^Hugepagesize:/{print $2}' "$MEMINFO_FILE" 2>/dev/null)
+  num "$n" && num "$sz" && printf '%s' $(( n * sz )) || printf 0
+}
+LIM_MEMLOCK_NEED=0   # KB: the SGA of the primary when it runs only in HugePages (use_large_pages=ONLY); set by 2.4
+lim_min() {
+  # memlock (KB): the SGA in HugePages must be lockable: at least the HugePages set here, and the SGA of the
+  # primary when it needs HugePages (ONLY). Without either, the SGA is not locked: any value is enough
+  local h
+  case "$1" in nofile) printf 65536 ;; nproc) printf 16384 ;; stack) printf 32768 ;;
+    memlock) h=$(hugepages_kb); [[ ${LIM_MEMLOCK_NEED:-0} -gt $h ]] && h=$LIM_MEMLOCK_NEED; printf '%s' "$h" ;;
+    *) printf 0 ;; esac
+}
 lim_enough() {
-  # $1 item, $2 hard value: at least the Oracle minimum (memlock: any value; its size depends on HugePages)
-  [[ "${2,,}" == unlimited || "${2,,}" == infinity || "$2" == "-1" || "$1" == memlock ]] && return 0
-  [[ "$2" =~ ^[0-9]+$ ]] && (( 10#$2 >= $(lim_min "$1") ))
+  # $1 item, $2 hard value: at least the Oracle minimum
+  [[ "${2,,}" == unlimited || "${2,,}" == infinity || "$2" == "-1" ]] && return 0
+  local m; m=$(lim_min "$1"); [[ "$m" == 0 ]] && return 0
+  [[ "$2" =~ ^[0-9]+$ ]] && (( 10#$2 >= m ))
 }
 lim_value() {
   # $1 user, $2 " @group1 @group2 ", $3 item -> "value|file|priority|line" of the hard limit pam_limits uses for
@@ -210,10 +224,22 @@ c_2_4() {
   # every limit the script sets is checked: its hard value as pam_limits uses it (a line for the user beats one
   # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
   # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
-  local who g v over="" w wf wp wl
+  local who g v over="" w wf wp wl ulp sga
+  # the primary needs HugePages for its SGA (use_large_pages=ONLY): memlock must cover that SGA here too
+  LIM_MEMLOCK_NEED=0; local lmnote="" lm_need=0
+  if ssh_alive && prim_sql "select upper(value) from v\$parameter where name='use_large_pages';"; then
+    ulp=$(first_line)
+    if [[ "$ulp" == ONLY || "$ulp" == AUTO_ONLY ]]; then
+      # to_char: a number of 10 digits or more would be printed as 1.0E+10
+      if prim_sql "select to_char(bytes) from v\$sgainfo where name='Maximum SGA Size';" && sga=$(first_line) && num "$sga"; then lm_need=$(( sga / 1024 ))
+      else lmnote="The SGA size of the primary (use_large_pages=$ulp) could not be read: memlock is checked against the HugePages here only."; fi
+    fi
+  else lmnote="The primary could not be asked whether it needs HugePages: memlock is checked against the HugePages here only."; fi
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
     who=" "; for g in $(id -nG "$u" 2>/dev/null); do [[ "$g" =~ ^[A-Za-z0-9_.-]+$ ]] && who+="@$g "; done
+    # the SGA of the database is locked by the database owner only (grid runs ASM)
+    LIM_MEMLOCK_NEED=0; [[ "$u" == "$ORACLE_USER" ]] && LIM_MEMLOCK_NEED=$lm_need
     for it in nofile nproc stack memlock; do
       w=$(lim_value "$u" "$who" "$it"); IFS='|' read -r v wf wp wl <<< "$w"
       if [[ -z "$v" ]]; then LIM_TODO+=("$u $it"); miss+=("$u:$it")
@@ -227,7 +253,7 @@ c_2_4() {
       fi
     done
   done < <(limit_users)
-  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits (nofile, nproc, stack, memlock) are set for: $(limit_users | paste -sd' ' -)"; return 0; fi
+  if [[ ${#miss[@]} -eq 0 ]]; then NOW="Limits (nofile, nproc, stack, memlock) are set for: $(limit_users | paste -sd' ' -)"; [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"; return 0; fi
   if [[ -n "$over" ]]; then
     NOW="Missing or too low limits: ${miss[*]}"$'\n'"A file read after $LIMITS_FILE sets a lower value; it would win over a line added there."
     PLAN="-- Raise these lines to at least the minimum (or remove them):"$'\n'"$(sed '/^$/d; s/^/-- /' <<< "$over")"
@@ -238,6 +264,7 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
+  [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
   [[ "$ORACLE_USER" != "oracle" ]] && ! id oracle >/dev/null 2>&1 && \
@@ -260,6 +287,8 @@ make_dir() {
   # Changes the owner of an existing directory only when it is empty. Never recursive, never through a link.
   local path=$1 owner=$2 p="" comp
   local -a parts=()
+  # "." or ".." parts would make the system-folder test below meaningless (/u01/../etc)
+  [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { bad "$path is not a plain absolute path. It is not created or changed."; return 1; }
   case "$path" in /etc/ORACLE|/etc/ORACLE/*) ;;   # Oracle's default wallet location
     /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/tmp)
     bad "$path is a system folder. It is not created or changed."; return 1 ;; esac
@@ -437,20 +466,83 @@ A firewall on the primary, or in the network, blocks it."
 fw_path_note() {
   # the port is open on this server: can the primary reach it through the network? (read-only: a connect from
   # the primary, nothing is sent). Only a hint here: steps 4.9, 7.6 and 8.1 test the real connection.
-  [[ "$MODE" == "check" || $FW_PATH_DONE -eq 1 ]] && return 0
+  # $1 = what was found here: "firewalld" (the port is open in it) or "none" (firewalld is not active)
+  # (also in check mode: a connect only, nothing is sent and nothing changes)
+  [[ $FW_PATH_DONE -eq 1 ]] && return 0
   ssh_alive || return 0
   prim_probe tcpto "$STANDBY_IP" "$PORT" || return 0
+  local here
+  if [[ "${1:-}" == firewalld ]]; then here="Port $PORT is open in firewalld here, so something else blocks it:"
+  else here="firewalld is not active here, so something else blocks it:"; fi
   case "$(head -n 1 <<< "$RUN_OUT")" in
-    OPEN|REFUSED) NOW+=$'\n'"The primary reaches $STANDBY_IP:$PORT through the network." ;;
-    TIMEOUT|BLOCKED) warn "The primary cannot reach $STANDBY_IP:$PORT (no answer, or the connection is rejected)."$'\n'"Port $PORT is open in firewalld here, so another firewall blocks it: in the network, or on this server outside"$'\n'"firewalld (nftables, iptables). Check:  nft list ruleset   Then ask your network administrator to allow"$'\n'"port $PORT from $PRIMARY_IP to $STANDBY_IP." ;;
+    OPEN) NOW+=$'\n'"The primary reaches $STANDBY_IP:$PORT through the network." ;;
+    REFUSED) NOW+=$'\n'"The primary gets an answer from $STANDBY_IP:$PORT (connection refused): nothing listens yet,"$'\n'"or a firewall rejects it. Steps 7.6 and 8.1 test the real connection once the listener runs." ;;
+    TIMEOUT|BLOCKED) warn "The primary cannot reach $STANDBY_IP:$PORT (no answer, or the connection is rejected)."$'\n'"$here a firewall in the network, or rules on this server"$'\n'"outside firewalld (check:  nft list ruleset). Ask your network administrator to allow"$'\n'"port $PORT from $PRIMARY_IP to $STANDBY_IP." ;;
+    NOROUTE) warn "The primary cannot reach $STANDBY_IP:$PORT: no route to host."$'\n'"Either $STANDBY_IP is not the right address of this server, or a firewall rejects the connection"$'\n'"with icmp-host-prohibited (the reject of firewalld). Check the address first." ;;
+    UNREACH) warn "The primary cannot reach $STANDBY_IP:$PORT: the network is unreachable from the primary."$'\n'"The primary has no route to that network, or a firewall rejects it (icmp-net-prohibited)."$'\n'"Check the routes of the primary first (ip route get $STANDBY_IP, on the primary)." ;;
   esac
+  return 0
+}
+local_fw_rules() {
+  # firewalld is not active: rules of nftables or iptables on this server for incoming traffic (read-only; a
+  # note, the real test is the connect from the primary). Named: a drop or reject rule for the port itself; or
+  # a general drop (policy drop, drop/reject rules) with no accept rule for the port.
+  local inp="" r
+  local all=""
+  # "all" = every chain but the output and forward ones (an accept there is not for incoming traffic)
+  command -v nft >/dev/null 2>&1 && { r=$(nft list ruleset 2>/dev/null); inp=$(awk '/hook input/ { i = 1 } i && /^[[:space:]]*}/ { i = 0 } i { print }' <<< "$r")
+    all=$(awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }' <<< "$r"); }
+  command -v iptables >/dev/null 2>&1 && { r=$(iptables -S 2>/dev/null); all+=$'\n'$(grep -vE '^-(P|A) (OUTPUT|FORWARD)' <<< "$r"); inp+=$'\n'$(grep -E '^-(P|A) INPUT' <<< "$r"); }
+  grep -q '[^[:space:]]' <<< "$inp" || return 0
+  # named sets, verdict maps, port ranges and "!=" are not read here: an accept rule written that way may cover the
+  # port, so then "no accept" is not claimed (such a construct elsewhere changes nothing)
+  local unread='dports? (@|vmap|!=)|dports?[[:space:]]+[0-9]+[-:][0-9]+|--match-set' acc_unread=0
+  grep -E "$unread" <<< "$all" | grep -qiE 'accept|vmap' && acc_unread=1
+  # a rule that names the port (dport / --dport / --dports list, nft set { 22, 1521 }); only the number is read
+  local pre="(dports?|--dports?)[[:space:]]+([{][^}]*|[0-9,:]*,)?[[:space:]]*\b$PORT\b"
+  # (a rule for udp or for one destination address is not this port of this server)
+  local notmine='udp|(^| )-d |daddr|--dst'
+  r=$(grep -E "$pre" <<< "$inp" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
+  if [[ -n "$r" ]]; then
+    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld drops or rejects port $PORT:"$'\n'"  $r"
+    return 0
+  fi
+  # the input chain accepts the port: a drop elsewhere is not looked at
+  grep -E "$pre" <<< "$inp" | grep -qiE 'accept' && return 0
+  # in another chain (it may be one the input chain jumps to; this is not followed)
+  r=$(grep -E "$pre" <<< "$all" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
+  if [[ -n "$r" ]]; then
+    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld, in a chain other than input, may drop port $PORT"$'\n'"(if the input chain jumps to it):  $r"
+    return 0
+  fi
+  # an accept for the port anywhere (also in a chain the input chain jumps to): no note
+  grep -E "$pre" <<< "$all" | grep -qiE 'accept' && return 0
+  [[ $acc_unread -eq 1 ]] && return 0
+  # a general drop (not the usual "ct state invalid drop", which drops only broken packets)
+  # rules for one protocol or one interface count (they cover the port too); rules for some addresses or other
+  # ports do not
+  # a drop for all TCP (or every protocol) counts; one for another protocol, one interface, some addresses,
+  # flags, rates or sets does not
+  # (the reject answer, "--reject-with icmp-host-prohibited" or "reject with icmpx ...", is not a match: cut off
+  # before the test; the shown rule is the whole line)
+  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$inp" \
+      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|^-A INPUT( .*)? -j (DROP|REJECT)' \
+      | while IFS= read -r l; do
+          c=$(sed -E 's/(--reject-with|reject with) .*//' <<< "$l")
+          grep -qE '(saddr|daddr|dport|sport|ct state|ct status|iifname|oifname|(^| )iif |(^| )oif |(^| )-s |(^| )-d |(^| )-i |(^| )-o |--dport|--sport|--src|--dst|--ctstate|--state|--match-set|tcp flags|--tcp-flags|limit|recent|nfproto|icmp|udp|sctp|l4proto [^t]|protocol [^t]|! -p )' <<< "$c" && continue
+          # -p: only tcp, all, 0 or 6 cover this port
+          if [[ "$c" =~ (^|[[:space:]])-p[[:space:]]+([^[:space:]]+) ]] && ! [[ "${BASH_REMATCH[2]}" =~ ^(tcp|all|0|6)$ ]]; then continue; fi
+          printf '%s\n' "$l"
+        done | head -n 1 | sed 's/^[[:space:]]*//')
+  [[ -n "$r" ]] || return 0
+  NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject incoming traffic"$'\n'"(for example:  $r), and no rule that accepts port $PORT."$'\n'"Check that $PORT/tcp is allowed:  nft list ruleset  (or:  iptables -S INPUT)"
   return 0
 }
 FW_PATH_DONE=0      # 1 only inside 4.9 (it runs the check of 2.9 quietly, without this probe)
 # ---- 2.9 firewall here ----
 FW_ZONE=""
 c_2_9() {
-  if ! systemctl is-active --quiet firewalld 2>/dev/null; then NOW="firewalld is not active"; fw_path_note; return 0; fi
+  if ! systemctl is-active --quiet firewalld 2>/dev/null; then NOW="firewalld is not active"; local_fw_rules; fw_path_note none; return 0; fi
   local ifc; ifc=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
   FW_ZONE=""
   [[ -n "$ifc" ]] && { FW_ZONE=$(firewall-cmd --get-zone-of-interface="$ifc" 2>/dev/null) || FW_ZONE=""; }
@@ -463,7 +555,7 @@ c_2_9() {
   local rt=0 pm=0
   firewall-cmd --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && rt=1
   firewall-cmd --permanent --zone="$FW_ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1 && pm=1
-  if [[ $rt -eq 1 && $pm -eq 1 ]]; then NOW="Port $PORT/tcp is open (zone $FW_ZONE), also after a reboot"; fw_path_note; return 0; fi
+  if [[ $rt -eq 1 && $pm -eq 1 ]]; then NOW="Port $PORT/tcp is open (zone $FW_ZONE), also after a reboot"; fw_path_note firewalld; return 0; fi
   if [[ $rt -eq 1 ]]; then NOW="Port $PORT/tcp is open now, but not saved: it closes at the next reboot (zone $FW_ZONE)"
   elif [[ $pm -eq 1 ]]; then NOW="Port $PORT/tcp is saved as open, but the running firewall does not have it yet (zone $FW_ZONE)"
   else NOW="Port $PORT/tcp is closed in firewalld (zone $FW_ZONE${ifc:+, interface $ifc})"; fi
@@ -484,17 +576,32 @@ d_2_9() {
 }
 
 # ---- 2.10 time ----
+CHRONY_WAITED=0
 c_2_10() {
   # a running service is enough to go on; a clock that is not in sync (yet) is a warning: redo shipping and
   # apply work, but the times in the alert logs and lag reports of the two servers do not match
   if systemctl is-active --quiet chronyd 2>/dev/null; then
     if grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)"; then NOW="chronyd is running and the clock is in sync"; return 0; fi
+    # a chronyd that has just started needs a minute or two: looked at again a few times (not in check mode, and
+    # once per run: a server that cannot reach a time source does not wait at every check)
+    local n=0
+    [[ $CHRONY_WAITED -eq 1 ]] && n=6; CHRONY_WAITED=1
+    while [[ "$MODE" != check && $n -lt 6 ]]; do
+      n=$((n + 1)); say "The clock is not in sync yet. Checked again in 20 seconds ($n of 6)"; nap 20
+      grep -q 'Leap status.*Normal' <<< "$(chronyc tracking 2>/dev/null)" && { NOW="chronyd is running and the clock is in sync"; return 0; }
+    done
     NOW="chronyd is running, but the clock is not in sync"
     warn "The clock of this server is not in sync. Check:  chronyc sources -v  (a time server must be reachable)"
     return 0
   fi
   if systemctl is-active --quiet ntpd 2>/dev/null; then
     if timedatectl status 2>/dev/null | grep -qiE 'synchronized: yes'; then NOW="ntpd is running and the clock is in sync"; return 0; fi
+    local m=0
+    [[ $CHRONY_WAITED -eq 1 ]] && m=6; CHRONY_WAITED=1
+    while [[ "$MODE" != check && $m -lt 6 ]]; do
+      m=$((m + 1)); say "The clock is not in sync yet. Checked again in 20 seconds ($m of 6)"; nap 20
+      timedatectl status 2>/dev/null | grep -qiE 'synchronized: yes' && { NOW="ntpd is running and the clock is in sync"; return 0; }
+    done
     NOW="ntpd is running, but the clock is not in sync"
     warn "The clock of this server is not in sync. Check:  ntpq -p  (a time server must be reachable)"
     return 0
@@ -588,8 +695,7 @@ c_2_12() {
     # the rules are applied by systemd-udevd: without it /dev/oraasm stays empty
     if ! systemctl is-active --quiet systemd-udevd 2>/dev/null; then
       NOW="ASM disks use udev rules, but systemd-udevd is not running. The rules would not be applied."
-      PLAN="systemctl start systemd-udevd"$'\n'"systemctl status systemd-udevd"$'\n'"-- Then answer r."
-      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      A212_MODE=udevd; PLAN="systemctl start systemd-udevd"
       return 1
     fi
     NOW="ASM disks use udev rules, with devices in /dev/oraasm
@@ -630,6 +736,11 @@ To use ASMLib instead: answer s, install oracleasm-support (step 2.3), then run 
 d_2_12() {
   case "$A212_MODE" in
     to_udev|save) ASM_METHOD=udev; save_settings; return 0 ;;
+    udevd)
+      # the udev service of the system: started (nothing else changes); a part of every Linux system
+      run_cmds <<< "systemctl start systemd-udevd" || { bad "systemd-udevd did not start. To see why:  systemctl status systemd-udevd"; return 1; }
+      systemctl is-active --quiet systemd-udevd 2>/dev/null || { bad "systemd-udevd is still not running. To see why:  systemctl status systemd-udevd"; return 1; }
+      return 0 ;;
   esac
   if [[ -n "$PLAN" && "$PLAN" != "Use ASMLib"* ]]; then
     journal ASMCFG oracleasm "$(tr '\n' ';' <<< "$PLAN")"
@@ -833,7 +944,7 @@ partprobe $disk" || return 1
   command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null
   local n=0
   until [[ "$(lsblk -dn -o TYPE "$part" 2>/dev/null)" == "part" ]]; do
-    n=$((n + 1)); [[ $n -gt 10 ]] && { bad "Partition $part did not appear"; return 1; }; sleep 1
+    n=$((n + 1)); [[ $n -gt 10 ]] && { bad "Partition $part did not appear"; return 1; }; nap 1
   done
   if [[ "$(asm_method)" == "asmlib" ]]; then
     if ! run_cmds <<< "oracleasm createdisk $label $part
@@ -859,7 +970,7 @@ oracleasm scandisks"; then
     run_cmds <<< "udevadm control --reload-rules
 udevadm trigger --action=change --sysname-match=${part#/dev/}
 udevadm settle" || return 1
-    n=0; until [[ -e "/dev/oraasm/$label" ]]; do n=$((n + 1)); [[ $n -gt 10 ]] && break; sleep 1; done
+    n=0; until [[ -e "/dev/oraasm/$label" ]]; do n=$((n + 1)); [[ $n -gt 10 ]] && break; nap 1; done
     local perm; perm=$(stat -L -c '%U:%G:%a' "/dev/oraasm/$label" 2>/dev/null)
     [[ "$perm" == "$GRID_USER:$(asm_owner_group):660" ]] || { bad "/dev/oraasm/$label has owner and mode '$perm', but needs $GRID_USER:$(asm_owner_group):660"; return 1; }
   fi
@@ -1160,7 +1271,7 @@ storage_not_shared() {
       if [[ "$ans" == "NO" && $net -eq 1 && "$STORAGE_NET_DONE" != *" $d|$lsrc "* ]]; then
         # a network file system client may cache folder contents for up to a minute: ask again after that (once per run)
         say "$d is $fst. Testing again in 65 seconds, as the primary may cache the folder contents ..."
-        sleep 65
+        nap 65
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
@@ -1276,28 +1387,56 @@ shm_size_mb() {
   esac
   return 0
 }
-SHM_BOOT_FROM="" SHM_BOOT_MB=""
+SHM_BOOT_FROM="" SHM_BOOT_MB="" SHM_BOOT_RO=0 SHM_BOOT_OPTS="" SHM_UNIT_WIN=""
+shm_dropin() {
+  # a drop-in outside /etc that wins is masked by one of the same name in /etc; else a name that sorts last
+  if [[ $SHM_BOOT_RO -eq 1 && "$SHM_UNIT_WIN" == *.conf ]]; then printf '%s.d/%s' "$SHM_UNIT_FILE" "$(basename "$SHM_UNIT_WIN")"
+  else printf '%s.d/zz-dg-standby-shm.conf' "$SHM_UNIT_FILE"; fi
+}
+shm_opt_mb() {
+  # $1 mount options -> the size they give in MB (no size= = the tmpfs default, half the RAM; empty = unreadable)
+  local sz=""
+  [[ ",$1," =~ ,size=([^,]+), ]] && sz=${BASH_REMATCH[1]}
+  if [[ -n "$sz" ]]; then shm_size_mb "$sz"
+  elif [[ $MEM_RAM_MB -gt 0 ]]; then printf '%s' $(( MEM_RAM_MB / 2 )); fi
+  return 0
+}
 shm_boot_calc() {
   # SHM_BOOT_MB: the size of /dev/shm after the next boot (empty when it cannot be read); SHM_BOOT_FROM: the file
-  # that sets it. A systemd unit for /dev/shm wins over fstab. No size option = the tmpfs default, half of the RAM.
-  local o sz=""
-  if [[ -f "$SHM_UNIT_FILE" ]]; then
-    SHM_BOOT_FROM=$SHM_UNIT_FILE
-    o=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$SHM_UNIT_FILE" | tail -n 1)
-  else
-    SHM_BOOT_FROM=$FSTAB_FILE
-    o=$(awk '!/^[[:space:]]*#/ && $2 == "/dev/shm" { o = $4 } END { print o }' "$FSTAB_FILE" 2>/dev/null)
-  fi
-  # a drop-in (dev-shm.mount.d/*.conf) that sets Options wins over both (systemd reads them last, in name order)
-  local f
+  # that gives it. /dev/shm is mounted by systemd itself early at boot; the fstab line is applied to it then. A
+  # mount unit for it (SHM_UNIT_WIN, the file whose Options line wins) may count too, so the SMALLER of the two
+  # sizes is taken: the check never relies on the bigger one.
+  local fo uo="" f fmb umb
+  fo=$(awk '!/^[[:space:]]*#/ && $2 == "/dev/shm" { o = $4 } END { print o }' "$FSTAB_FILE" 2>/dev/null)
+  SHM_UNIT_WIN=""; SHM_BOOT_RO=0
+  # the files in /etc: the unit, then its drop-ins (read last, in name order)
+  if [[ -f "$SHM_UNIT_FILE" ]]; then SHM_UNIT_WIN=$SHM_UNIT_FILE; uo=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$SHM_UNIT_FILE" | tail -n 1); fi
   for f in "$SHM_UNIT_FILE.d"/*.conf; do
     [[ -f "$f" ]] && grep -qE '^[[:space:]]*Options[[:space:]]*=' "$f" || continue
-    SHM_BOOT_FROM=$f; o=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$f" | tail -n 1)
+    SHM_UNIT_WIN=$f; uo=$(sed -n 's/^[[:space:]]*Options[[:space:]]*=[[:space:]]*//p' "$f" | tail -n 1)
   done
-  SHM_BOOT_MB=""
-  [[ ",$o," =~ ,size=([^,]+), ]] && sz=${BASH_REMATCH[1]}
-  if [[ -n "$sz" ]]; then SHM_BOOT_MB=$(shm_size_mb "$sz")
-  elif [[ $MEM_RAM_MB -gt 0 ]]; then SHM_BOOT_MB=$(( MEM_RAM_MB / 2 )); fi
+  # with systemd running, what it uses: "systemctl cat" also shows units and drop-ins in /run and /usr/lib (the
+  # last Options line wins; a "# /path" line names each file). The unit made from fstab (/run/systemd/generator)
+  # is the fstab line itself, read from fstab (the generated copy is old until a daemon-reload). A file outside
+  # /etc is never changed: an /etc drop-in sets the size over it (SHM_BOOT_RO).
+  if [[ -d "$SYSTEMD_RUN_DIR" ]] && command -v systemctl >/dev/null 2>&1; then
+    local cat_out w=""
+    if cat_out=$(systemctl cat dev-shm.mount 2>/dev/null) && [[ -n "$cat_out" ]]; then
+      w=$(awk '/^# \/[^ ]+\.(mount|conf)$/ { f = substr($0, 3) } /^[[:space:]]*Options[[:space:]]*=/ { v = $0; sub(/^[[:space:]]*Options[[:space:]]*=[[:space:]]*/, "", v); wf = f; wo = v; n = 1 } END { if (n) print wf "\t" wo }' <<< "$cat_out")
+      if [[ -n "$w" ]]; then
+        f=${w%%$'\t'*}
+        if [[ "$f" == /run/systemd/generator* ]]; then SHM_UNIT_WIN=""; uo=""
+        else SHM_UNIT_WIN=$f; uo=${w#*$'\t'}; [[ "$f" == /etc/* || "$f" == "$SHM_UNIT_FILE"* ]] || SHM_BOOT_RO=1; fi
+      fi
+    fi
+  fi
+  SHM_BOOT_OPTS=$uo
+  fmb=$(shm_opt_mb "$fo")
+  SHM_BOOT_FROM=$FSTAB_FILE; SHM_BOOT_MB=$fmb
+  [[ -n "$SHM_UNIT_WIN" ]] || return 0
+  umb=$(shm_opt_mb "$uo")
+  if ! num "$umb"; then SHM_BOOT_FROM=$SHM_UNIT_WIN; SHM_BOOT_MB=""
+  elif num "$fmb" && [[ $umb -le $fmb ]]; then SHM_BOOT_FROM=$SHM_UNIT_WIN; SHM_BOOT_MB=$umb; fi
   return 0
 }
 mem_probe() {
@@ -1318,10 +1457,10 @@ mem_probe() {
   # the SGA as the instance really has it: with a manual SGA (sga_target and memory_target 0) the parameters say
   # nothing, the sizes of its parts (shared_pool_size, db_cache_size, ...) add up to "Maximum SGA Size"
   local smax=""
-  prim_sql "select bytes from v\$sgainfo where name='Maximum SGA Size';" && smax=$(first_line)
+  prim_sql "select to_char(bytes) from v\$sgainfo where name='Maximum SGA Size';" && smax=$(first_line)
   if num "$smax"; then [[ $smax -gt $MEM_SGA ]] && MEM_SGA=$smax
   elif [[ $MEM_SGA -eq 0 && $MEM_MT -eq 0 ]]; then return 2; fi
-  local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); num "$kb" || kb=0
+  local kb; kb=$(awk '/^MemTotal:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); num "$kb" || kb=0
   MEM_RAM_MB=$(( kb / 1024 ))
   local sga_mb=$(( MEM_SGA / 1048576 )) pga_mb=$(( MEM_PGA / 1048576 )) mt_mb=$(( MEM_MT / 1048576 )) mmt_mb=$(( mmt / 1048576 )) need_mb shm_need=0
   # automatic memory (memory_target > 0) holds the SGA and the PGA; otherwise they are added.
@@ -1377,8 +1516,8 @@ mem_probe() {
     fi
   fi
   if [[ "$MEM_ULP" == "ONLY" || "$MEM_ULP" == "AUTO_ONLY" ]]; then
-    local hp hpkb; hp=$(awk '/^HugePages_Total:/{print $2}' /proc/meminfo 2>/dev/null); num "$hp" || hp=0
-    hpkb=$(awk '/^Hugepagesize:/{print $2}' /proc/meminfo 2>/dev/null); num "$hpkb" || hpkb=0
+    local hp hpkb; hp=$(awk '/^HugePages_Total:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); num "$hp" || hp=0
+    hpkb=$(awk '/^Hugepagesize:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); num "$hpkb" || hpkb=0
     if [[ $(( hp * hpkb / 1024 )) -lt $sga_mb ]]; then
       MEM_HP_LOW=1
       MEM_INFO+=$'\n'"HugePages: the primary requires them (use_large_pages=$MEM_ULP), this server has too few."
@@ -1408,7 +1547,20 @@ c_2_16() {
 "
     PLAN+="Keep ${MEM_SHM_MB} MB after a reboot: the /dev/shm line in $FSTAB_FILE gets size=${MEM_SHM_MB}m (a backup is kept)"
     shm_boot_calc
-    [[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && PLAN+=$'\n'"$SHM_BOOT_FROM sets /dev/shm at boot: its Options line gets size=${MEM_SHM_MB}m too (a backup is kept)"
+    if [[ $SHM_BOOT_RO -eq 0 && -n "$SHM_UNIT_WIN" && -L "$SHM_UNIT_WIN" ]]; then
+      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      PLAN="-- $SHM_UNIT_WIN sets /dev/shm at boot, but it is a link: the script does not write through it."$'\n'"-- Set size=${MEM_SHM_MB}m in its Options line (in the file it points to), and in $FSTAB_FILE, then:"$'\n'"systemctl daemon-reload"
+      [[ $cur -lt $MEM_SHM_MB ]] && PLAN+=$'\n'"mount -o remount,size=${MEM_SHM_MB}m /dev/shm"
+      PLAN+=$'\n'"-- Then answer r."
+      return 1
+    fi
+    if [[ $SHM_BOOT_RO -eq 1 && -L "$(shm_dropin)" ]]; then
+      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      PLAN="-- $SHM_UNIT_WIN sets /dev/shm at boot. The drop-in that would set the size over it is a link:"$'\n'"--   $(shm_dropin)"$'\n'"-- Remove the link (rm $(shm_dropin)), then answer r: the script writes the drop-in then."
+      return 1
+    fi
+    if [[ $SHM_BOOT_RO -eq 1 ]]; then PLAN+=$'\n'"$SHM_UNIT_WIN sets /dev/shm at boot. It is not changed; this drop-in sets size=${MEM_SHM_MB}m and wins over it:"$'\n'"  $(shm_dropin)"
+    elif [[ -n "$SHM_UNIT_WIN" ]]; then PLAN+=$'\n'"$SHM_UNIT_WIN sets /dev/shm at boot: its Options line gets size=${MEM_SHM_MB}m too (a backup is kept)"; fi
     PLAN+=$'\n'"Then the size for the next boot is read again from these files."
   else
     KIND_NOW=manual
@@ -1430,8 +1582,19 @@ d_2_16() {
   fi
   # a systemd mount unit for /dev/shm (or a drop-in of it) wins over fstab at boot: the size is set in the file
   # that wins, too
-  shm_boot_calc; local uf=""
-  [[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && uf=$SHM_BOOT_FROM
+  shm_boot_calc; local uf=$SHM_UNIT_WIN
+  if [[ $SHM_BOOT_RO -eq 1 ]]; then
+    # the winning file is outside /etc (a package or /run owns it): a drop-in in /etc sets the size over it
+    local dn dopts="" x ol=(); dn=$(shm_dropin)
+    [[ -L "$dn" ]] && { bad "$dn is a symbolic link. It is not written through."; printf 'Remove the link (as root):  rm %s   Then run this step again.\n' "$dn" | hint; return 1; }
+    IFS=',' read -ra ol <<< "$SHM_BOOT_OPTS"
+    for x in "${ol[@]}"; do [[ -z "$x" || "$x" == size=* ]] || dopts+="${dopts:+,}$x"; done
+    install -d -m 755 "$(dirname "$dn")" || return 1
+    [[ -f "$dn" ]] && { backup_file "$dn" || return 1; }
+    printf '# Written by dg_standby_setup.sh: the size of /dev/shm for the Oracle SGA (wins over %s)\n[Mount]\nOptions=%s\n' "$SHM_UNIT_WIN" "${dopts:+$dopts,}size=${MEM_SHM_MB}m" | write_as root "$dn" 644 || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    uf=""
+  fi
   if [[ -n "$uf" ]]; then
     if ! grep -qE '^[[:space:]]*Options[[:space:]]*=' "$uf"; then
       bad "$uf sets /dev/shm at boot, but has no Options line to set the size in."
@@ -1464,12 +1627,14 @@ d_2_16() {
     END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE" > "$tmp" || return 1
   backup_file "$FSTAB_FILE" || return 1
   write_as root "$FSTAB_FILE" 644 < "$tmp" || return 1
+  # systemd makes its unit from fstab only at a daemon-reload (or the next boot)
+  [[ -d "$SYSTEMD_RUN_DIR" ]] && { systemctl daemon-reload >/dev/null 2>&1 || true; }
   # what the next boot gets is read again from the files just written
   shm_boot_calc; local boot=$SHM_BOOT_MB
   if ! num "$boot" || [[ $boot -lt $MEM_SHM_NEED ]]; then
     bad "After a reboot /dev/shm would get ${boot:-an unknown size} MB ($SHM_BOOT_FROM), not ${MEM_SHM_MB} MB."
     printf 'Check the /dev/shm line in %s%s by hand.
-' "$FSTAB_FILE" "$([[ "$SHM_BOOT_FROM" != "$FSTAB_FILE" ]] && printf ' and the Options line in %s' "$SHM_BOOT_FROM")" | hint
+' "$FSTAB_FILE" "$([[ -n "$SHM_UNIT_WIN" ]] && printf ' and the Options line in %s' "$SHM_UNIT_WIN")" | hint
     return 1
   fi
   say "/dev/shm is $(human_mb "$MEM_SHM_MB") now, and $(human_mb "$boot") after a reboot ($SHM_BOOT_FROM)."

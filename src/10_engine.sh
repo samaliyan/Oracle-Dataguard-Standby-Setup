@@ -190,6 +190,8 @@ next_cmd() {
     step_ok_anywhere "$id" && continue
     n=$(step_num "$id"); [[ $n -lt $best ]] && { best=$n; nx=$id; }
   done
+  # (record() clears it when that step is done later in the run; one set after the step was done, such as 7.2 after
+  # a failed copy, is a deliberate "go back there")
   [[ -n "$RESUME_STEP" && "$RESUME_STEP" != 1.* ]] && nx=$RESUME_STEP
   [[ -n "$nx" ]] || return 0
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
@@ -341,7 +343,7 @@ job_wait_loop() {
       w) WATCH_STOP=0; trap 'WATCH_STOP=1' INT
          { tail -n 20 -f --pid=$$ -- "$JOB_OUT" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
          tp=$!; TAIL_PID=$tp
-         while [[ $WATCH_STOP -eq 0 ]] && job_running "$JOB_PID" && [[ ! -f "$JOB_OUT.rc" ]]; do sleep 2; done
+         while [[ $WATCH_STOP -eq 0 ]] && job_running "$JOB_PID" && [[ ! -f "$JOB_OUT.rc" ]]; do nap 2; done
          sleep 1; pkill -P "$tp" 2>/dev/null; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; TAIL_PID=""
          trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT ;;
       c) if confirm_word "Continue without '$JOB_TITLE'?" "CONTINUE"; then

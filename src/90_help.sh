@@ -161,8 +161,9 @@ RUN    Add these lines for each owner:
        <user> soft stack 10240     <user> hard stack 32768
        <user> soft memlock unlimited   <user> hard memlock unlimited
 EXPECT As <user>, after a new login:  ulimit -Hn  shows 65536
-       A limit set by you counts when its hard value is at least the one above
-       (memlock: any value). A lower value is reported, and the lines above are added.
+       A limit set by you counts when its hard value is at least the one above.
+       memlock: with HugePages set on this server, at least their total size (in KB);
+       without HugePages any value. A lower value is reported, and the lines above are added.
 EOF
   ;;
   2.5)
@@ -216,7 +217,9 @@ EXPECT firewall-cmd --zone=<zone> --query-port=$PO/tcp  shows yes
        (or firewalld is not running)
        The script then lets the primary try a connection to port $PO here (nothing is sent).
        "Connection refused" is fine at this point (no listener yet); no answer at all
-       means a firewall in the network blocks the port.
+       means a firewall blocks the port: in the network, or rules here outside firewalld
+       (nft list ruleset). "No route to host": a wrong address, or a reject by a firewall.
+       With firewalld not running, other rules here that drop traffic are named as a note.
 EOF
   ;;
   2.10) cat <<EOF
@@ -225,6 +228,8 @@ WHERE  Both servers, as root
 RUN    systemctl enable --now chronyd
        chronyc tracking
 EXPECT Leap status : Normal   (a running ntpd is also fine)
+       A chronyd or ntpd that has just started is looked at again for about 2 minutes (once per run);
+       a clock still not in sync then is a warning, not a stop.
 EOF
   ;;
   2.11)
@@ -246,8 +251,8 @@ WHY    ASMLib needs the UEK kernel (Oracle Linux 7 or 8). Otherwise udev rules a
        they work on every kernel.
 RUN    ASMLib:
        oracleasm configure -u $GU -g $AG -e -s y ; oracleasm init ; systemctl enable oracleasm ; oracleasm status
-       udev: nothing to do here (one rule per disk in step 2.13).
-       Set ASM_METHOD=udev in the settings.
+       udev: one rule per disk in step 2.13. systemd-udevd must run (the script starts it:
+       systemctl start systemd-udevd). Set ASM_METHOD=udev in the settings.
 EXPECT ASMLib: "Checking if ASM is loaded: yes",
        and  systemctl is-enabled oracleasm  shows enabled
 EOF
@@ -327,10 +332,13 @@ RUN    On the primary, as oracle in sqlplus:
 EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
        (the PGA is a target, not taken at startup).
        With memory_target: /dev/shm (df -h /dev/shm) is at least memory_target + 1 GB,
-       now and after a reboot (the size= option of the /dev/shm line in /etc/fstab, or of the
-       Options line in /etc/systemd/system/dev-shm.mount when that file exists, or of a drop-in
-       dev-shm.mount.d/*.conf that sets Options; no size = half the RAM). A size that cannot be
-       read (for example 1.5G, which tmpfs does not take) counts as too small.
+       now and after a reboot. The size after a reboot: the size= option of the /dev/shm line in
+       /etc/fstab, and, when a mount unit for /dev/shm sets Options (the last Options line that
+       systemctl cat dev-shm.mount shows, in /etc, /run or /usr/lib; else the unit and its drop-ins
+       in /etc), the smaller of the two. No size = half the RAM. A size that cannot be read (for
+       example 1.5G, which tmpfs does not take) counts as too small.
+       A file outside /etc is not changed: a drop-in in /etc/systemd/system/dev-shm.mount.d sets
+       the size over it.
 IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
        /dev/shm too small: the script does it (answer y). By hand:
        mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab
@@ -355,8 +363,12 @@ EOF
     printf '       chmod 644 /stage/*.zip\n'
     printf '       The owner must be root, %s or %s. Nobody else may be able to change the files.\n' "$OU" "$GU"
     printf 'EXPECT The script finds them. It searches: %s\n' "${ZIP_DIRS[*]}"
-    printf '       With RU_DIR in the settings: one of its patch folders (the numbered folders) must be\n'
-    printf '       a patch of the primary (opatch lspatches on the primary). Otherwise this step stops.\n'
+    printf '       With RU_DIR in the settings: RU_DIR is the numbered folder of the Release Update (or holds\n'
+    printf '       exactly one). One of its patches must be on the database home of the primary, and with\n'
+    printf '       Grid also on its Grid home (opatch lspatches on the primary). Otherwise this step stops.\n'
+    printf '       Steps 3.2 and 3.6 check this again before they install (also when 3.1 was skipped).\n'
+    printf '       Only the home that is installed is compared (3.2: Grid, 3.6: database).\n'
+    printf '       The file system of each home needs about 2.5 times the size of its zip files free.\n'
   ;;
   3.2) cat <<EOF
 TITLE  Grid Infrastructure software (Oracle Restart)
@@ -551,8 +563,9 @@ WHERE  The primary ($P), SQL*Plus as sysdba
 RUN    $PSQL
        show parameter log_archive_dest_1
        show parameter db_recovery_file_dest
-       -- only if neither is set:
-       alter system set db_recovery_file_dest_size=200G scope=both;
+       -- only if neither is set (the script fills in a size: 3 days of the archived logs of
+       -- the last week plus 20 %, at least 10G; and a disk group named FRA or RECO if there is one):
+       alter system set db_recovery_file_dest_size=<size>G scope=both;
        alter system set db_recovery_file_dest='<+DG or folder>' scope=both;
 EXPECT log_archive_dest_1 has LOCATION=..., or a recovery area is set
 EOF
@@ -641,7 +654,9 @@ EOF
     [[ $G -eq 1 ]] && printf 'RUN    Add this entry:\n'
     printf '       SID_LIST_%s =\n         (SID_LIST =\n           (SID_DESC =\n             (GLOBAL_DBNAME = %s)\n             (SID_NAME = %s)\n             (ORACLE_HOME = %s)\n           )\n         )\n' "$SL" "$SSV" "$SID" "$DBH"
     printf '       If SID_LIST_%s is already there without this SID, the entry goes inside it\n' "$SL"
-    printf '       (the script does that, with a backup). A wrong existing entry is corrected by hand.\n'
+    printf '       (the script does that, with a backup). A wrong entry of this SID is replaced the same way,\n'
+    printf '       when it is on lines of its own; other entries stay. A listener.ora that is a link is\n'
+    printf '       never written through: then the entry is added by hand.\n'
     printf 'EXPECT Step 5.2 checks it.\n'
   ;;
   5.2) cat <<EOF
@@ -660,7 +675,8 @@ EOF
     cat <<EOF
 WHERE  This server ($S), as $OU, file $DBH/network/admin/tnsnames.ora
 WHY    This server needs two aliases: the primary (step 5.3) and itself (step 5.4).
-RUN    Add this entry:
+RUN    Add this entry (an existing entry of $TA that is different is replaced; the script does it,
+       with a backup, when the entry is written in the usual way):
        $TA =
          (DESCRIPTION =
            (ADDRESS = (PROTOCOL = TCP)(HOST = $TH)(PORT = $PO))
@@ -717,6 +733,10 @@ RUN    On the primary:
        No WALLET_ROOT on the primary (12c, or the old setup):
        add this line to $DBH/network/admin/sqlnet.ora:
        ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = <folder>)))
+       (an existing entry is replaced; comments on it are kept above the new line. A sqlnet.ora
+       that is a link is not written through.)
+       18c and newer: WALLET_ROOT/tde_seps (the external-store password) is copied too. If the
+       primary cannot be asked whether it is there, the step stops (it is not left out).
 EXPECT md5sum of the wallet files is the same on both servers.
 EOF
   ;;
@@ -726,7 +746,9 @@ WHERE  This server ($S), as root
 RUN    mkdir -p ${ORACLE_BASE:-<oracle base>}/admin/$SU/adump ${DIAG_DEST:-<diagnostic_dest of primary>}
        chown $OU:$IG <each new folder>
 EXPECT The audit folder of the standby and the diagnostic_dest of the primary exist
-       and are writable by $OU.
+       and are writable by $OU. A standby that exists already: also the audit_file_dest
+       set in its spfile, when it is another folder. Under the Oracle base the script makes it;
+       outside it, it is a step to do by hand (mkdir, chown $OU:$IG).
 EOF
   ;;
   7.2) cat <<EOF
@@ -773,6 +795,9 @@ EOF
 TITLE  /etc/oratab entry for $SID
 WHERE  This server ($S), as root
 RUN    echo '$SID:$DBH:N' >> /etc/oratab
+       /etc/oratab as a link: the script writes the file it points to only when the link is
+       owned by root and every folder above that file can be changed only by root.
+       Otherwise the line is added by hand.
 EXPECT As $OU, . oraenv (answer $SID) sets ORACLE_HOME=$DBH
 EOF
   ;;
@@ -822,7 +847,12 @@ RUN    srvctl config database -db $SU
          -pwfile $DBH/dbs/orapw$SID -role PHYSICAL_STANDBY -startoption MOUNT \\
          -dbname ${DB_NAME:-<db_name>} -instance $SID -diskgroup $(tr ' ' ',' <<< "$DGS")${PRIMARY_DOMAIN:+ -domain $PRIMARY_DOMAIN}
 EXPECT srvctl config database -db $SU
-       shows the instance name exactly $SID
+       shows the instance name exactly $SID, its disk groups include $(tr ' ' ',' <<< "$DGS")${PRIMARY_DOMAIN:+,
+       and the domain $PRIMARY_DOMAIN}. Missing disk groups or a wrong domain are changed in place
+       (srvctl modify database). A new registration keeps the management policy, stop option,
+       disk groups and domain of the old one. A registered disk group this server does not
+       have is taken out (srvctl modify); a domain the primary does not set is reported. When the
+       disk groups of this server cannot be read, the step waits (it is not passed).
 IF     "Connected to an idle instance": the -instance value is wrong.
 EOF
   ;;
@@ -919,7 +949,13 @@ EOF
     printf '       When the unit is in place, the step also checks what it started: a stopped listener\n'
     printf '       or apply is started again (asked first); a database that is not a physical standby\n'
     printf '       is only reported. A standby that is down is started through the unit (no Grid),\n'
-    printf '       or the step waits for Oracle Restart to mount it (Grid).\n'
+    printf '       or the step looks again for up to 6 times %s seconds while Oracle Restart mounts it\n' "${POLL_WAIT:-20}"
+    printf '       (Grid; if step 9.2 had mounted it in this run, it stopped: that is reported instead).\n'
+    printf '       An OPEN standby: the unit does not start apply there (Active Data Guard license).\n'
+    printf '       Errors at boot go to the journal with priority "err":\n'
+    printf '         journalctl -p err -u <unit>\n'
+    printf '       The unit stays active after such an error on purpose: only an active unit runs its\n'
+    printf '       stop at shutdown, the clean stop of the standby.\n'
   ;;
   9.8) cat <<EOF
 TITLE  Clean-up of archived logs on the standby
@@ -986,7 +1022,9 @@ RUN    $SSQL
 EXPECT MRP0 runs, at least one standby log is ACTIVE, and no Error or Fatal
        message is newer than 15 minutes. Otherwise the step is "waiting":
        run the script again in a few minutes. Older errors (24 hours) are
-       shown as a warning.
+       shown as a warning; when new ones came since the last run (but none in the last 15
+       minutes), the step is "waiting" too. No standby log at all: step 9.3 adds them.
+       A view that cannot be read is a problem, not "running".
        Right after the setup, a few messages from the start of transport are
        normal (for example ORA-16401). New ones that keep coming are not.
 EOF

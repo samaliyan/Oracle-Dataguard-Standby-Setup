@@ -229,6 +229,11 @@ Data Guard needs Enterprise Edition, so this script cannot build a standby for i
   if [[ -n "$linv" && "$linv" != "$INVENTORY_DIR" ]] && v_path "$linv"; then
     _log INFO "inventory: this server uses $linv (/etc/oraInst.loc), the primary $INVENTORY_DIR"
     INVENTORY_DIR=$linv
+  elif [[ -e /etc/oraInst.loc ]] && { [[ -z "$linv" ]] || ! v_path "$linv"; }; then
+    # the file is there but gives no usable path (unreadable or malformed): said, not passed over in silence
+    DISC_NOTES+=("/etc/oraInst.loc on this server exists, but no usable inventory_loc line can be read from it.
+The inventory path of the primary is used: $INVENTORY_DIR
+Check the file (as root):  cat /etc/oraInst.loc")
   fi
 
   # ---- owners, ids, groups

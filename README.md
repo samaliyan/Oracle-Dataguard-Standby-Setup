@@ -125,7 +125,7 @@ docs/DESIGN.md        design notes
 
 ## Tests
 
-`test/run_scenarios.sh` runs over 440 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
+`test/run_scenarios.sh` runs over 470 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 

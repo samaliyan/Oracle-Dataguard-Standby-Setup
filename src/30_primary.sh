@@ -9,7 +9,9 @@ SYS_VERIFIED=0
 PRIMARY_TNS_ADMIN=""
 
 v_name() { [[ "$1" =~ ^[A-Za-z0-9_.+-]+$ && "$1" != -* ]]; }
-v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ ]]; }
+# an absolute path of plain characters, with no "." or ".." part and no "//" (a path read from a file another user
+# controls must not climb out of the folder it seems to be in)
+v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) && "$1" != *//* ]]; }
 
 ssh_alive() {
   [[ -n "$SSH_CTL" && -e "$SSH_CTL" ]] || return 1
@@ -68,9 +70,10 @@ prim_probe() {
     tnsping)     cmd="env ORACLE_HOME=$1 TNS_ADMIN=$2 $1/bin/tnsping $3 1" ;;
     hosts)       cmd="getent ahostsv4 $1" ;;
     # can the primary open a TCP connection to $1:$2 (this server)? Only a connect, nothing is sent.
-    # OPEN, REFUSED (the network lets it through, nothing listens yet), TIMEOUT or BLOCKED (dropped or rejected)
+    # OPEN, REFUSED (the network lets it through, nothing listens yet), TIMEOUT (dropped), UNREACH (no route on the
+    # primary), NOROUTE (no route to host: a wrong address, or a reject with icmp-host-prohibited) or BLOCKED
     tcpto)       num "$2" || fatal "Safety stop: invalid port $2"
-                 cmd="sh -c 'e=\$(LC_ALL=C timeout 8 bash -c \"exec 3<>/dev/tcp/$1/$2\" 2>&1); r=\$?; case \"\$r:\$e\" in 0:*) echo OPEN;; 124:*) echo TIMEOUT;; *refused*) echo REFUSED;; *) echo BLOCKED;; esac'" ;;
+                 cmd="sh -c 'e=\$(LC_ALL=C timeout 8 bash -c \"exec 3<>/dev/tcp/$1/$2\" 2>&1); r=\$?; case \"\$r:\$e\" in 0:*) echo OPEN;; 124:*) echo TIMEOUT;; *refused*) echo REFUSED;; *unreachable*) echo UNREACH;; *No\\ route*) echo NOROUTE;; *) echo BLOCKED;; esac'" ;;
     *) fatal "Safety stop: unknown primary check $p" ;;
   esac
   # commands that read files or devices end on the primary itself after 120 s (a hung NFS path must not leave

@@ -265,14 +265,29 @@ c_4_6() {
     return 0
   fi
   NOW="The primary has no archive destination and no recovery area."$'\n'"Its archived logs go to \$ORACLE_HOME/dbs."
+  # filled in from what the primary shows (read-only): the archived logs of the last 7 days, 3 days of them
+  # plus 20 % (at least 10 GB), and a disk group named for it (FRA, RECO) when there is one
+  local amb="" gb fdg="" why
+  prim_sql "select nvl(round(sum(blocks*block_size)/1048576/greatest(1,least(7,sysdate-min(first_time)))),0) from v\$archived_log where first_time > sysdate-7 and standby_dest='NO' and name is not null and dest_id=(select min(dest_id) from v\$archived_log where first_time > sysdate-7 and standby_dest='NO' and name is not null);" && amb=$(first_line)
+  if num "$amb" && [[ $amb -gt 0 ]]; then
+    gb=$(( (amb * 3 * 12 / 10 + 1023) / 1024 )); why="about 3 days of archived logs: $(human_mb "$amb") a day in the last week"
+  else gb=$(( PRIMARY_DB_MB / 10 / 1024 )); why="a tenth of the database size; the archive volume could not be read"; fi
+  [[ $gb -lt 10 ]] && gb=10
   if [[ -n "$DATA_DG" ]]; then
-    PLAN="alter system set db_recovery_file_dest_size=<size, e.g. 200G> scope=both;
-alter system set db_recovery_file_dest='+<a disk group for it, e.g. FRA>' scope=both;"
+    # a disk group named for it: FRA or RECO, alone or with a usual suffix (RECOC1, FRA1, FRA_DG, RECODG), not
+    # another word (FRANKLIN, RECOVERY)
+    local dgq=1
+    prim_sql "select name from v\$asm_diskgroup_stat order by name;" && dgq=0 && fdg=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$SQL_OUT" | grep -iE '^(FRA|RECO)(C?[0-9]+|_?DG[0-9]*|_[A-Za-z0-9_]*)?$' | head -n 1)
+    [[ -n "$fdg" ]] || fdg=$DATA_DG
+    PLAN="alter system set db_recovery_file_dest_size=${gb}G scope=both;
+alter system set db_recovery_file_dest='+${fdg^^}' scope=both;"
+    PLAN+=$'\n'"-- Size: $why."$'\n'"-- Disk group: $(if [[ $dgq -ne 0 ]]; then printf 'the one of the datafiles (the disk groups of the primary could not be read)'; elif [[ "${fdg^^}" == "${DATA_DG^^}" ]]; then printf 'the one of the datafiles (no FRA or RECO disk group found)'; else printf 'the one named for it'; fi). Check that it has the space."
   else
-    PLAN="-- Use a folder with enough space, owned by $ORACLE_USER, for example:
-host mkdir -p /u01/app/oracle/fast_recovery_area
-alter system set db_recovery_file_dest_size=<size, e.g. 200G> scope=both;
-alter system set db_recovery_file_dest='/u01/app/oracle/fast_recovery_area' scope=both;"
+    PLAN="-- A folder with enough space, owned by $ORACLE_USER, for example:
+host mkdir -p ${ORACLE_BASE:-/u01/app/oracle}/fast_recovery_area
+alter system set db_recovery_file_dest_size=${gb}G scope=both;
+alter system set db_recovery_file_dest='${ORACLE_BASE:-/u01/app/oracle}/fast_recovery_area' scope=both;"
+    PLAN+=$'\n'"-- Size: $why. Check that the folder has the space."
   fi
   PLAN+=$'\n'"-- The archived logs of the primary then go there. Then answer r here."
   PLAN_UNDO="alter system reset db_recovery_file_dest scope=both; alter system reset db_recovery_file_dest_size scope=both;  only after the archived logs in it are backed up"
@@ -426,7 +441,7 @@ c_4_9() {
           CHECK_WAITS=1; return 0
         fi
         NOW="The alias $STANDBY_TNS on the primary is right, but the primary gets no answer at all from $STANDBY_HOST:$PORT (timeout)."
-        PLAN="-- A firewall between the servers probably drops the connection. Port $PORT on this server is open (checked now)."$'\n'"-- A network firewall must allow port $PORT from the primary ($PRIMARY_IP) to this server ($STANDBY_IP)."$'\n'"-- Then answer r. Steps 7.6 and 8.1 test the connection again before the copy."
+        PLAN="-- A firewall probably drops the connection. firewalld on this server does not block port $PORT (checked now)."$'\n'"-- Not seen by that check: a firewall in the network, and rules here outside firewalld (nft list ruleset)."$'\n'"-- Port $PORT must be allowed from the primary ($PRIMARY_IP) to this server ($STANDBY_IP)."$'\n'"-- Then answer r. Steps 7.6 and 8.1 test the connection again before the copy."
         MANUAL_WHERE="To do in the network between the servers"; MANUAL_HOW="your network administrator"
         return 2
       fi

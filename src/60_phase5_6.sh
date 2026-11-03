@@ -4,6 +4,15 @@
 lsnr_file() { printf '%s/network/admin/listener.ora' "$(lsnr_home)"; }
 tns_file()  { printf '%s/network/admin/tnsnames.ora' "$DB_HOME"; }
 
+net_dir_note() {
+  # $1 a network file: its folder may be a link to a TNS_ADMIN shared with other homes or servers. Said in the
+  # plan, and asked also with --yes
+  local d r; d=$(dirname "$1"); [[ -L "$d" ]] || return 0
+  r=$(readlink -e -- "$d" 2>/dev/null) || return 0
+  PLAN+=$'\n'"Note: $d is a link to $r. That folder may be shared with other homes or servers:"$'\n'"the change is made there."
+  YES_HOLD=1
+  return 0
+}
 static_entry_state() {
   # 0 = correct, 1 = missing, 2 = present with another ORACLE_HOME
   local f; f=$(lsnr_file)
@@ -77,6 +86,37 @@ sidlist_insert() {
     { print }
     END { if (!done) exit 1 }' "$1"
 }
+sidlist_replace() {
+  # $1 listener.ora -> the file with the SID_DESC of this SID (the one that is not right) replaced by the right
+  # one. 1 unless: exactly one SID_LIST_<listener> block in the usual form, exactly one SID_DESC of this SID in it,
+  # and that SID_DESC on lines of its own (nothing else before its "(" or after its ")" on those lines).
+  local n; n=$(grep -ciE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$1")
+  [[ "$n" == 1 ]] || return 1
+  [[ "$(sidlist_of "$(norm "$(sed 's/#.*//' "$1")")")" == "(SID_LIST="* ]] || return 1
+  awk -v key="SID_LIST_${SB_LSNR^^}" -v sid="${STANDBY_SID^^}" -v svc="${STANDBY_SERVICE^^}" -v desc="$(sid_desc_block)" '
+    function cl(s) { t = s; sub(/#.*/, "", t); return t }
+    # an entry of this SID for another service (for example <db>_DGMGRL of the broker) is never replaced
+    function flush(   x) { x = toupper(bufc); gsub(/[ \t\r\n]/, "", x)
+      if (index(x, "(SID_NAME=" sid ")") && (!index(x, "(GLOBAL_DBNAME=") || index(x, "(GLOBAL_DBNAME=" svc ")"))) {
+        if (!safe) bad = 1; hits++; printf "%s", com; print desc }
+      else { if (index(x, "(SID_NAME=" sid ")")) others++; printf "%s", buf }
+      buf = ""; bufc = ""; com = ""; ind = 0 }
+    !inb && !done && toupper($0) ~ ("^[[:space:]]*" key "[[:space:]]*=") { inb = 1; d = 0 }
+    inb {
+      line = $0; code = cl(line); startl = 0; endl = 0
+      for (j = 1; j <= length(code); j++) {
+        c = substr(code, j, 1)
+        if (c == "(") { d++; if (d == 2) { ind = 1; safe = (substr(code, 1, j - 1) ~ /^[[:space:]]*$/); startl = 1 } }
+        else if (c == ")") { d--; if (d == 1 && ind) { if (substr(code, j + 1) !~ /^[[:space:]]*$/) safe = 0; endl = 1 }
+                             if (d == 0) { inb = 0; done = 1 } }
+      }
+      if (ind || endl) { buf = buf line "\n"; bufc = bufc code "\n"; i = index(line, "#"); if (i) com = com "    " substr(line, i) "\n"; if (endl) flush(); next }
+      print line; next
+    }
+    { print }
+    # 3 = every entry of this SID serves another service (none to replace: one may be added next to them)
+    END { if (!done || bad) exit 1; if (hits == 0 && others > 0) exit 3; if (hits != 1) exit 1 }' "$1"
+}
 lsnr_desc_block() {
   printf '%s =\n  (DESCRIPTION_LIST =\n    (DESCRIPTION =\n      (ADDRESS = (PROTOCOL = TCP)(HOST = %s)(PORT = %s))\n    )\n  )\n' \
     "$SB_LSNR" "$STANDBY_HOST" "$PORT"
@@ -115,6 +155,15 @@ c_5_1() {
 ORACLE_HOME (database home, not Grid):
   $DB_HOME"
   L51_MODE=""
+  # a link is never written through: what is missing is shown, to add by hand in the file it points to
+  if [[ -L "$f" ]]; then
+    NOW="listener.ora is a link to $(readlink -f -- "$f" 2>/dev/null || printf 'a missing file'). The script does not write through a link."$'\n'"  $f"
+    KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Edit the file the link points to. SID_LIST_$SB_LSNR must hold this entry:"$'\n'"$(sid_desc_block)"
+    ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
+    PLAN+=$'\n'"-- Then answer r."
+    return 1
+  fi
   if ! use_grid && ! lsnr_has_desc; then
     if [[ $st -eq 1 ]] && ! lsnr_has_sidlist; then
       # no Grid: the listener lives in the database home and must be defined completely
@@ -123,6 +172,7 @@ ORACLE_HOME (database home, not Grid):
       PLAN="Write this to listener.ora (owner $ORACLE_USER; a backup is kept):
 $(lsnr_desc_block)
 $(static_block)"
+      net_dir_note "$f"
       return 1
     fi
     if [[ $st -eq 0 ]]; then
@@ -130,6 +180,7 @@ $(static_block)"
       NOW="listener.ora has the static entry, but no address for the listener $SB_LSNR:"$'\n'"  $f"
       PLAN="Add this to listener.ora (a backup is kept):
 $(lsnr_desc_block)"
+      net_dir_note "$f"
       return 1
     fi
   fi
@@ -138,6 +189,7 @@ $(lsnr_desc_block)"
     NOW="listener.ora has no static entry for $STANDBY_SID:"$'\n'"  $f"
     PLAN="Add this to listener.ora (owner $(lsnr_user); a backup is kept):
 $(static_block)"
+    net_dir_note "$f"
     return 1
   fi
   # the block is there, without this SID: the entry is put inside it (one block of that name, written the usual
@@ -148,12 +200,38 @@ $(static_block)"
     PLAN="Add this entry inside SID_LIST_$SB_LSNR (owner $(lsnr_user); a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == insert_desc ]] && PLAN+=$'\n'"and this listener address:"$'\n'"$(lsnr_desc_block)"
+    net_dir_note "$f"
+    return 1
+  fi
+  # the entry of this SID is there but not right: it is replaced (one block, one entry of this SID, on lines of
+  # its own; a backup is kept). Other entries stay as they are.
+  if [[ $st -eq 2 ]] && sidlist_replace "$f" >/dev/null 2>&1; then
+    # an existing entry is changed: asked also with --yes (another database may have set it up)
+    L51_MODE=replace; YES_HOLD=1; ! use_grid && ! lsnr_has_desc && L51_MODE=replace_desc
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."$'\n'"  $f"
+    PLAN="Replace the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR with this (a backup is kept; the other entries stay):
+$(sid_desc_block)"
+    [[ "$L51_MODE" == replace_desc ]] && PLAN+=$'\n'"and add this listener address:"$'\n'"$(lsnr_desc_block)"
+    PLAN+=$'\n'"A running listener reads it at the next reload (step 5.2)."
+    net_dir_note "$f"
+    return 1
+  fi
+  # the wrong entry of this SID serves another service (the broker's _DGMGRL): it stays, the entry of
+  # $STANDBY_SERVICE is added next to it
+  local rr=0; [[ $st -eq 2 ]] && { sidlist_replace "$f" >/dev/null 2>&1 || rr=$?; }
+  if [[ $st -eq 2 && $rr -eq 3 ]] && sidlist_insert "$f" >/dev/null 2>&1; then
+    L51_MODE=insert; ! use_grid && ! lsnr_has_desc && L51_MODE=insert_desc
+    NOW="listener.ora has an entry for $STANDBY_SID, but for another service:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"  $f"
+    PLAN="Add this entry inside SID_LIST_$SB_LSNR (a backup is kept; the other entry stays, it may be used by the broker):
+$(sid_desc_block)"
+    [[ "$L51_MODE" == insert_desc ]] && PLAN+=$'\n'"and this listener address:"$'\n'"$(lsnr_desc_block)"
+    net_dir_note "$f"
     return 1
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
     NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
-    NOW+=$'\n'"The script only adds new entries; it does not change an existing one."$'\n'"Please correct this entry by hand."
+    NOW+=$'\n'"It is written in a form the script does not change (more than one entry or block, or other text"$'\n'"on its lines). Please correct this entry by hand."
   else
     NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID, written in a form the script does not change"$'\n'"(more than one such block, or its parentheses do not close). Please add the entry by hand."
   fi
@@ -168,22 +246,35 @@ $(sid_desc_block)"
   ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
   return 1
 }
+lsnr_reload_flag() { printf '%s/listener_reload_due' "$STATE_DIR"; }
+lsnr_changed() { install -d -m 700 "$STATE_DIR" 2>/dev/null; : > "$(lsnr_reload_flag)"; }
 d_5_1() {
   local f u txt; f=$(lsnr_file); u=$(lsnr_user)
   backup_file "$f" "$u" || return 1
+  # whatever is changed below, a running listener reads it only at a reload (step 5.2 does it): the flag is set
+  # only after the file was really changed (lsnr_changed)
   txt="# Added by dg_standby_setup.sh $RUN_ID"$'\n'
   case "$L51_MODE" in
     insert|insert_desc)
       local new; new=$(sidlist_insert "$f") || { bad "The entry could not be put into SID_LIST_$SB_LSNR of $f. Add it by hand."; return 1; }
       printf '%s\n' "$new" | write_as "$u" "$f" "$(stat -c '%a' -- "$f")" || return 1
+      lsnr_changed
       sid_desc_block | log_block "added inside SID_LIST_$SB_LSNR of $f"
       [[ "$L51_MODE" == insert ]] && return 0
+      txt+="$(lsnr_desc_block)" ;;
+    replace|replace_desc)
+      local new; new=$(sidlist_replace "$f") || { bad "The entry of $STANDBY_SID in SID_LIST_$SB_LSNR of $f could not be replaced. Correct it by hand."; return 1; }
+      printf '%s\n' "$new" | write_as "$u" "$f" "$(stat -c '%a' -- "$f")" || return 1
+      lsnr_changed
+      sid_desc_block | log_block "replaced the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR of $f"
+      [[ "$L51_MODE" == replace ]] && return 0
       txt+="$(lsnr_desc_block)" ;;
     both)   txt+="$(lsnr_desc_block)"$'\n'"$(static_block)" ;;
     desc)   txt+="$(lsnr_desc_block)" ;;
     *)      txt+="$(static_block)" ;;
   esac
   printf '%s\n' "$txt" | append_as "$u" "$f" || return 1
+  lsnr_changed
   printf '%s\n' "$txt" | log_block "added to $f"
 }
 
@@ -219,6 +310,13 @@ srvctl start listener -listener $SB_LSNR"
     fi
     return 1
   fi
+  # step 5.1 changed listener.ora while the listener ran: an old entry of this SID may still show, so the reload
+  # is due whatever the status says
+  if [[ -f "$(lsnr_reload_flag)" ]]; then
+    NOW="Step 5.1 changed listener.ora. The running listener $SB_LSNR still has the old entries."
+    PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
+    return 1
+  fi
   if grep -qF "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT"; then NOW="The listener shows Instance \"$STANDBY_SID\", status UNKNOWN (port $PORT)"; return 0; fi
   NOW="The listener does not show the static instance $STANDBY_SID yet"
   PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
@@ -226,10 +324,12 @@ srvctl start listener -listener $SB_LSNR"
 }
 L52_GRIDPORT=0
 d_5_2() {
-  [[ $L52_GRIDPORT -eq 1 ]] && { d_3_10; return; }
+  # the port change restarts the listener: it reads listener.ora then, no reload is due any more
+  [[ $L52_GRIDPORT -eq 1 ]] && { d_3_10 || return 1; rm -f -- "$(lsnr_reload_flag)"; return 0; }
   local a=reload; [[ $L52_START -eq 1 ]] && a=start
   run_logged "lsnrctl $a" as_lsnr timeout 120 "$(lsnr_home)/bin/lsnrctl" "$a" "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   [[ "$a" == "start" ]] && journal LSNRSTART "$SB_LSNR" "started from $(lsnr_home)"
+  rm -f -- "$(lsnr_reload_flag)"
   return 0
 }
 
@@ -241,7 +341,33 @@ tns_alias_present() {
   a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$1")
   grep -qiE "^[[:space:]]*$a[[:space:]]*=" "$f"
 }
+tns_replace() {
+  # $1 tnsnames.ora, $2 alias -> the file with the entry of that alias replaced by the right one (tns_block).
+  # 1 unless: exactly one entry starts with "<alias> =" on its own line, its parentheses close, and nothing
+  # else follows on the line where it ends. Comments inside it are kept above the new entry; other entries stay.
+  local a n; a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$2")
+  n=$(grep -ciE "^[[:space:]]*$a[[:space:]]*=" "$1"); [[ "$n" == 1 ]] || return 1
+  # the alias is compared as text (an awk pattern from -v would turn "\." into "any character")
+  DG_ALIAS="$2" awk -v blk="$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")" '
+    function cl(s) { t = s; sub(/#.*/, "", t); return t }
+    function name(s,   t) { t = cl(s); if (!index(t, "=")) return ""; t = substr(t, 1, index(t, "=") - 1); gsub(/[ \t\r]/, "", t); return toupper(t) }
+    !inb && !done && name($0) == toupper(ENVIRON["DG_ALIAS"]) { inb = 1; d = 0; opened = 0 }
+    inb {
+      code = cl($0); i = index($0, "#"); if (i) com = com substr($0, i) "\n"
+      for (j = 1; j <= length(code); j++) {
+        c = substr(code, j, 1)
+        if (c == "(") { d++; opened = 1 }
+        else if (c == ")") { d--; if (d < 0) bad = 1
+          if (d == 0 && opened) { if (substr(code, j + 1) !~ /^[[:space:]]*$/) bad = 1; inb = 0; done = 1; printf "%s", com; print blk; next } }
+      }
+      next
+    }
+    { print }
+    END { if (!done || bad) exit 1 }' "$1"
+}
+TNS_MODE=""
 c_tns() {
+  TNS_MODE=""
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
   local f; f=$(tns_file)
@@ -249,6 +375,15 @@ c_tns() {
   if tns_alias_present "$T_ALIAS" && run_logged "tnsping $T_ALIAS" as_oracle timeout 60 "$DB_HOME/bin/tnsping" "$T_ALIAS" 1 && grep -q '^OK' <<< "$RUN_OUT"; then
     if tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC"; then NOW="tnsping $T_ALIAS works ($T_HOST:$PORT/$T_SVC, UR=A)"; return 0; fi
     NOW="The alias $T_ALIAS exists but is different: $TNS_WHY"
+    # the right entry is known: the old one is replaced (a backup is kept) when it is written the usual way
+    if [[ ! -L "$f" ]] && tns_replace "$f" "$T_ALIAS" >/dev/null 2>&1; then
+      # an existing entry is changed: asked also with --yes (another database of this home may use the alias)
+      TNS_MODE=replace; YES_HOLD=1
+      PLAN="Replace the entry $T_ALIAS in tnsnames.ora with this (a backup is kept; other entries stay):
+$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+      net_dir_note "$f"
+      return 1
+    fi
     KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
     PLAN="-- Edit this file:
 --   $f
@@ -269,6 +404,15 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
           NOW+=$'\n'"The listener on $T_HOST is not running. Check $LISTENER_NAME on the primary (port $PORT)."; return 2
         fi ;;
     esac
+    # the entry itself is wrong (tnsping read it, "Attempting to contact ..."): replaced as when tnsping works
+    if grep -qi 'Attempting to contact' <<< "$RUN_OUT" && ! tns_desc_ok "$RUN_OUT" "$T_HOST" "$T_SVC" && [[ ! -L "$f" ]] && tns_replace "$f" "$T_ALIAS" >/dev/null 2>&1; then
+      NOW="The alias $T_ALIAS exists but is different: $TNS_WHY"
+      TNS_MODE=replace; YES_HOLD=1
+      PLAN="Replace the entry $T_ALIAS in tnsnames.ora with this (a backup is kept; other entries stay):
+$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+      net_dir_note "$f"
+      return 1
+    fi
     NOW="The alias $T_ALIAS is in tnsnames.ora, but tnsping fails: $(grep -E 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
     KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
     PLAN="-- Edit this file:
@@ -278,13 +422,27 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     return 1
   fi
   NOW="The alias $T_ALIAS is missing from tnsnames.ora:"$'\n'"  $f"
+  if [[ -L "$f" ]]; then
+    NOW+=$'\n'"tnsnames.ora is a link to $(readlink -f -- "$f" 2>/dev/null || printf 'a missing file'). The script does not write through a link."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
+    PLAN="-- Add this to the file the link points to, then answer r:
+$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    return 1
+  fi
   PLAN="Add this to tnsnames.ora (a backup is kept):
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+  net_dir_note "$f"
   return 1
 }
 d_tns() {
   local f; f=$(tns_file)
   backup_file "$f" "$ORACLE_USER" || return 1
+  if [[ "$TNS_MODE" == replace ]]; then
+    local new; new=$(tns_replace "$f" "$T_ALIAS") || { bad "The entry $T_ALIAS in $f could not be replaced. Correct it by hand."; return 1; }
+    printf '%s\n' "$new" | write_as "$ORACLE_USER" "$f" "$(stat -c '%a' -- "$f")" || return 1
+    tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | log_block "replaced the entry $T_ALIAS in $f"
+    return 0
+  fi
   tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | append_as "$ORACLE_USER" "$f" || return 1
   tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | log_block "added to $f"
 }
@@ -329,7 +487,9 @@ c_6_1() {
   if prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
   fi
   if [[ -z "$pfile" || "$pfile" == "-" ]]; then
-    if prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && [[ "$(head -n 1 <<< "$RUN_OUT")" == "YES" ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
+    local pex=""; prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && pex=$(head -n 1 <<< "$RUN_OUT")
+    if [[ "$pex" == YES ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
+    elif [[ "$pex" != NO ]]; then NOW="Cannot tell whether $DB_HOME/dbs/orapw$PRIMARY_SID is on the primary (no answer$([[ $PROBE_TIMED_OUT -eq 1 ]] && printf ' in time'))."$'\n'"Answer r to check again."; return 2
     else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
   fi
   [[ "$pfile" =~ ^\+[A-Za-z0-9_./+-]+$ || "$pfile" =~ ^/[A-Za-z0-9_./-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
@@ -340,6 +500,11 @@ c_6_1() {
     local sx=0; prim_probe statx "$t" || sx=1
     # no answer in time: whether a copy is there is not known (never taken as "no copy")
     [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="The primary did not answer in time, so it is not known whether $t is there. Answer r to check again."; return 2; }
+    # stat failed for another reason: only a clear "not there" means no copy yet
+    if [[ $sx -ne 0 ]]; then
+      local ex=""; prim_probe exists "$t" && ex=$(head -n 1 <<< "$RUN_OUT")
+      [[ "$ex" == NO ]] || { NOW="Cannot tell whether the temporary copy $t is on the primary (stat failed${ex:+, the file is there})."$'\n'"The ssh user $PRIMARY_SSH_USER must be able to read /tmp there. Answer r to check again."; return 2; }
+    fi
     if [[ $sx -eq 0 && -n "$(head -n 1 <<< "$RUN_OUT")" ]]; then
       IFS='|' read -r towner tg tmode ttype tm <<< "$(head -n 1 <<< "$RUN_OUT")"
       if [[ "$ttype" != "regular file" || ( "$towner" != "$GRID_USER" && "$towner" != "$ORACLE_USER" ) || ! "$tmode" =~ ^[0-7]+$ || $(( 8#$tmode & 8#027 )) -ne 0 ]]; then
@@ -474,16 +639,24 @@ tde_autologin_missing() {
 }
 sqlnet_wallet_replaced() {
   # $1 sqlnet.ora, $2 wallet folder -> the file with its ENCRYPTION_WALLET_LOCATION entry (one or more lines,
-  # up to its last closing parenthesis) replaced by one line for $2. 1 when there is not exactly one entry.
+  # up to the parenthesis that closes it) replaced by one line for $2. Comments on the old lines are kept, as
+  # comment lines just above it. 1 when there is not exactly one entry, it does not close, or other text follows
+  # its closing parenthesis on that line (another parameter would be lost).
   awk -v dir="$2" '
-    function cnt(s, re,   t) { t = s; sub(/#.*/, "", t); return gsub(re, "", t) }
+    function keepc(s,   i) { i = index(s, "#"); if (i) com = com substr(s, i) "\n" }
+    function emit() { printf "%s", com; com = ""; print "ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = " dir ")))" }
+    # walks the code of one line of the entry; 1 when the entry closed on it
+    function scan(s,   k, ch) { for (k = 1; k <= length(s); k++) { ch = substr(s, k, 1)
+        if (ch == "(") { dd++; op = 1 }
+        else if (ch == ")") { dd--; if (dd < 0) bad = 1; if (dd == 0 && op) { if (substr(s, k + 1) !~ /^[[:space:]]*$/) bad = 1; return 1 } } }
+      return 0 }
     !ine && toupper($0) ~ /^[[:space:]]*ENCRYPTION_WALLET_LOCATION/ {
-      c0 = $0; sub(/#.*/, "", c0)
-      found++; depth = cnt($0, "[(]") - cnt($0, "[)]"); ine = (depth > 0 || c0 !~ /[)]/)
-      print "ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = " dir ")))"; next }
-    ine { c0 = $0; sub(/#.*/, "", c0); depth += cnt($0, "[(]") - cnt($0, "[)]"); if (depth <= 0 && c0 ~ /[)]/) ine = 0; next }
+      c0 = $0; sub(/#.*/, "", c0); keepc($0); found++; dd = 0; op = 0
+      if (scan(c0)) emit(); else ine = 1
+      next }
+    ine { c0 = $0; sub(/#.*/, "", c0); keepc($0); if (scan(c0)) { ine = 0; emit() }; next }
     { print }
-    END { if (found != 1 || ine) exit 1 }' "$1"
+    END { if (found != 1 || ine || bad) exit 1 }' "$1"
 }
 sqlnet_has_wallet() {
   # the same folder with or without a final / counts
@@ -500,7 +673,21 @@ c_6_3() {
   local -a dirs=(); local d f; mapfile -t dirs < <(tde_dirs)
   [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   # 18c+: the password for "IDENTIFIED BY EXTERNAL STORE" is in WALLET_ROOT/tde_seps
-  [[ -n "$WALLET_ROOT" ]] && need_ssh && prim_probe lsdir "$WALLET_ROOT/tde_seps" && grep -qx 'cwallet.sso' <<< "$RUN_OUT" && dirs+=("$WALLET_ROOT/tde_seps")
+  # (a folder that cannot be read is not left out silently: the password in it would be missing here)
+  if [[ -n "$WALLET_ROOT" ]] && need_ssh; then
+    local sx=""; prim_probe exists "$WALLET_ROOT/tde_seps" && sx=$(head -n 1 <<< "$RUN_OUT")
+    [[ "$sx" == YES || "$sx" == NO ]] || { NOW="Cannot tell whether $WALLET_ROOT/tde_seps exists on the primary (no answer)."; return 2; }
+    # "not there" counts only when the ssh user can look into WALLET_ROOT (else test -e says no for anything)
+    if [[ "$sx" == NO ]]; then
+      local cl=""; prim_probe canlook "$WALLET_ROOT" && cl=$(head -n 1 <<< "$RUN_OUT")
+      [[ "$cl" == YES ]] || { NOW="Cannot tell whether $WALLET_ROOT/tde_seps exists on the primary: the ssh user $PRIMARY_SSH_USER cannot look into $WALLET_ROOT."; return 2; }
+    fi
+    if [[ "$sx" == YES ]]; then
+      prim_probe lsdir "$WALLET_ROOT/tde_seps" || { NOW="Cannot list $WALLET_ROOT/tde_seps on the primary. The ssh user must be able to read it."; return 2; }
+      if grep -qx 'cwallet.sso' <<< "$RUN_OUT"; then dirs+=("$WALLET_ROOT/tde_seps")
+      elif grep -q '[^[:space:]]' <<< "$RUN_OUT"; then warn "$WALLET_ROOT/tde_seps on the primary has no cwallet.sso. It is not copied."; fi
+    fi
+  fi
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   for d in "${dirs[@]}"; do
     [[ "$d" == /* ]] && v_path "$d" || { NOW="The TDE wallet is at $d, in ASM or at an unusual path"; PLAN="Copy the wallet files by hand to the same location for the standby, for example with asmcmd cp."; return 2; }
@@ -546,6 +733,15 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
         return 1
       else
         TDE_SQLNET=1
+      fi
+      # a link is never written through: found now, not after the wallet files are copied
+      if [[ $TDE_SQLNET -ne 0 && -L "$(sqlnet_file)" ]]; then
+        NOW="sqlnet.ora is a link to $(readlink -f -- "$(sqlnet_file)" 2>/dev/null || printf 'a missing file'). The script does not write through a link."$'\n'"  $(sqlnet_file)"
+        KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"; TDE_SQLNET=0
+        PLAN="-- In the file the link points to, the wallet entry must be (one entry only):
+ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))
+-- Then answer r."
+        return 1
       fi
     fi
   fi
@@ -635,6 +831,16 @@ tde_make_autologin() {
     out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
     out=${out//"$pw"/*****}
     printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
+    # a folder whose keystore has another password (a PDB keystore in isolated mode): asked once more, for it only
+    # only a wrong password (PKI-02002 / "incorrect"), not a missing or unreadable wallet, earns a second question
+    if [[ ! -f "$d/cwallet.sso" ]] && runuser -u "$ORACLE_USER" -- test -r "$d/ewallet.p12" && grep -qiE 'PKI-02002|incorrect' <<< "$out" && ! grep -qiE 'PKI-0200[3-9]|not found|no such|permission' <<< "$out"; then
+      warn "The password did not open the keystore in $d. It may have its own password."
+      ask_secret "TDE keystore password for $d only"
+      local pw2=$SECRET; SECRET=""
+      out=$(printf '%s\n' "$pw2" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
+      out=${out//"$pw2"/*****}; out=${out//"$pw"/*****}; pw2=""
+      printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt (its own password)"
+    fi
     if [[ -f "$d/cwallet.sso" ]]; then
       say "Made $d/cwallet.sso"; journal_file_written "$d/cwallet.sso" 0
     else

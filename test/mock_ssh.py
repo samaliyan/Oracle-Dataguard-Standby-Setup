@@ -93,7 +93,8 @@ def remote(cmd, stdin_data):
     m = re.fullmatch(r"sh -c 'timeout 120 test -e (\S+); r=\$\?; \[ \$r -eq 0 \] && echo YES; \[ \$r -eq 1 \] && echo NO; true'", cmd)
     if m:
         f = m.group(1)
-        print("YES" if (f in files() or any(f.startswith(d.rstrip("/") + "/") for d in P.get("shared_dirs", [])) and os.path.exists(f)) else "NO"); return 0
+        if f in P.get("exists_fail", []): return 255
+        print("YES" if (f in files() or f in P.get("lsdir", {}) or any(f.startswith(d.rstrip("/") + "/") for d in P.get("shared_dirs", [])) and os.path.exists(f)) else "NO"); return 0
     m = re.fullmatch(r"sh -c 'timeout 120 test -d (\S+) -a -x (\S+); r=\$\?; \[ \$r -eq 0 \] && echo YES; \[ \$r -eq 1 \] && echo NO; true'", cmd)
     if m:
         print("YES" if m.group(1) in P.get("canlook_yes", []) else P.get("canlook", "YES")); return 0
@@ -126,6 +127,7 @@ def remote(cmd, stdin_data):
     if m:
         import time
         f = m.group(1); t = int(time.time())
+        if f in P.get("stat_fail", []): print(f"stat: cannot stat '{f}': Permission denied", file=sys.stderr); return 1
         lh = P.get("listener_home", P["grid_home"] if grid else P["db_home"])
         if f == P["db_home"] + "/bin/oracle": print(f"{P.get('db_bin_owner', 'oracle')}|oinstall|{P.get('db_bin_mode', '6751')}|regular file|{t}"); return 0
         if grid and f == P["grid_home"] + "/bin/oracle": print(f"{'oracle' if P.get('single_owner') else 'grid'}|oinstall|6751|regular file|{t}"); return 0

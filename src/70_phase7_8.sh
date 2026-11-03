@@ -38,13 +38,19 @@ standby_complete() {
   SC_INFO=""
   local_state
   if [[ "$LSTATE" != "MOUNTED" && "$LSTATE" != "OPEN" ]]; then
-    [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]] && return 0
+    if [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]]; then
+      # only the record: the files are checked when the standby is mounted (step 9.2 mounts it)
+      SC_INFO="Recorded as built, not checked now: the standby is not mounted. Its files are checked when it is mounted."
+      return 0
+    fi
     SC_INFO="the standby is not mounted and no finished copy is recorded"; return 1
   fi
-  [[ "$(marker_kind)" == "duplicate" ]] && return 0
-  if [[ "$(marker_kind)" == "seen" ]]; then
-    if sql_local "select count(*) from v\$datafile_header where error is not null;" && [[ "$(first_line)" != "0" ]]; then
-      warn "The standby was complete before, but now $(first_line) datafile header(s) show an error."$'\n'"Usually a datafile was added on the primary, or a file is OFFLINE."
+  if [[ "$(marker_kind)" == "duplicate" || "$(marker_kind)" == "seen" ]]; then
+    # verified before: header errors now are reported, never treated as a failed copy
+    if ! sql_local "select count(*) from v\$datafile_header where error is not null;" || ! num "$(first_line)"; then
+      SC_INFO="the datafile headers of the standby cannot be read now ($(ora_errors "$SQL_OUT"))"; return 2
+    elif [[ "$(first_line)" != "0" ]]; then
+      warn "The standby was complete before, but now $(first_line) datafile header(s) show an error."$'\n'"Usually a datafile was added on the primary, a file is OFFLINE, or a file was removed."
       say "To see them:  select file#, error from v\$datafile_header where error is not null;"
       say "To build the standby again, see the help of step 8.2."
       say "Remove files only if step 2.15 proved that the storage is not shared."
@@ -140,11 +146,11 @@ leftover_cleanup_plan() {
 DETECT_RC=0
 detect_built() {
   # sets STANDBY_BUILT (used by phases 7-10); DETECT_RC 2 = cannot tell (SC_INFO)
-  STANDBY_BUILT=0; DETECT_RC=0
+  STANDBY_BUILT=0; DETECT_RC=0; SC_INFO=""
   local_state
   if [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]]; then
     sql_local "select database_role from v\$database;" || { DETECT_RC=2; SC_INFO="cannot read the role ($(ora_errors "$SQL_OUT"))"; return 0; }
-    [[ "$(first_line)" == "PHYSICAL STANDBY" ]] || return 0
+    [[ "$(first_line)" == "PHYSICAL STANDBY" ]] || { SC_INFO="the database here is $LSTATE with role $(first_line), not a physical standby"; return 0; }
   fi
   local rc=0; standby_complete || rc=$?
   [[ $rc -eq 0 ]] && STANDBY_BUILT=1
@@ -154,9 +160,23 @@ detect_built() {
 
 # ---- 7.1 ----
 adump_dir() { printf '%s/admin/%s/adump' "$ORACLE_BASE" "$STANDBY_UNIQUE"; }
+spfile_audit_dest() {
+  # audit_file_dest in the spfile of a standby that exists already (a copy made before, not by step 8.2 of this
+  # script, may keep the primary's own folder): empty when there is no spfile or no such line
+  local f v; f=$(spfile_path); [[ -f "$f" ]] || return 0
+  v=$(grep -a -o -iE "^[*A-Za-z0-9_]*\.audit_file_dest='[^']+'" "$f" 2>/dev/null | tail -n 1 | sed "s/^[^']*'//; s/'\$//")
+  v=${v%/}
+  if [[ "$v" == /* ]] && v_path "$v"; then printf '%s' "$v"
+  elif [[ -n "$v" ]]; then warn "The spfile of the standby sets audit_file_dest to an unusual path ($v). The script does not use it; check it by hand." >&2; fi
+  return 0
+}
 inst_dirs() {
   # folders the instance needs at startup (same paths as on primary)
   adump_dir; printf '\n'
+  # (only under ORACLE_BASE: a folder elsewhere, read from a file the oracle user owns, is not made by root)
+  local a obr; a=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
+  [[ -n "$a" && ! ( -L "$a" && ! -e "$a" ) ]] && a=$(readlink -m -- "$a" 2>/dev/null || printf '%s' "$a")
+  [[ -n "$a" && "$a" != "$(readlink -m -- "$(adump_dir)" 2>/dev/null)" && "$a" == "$obr"/* ]] && printf '%s\n' "$a"
   [[ -n "$DIAG_DEST" ]] && printf '%s\n' "$DIAG_DEST"
   return 0
 }
@@ -168,10 +188,38 @@ c_7_1() {
     [[ -n "$d" ]] || continue
     if [[ -d "$d" ]] && runuser -u "$ORACLE_USER" -- test -w "$d"; then have+="  $d"$'\n'; else I71+=("$d"); fi
   done < <(inst_dirs)
+  # an audit folder outside ORACLE_BASE (read from the spfile, a file the oracle user owns) is not created by
+  # root: it is a step to do by hand, never passed with a warning (the instance does not start without it)
+  local sa out="" obr broken=""; sa=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
+  # a link that points nowhere: said as such (resolved, it would look like a folder to make)
+  [[ -n "$sa" && -L "$sa" && ! -e "$sa" ]] && broken=$sa
+  # the real place (a folder above may be a link, also one the oracle user made): judged and shown resolved,
+  # against the resolved ORACLE_BASE; under it, it is in the list above (inst_dirs) and made there
+  [[ -n "$sa" ]] && sa=$(readlink -m -- "$sa" 2>/dev/null || printf '%s' "$sa")
+  if [[ -n "$broken" ]]; then out=$broken
+  elif [[ -n "$sa" && "$sa" != "$obr"/* ]] && ! { [[ -d "$sa" ]] && runuser -u "$ORACLE_USER" -- test -w "$sa"; }; then out=$sa; fi
+  if [[ ${#I71[@]} -eq 0 && -n "$out" ]]; then
+    NOW="The spfile of the standby sets audit_file_dest to $out (outside $ORACLE_BASE)."$'\n'"It is missing or not writable by $ORACLE_USER. The instance does not start without it."
+    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    # the path comes from a file the oracle user can change: no chown is suggested for a folder that exists, and a
+    # system folder is never offered to that user
+    case "$out" in /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/tmp|/tmp/*|/home|/home/*|/srv|/srv/*|/opt|/run|/run/*)
+        PLAN="-- $out is a system folder: it must not be the audit folder of the database."$'\n'"-- Change audit_file_dest in the spfile of $STANDBY_SID to a folder under $ORACLE_BASE (for example"$'\n'"-- $(adump_dir)), then answer r." ;;
+      *) if [[ -n "$broken" || -e "$out" || -L "$out" ]] && [[ ! -d "$out" ]]; then
+           PLAN="-- $out is there, but it is not a folder (a file or a broken link). Check what it is:  ls -l $out"$'\n'"-- Change audit_file_dest in the spfile to a folder under $ORACLE_BASE. Then answer r."
+         elif [[ -e "$out" ]]; then
+           PLAN="-- $out exists, but $ORACLE_USER cannot write to it. Check who owns it and why:  ls -ld $out"$'\n'"-- Give $ORACLE_USER write access only if the folder is meant for this database,"$'\n'"-- or change audit_file_dest in the spfile. Then answer r."
+         else
+           PLAN="-- The script does not create a folder outside $ORACLE_BASE that comes from the spfile."$'\n'"mkdir -p $out"$'\n'"chown $ORACLE_USER:$INSTALL_GROUP $out"$'\n'"-- (or change audit_file_dest in the spfile). Then answer r."
+         fi ;;
+    esac
+    return 1
+  fi
   if [[ ${#I71[@]} -eq 0 ]]; then NOW="The folders exist:"$'\n'"${have%$'\n'}"; return 0; fi
   I71_TODO=("${I71[@]}")
   NOW="Missing, or not writable by $ORACLE_USER:"$'\n'"$(printf '  %s\n' "${I71[@]}")"
-  PLAN="Create them with owner $ORACLE_USER:$INSTALL_GROUP"$'\n'"The audit folder is the one the standby uses (the copy in step 8.2 sets audit_file_dest to it);"$'\n'"the diagnostic folder is diagnostic_dest of the primary."
+  [[ -n "$out" ]] && NOW+=$'\n'"Also $out (audit_file_dest of the spfile, outside $ORACLE_BASE): the check after this action shows how to make it."
+  PLAN="Create them with owner $ORACLE_USER:$INSTALL_GROUP"$'\n'"The audit folder is the one the standby uses (the copy in step 8.2 sets audit_file_dest to it;"$'\n'"a standby that exists already uses the audit_file_dest of its spfile, also checked);"$'\n'"the diagnostic folder is diagnostic_dest of the primary."
   return 1
 }
 d_7_1() {
@@ -206,29 +254,35 @@ c_7_7() {
   oratab_link_plan
   return 1
 }
+oratab_file() {
+  # the file to write: /etc/oratab, or the file a safe link points to (empty: a link that is not safe)
+  if [[ -L /etc/oratab ]]; then safe_link_target /etc/oratab || true; else printf '/etc/oratab'; fi
+}
 oratab_link_plan() {
-  # a link is never written through by the script (it could point anywhere): the line is set by hand
+  # a link is written through only when it is safe (safe_link_target); else the line is set by hand
   [[ -L /etc/oratab ]] || return 0
   local t; t=$(readlink -f /etc/oratab 2>/dev/null)
-  NOW+=$'\n'"/etc/oratab is a link to ${t:-a missing file}. The script does not write through a link."
+  if [[ -n "$(oratab_file)" ]]; then NOW+=$'\n'"/etc/oratab is a link to $t (owned by root, in folders only root can change): that file is changed."; return 0; fi
+  NOW+=$'\n'"/etc/oratab is a link to ${t:-a missing file}. The script does not write through it:"$'\n'"the link or a folder above the file can be changed by a user other than root, or the file is missing."
   PLAN="-- Edit the file the link points to:  ${t:-/etc/oratab}"$'\n'"-- The line for $STANDBY_SID must be:"$'\n'"$STANDBY_SID:$DB_HOME:${yn:-N}"$'\n'"-- Then answer r."
   KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
 }
 d_7_7() {
-  local new=0; [[ -f /etc/oratab ]] || new=1
-  backup_file /etc/oratab || return 1
-  if [[ $new -eq 0 && ! -L /etc/oratab ]] && grep -qE "^${STANDBY_SID}:" /etc/oratab; then
+  local f; f=$(oratab_file); [[ -n "$f" ]] || { bad "/etc/oratab is a link that is not safe to write through."; return 1; }
+  local new=0; [[ -f "$f" ]] || new=1
+  backup_file "$f" || return 1
+  if [[ $new -eq 0 ]] && grep -qE "^${STANDBY_SID}:" "$f"; then
     # only the line of this SID changes (its Y/N stays); written in place, so owner, mode and label stay
     local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-    awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' /etc/oratab > "$tmp" || return 1
-    cat -- "$tmp" > /etc/oratab || { [[ -f "/etc/oratab.bak_$RUN_ID" ]] && cat -- "/etc/oratab.bak_$RUN_ID" > /etc/oratab; bad "/etc/oratab could not be written. The old content was put back."; return 1; }
+    awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' "$f" > "$tmp" || return 1
+    cat -- "$tmp" > "$f" || { [[ -f "$f.bak_$RUN_ID" ]] && cat -- "$f.bak_$RUN_ID" > "$f"; bad "$f could not be written. The old content was put back."; return 1; }
     rm -f -- "$tmp"
-    journal_file_written /etc/oratab 1
+    journal_file_written "$f" 1
     return 0
   fi
-  printf '%s:%s:N' "$STANDBY_SID" "$DB_HOME" | append_as root /etc/oratab || return 1
+  printf '%s:%s:N' "$STANDBY_SID" "$DB_HOME" | append_as root "$f" || return 1
   # a new file gets the usual owner; an existing one (Grid makes it) keeps its owner
-  [[ $new -eq 1 ]] && { chown root:"$INSTALL_GROUP" /etc/oratab; chmod 664 /etc/oratab; }
+  [[ $new -eq 1 ]] && { chown root:"$INSTALL_GROUP" "$f"; chmod 664 "$f"; }
   return 0
 }
 
@@ -305,7 +359,7 @@ touch $STATE_DIR/existing_files_ok"
     IDLE)
       if [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]]; then
         STANDBY_BUILT=1
-        NOW="The standby database exists (the copy finished). Step 9.2 starts it."
+        NOW="The standby database exists (the copy finished). Step 9.2 starts it."$'\n'"Recorded as built, not checked now: its files are checked when it is mounted."
         return 0
       fi
       # files of a copy that was interrupted (reboot, kill): they are named, never removed by the script
@@ -894,6 +948,7 @@ c_8_1() {
   detect_built
   [[ $STANDBY_BUILT -eq 1 ]] || need_sys || return 2
   [[ $STANDBY_BUILT -eq 1 ]] && { NOW="The standby database already exists. No copy is needed."; return 0; }
+  [[ $DETECT_RC -eq 2 ]] && { NOW="Cannot tell whether the standby here is complete: $SC_INFO"; return 2; }
   if dup_prechecks; then NOW=$PRE_INFO; return 0; fi
   NOW=$PRE_FIX
   [[ "$PRE_FIX" == *"(step "* ]] && return 2          # an earlier step is not done yet
@@ -946,7 +1001,10 @@ c_8_2() {
   need_ssh || return 2
   detect_built
   [[ $STANDBY_BUILT -eq 1 ]] || need_sys || return 2
-  [[ $STANDBY_BUILT -eq 1 ]] && { NOW="The standby database exists (the copy finished)"; return 0; }
+  [[ $STANDBY_BUILT -eq 1 ]] && { NOW="The standby database exists (the copy finished)"; [[ -n "$SC_INFO" ]] && NOW+=$'\n'"$SC_INFO"; return 0; }
+  # it cannot be told (headers unreadable), or it is no standby at all: never called a failed copy
+  [[ $DETECT_RC -eq 2 ]] && { NOW="Cannot tell whether the standby here is complete: $SC_INFO"; return 2; }
+  if [[ "$SC_INFO" == *"not a physical standby"* ]]; then NOW="Not copied: $SC_INFO. Nothing here is changed."; return 2; fi
   if [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]]; then
     NOW="A failed or unfinished copy is on this server: $SC_INFO."$'\n'"Clean it up first. Run  $SELF --from 7.2  (step 7.2 shows the commands)."
     return 2
@@ -995,7 +1053,7 @@ d_8_2() {
   if dup_log_ok "$rlog" "$rc"; then
     # "Finished" in the RMAN output is not the whole proof: the standby itself is looked at first. Only a
     # verified copy gets the "duplicate" marker (otherwise later steps would take the standby as built)
-    local vr=0; dup_verify || vr=$?
+    local vr=0; dup_verify "$rlog" || vr=$?
     [[ $vr -eq 1 ]] && return 1
     if [[ $vr -eq 2 ]]; then
       # recorded as a finished copy that is not checked yet: the next look at the mounted standby compares it
@@ -1027,9 +1085,12 @@ DUP_VERIFIED=""
 dup_verify() {
   # right after the duplicate: mounted, a physical standby, no datafile header error, the datafiles of the primary.
   # 0 = checked; 1 = something is wrong (said why; nothing is removed); 2 = it could not be checked now
+  # $1 the RMAN log of the copy (named in the hints)
+  local rl=${1:-the RMAN log}
   DUP_VERIFIED=""
   local_state
-  [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { bad "RMAN reported success, but the standby is not mounted ($LSTATE)."; printf 'See the alert log of %s and:  %s\n' "$STANDBY_SID" "$rlog" | hint; return 1; }
+  [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { bad "RMAN reported success, but the standby is not mounted ($LSTATE)."; printf 'See the alert log of %s and:  %s\n' "$STANDBY_SID" "$rl" | hint; return 1; }
+  adg_note "$LSTATE"
   sql_local "select database_role from v\$database;" || { warn "The new standby could not be read after the copy ($(ora_errors "$SQL_OUT"))."; return 2; }
   [[ "$(first_line)" == "PHYSICAL STANDBY" ]] || { bad "RMAN reported success, but the database role is $(first_line), not PHYSICAL STANDBY."; return 1; }
   local sc se pc

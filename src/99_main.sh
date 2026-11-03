@@ -372,6 +372,7 @@ main() {
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
+  [[ $FAST_WAITS -eq 1 ]] && _log WARN "DG_TEST_FAST_WAITS=1 is set: every wait is 0.2 seconds (a setting for the test suite)"
 
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
   printf '  %s\n' "$(rule 70)"

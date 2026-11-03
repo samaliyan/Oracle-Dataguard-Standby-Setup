@@ -149,8 +149,10 @@ undo_text() {
     DISKGROUP)  printf 'by hand, this destroys all data in it: as %s  export ORACLE_HOME=%s ORACLE_SID=+ASM ; $ORACLE_HOME/bin/sqlplus / as sysasm  ->  drop diskgroup %s including contents;' "$GRID_USER" "$GRID_HOME" "$obj" ;;
     ROOHCTL)    printf 'nothing: the home %s was made read/write (roohctl -disable). roohctl -enable makes it read-only again.' "$obj" ;;
     LSNRRES)    printf 'auto: srvctl stop listener -listener %s ; srvctl remove listener -listener %s   (as %s)' "$obj" "$obj" "$GRID_USER" ;;
-    LSNRPORT)   printf 'auto: srvctl modify listener -listener %s -endpoints TCP:%s ; then stop and start the listener (the old port)' "$obj" "$(detail_field "$det" old)" ;;
-    LSNRSTART)  printf 'auto: lsnrctl stop %s   (as %s)' "$obj" "$(lsnr_user 2>/dev/null || printf '%s' "$ORACLE_USER")" ;;
+    LSNRPORT)   if [[ "$(detail_field "$det" old)" =~ ^[0-9]+$ ]]; then printf 'auto: srvctl modify listener -listener %s -endpoints TCP:%s ; then stop and start the listener (the old port)' "$obj" "$(detail_field "$det" old)"
+                else printf 'by hand (the old port could not be read): srvctl modify listener -listener %s -endpoints TCP:<old port> ; then stop and start the listener' "$obj"; fi ;;
+    LSNRSTART)  if [[ "$(detail_field "$det" via)" == srvctl ]]; then printf 'auto: srvctl stop listener -listener %s   (as %s)' "$obj" "${GRID_USER:-grid}"
+                else printf 'auto: lsnrctl stop %s   (as %s)' "$obj" "$(lsnr_user 2>/dev/null || printf '%s' "$ORACLE_USER")"; fi ;;
     INSTANCE)   printf 'auto: shut down the instance %s (srvctl stop database if it is registered, else shutdown immediate)' "$obj" ;;
     DUPLICATE)  printf 'by hand: shutdown abort, then remove the files of %s on this server only, NEVER those of the primary. Details:  %s --help-step 8.2' "$obj" "$SELF" ;;
     DUPLICATE_DONE) printf 'nothing separate: the copied standby %s goes with the DUPLICATE line' "$obj" ;;
@@ -163,11 +165,16 @@ undo_text() {
     SHM)        b=$(detail_field "$det" old)
                 if [[ -n "$b" && "$b" != "-" ]]; then printf 'by hand, usually not wanted: mount -o remount,size=%s /dev/shm   (the fstab line has its own backup)' "$b"
                 else printf 'by hand, usually not wanted: the old size of /dev/shm is not known; the fstab line has its own backup'; fi ;;
-    SRVOPT)     local so oh op; so=$(detail_field "$det" old | tr '_' ' '); oh=$(detail_field "$det" oldhome); op=$(detail_field "$det" oldpw)
+    SRVOPT)     local so oh op odg odm; so=$(detail_field "$det" old | tr '_' ' '); oh=$(detail_field "$det" oldhome); op=$(detail_field "$det" oldpw)
+                odg=$(detail_field "$det" olddg); odm=$(detail_field "$det" olddom)
                 printf 'by hand, usually not wanted: srvctl modify database -db %s' "$obj"
                 [[ -n "$so" ]] && { [[ "$so" == unknown ]] && printf ' -startoption <the old option>' || printf ' -startoption "%s"' "$so"; }
                 [[ -n "$oh" && "$oh" != "-" ]] && printf ' -oraclehome %s' "$oh"
                 [[ -n "$op" && "$op" != "-" ]] && printf ' -pwfile %s' "$op"
+                [[ -n "$odg" && "$odg" != "-" ]] && printf ' -diskgroup %s' "$odg"
+                [[ -n "$odm" && "$odm" != "-" ]] && printf ' -domain %s' "$odm"
+                [[ "$odg" == "-" ]] && printf '   (there were no disk groups in the registration: remove the added ones by hand)'
+                [[ "$odm" == "-" ]] && printf "   (there was no domain in the registration: -domain '')"
                 [[ "$op" == "-" ]] && printf '   (there was no password file in the registration)'
                 true ;;
     SRVCTL_OLD) b=$(detail_field "$det" file)
@@ -403,6 +410,12 @@ firewall-cmd --zone=${obj%%:*} --remove-port=${obj#*:}" ;;
       run_logged "srvctl start listener" as_grid "$GRID_HOME/bin/srvctl" start listener -listener "$obj" || true
       say "Listener $obj is back on port $old."; return 0 ;;
     LSNRSTART)
+      if [[ "$(detail_field "$det" via)" == srvctl ]]; then
+        # an Oracle Restart listener is stopped through Oracle Restart (lsnrctl would leave the resource behind)
+        if run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$obj"; then say "Listener $obj stopped."; return 0; fi
+        grep -qE 'PRCC-1016|PRCR-1005|not running' <<< "$RUN_OUT" && { say "Listener $obj was not running."; return 0; }
+        bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1
+      fi
       if run_logged "lsnrctl stop" as_lsnr timeout 120 "$(lsnr_home)/bin/lsnrctl" stop "$obj"; then say "Listener $obj stopped."; return 0; fi
       grep -qE 'TNS-12541|TNS-12560|TNS-00511|No listener' <<< "$RUN_OUT" && { say "Listener $obj was not running."; return 0; }
       bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1 ;;

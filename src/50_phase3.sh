@@ -148,19 +148,57 @@ media_matches() {
 media_is_staged() { local k; k=$(media_kind "${1%%,*}"); [[ "$k" == *_staged ]]; }
 
 # ---- 3.1 installer files ----
+media_room() {
+  # $1 Grid media, $2 database media (comma lists; empty = not unpacked now) -> 1 (NOW/PLAN set) when a file
+  # system has not about 2.5 times the size of the zips free. They are unpacked into the home (image) or the
+  # stage folder (staged 12.x media). A home that already holds files (an unzip that stopped) is not counted:
+  # step 3.2 / 3.6 deal with it.
+  local -A need_mnt=(); local x fl dest zmb mnt short="" unread="" f
+  for x in grid db; do
+    if [[ $x == grid ]]; then fl=$1; dest=$GRID_HOME; else fl=$2; dest=$DB_HOME; fi
+    [[ -n "$fl" ]] || continue
+    local -a mfl=(); IFS=',' read -ra mfl <<< "$fl"
+    for f in "${mfl[@]}"; do [[ -r "$f" ]] || unread+="  $f"$'\n'; done
+    zmb=$(for f in "${mfl[@]}"; do stat -c '%s' -- "$f" 2>/dev/null; done | awk '{s += $1} END {printf "%d", s / 1048576}')
+    # staged media (12.x): unpacked into the stage folder, then installed into the home: both count
+    local dd; for dd in $(media_is_staged "$fl" && printf '%s ' "$(stage_dir "$x")"; printf '%s' "$dest"); do
+      [[ -d "$dd" ]] && ! dir_empty "$dd" && continue
+      mnt=$(mnt_of "$dd")
+      [[ -n "$mnt" ]] || { short+="The free space for $dd could not be measured (df)."$'\n'; continue; }
+      need_mnt[$mnt]=$(( ${need_mnt[$mnt]:-0} + zmb * 25 / 10 ))
+    done
+  done
+  for mnt in "${!need_mnt[@]}"; do
+    [[ $(free_mb_of "$mnt") -ge ${need_mnt[$mnt]} ]] || short+="$mnt has $(human_mb "$(free_mb_of "$mnt")") free. Unpacking the installer files needs about $(human_mb "${need_mnt[$mnt]}")."$'\n'
+  done
+  if [[ -n "$unread" ]]; then
+    NOW="These installer files are missing or cannot be read:"$'\n'"${unread%$'\n'}"
+    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Put them back (owner root, mode 644), or set GRID_MEDIA / DB_MEDIA again:  $SELF --settings  (choose e)."$'\n'"-- Then answer r."
+    return 1
+  fi
+  [[ -z "$short" ]] && return 0
+  NOW="Not enough space to unpack the installer files:"$'\n'"${short%$'\n'}"
+  KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+  PLAN="-- Make room on that file system (or make it bigger), then answer r."
+  return 1
+}
 F_GRID=""; F_DB=""
 c_3_1() {
   users_ok || { NOW="The Oracle users do not exist yet (step 2.2)"; return 2; }
   local need_g=0 need_d=0
-  if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; fi
-  db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1
-  if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
+  local inst=""
+  if use_grid; then grid_state; [[ "$GSTATE" == "NEED_UNZIP" ]] && need_g=1; [[ "$GSTATE" == NEED_UNZIP || "$GSTATE" == NEED_INSTALL ]] && inst+=" grid"; fi
+  db_state; [[ "$DSTATE" == "NEED_UNZIP" ]] && need_d=1; [[ "$DSTATE" == NEED_UNZIP || "$DSTATE" == NEED_INSTALL ]] && inst+=" db"
   # a Release Update in RU_DIR is applied by the installer: it must be one the primary has (found now, not after
-  # two installs at step 3.11)
-  ru_matches_primary || return 1
+  # two installs at step 3.11), also when the software is unpacked but not installed yet; only the homes that
+  # are installed now are compared
+  [[ -n "$inst" ]] && { ru_matches_primary "$inst" || return 1; }
+  if [[ $need_g -eq 0 && $need_d -eq 0 ]]; then NOW="Not needed: the software is already unpacked or installed"; return 0; fi
   # files already named in the settings are checked like found ones: right kind (Grid / database) and release
   if { [[ $need_g -eq 0 ]] || { media_ok "$GRID_MEDIA" && media_matches "$GRID_MEDIA" grid; }; } \
      && { [[ $need_d -eq 0 ]] || { media_ok "$DB_MEDIA" && media_matches "$DB_MEDIA" db; }; }; then
+    media_room "$([[ $need_g -eq 1 ]] && printf '%s' "$GRID_MEDIA")" "$([[ $need_d -eq 1 ]] && printf '%s' "$DB_MEDIA")" || return 1
     NOW="Installer files are known"
     [[ -n "$GRID_MEDIA" ]] && NOW+=$'\n'"Grid:      $GRID_MEDIA"
     [[ -n "$DB_MEDIA" ]] && NOW+=$'\n'"Database:  $DB_MEDIA"
@@ -204,6 +242,7 @@ c_3_1() {
     [[ $need_g -eq 1 ]] && PLAN+=$'\n'"     grid:     $(base_media_name grid "$(want_rel grid)")"
     return 1
   fi
+  media_room "$F_GRID" "$F_DB" || return 1
   NOW="Installer files found"
   PLAN="Use these installer files:"
   [[ $need_g -eq 1 ]] && PLAN+=$'\n'"  Grid:      $(media_desc "$F_GRID")"
@@ -416,8 +455,8 @@ Its group must be %s with write access for the group (mode 770).
 ru_applied() {
   # 0 when a patch of RU_DIR (its numbered folders) is already registered in the home $1
   [[ -n "${RU_DIR:-}" && -d "$RU_DIR" && -d "$1/inventory/oneoffs" ]] || return 1
-  local d id
-  for d in "$RU_DIR" "$RU_DIR"/*/; do
+  local d id r; r=$(ru_root); [[ -n "$r" ]] || return 1
+  for d in "$r" "$r"/*/; do
     id=$(basename "$d"); [[ "$id" =~ ^[0-9]{6,}$ ]] || continue
     [[ -d "$1/inventory/oneoffs/$id" ]] && return 0
   done
@@ -448,8 +487,10 @@ ru_args() {
   # a home that already has the Release Update (an earlier try applied it) does not get it again
   local h; [[ "${1:-}" == "grid" ]] && h=$GRID_HOME || h=$DB_HOME
   if ru_applied "$h"; then say "The Release Update is already in $h. It is not applied again." >&2; return 0; fi
-  if [[ "${1:-}" == "grid" && "$(want_rel grid)" == "12.2" ]]; then printf '%s\n' -applyPSU "$RU_DIR"
-  else printf '%s\n' -applyRU "$RU_DIR"; fi
+  # the folder of the Release Update itself (RU_DIR, or the one numbered folder in it)
+  local r; r=$(ru_root); [[ -n "$r" ]] || r=$RU_DIR
+  if [[ "${1:-}" == "grid" && "$(want_rel grid)" == "12.2" ]]; then printf '%s\n' -applyPSU "$r"
+  else printf '%s\n' -applyRU "$r"; fi
 }
 new_opatch() {
   # $1 home, $2 runner, $3 owner: the Release Update needs a newer OPatch than the base media has
@@ -791,6 +832,10 @@ c_3_2() {
   esac
   if ! unzip_failed_check "$GRID_HOME" "$(stage_dir grid)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   grid_ready || return 2
+  # the Release Update the installer applies (also when 3.1 was skipped with --from)
+  ru_matches_primary grid || return 1
+  # room to unpack (also when 3.1 was skipped with --from)
+  [[ "$GSTATE" == "NEED_UNZIP" ]] && { media_room "$GRID_MEDIA" "" || return 1; }
   NOW="Grid is not installed yet"
   PLAN=""
   # an inventory folder that an earlier, failed installer run left behind is moved aside first (else INS-32035)
@@ -938,12 +983,12 @@ d_3_4() {
       # measured in time (each check itself may take a while), with a line every minute
       local t0 last=0 el; t0=$(date +%s); say "Waiting for ASM to come online (up to 5 minutes) ..."
       until grid_state; [[ "$GSTATE" == "DONE" || "$GSTATE" == "ASM_DOWN" ]] || (( $(date +%s) - t0 >= 300 )); do
-        sleep 5; el=$(( ($(date +%s) - t0) / 60 )); [[ $el -gt $last ]] && { last=$el; say "Still waiting ($el min, state $GSTATE)"; }
+        nap 5; el=$(( ($(date +%s) - t0) / 60 )); [[ $el -gt $last ]] && { last=$el; say "Still waiting ($el min, state $GSTATE)"; }
       done
       # the stack is up but ASM was not started with it (not set to start by itself): started here
       if [[ "$GSTATE" == "ASM_DOWN" ]]; then
         run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-        t0=$(date +%s); until grid_state; [[ "$GSTATE" == "DONE" ]] || (( $(date +%s) - t0 >= 120 )); do sleep 5; done
+        t0=$(date +%s); until grid_state; [[ "$GSTATE" == "DONE" ]] || (( $(date +%s) - t0 >= 120 )); do nap 5; done
       fi
       [[ "$GSTATE" == "DONE" ]] || { bad "Oracle Restart started, but ASM did not come online in time (state $GSTATE)."; return 1; } ;;
     ASM_DOWN) run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; } ;;
@@ -1138,6 +1183,8 @@ c_3_6() {
   if ! unzip_failed_check "$DB_HOME" "$(stage_dir db)"; then SW_FIX=unzip; YES_HOLD=1; return 1; fi
   inventory_ready || return $?
   db_ready || return 2
+  ru_matches_primary db || return 1
+  [[ "$DSTATE" == "NEED_UNZIP" ]] && { media_room "" "$DB_MEDIA" || return 1; }
   NOW="Database software is not installed yet"
   PLAN=""
   if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
@@ -1294,38 +1341,60 @@ srvctl start listener -listener $SB_LSNR"
 }
 d_3_10() {
   run_logged "srvctl modify listener" as_grid "$GRID_HOME/bin/srvctl" modify listener -listener "$SB_LSNR" -endpoints "TCP:$PORT" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-  journal LSNRPORT "$SB_LSNR" "old=${L310_CUR:-1521} new=$PORT"
+  journal LSNRPORT "$SB_LSNR" "old=${L310_CUR:-unknown} new=$PORT"
   run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$SB_LSNR" || true
   run_logged "srvctl start listener" as_grid "$GRID_HOME/bin/srvctl" start listener -listener "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
 }
 
 # ---- 3.11 same software level as primary ----
 # The patches of a home are the folder names in <home>/inventory/oneoffs (what opatch lspatches reads).
+ru_root() {
+  # the Release Update folder: RU_DIR itself when it is named by its patch number, else its one numbered
+  # subfolder (empty when it has none or several: several Release Updates cannot be told apart)
+  local d n=0 r=""
+  if [[ "$(basename "$RU_DIR")" =~ ^[0-9]{6,9}$ ]]; then printf '%s' "$RU_DIR"; return 0; fi
+  for d in "$RU_DIR"/*/; do [[ "$(basename "$d")" =~ ^[0-9]{6,9}$ ]] && { n=$((n + 1)); r=${d%/}; }; done
+  [[ $n -eq 1 ]] && printf '%s' "$r"
+  return 0
+}
 ru_ids() {
-  # the patch numbers of RU_DIR: the folder itself or its subfolders (a Grid RU holds the database RU as one)
-  local d id
-  for d in "$RU_DIR" "$RU_DIR"/*/; do id=$(basename "$d"); [[ "$id" =~ ^[0-9]{6,9}$ ]] && printf '%s\n' "$id"; done | sort -u
+  # the patch numbers of the Release Update: its folder and its subfolders (a Grid RU holds the database RU,
+  # OCW and others as subfolders; a home lists those, not the number of the bundle)
+  local d id r; r=$(ru_root); [[ -n "$r" ]] || return 0
+  for d in "$r" "$r"/*/; do id=$(basename "$d"); [[ "$id" =~ ^[0-9]{6,9}$ ]] && printf '%s\n' "$id"; done | sort -u
 }
 ru_matches_primary() {
-  # 0 = no RU_DIR, or one of its patches is on the primary's database home (or the primary cannot be read:
-  # step 3.11 compares later). 1 = RU_DIR is not the primary's Release Update (NOW and PLAN say why)
+  # $1 the homes that are installed now: "grid", "db" or "grid db" (only those are compared: the other home
+  # may be at another Release Update on the primary). 0 = no RU_DIR, or its patches are on those homes of the
+  # primary, or the primary cannot be read (step 3.11 compares later). 1 = RU_DIR is not the primary's Release
+  # Update (NOW and PLAN say why). Called by 3.1 and again before each install (3.2, 3.6), so --from cannot skip it.
   [[ -n "${RU_DIR:-}" && -d "$RU_DIR" ]] || return 0
-  local ids pp; ids=$(ru_ids)
+  local which=${1:-grid db} homes=() ids pp h hl n=0 d
+  [[ " $which " == *" db "* ]] && homes+=("$DB_HOME")
+  [[ " $which " == *" grid "* ]] && use_grid && [[ -n "$GRID_HOME" ]] && homes+=("$GRID_HOME")
+  [[ ${#homes[@]} -gt 0 ]] || return 0
+  ids=$(ru_ids)
   if [[ -z "$ids" ]]; then
-    NOW="RU_DIR ($RU_DIR) has no patch folder (a folder named by its patch number, for example 35642822)."
-    PLAN="-- Unzip the Release Update zip so that RU_DIR is that numbered folder, or the folder that holds it."$'\n'"-- Then set RU_DIR again:  $SELF --settings  (choose e). Then answer r."
+    for d in "$RU_DIR"/*/; do [[ "$(basename "$d")" =~ ^[0-9]{6,9}$ ]] && n=$((n + 1)); done
+    if [[ $n -gt 1 ]]; then NOW="RU_DIR ($RU_DIR) holds $n patch folders. It is not known which one is the Release Update."
+    else NOW="RU_DIR ($RU_DIR) has no patch folder (a folder named by its patch number, for example 35642822)."; fi
+    PLAN="-- Set RU_DIR to the numbered folder of the Release Update that the primary has:  $SELF --settings  (choose e)."$'\n'"-- Then answer r."
     KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
     return 1
   fi
   need_ssh || { warn "The patches of the primary cannot be read now. Step 3.11 compares them after the install."; return 0; }
-  pp=$(primary_patches "$DB_HOME" 2>/dev/null) || { warn "The patches of the primary cannot be read ($DB_HOME/inventory). Step 3.11 compares them after the install."; return 0; }
-  [[ -n "$pp" ]] || { NOW="The primary has no patches, but RU_DIR is set ($RU_DIR)."$'\n'"The standby must have the same software level as the primary."; PLAN="-- Remove RU_DIR and OPATCH_ZIP from the settings:  $SELF --settings  (choose e). Then answer r."; KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"; return 1; }
-  if [[ -z "$(comm -12 <(printf '%s\n' "$ids") <(printf '%s\n' "$pp" | sort -u))" ]]; then
-    NOW="RU_DIR ($RU_DIR) is not the Release Update of the primary."$'\n'"Patches in RU_DIR:  $(paste -sd' ' - <<< "$ids")"$'\n'"Patches on the primary:  $(head -n 6 <<< "$pp" | paste -sd' ' -)$([[ $(wc -l <<< "$pp") -gt 6 ]] && printf ' ...')"
-    PLAN="-- Unzip the Release Update that the primary has (see:  opatch lspatches  on the primary),"$'\n'"-- then set RU_DIR to it:  $SELF --settings  (choose e). Then answer r."
-    KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
-    return 1
-  fi
+  for h in "${homes[@]}"; do
+    [[ "$h" == "$DB_HOME" ]] && hl="database home" || hl="Grid home"
+    pp=$(primary_patches "$h" 2>/dev/null) || { warn "The patches of the primary cannot be read ($h/inventory). Step 3.11 compares them after the install."; continue; }
+    [[ -n "$pp" ]] || { NOW="The $hl of the primary has no patches, but RU_DIR is set ($RU_DIR)."$'\n'"The standby must have the same software level as the primary."; PLAN="-- Remove RU_DIR and OPATCH_ZIP from the settings:  $SELF --settings  (choose e). Then answer r."; KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"; return 1; }
+    if [[ -z "$(comm -12 <(printf '%s\n' "$ids") <(printf '%s\n' "$pp" | sort -u))" ]]; then
+      NOW="RU_DIR ($RU_DIR) is not the Release Update of the primary ($hl $h)."$'\n'"Patches in RU_DIR:  $(paste -sd' ' - <<< "$ids")"$'\n'"Patches on the primary:  $(head -n 6 <<< "$pp" | paste -sd' ' -)$([[ $(wc -l <<< "$pp") -gt 6 ]] && printf ' ...')"
+      PLAN="-- Unzip the Release Update that the primary has (see:  opatch lspatches  on the primary),"$'\n'"-- then set RU_DIR to it:  $SELF --settings  (choose e). Then answer r."
+      [[ ${#homes[@]} -gt 1 ]] && PLAN+=$'\n'"-- If the Grid home and the database home of the primary have different Release Updates, no one"$'\n'"-- RU_DIR fits both: remove RU_DIR and OPATCH_ZIP, install, and patch each home as step 3.11 shows."
+      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      return 1
+    fi
+  done
   return 0
 }
 local_patches() { ls -1 "$1/inventory/oneoffs" 2>/dev/null | grep -E '^[0-9]{6,9}$' | sort -u; }

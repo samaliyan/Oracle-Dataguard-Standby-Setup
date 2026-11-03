@@ -104,7 +104,24 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   new standby after RMAN reports success. 10.2 and 10.3 check again 6 times (DG_POLL_WAIT seconds, default 20).
 - Edits inside existing files (5.13): only when the structure is unambiguous (one entry or block, parentheses that
   close), always with a backup and a journal entry; otherwise the plan is manual. listener.ora: a SID_DESC is put
-  inside SID_LIST_<listener>; sqlnet.ora: the one ENCRYPTION_WALLET_LOCATION entry is replaced.
+  inside SID_LIST_<listener>, or (5.14) the wrong SID_DESC of this SID is replaced when it stands on lines of its
+  own; tnsnames.ora (5.14): a wrong alias entry is replaced when it starts on its own line and nothing follows its
+  closing parenthesis; sqlnet.ora: the one ENCRYPTION_WALLET_LOCATION entry is replaced, its comments kept as
+  comment lines above it.
+- Links (5.14): listener.ora, tnsnames.ora and sqlnet.ora that are symbolic links are never written through (found
+  in the check, manual plan). /etc/oratab as a link is written through only when safe_link_target accepts it: the
+  link owned by root, the target a regular file of root or an Oracle owner, every folder above it owned by root and
+  writable only by root.
+- Boot script (5.14): it never starts apply on an OPEN standby (Active Data Guard). Its errors carry the "<3>"
+  prefix (journal priority err, for monitoring). The unit stays active after an error on purpose: a failed unit
+  does not run ExecStop, and the stop is the clean shutdown of the standby.
+- /dev/shm boot size (5.14): with systemd running, "systemctl cat dev-shm.mount" (the last Options line wins, also
+  in /run and /usr/lib). A file outside /etc is never changed; an /etc drop-in zz-dg-standby-shm.conf sets the size.
+- Tests (5.15): the harness runs the script with DG_TEST_FAST_WAITS=1 (every nap is 0.2 s; the mocks answer at
+  once). A full regression runs once, at the end of a version; the GitHub copy gets a short smoke run.
+- Release Update identity (5.14): RU_DIR is the numbered folder (or holds exactly one); one of its patches must be
+  on the primary's database home and, with Grid, its Grid home; only the home being installed is compared (5.15). Checked in 3.1 when an install is pending, and
+  again in 3.2 and 3.6 before the installer runs.
 - Long jobs: Ctrl+C asks [w] keep watching / [d] leave it running; the step is recorded RUNNING, the stop text
   says not to start it again, --status shows "Running now". A job that ends while no run watches is recorded
   by the next run (installer success records, root.sh, unzip, the duplicate with its pfile rename), journaled

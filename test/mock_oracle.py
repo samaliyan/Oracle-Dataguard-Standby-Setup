@@ -55,6 +55,10 @@ def primary_sql(q, pri):
         return pri["version"]
     if "group by loc" in l:
         return "\n".join(pri["locs"])
+    if "from v$archived_log where first_time > sysdate-7" in l:
+        return str(pri.get("arch_mb_day", 0))
+    if l.strip() == "select name from v$asm_diskgroup_stat order by name;":
+        return "\n".join(pri.get("dg_names", ["DATA", "FRA"]))
     if "max(blocksize)" in l:
         return f"{pri.get('blocksize', 512)}|{pri.get('srl_small', 0)}"
     if "'d|'||file#||'|'||name from v$datafile" in l:
@@ -198,6 +202,10 @@ def local_sql(q, st, sid):
         return str(inst.get("srl_active", 1))
     if "select message from" in l and "v$dataguard_status" in l:
         return "\n".join(inst.get("dg_msgs", ["ORA-16401: archive log rejected by Remote File Server (RFS)"])[:3])
+    if "from v$dataguard_status" in l and "to_char(max(timestamp)" in l:
+        return inst.get("dg_err_last", "-")
+    if "from v$dataguard_status" in l and "count(*)" in l and inst.get("dgs_fail"):
+        return "ORA-01219: database or pluggable database not open: queries allowed on fixed tables or views only"
     if "from v$dataguard_status" in l and "1/96" in l:
         return str(inst.get("dg_errors_recent", 0))
     if "from v$dataguard_status" in l:
@@ -255,6 +263,7 @@ def local_sql(q, st, sid):
         inst["mrp"] = 1; st["instances"][sid] = inst; return ""
     if "v$dataguard_stats" in l: return "+00 00:00:00|+00 00:00:01"
     if "select count(*) from v$datafile_header where error is not null;" in l:
+        if inst.get("hdr_fail"): return "ORA-00210: cannot open the specified control file"
         return str(inst.get('df_errors', 0))
     if "(select count(*) from v$datafile)||'|'||" in l:
         return f"{inst.get('datafiles', 0)}|{inst.get('df_errors', 0)}"
@@ -314,6 +323,8 @@ def sqlplus():
             out.append(str(cfg.get("fra_usable", cfg["data_free"])))
         elif "select total_mb from v$asm_diskgroup" in ql:
             out.append(str(cfg.get("fra_total", 400000)))
+        elif ql.strip().startswith("select name from v$asm_diskgroup") and "state in" not in ql:
+            out.append("ORA-15018: diskgroup cannot be created" if st.get("asm_fail") else "\n".join(st.get("dgs", ["DATA"])))
         elif "v$asm_diskgroup" in ql:
             if "free_mb from" in ql: out.append(str(cfg["data_free"]))
             else:
@@ -372,6 +383,8 @@ def srvctl():
         if not reg: print(f"PRCD-1120 : The resource for database {a[-1]} could not be found."); return 1
         print(f"Database unique name: {a[-1]}\nDatabase name: proddb\nOracle home: {reg['home']}\nSpfile: {reg['spfile']}\n"
               f"Password file: {reg['pwfile']}\nStart options: {reg.get('startopt', 'mount')}\nDatabase role: {reg['role']}\nDatabase instance: {reg['instance']}")
+        print(f"Disk Groups: {reg.get('dg', ','.join(st.get('dgs', [])))}")
+        print(f"Domain: {reg.get('domain', '')}")
         if reg.get("policy"): print(f"Management policy: {reg['policy']}")
         if reg.get("stopopt"): print(f"Stop options: {reg['stopopt']}")
         return 0
@@ -381,6 +394,8 @@ def srvctl():
         st["srvctl"] = {"home": d["-oraclehome"], "spfile": d["-spfile"], "pwfile": d["-pwfile"], "role": d["-role"], "instance": d["-instance"], "running": 0}
         if "-policy" in d: st["srvctl"]["policy"] = d["-policy"]
         if "-stopoption" in d: st["srvctl"]["stopopt"] = d["-stopoption"]
+        if "-diskgroup" in d: st["srvctl"]["dg"] = d["-diskgroup"]
+        if "-domain" in d: st["srvctl"]["domain"] = d["-domain"]
         st.setdefault("srvctl_add_args", []).append(a)
         save(STB, st); return 0
     if a[:2] == ["modify", "database"]:
@@ -389,6 +404,8 @@ def srvctl():
         if "-startoption" in d: reg["startopt"] = d["-startoption"].lower()
         if "-pwfile" in d: reg["pwfile"] = d["-pwfile"]
         if "-oraclehome" in d: reg["home"] = d["-oraclehome"]
+        if "-diskgroup" in d: reg["dg"] = d["-diskgroup"]
+        if "-domain" in d: reg["domain"] = d["-domain"]
         save(STB, st); return 0
     if a[:2] == ["status", "database"]:
         if not reg: print("PRCD-1120"); return 1

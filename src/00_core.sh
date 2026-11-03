@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.13"
+readonly SCRIPT_VERSION="5.16"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -81,6 +81,14 @@ num "$POLL_WAIT" && (( 10#$POLL_WAIT >= 1 && 10#$POLL_WAIT <= 300 )) || POLL_WAI
 POLL_WAIT=$((10#$POLL_WAIT))
 OS_RELEASE_FILE=${DG_OS_RELEASE_FILE:-/etc/os-release}
 FSTAB_FILE=${DG_FSTAB_FILE:-/etc/fstab}
+MEMINFO_FILE=${DG_MEMINFO_FILE:-/proc/meminfo}
+# waits between looks at something that is still starting (apply, a job, RFS): nap N sleeps N seconds. The test
+# harness sets DG_TEST_FAST_WAITS=1 (mocks answer at once): then every such wait is 0.2 seconds. Nothing else changes.
+FAST_WAITS=0; [[ "${DG_TEST_FAST_WAITS:-}" == 1 ]] && FAST_WAITS=1
+# (said on screen when it is on: in a real run every wait for something that starts would be too short)
+[[ $FAST_WAITS -eq 1 ]] && printf 'Note: DG_TEST_FAST_WAITS=1 is set (a setting for the test suite): waits are shortened to 0.2 seconds.\n' >&2
+nap() { if [[ $FAST_WAITS -eq 1 ]]; then sleep 0.2; else sleep "$1"; fi; }
+SYSTEMD_RUN_DIR=${DG_SYSTEMD_RUN_DIR:-/run/systemd/system}   # exists when systemd is running
 SHM_UNIT_FILE=${DG_SHM_UNIT_FILE:-/etc/systemd/system/dev-shm.mount}   # when it exists, it sets /dev/shm at boot (not fstab)
 OS_ID=""; OS_MAJOR=""; PKG=""
 
@@ -339,8 +347,12 @@ confirm_word() {
 
 ask_secret() {
   # $1 prompt. Result in SECRET.
+  # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
+  local st=""; st=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
-  IFS= read -rs SECRET < "$PROMPT_IN" || fatal "No answer could be read for: $1  (run the script in an interactive terminal, for example ssh -t)"
+  local rc=0; IFS= read -rs SECRET < "$PROMPT_IN" || rc=$?
+  [[ -n "$st" ]] && stty "$st" < "$PROMPT_IN" 2>/dev/null
+  [[ $rc -eq 0 ]] || fatal "No answer could be read for: $1  (run the script in an interactive terminal, for example ssh -t)"
   printf '\n'
   _log ASK "$1  -> (hidden)"
 }
@@ -618,7 +630,7 @@ If this run stops, the next run will not know that $title is still running."
   TAIL_PID=$!
   local t0=$SECONDS hb=0
   while kill -0 "$TAIL_PID" 2>/dev/null; do
-    sleep 5
+    nap 5
     if [[ $RL_INT -eq 1 ]]; then
       RL_INT=0; printf '\n'
       job_detach_question "$title" "$jpid" "$out"
@@ -639,7 +651,7 @@ If this run stops, the next run will not know that $title is still running."
   n=0
   while job_running "$jpid"; do
     [[ $n -eq 0 ]] && say "Waiting for the rest of the job (session $jpid) to end."
-    n=$((n + 1)); sleep 2
+    n=$((n + 1)); nap 2
     if [[ $RL_INT -eq 1 ]]; then RL_INT=0; printf '\n'; job_detach_question "$title" "$jpid" "$out"; fi
     # the command has ended and only programs it started still run: do not wait for them
     if [[ -f "$out.rc" && $n -ge 30 ]]; then
@@ -721,6 +733,25 @@ write_as() {
   fi
   declare -F journal_file_written >/dev/null && journal_file_written "$f" "$existed"
   return 0
+}
+
+safe_link_target() {
+  # $1 a symbolic link -> prints the file it points to, when writing through it is safe: the link is owned by
+  # root, the target is a regular file of root, $ORACLE_USER or $GRID_USER, and every folder above the target is
+  # owned by root and writable only by root (nobody else could swap the file). 1 otherwise.
+  [[ -L "$1" && "$(stat -c '%U' -- "$1" 2>/dev/null)" == root ]] || return 1
+  local t d o m; t=$(readlink -e -- "$1" 2>/dev/null) || return 1
+  [[ -f "$t" && ! -L "$t" ]] || return 1
+  o=$(stat -c '%U' -- "$t" 2>/dev/null)
+  [[ "$o" == root || "$o" == "$ORACLE_USER" || ( -n "${GRID_USER:-}" && "$o" == "$GRID_USER" ) ]] || return 1
+  d=$(dirname "$t")
+  while :; do
+    IFS=' ' read -r o m <<< "$(stat -c '%U %a' -- "$d" 2>/dev/null)"
+    [[ "$o" == root && "$m" =~ ^[0-7]+$ ]] && (( (8#$m & 8#022) == 0 )) || return 1
+    [[ "$d" == / ]] && break
+    d=$(dirname "$d")
+  done
+  printf '%s' "$t"
 }
 
 first_line() {
