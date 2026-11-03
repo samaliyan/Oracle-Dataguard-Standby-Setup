@@ -9,7 +9,7 @@ net_dir_note() {
   # plan, and asked also with --yes
   local d r; d=$(dirname "$1"); [[ -L "$d" ]] || return 0
   r=$(readlink -e -- "$d" 2>/dev/null) || return 0
-  PLAN+=$'\n'"Note: $d is a link to $r. That folder may be shared with other homes or servers:"$'\n'"the change is made there."
+  PLAN+=$'\n'"-- Note: $d is a link to $r. That folder may be shared with other homes or servers."
   YES_HOLD=1
   return 0
 }
@@ -162,6 +162,7 @@ ORACLE_HOME (database home, not Grid):
     PLAN="-- Edit the file the link points to. SID_LIST_$SB_LSNR must hold this entry:"$'\n'"$(sid_desc_block)"
     ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
     PLAN+=$'\n'"-- Then answer r."
+    net_dir_note "$f"
     return 1
   fi
   if ! use_grid && ! lsnr_has_desc; then
@@ -244,6 +245,7 @@ $(sid_desc_block)"
       (ORACLE_HOME = $DB_HOME)
     )"
   ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
+  net_dir_note "$f"
   return 1
 }
 lsnr_reload_flag() { printf '%s/listener_reload_due' "$STATE_DIR"; }
@@ -308,6 +310,7 @@ srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
 srvctl stop listener -listener $SB_LSNR
 srvctl start listener -listener $SB_LSNR"
     fi
+    net_dir_note "$(lsnr_file)"
     return 1
   fi
   # step 5.1 changed listener.ora while the listener ran: an old entry of this SID may still show, so the reload
@@ -389,6 +392,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
 --   $f
 -- The entry must be:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$(tns_file)"
     return 1
   fi
   if tns_alias_present "$T_ALIAS"; then
@@ -419,6 +423,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
 --   $f
 -- Fix the entry. Check the brackets and the host name:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$(tns_file)"
     return 1
   fi
   NOW="The alias $T_ALIAS is missing from tnsnames.ora:"$'\n'"  $f"
@@ -427,6 +432,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
     PLAN="-- Add this to the file the link points to, then answer r:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$f"
     return 1
   fi
   PLAN="Add this to tnsnames.ora (a backup is kept):
@@ -664,13 +670,21 @@ sqlnet_has_wallet() {
   norm "$(sed 's/#.*//' "$f")" | grep -qE "\(DIRECTORY=\"?$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "${d^^}")/?\"?\)"
 }
 c_6_3() {
+  # the wallet query of the discovery failed: asked again now; still failing = not known (never "no wallet")
+  if [[ ${TDE_UNREAD:-0} -eq 1 ]]; then
+    need_ssh || return 2
+    tde_read
+    [[ $TDE_UNREAD -eq 0 ]] || { NOW="Cannot read the TDE settings of the primary${TDE_ERR:+ ($TDE_ERR)}. Whether it uses TDE is not known."; return 2; }
+  fi
+  # wallet_root of the primary that is not a plain folder: the wallet (and tde_seps) are copied by hand
+  [[ -n "${WROOT_BAD:-}" ]] && { NOW="wallet_root on the primary is '$WROOT_BAD', which is not a plain folder."$'\n'"Copy the TDE wallet to the same place for the standby by hand."; return 2; }
   [[ -n "$TDE_INFO" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   if awk -F'|' 'toupper($1)!="FILE" && toupper($3)!="NOT_AVAILABLE"' <<< "$TDE_INFO" | grep -q .; then
     NOW="The primary uses a TDE keystore that is not a file (HSM or OKV):"$'\n'"$TDE_INFO"
     PLAN="Set up the same keystore for $STANDBY_UNIQUE on this server, as your HSM or OKV vendor describes."
     return 2
   fi
-  local -a dirs=(); local d f; mapfile -t dirs < <(tde_dirs)
+  local -a dirs=(); local d f seps_note=""; mapfile -t dirs < <(tde_dirs)
   [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   # 18c+: the password for "IDENTIFIED BY EXTERNAL STORE" is in WALLET_ROOT/tde_seps
   # (a folder that cannot be read is not left out silently: the password in it would be missing here)
@@ -685,7 +699,7 @@ c_6_3() {
     if [[ "$sx" == YES ]]; then
       prim_probe lsdir "$WALLET_ROOT/tde_seps" || { NOW="Cannot list $WALLET_ROOT/tde_seps on the primary. The ssh user must be able to read it."; return 2; }
       if grep -qx 'cwallet.sso' <<< "$RUN_OUT"; then dirs+=("$WALLET_ROOT/tde_seps")
-      elif grep -q '[^[:space:]]' <<< "$RUN_OUT"; then warn "$WALLET_ROOT/tde_seps on the primary has no cwallet.sso. It is not copied."; fi
+      elif grep -q '[^[:space:]]' <<< "$RUN_OUT"; then seps_note="$WALLET_ROOT/tde_seps on the primary has no cwallet.sso. It is not copied (no external-store password to take)."; warn "$seps_note"; fi
     fi
   fi
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
@@ -730,6 +744,7 @@ c_6_3() {
 --   $(sqlnet_file)
 -- Change the ENCRYPTION_WALLET_LOCATION line to:
 ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"
+        net_dir_note "$(sqlnet_file)"
         return 1
       else
         TDE_SQLNET=1
@@ -765,6 +780,7 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
     NOW="The TDE wallet is the same as on the primary:$have"
     [[ -n "$WALLET_ROOT" ]] && NOW+=$'\n'"wallet_root=$WALLET_ROOT comes to the standby with the spfile." || NOW+=$'\n'"The wallet location ${dirs[0]} is set in:"$'\n'"  $(sqlnet_file)"
+    [[ -n "$seps_note" ]] && NOW+=$'\n'"Note: $seps_note"
     return 0
   fi
   NOW="The primary uses TDE.${miss:+ Missing here:$miss}${diff:+ Different here:$diff}"

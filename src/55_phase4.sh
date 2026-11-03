@@ -189,7 +189,7 @@ find_dest() {
   [[ -n "$DEST_N" ]] || return 1
   # a second free one (not DEST_N), for the duplex folder when log_archive_dest is moved (4.4)
   DEST_FREE2=""
-  for ((n = 3; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
+  for ((n = 2; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
   return 0
 }
 c_4_4() {
@@ -281,7 +281,15 @@ c_4_6() {
     [[ -n "$fdg" ]] || fdg=$DATA_DG
     PLAN="alter system set db_recovery_file_dest_size=${gb}G scope=both;
 alter system set db_recovery_file_dest='+${fdg^^}' scope=both;"
-    PLAN+=$'\n'"-- Size: $why."$'\n'"-- Disk group: $(if [[ $dgq -ne 0 ]]; then printf 'the one of the datafiles (the disk groups of the primary could not be read)'; elif [[ "${fdg^^}" == "${DATA_DG^^}" ]]; then printf 'the one of the datafiles (no FRA or RECO disk group found)'; else printf 'the one named for it'; fi). Check that it has the space."
+    # the free space of that disk group on the primary (read-only), against the size
+    local ufm=""; prim_sql "select to_char(usable_file_mb) from v\$asm_diskgroup_stat where name=upper('${fdg^^}');" && ufm=$(first_line)
+    # (negative on a NORMAL or HIGH redundancy group that has lost room for a failure: no usable space)
+    if [[ "$ufm" =~ ^-[0-9]+$ ]]; then why+=" (+${fdg^^} has no usable space now: add space first)"
+    elif num "$ufm"; then
+      if [[ $ufm -lt $(( gb * 1024 )) ]]; then why+=" (+${fdg^^} has only $(human_mb "$ufm") usable: make it smaller, or add space)"
+      else why+=" (+${fdg^^} has $(human_mb "$ufm") usable)"; fi
+    fi
+    PLAN+=$'\n'"-- Size: $why."$'\n'"-- Disk group: $(if [[ $dgq -ne 0 ]]; then printf 'the one of the datafiles (the disk groups of the primary could not be read)'; elif [[ "${fdg^^}" == "${DATA_DG^^}" ]]; then printf 'the one of the datafiles (no FRA or RECO disk group found)'; else printf 'the one named for it'; fi).$(num "$ufm" || [[ "$ufm" =~ ^-[0-9]+$ ]] || printf ' Its usable space could not be read: check it.')"
   else
     PLAN="-- A folder with enough space, owned by $ORACLE_USER, for example:
 host mkdir -p ${ORACLE_BASE:-/u01/app/oracle}/fast_recovery_area

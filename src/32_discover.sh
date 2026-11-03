@@ -5,10 +5,28 @@
 # A program found this way is used only when it belongs to the user that runs
 # the process and nobody else can change it.
 #------------------------------------------------------------------------------
-PS_OUT=""; DB_PMON_PID=""; ASM_PMON_PID=""; AUDIT_DEST=""; DIAG_DEST=""; TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""
+PS_OUT=""; DB_PMON_PID=""; ASM_PMON_PID=""; AUDIT_DEST=""; DIAG_DEST=""; TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0
 PRIM_CLOCK_OFFSET=0    # primary clock minus this server's clock (seconds)
 DISC_NOTES=()          # things worth telling the user (oratab differs, env missing, ...)
 
+tde_read() {
+  # the TDE wallet of the primary -> TDE_INFO, WALLET_ROOT, TDE_CONFIG. TDE_UNREAD=1 when a query failed: an empty
+  # answer is "no wallet", a failed query is "not known" (step 6.3 asks again and says so). Used by the discovery
+  # and by 6.3, so both read the same columns (wallet_type: a LOCAL auto-login wallet opens only where it was made)
+  TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0; TDE_ERR=""; WROOT_BAD=""
+  if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  elif prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  else TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT"); fi
+  if [[ $DB_MAJOR -ge 18 ]]; then
+    if prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name in ('wallet_root','tde_configuration');"; then
+      local wn wv
+      while IFS='|' read -r wn wv; do
+        case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { WROOT_BAD=$WALLET_ROOT; WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
+      done <<< "$SQL_OUT"
+    else TDE_UNREAD=1; [[ -n "$TDE_ERR" ]] || TDE_ERR=$(ora_errors "$SQL_OUT"); fi
+  fi
+  return 0
+}
 parse_id_line() {
   # "uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba)"
   # -> sets PID_UID PID_PGROUP PID_GROUPS(name:gid,...)
@@ -387,18 +405,9 @@ Assuming LISTENER, port $PORT, service $want."
   fi
 
   # ---- TDE (12.1+ view; an empty answer means no wallet). 18c+: wallet_root / tde_configuration
-  TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""
-  # wallet_type (12.1.0.2+): LOCAL_AUTOLOGIN wallets open only on the host that made them
-  if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
-  else prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;" && TDE_INFO=$SQL_OUT; fi
-  if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name in ('wallet_root','tde_configuration');"; then
-    local wn wv
-    while IFS='|' read -r wn wv; do
-      case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { DISC_NOTES+=("wallet_root on the primary is '$WALLET_ROOT', which is not a folder.
-Copy the TDE wallet by hand in step 6.3.");WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
-
-    done <<< "$SQL_OUT"
-  fi
+  tde_read
+  [[ -n "$WROOT_BAD" ]] && DISC_NOTES+=("wallet_root on the primary is '$WROOT_BAD', which is not a folder.
+Copy the TDE wallet by hand in step 6.3.")
 
   local n; for n in "${DISC_NOTES[@]+"${DISC_NOTES[@]}"}"; do warn "$n"; done
   set_primary_how

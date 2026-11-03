@@ -1495,7 +1495,7 @@ check "unit: the RU check compares only the home being installed; memlock covers
 fresh empty; rc=$(run $T/z110a.txt)
 jset $S "d['srvctl']['dg']='DATA,FRA,GONE'"
 rc=$(run $T/z110.txt --only 9.1)
-check "9.1: a registered disk group this server does not have -> named and taken out (srvctl modify, the others stay)" "grep -q 'disk group(s) this server does not have: GONE' $T/z110.txt && python3 -c \"import json;assert json.load(open('$S'))['srvctl']['dg']=='DATA,FRA'\""
+check "9.1: a registered disk group ASM here does not see -> named, never taken out by the script" "grep -q 'disk group(s) that ASM here does not see: GONE' $T/z110.txt && python3 -c \"import json;assert json.load(open('$S'))['srvctl']['dg']=='DATA,FRA,GONE'\""
 jset $S "d['srvctl']['dg']='DATA,FRA'; d['srvctl']['spfile']='/wrong/spfileX.ora'; d['srvctl']['policy']='MANUAL'; d['srvctl']['stopopt']='abort'"
 rc=$(run $T/z111.txt --only 9.1 --check)
 check "9.1: the srvctl add shown for a new registration has the kept values (policy, stop option)" "grep -q 'srvctl add database -db .*-policy MANUAL -stopoption abort' $T/z111.txt"
@@ -1513,7 +1513,7 @@ check "7.1: the spfile's audit folder outside ORACLE_BASE is missing -> a step b
 
 fresh; jset $O "d['nft_ruleset']='table inet filter {\n  chain input {\n    type filter hook input priority 0; policy accept;\n    tcp dport 1521 drop\n  }\n}'"
 rc=$(run $T/z115.txt --only 2.9)
-check "2.9: a rule outside firewalld that drops the port itself -> that rule is named" "grep -q 'drops or rejects port 1521' $T/z115.txt && grep -q 'tcp dport 1521 drop' $T/z115.txt"
+check "2.9: a rule outside firewalld that drops the port itself -> that rule is shown" "grep -q 'rules outside firewalld that drop or reject' $T/z115.txt && grep -q 'tcp dport 1521 drop' $T/z115.txt"
 fresh; jset $P "d['stby_fw_drop']=1"
 rc=$(run $T/z116.txt --only 2.9 --check)
 check "2.9 in check mode: the connect from the primary is tried too (read-only)" "grep -q 'The primary cannot reach' $T/z116.txt && cmds_whitelisted"
@@ -1527,10 +1527,10 @@ check "4.6: the Exadata-style RECOC1 is taken for the recovery area" "grep -q \"
 # 5.16: ninth external review
 fresh; jset $O "d['nft_ruleset']='table inet f {\n chain input {\n  type filter hook input priority 0; policy accept;\n  jump sub\n }\n chain sub {\n  tcp dport 1521 reject\n }\n}'"
 rc=$(run $T/z120.txt --only 2.9)
-check "2.9: a reject for the port in a chain the input chain jumps to -> named as 'may drop'" "grep -q 'may drop port 1521' $T/z120.txt"
+check "2.9: a reject for the port in a chain the input chain jumps to -> shown" "grep -q 'tcp dport 1521 reject' $T/z120.txt"
 fresh; jset $O "d['iptables_input']='-P INPUT ACCEPT\n-A INPUT -p tcp -j DROP'"
 rc=$(run $T/z121.txt --only 2.9)
-check "2.9: a drop of all TCP in INPUT -> noted (it covers the port)" "grep -q 'drop or reject incoming traffic' $T/z121.txt"
+check "2.9: a drop of all TCP in INPUT -> shown" "grep -q -- '-A INPUT -p tcp -j DROP' $T/z121.txt"
 fresh empty; rc=$(run $T/z122a.txt)
 jset $S "d['asm_fail']=1"
 rc=$(run $T/z122.txt --only 9.1)
@@ -1542,6 +1542,82 @@ fresh; jset $P "d['pwfile']=''; d['exists_fail']=['$T/u01/app/oracle/product/19.
 rc=$(DG_TEST_QUIT_AT=6.2 run $T/z124.txt)
 check "6.1: the primary does not answer whether its password file is there -> not called missing" "grep -q 'Cannot tell whether .*orapwPRODDB is on the primary' $T/z124.txt && ! grep -q 'The password file of the primary was not found' $T/z124.txt"
 
+# 5.17: tenth external review
+fresh; jset $P "d['tde_fail']=1; d['tde']=['FILE|$T/pwallet/|OPEN']"
+rc=$(DG_TEST_QUIT_AT=7.1 run $T/z130.txt)
+check "6.3: the wallet query of the primary fails -> not known, never 'does not use TDE'" "grep -q 'Whether it uses TDE is not known' $T/z130.txt && ! grep -q 'The primary does not use a TDE wallet' $T/z130.txt"
+fresh empty; rc=$(run $T/z131a.txt)
+printf "*.audit_file_dest='/u01/x/../../etc/aud'\n" >> $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z131.txt --only 7.1)
+check "7.1: an audit_file_dest with '..' -> a step by hand, nothing made" "grep -q 'audit_file_dest to an unusual path' $T/z131.txt && [[ \$(res 7.1 $T/z131.txt) != OK && \$(res 7.1 $T/z131.txt) != DONE ]] && [[ ! -e /etc/aud ]]"
+ut_517() { bash <<EOF
+source <(sed -n '/^local_fw_rules()/,/^}/p' $T/dg_standby_setup.sh)
+PORT=1521 STANDBY_IP=10.1.1.5
+ip() { echo "2: eth0    inet 10.1.1.5/24 brd x"; }
+t() { NFT="\$1"; IPT="\$2"; nft() { printf '%s\n' "\$NFT"; }; iptables() { printf '%s\n' "\$IPT"; }; NOW=""; local_fw_rules; [[ -n "\$NOW" ]] && echo 1 || echo 0; }
+a=\$(t "" \$'-P INPUT ACCEPT\n-A INPUT -d 10.1.1.5/32 -p tcp --dport 1521 -j DROP')
+b=\$(t "" \$'-P INPUT ACCEPT\n-A INPUT -p tcp --dport 1521 -j ACCEPT')
+c=\$(t "" \$'-P INPUT DROP')
+d=\$(t \$'table inet f {\n chain input {\n  type filter hook input priority 0; policy accept;\n  ct state invalid drop\n }\n}' "-P INPUT ACCEPT")
+echo "\$a\$b\$c\$d"
+EOF
+}
+fresh; ut_517 > $T/ut_517.txt
+check "unit: firewall note shows drop/reject rules and a drop policy, not accept rules or 'ct state invalid drop'" "[[ \$(cat $T/ut_517.txt) == 1010 ]]"
+
+# 5.18: eleventh external review
+fresh empty; rc=$(run $T/z140a.txt)
+printf "*.audit_file_dest='/srv/dgt518/aud'\n" >> $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z140.txt --only 7.1)
+check "7.1: an audit folder under /srv (root's) -> a root step by hand, not refused, nothing made" "grep -q 'chown oracle:oinstall /srv/dgt518/aud' $T/z140.txt && ! grep -q 'must not be the audit folder' $T/z140.txt && [[ ! -e /srv/dgt518 ]]"
+mkdir -p /srv/dgt518o && chown nobody /srv/dgt518o
+sed -i "s|/srv/dgt518/aud|/srv/dgt518o/aud|" $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z141.txt --only 7.1)
+check "7.1: an audit folder under a folder of another user -> refused, the owner named" "grep -q 'under /srv/dgt518o, which belongs to nobody' $T/z141.txt && [[ ! -e /srv/dgt518o/aud ]]"
+mkdir -p /srv/dgt518w && chmod 777 /srv/dgt518w
+sed -i "s|/srv/dgt518o/aud|/srv/dgt518w/aud|" $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z143.txt --only 7.1)
+check "7.1: a parent folder others can write to -> the oracle user makes it, no root chown" "grep -q 'As oracle (not as root' $T/z143.txt && ! grep -q 'chown .*/srv/dgt518w' $T/z143.txt && [[ ! -e /srv/dgt518w/aud ]]"
+sed -i "s|/srv/dgt518w/aud|/home/nosuchuser518/aud|" $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z144.txt --only 7.1)
+check "7.1: a folder under /home outside the oracle home (account not listed) -> refused" "grep -q 'under /home, outside the home folder' $T/z144.txt"
+rm -rf /srv/dgt518o /srv/dgt518 /srv/dgt518w
+ln -sfn "/srv/q 518" $T/lnk518
+sed -i "s|/home/nosuchuser518/aud|$T/lnk518/aud|" $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
+rc=$(run $T/z145.txt --only 7.1)
+check "7.1: a link leads to a path with a space -> refused, no root command shown" "grep -q 'leads, through links, to an unusual path' $T/z145.txt && ! grep -q '^ *chown ' $T/z145.txt && ! grep -q '^ *mkdir -p /srv/q' $T/z145.txt"
+rm -f $T/lnk518
+fresh empty; rc=$(run $T/z142a.txt)
+jset $S "d['srvctl']['dg']='DATA,FRA,GONE'"
+rc=$(run $T/z142.txt --only 9.1)
+check "9.1: OK still names a registered disk group ASM here does not see" "grep -q 'it still names disk group(s) ASM here does not see: GONE' $T/z142.txt"
+ut_518() { bash <<EOF
+source <(sed -n '/^srv_add()/,/^}/p' $T/dg_standby_setup.sh)
+srv_new_args() { :; }; bad() { echo "BAD \$*"; }; warn() { :; }; say() { :; }; ran=0
+run_logged() { ran=1; return 0; }
+SRV_DG_UNREAD="DATA,FRA" SRV_DG_LOST="" STANDBY_UNIQUE=x; SRV_KEPT=()
+srv_add "saved config" >/dev/null; a=\$?; a="\$a\$ran"
+ran=0; SRV_DG_UNREAD=""; srv_add "saved config" >/dev/null 2>&1; b="\$ran"
+echo "\$a \$b"
+EOF
+}
+fresh; ut_518 > $T/ut_518.txt
+check "unit: no new registration while the disk groups cannot be read; added when they can" "[[ \$(cat $T/ut_518.txt) == '10 1' ]]"
+
+ut_518b() { bash <<EOF
+source <(sed -n '/^root_holds()/,/^}/p; /^make_dir()/,/^}/p' $T/dg_standby_setup.sh)
+INSTALL_GROUP=oinstall; say() { :; }; journal() { :; }; bad() { echo "BAD \$*"; }; warn() { :; }
+dir_empty() { [[ -z "\$(ls -A -- "\$1")" ]]; }
+rm -rf $T/md518; mkdir -p $T/md518/o; chown oracle:oinstall $T/md518/o; chmod 755 $T/md518/o
+make_dir $T/md518/o/a/b oracle >/dev/null; a=\$(stat -c '%U:%G' $T/md518/o/a/b 2>/dev/null)
+make_dir $T/md518/o/g/h grid > $T/md518.out; [[ -e $T/md518/o/g ]] && b=made || b=none
+grep -q 'cannot be made by grid' $T/md518.out && c=said || c=silent
+mkdir -p $T/md518/r; make_dir $T/md518/r/x oracle >/dev/null; d=\$(stat -c '%U' $T/md518/r/x)
+rm -rf $T/md518; echo "\$a \$b \$c \$d"
+EOF
+}
+fresh; ut_518b > $T/ut_518b.txt
+check "unit: below a folder another user owns, folders are made as their owner (never by root); one the owner cannot make is said, nothing made" "[[ \$(cat $T/ut_518b.txt) == 'oracle:oinstall none said oracle' ]]"
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
 for f in "${FAILED[@]}"; do echo "  - $f"; done

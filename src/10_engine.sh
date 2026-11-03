@@ -94,8 +94,11 @@ record() {
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
-  { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
-    && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"
+  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
+    && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"; }; then
+    # the next run would show an old result for this step: said once
+    [[ ${PROGRESS_WARNED:-0} -eq 1 ]] || { PROGRESS_WARNED=1; warn "The progress file $PROGRESS_FILE cannot be written. The next run may show old results."; }
+  fi
   chmod 600 "$PROGRESS_FILE" 2>/dev/null
   return 0
 }
@@ -498,6 +501,7 @@ run_step() {
     if [[ $drc -eq 0 ]]; then
       NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
       # done, but the result cannot really be checked yet: waiting (checked again in a later run)
+      if [[ $rc -eq 0 && $CHECK_WAITS -eq 2 ]] && is_optional "$id"; then wait_msg "Done, not checked yet. $NOW"; record "$id" SKIPPED_OPTIONAL; return 0; fi
       if [[ $rc -eq 0 && $CHECK_WAITS -ne 0 ]]; then wait_msg "Done, not checked yet. $NOW"; record "$id" WAITS; return 0; fi
       if [[ $rc -eq 0 ]]; then
         ok_lines "Done. ${DONE_MSG:-$NOW}"
@@ -587,6 +591,10 @@ summary() {
     done
   fi
   declare -F journal_run_summary >/dev/null && journal_run_summary
+  # what the start-at-boot unit reported at this boot: shown in every summary (also when 9.7 did not run now)
+  # (not again when step 9.7 ran in this run: it showed them)
+  local be=""; [[ ${BOOT_ERR_SHOWN:-0} -eq 1 ]] || be=$(boot_errors_now 2>/dev/null)
+  [[ -n "$be" ]] && printf '\n  %sAt this boot, the start-at-boot unit reported:%s\n%s\n  To see it all:  journalctl -p err -u %s\n' "$C_Y" "$C_N" "$(sed 's/^/    /' <<< "$be")" "$(unit_name)"
   printf '\n  Log:        %s\n' "$LOG_FILE"
   [[ -s "$ACTIONS_FILE" ]] && printf '  Commands:   %s\n' "$ACTIONS_FILE"
   printf '  %s\n' "$(primary_note)"

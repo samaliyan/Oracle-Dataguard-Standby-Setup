@@ -178,10 +178,10 @@ hugepages_kb() {
   local n sz; n=$(awk '/^HugePages_Total:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); sz=$(awk '/^Hugepagesize:/{print $2}' "$MEMINFO_FILE" 2>/dev/null)
   num "$n" && num "$sz" && printf '%s' $(( n * sz )) || printf 0
 }
-LIM_MEMLOCK_NEED=0   # KB: the SGA of the primary when it runs only in HugePages (use_large_pages=ONLY); set by 2.4
+LIM_MEMLOCK_NEED=0   # KB: the SGA of the primary when it runs only in HugePages (use_large_pages=ONLY or AUTO_ONLY); set by 2.4
 lim_min() {
   # memlock (KB): the SGA in HugePages must be lockable: at least the HugePages set here, and the SGA of the
-  # primary when it needs HugePages (ONLY). Without either, the SGA is not locked: any value is enough
+  # primary when it needs HugePages (ONLY or AUTO_ONLY). Without either, the SGA is not locked: any value is enough
   local h
   case "$1" in nofile) printf 65536 ;; nproc) printf 16384 ;; stack) printf 32768 ;;
     memlock) h=$(hugepages_kb); [[ ${LIM_MEMLOCK_NEED:-0} -gt $h ]] && h=$LIM_MEMLOCK_NEED; printf '%s' "$h" ;;
@@ -225,7 +225,7 @@ c_2_4() {
   # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
   # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
   local who g v over="" w wf wp wl ulp sga
-  # the primary needs HugePages for its SGA (use_large_pages=ONLY): memlock must cover that SGA here too
+  # the primary needs HugePages for its SGA (use_large_pages=ONLY or AUTO_ONLY): memlock must cover that SGA here too
   LIM_MEMLOCK_NEED=0; local lmnote="" lm_need=0
   if ssh_alive && prim_sql "select upper(value) from v\$parameter where name='use_large_pages';"; then
     ulp=$(first_line)
@@ -282,10 +282,21 @@ d_2_4() {
 }
 
 # ---- 2.5 folders ----
+root_holds() {
+  # 0 when only root can change the entry $2 in folder $1: $1 belongs to root and is not writable by group or
+  # others, or it is sticky and $2 is there already, owned by root and not a link (nobody else can rename it)
+  local o m; IFS=' ' read -r o m <<< "$(stat -c '%U %a' -- "$1" 2>/dev/null)"
+  [[ "$o" == root && "$m" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$m & 8#022) == 0 )) && return 0
+  (( (8#$m & 8#1000) != 0 )) && [[ -d "$2" && ! -L "$2" && "$(stat -c '%U' -- "$2" 2>/dev/null)" == root ]]
+}
 make_dir() {
   # $1 path, $2 owner. Creates missing components owned by $2 (group INSTALL_GROUP, 775).
   # Changes the owner of an existing directory only when it is empty. Never recursive, never through a link.
-  local path=$1 owner=$2 p="" comp
+  # Root acts only while no one else can change the folders on the way (root_holds, from / down). Below a
+  # folder another user can change (for example the oracle base, or a group-writable /u01/app), the rest is made
+  # as $2 itself: a link put in place there between two steps then leads nowhere $2 could not write anyway
+  local path=$1 owner=$2 p="" par="/" comp held=1
   local -a parts=()
   # "." or ".." parts would make the system-folder test below meaningless (/u01/../etc)
   [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { bad "$path is not a plain absolute path. It is not created or changed."; return 1; }
@@ -300,11 +311,24 @@ make_dir() {
       local lo; lo=$(stat -c '%U' "$p")
       [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo. It is not used."; return 1; }
     fi
-    if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
+    [[ $held -eq 1 ]] && ! root_holds "$par" "$p" && held=0
+    if [[ ! -e "$p" && ! -L "$p" ]]; then
+      if [[ $held -eq 1 ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1
+      else
+        runuser -u "$owner" -- mkdir -m 775 -- "$p" 2>/dev/null && runuser -u "$owner" -- chgrp -h "$INSTALL_GROUP" -- "$p" 2>/dev/null \
+          || { bad "$p cannot be made by $owner (the folder above can be changed by users other than root, so root does not make it). Make it, as $owner:  mkdir -p $path"; return 1; }
+      fi
+      say "Created $p"; journal DIR "$p" "owner $owner"
+    fi
     [[ -d "$p" ]] || { bad "$p exists, but it is not a folder. It is not changed."; return 1; }
+    par=$p
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
-  if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
+  if dir_empty "$path"; then
+    # the mode is set as the new owner: a link swapped in after chown -h then points only where $owner may write
+    if [[ $held -eq 1 ]]; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"
+    else chown -h "$owner:$INSTALL_GROUP" "$path" && runuser -u "$owner" -- chmod 775 -- "$path"; fi
+  fi
 }
 dir_specs() {
   if use_grid; then printf '%s\n' "$GRID_BASE:$GRID_USER" "$GRID_HOME:$GRID_USER"; fi
@@ -484,58 +508,20 @@ fw_path_note() {
   return 0
 }
 local_fw_rules() {
-  # firewalld is not active: rules of nftables or iptables on this server for incoming traffic (read-only; a
-  # note, the real test is the connect from the primary). Named: a drop or reject rule for the port itself; or
-  # a general drop (policy drop, drop/reject rules) with no accept rule for the port.
-  local inp="" r
-  local all=""
-  # "all" = every chain but the output and forward ones (an accept there is not for incoming traffic)
-  command -v nft >/dev/null 2>&1 && { r=$(nft list ruleset 2>/dev/null); inp=$(awk '/hook input/ { i = 1 } i && /^[[:space:]]*}/ { i = 0 } i { print }' <<< "$r")
-    all=$(awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }' <<< "$r"); }
-  command -v iptables >/dev/null 2>&1 && { r=$(iptables -S 2>/dev/null); all+=$'\n'$(grep -vE '^-(P|A) (OUTPUT|FORWARD)' <<< "$r"); inp+=$'\n'$(grep -E '^-(P|A) INPUT' <<< "$r"); }
-  grep -q '[^[:space:]]' <<< "$inp" || return 0
-  # named sets, verdict maps, port ranges and "!=" are not read here: an accept rule written that way may cover the
-  # port, so then "no accept" is not claimed (such a construct elsewhere changes nothing)
-  local unread='dports? (@|vmap|!=)|dports?[[:space:]]+[0-9]+[-:][0-9]+|--match-set' acc_unread=0
-  grep -E "$unread" <<< "$all" | grep -qiE 'accept|vmap' && acc_unread=1
-  # a rule that names the port (dport / --dport / --dports list, nft set { 22, 1521 }); only the number is read
-  local pre="(dports?|--dports?)[[:space:]]+([{][^}]*|[0-9,:]*,)?[[:space:]]*\b$PORT\b"
-  # (a rule for udp or for one destination address is not this port of this server)
-  local notmine='udp|(^| )-d |daddr|--dst'
-  r=$(grep -E "$pre" <<< "$inp" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
-  if [[ -n "$r" ]]; then
-    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld drops or rejects port $PORT:"$'\n'"  $r"
-    return 0
-  fi
-  # the input chain accepts the port: a drop elsewhere is not looked at
-  grep -E "$pre" <<< "$inp" | grep -qiE 'accept' && return 0
-  # in another chain (it may be one the input chain jumps to; this is not followed)
-  r=$(grep -E "$pre" <<< "$all" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
-  if [[ -n "$r" ]]; then
-    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld, in a chain other than input, may drop port $PORT"$'\n'"(if the input chain jumps to it):  $r"
-    return 0
-  fi
-  # an accept for the port anywhere (also in a chain the input chain jumps to): no note
-  grep -E "$pre" <<< "$all" | grep -qiE 'accept' && return 0
-  [[ $acc_unread -eq 1 ]] && return 0
-  # a general drop (not the usual "ct state invalid drop", which drops only broken packets)
-  # rules for one protocol or one interface count (they cover the port too); rules for some addresses or other
-  # ports do not
-  # a drop for all TCP (or every protocol) counts; one for another protocol, one interface, some addresses,
-  # flags, rates or sets does not
-  # (the reject answer, "--reject-with icmp-host-prohibited" or "reject with icmpx ...", is not a match: cut off
-  # before the test; the shown rule is the whole line)
-  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$inp" \
-      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|^-A INPUT( .*)? -j (DROP|REJECT)' \
-      | while IFS= read -r l; do
-          c=$(sed -E 's/(--reject-with|reject with) .*//' <<< "$l")
-          grep -qE '(saddr|daddr|dport|sport|ct state|ct status|iifname|oifname|(^| )iif |(^| )oif |(^| )-s |(^| )-d |(^| )-i |(^| )-o |--dport|--sport|--src|--dst|--ctstate|--state|--match-set|tcp flags|--tcp-flags|limit|recent|nfproto|icmp|udp|sctp|l4proto [^t]|protocol [^t]|! -p )' <<< "$c" && continue
-          # -p: only tcp, all, 0 or 6 cover this port
-          if [[ "$c" =~ (^|[[:space:]])-p[[:space:]]+([^[:space:]]+) ]] && ! [[ "${BASH_REMATCH[2]}" =~ ^(tcp|all|0|6)$ ]]; then continue; fi
-          printf '%s\n' "$l"
-        done | head -n 1 | sed 's/^[[:space:]]*//')
+  # firewalld is not active: rules of nftables or iptables on this server (read-only). They are not judged here
+  # (sets, maps, jumps and scopes make a sure verdict impossible): the drop and reject rules are shown, so the
+  # admin can see at once whether one of them stops port $PORT. The real test is the connect from the primary.
+  local r="" rules="" myif
+  command -v nft >/dev/null 2>&1 && rules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
+  command -v iptables >/dev/null 2>&1 && rules+=$'\n'$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  # (not "ct state invalid ... drop": it only drops broken packets)
+  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
+      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)' \
+      | sed 's/^[[:space:]]*//' | head -n 3)
   [[ -n "$r" ]] || return 0
-  NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject incoming traffic"$'\n'"(for example:  $r), and no rule that accepts port $PORT."$'\n'"Check that $PORT/tcp is allowed:  nft list ruleset  (or:  iptables -S INPUT)"
+  myif=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
+  NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject traffic, for example:"$'\n'"$(sed 's/^/  /' <<< "$r")"
+  NOW+=$'\n'"Check that they let port $PORT/tcp from $PRIMARY_IP in${myif:+ (on $myif, the interface of $STANDBY_IP)}:  nft list ruleset  (or:  iptables -S)"
   return 0
 }
 FW_PATH_DONE=0      # 1 only inside 4.9 (it runs the check of 2.9 quietly, without this probe)

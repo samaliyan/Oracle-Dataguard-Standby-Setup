@@ -93,6 +93,8 @@ def primary_sql(q, pri):
         for k, v in p.items():
             if re.fullmatch(r"log_archive_dest_\d+", k) and v and "location" in str(v).lower(): rows[k] = v
         return "\n".join(f"{k}|{v or '-'}" for k, v in rows.items())
+    if "from v$encryption_wallet" in l and pri.get("tde_fail"):
+        return "ORA-00942: table or view does not exist"
     if "from v$encryption_wallet" in l:
         return "\n".join(pri.get("tde", ["FILE|-|NOT_AVAILABLE"]))
     if "select name from v$controlfile;" in l:
@@ -201,7 +203,8 @@ def local_sql(q, st, sid):
     if "v$standby_log where status='active'" in l:
         return str(inst.get("srl_active", 1))
     if "select message from" in l and "v$dataguard_status" in l:
-        return "\n".join(inst.get("dg_msgs", ["ORA-16401: archive log rejected by Remote File Server (RFS)"])[:3])
+        pre = "DGMSG:" if "'dgmsg:'||" in l else ""
+        return "\n".join(pre + m for m in inst.get("dg_msgs", ["ORA-16401: archive log rejected by Remote File Server (RFS)"])[:3])
     if "from v$dataguard_status" in l and "to_char(max(timestamp)" in l:
         return inst.get("dg_err_last", "-")
     if "from v$dataguard_status" in l and "count(*)" in l and inst.get("dgs_fail"):

@@ -219,7 +219,9 @@ EXPECT firewall-cmd --zone=<zone> --query-port=$PO/tcp  shows yes
        "Connection refused" is fine at this point (no listener yet); no answer at all
        means a firewall blocks the port: in the network, or rules here outside firewalld
        (nft list ruleset). "No route to host": a wrong address, or a reject by a firewall.
-       With firewalld not running, other rules here that drop traffic are named as a note.
+       With firewalld not running, up to three rules here that drop or reject traffic are
+       shown as a note (nft or iptables). The script does not judge them: check that they
+       let port $PO/tcp from the primary in.
 EOF
   ;;
   2.10) cat <<EOF
@@ -749,6 +751,12 @@ EXPECT The audit folder of the standby and the diagnostic_dest of the primary ex
        and are writable by $OU. A standby that exists already: also the audit_file_dest
        set in its spfile, when it is another folder. Under the Oracle base the script makes it;
        outside it, it is a step to do by hand (mkdir, chown $OU:$IG).
+       Refused as the audit folder: a system folder (/, /usr, /etc, /tmp, /opt, /run ...,
+       and /home and /srv themselves), a folder under /home outside the home of $OU,
+       the home of another account, an Oracle home or base (Grid too) or a folder above one,
+       and a folder whose nearest existing part belongs to a user other than root or $OU.
+       A root step (mkdir, chown) is shown only when no one but root can change the folders
+       on the way; otherwise $OU makes the folder itself when it can, or it is refused.
 EOF
   ;;
   7.2) cat <<EOF
@@ -952,6 +960,7 @@ EOF
     printf '       or the step looks again for up to 6 times %s seconds while Oracle Restart mounts it\n' "${POLL_WAIT:-20}"
     printf '       (Grid; if step 9.2 had mounted it in this run, it stopped: that is reported instead).\n'
     printf '       An OPEN standby: the unit does not start apply there (Active Data Guard license).\n'
+    printf '       What the unit reported at this boot is also shown at the end of every run.\n'
     printf '       Errors at boot go to the journal with priority "err":\n'
     printf '         journalctl -p err -u <unit>\n'
     printf '       The unit stays active after such an error on purpose: only an active unit runs its\n'

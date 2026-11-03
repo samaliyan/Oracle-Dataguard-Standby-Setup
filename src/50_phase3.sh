@@ -158,7 +158,9 @@ media_room() {
     if [[ $x == grid ]]; then fl=$1; dest=$GRID_HOME; else fl=$2; dest=$DB_HOME; fi
     [[ -n "$fl" ]] || continue
     local -a mfl=(); IFS=',' read -ra mfl <<< "$fl"
-    for f in "${mfl[@]}"; do [[ -r "$f" ]] || unread+="  $f"$'\n'; done
+    # readable by the user who unpacks it (root reads any file; the unzip runs as the owner of the home)
+    local uu; [[ $x == grid ]] && uu=$GRID_USER || uu=$ORACLE_USER
+    for f in "${mfl[@]}"; do [[ -r "$f" ]] && runuser -u "$uu" -- test -r "$f" 2>/dev/null || unread+="  $f  (as $uu)"$'\n'; done
     zmb=$(for f in "${mfl[@]}"; do stat -c '%s' -- "$f" 2>/dev/null; done | awk '{s += $1} END {printf "%d", s / 1048576}')
     # staged media (12.x): unpacked into the stage folder, then installed into the home: both count
     local dd; for dd in $(media_is_staged "$fl" && printf '%s ' "$(stage_dir "$x")"; printf '%s' "$dest"); do
@@ -174,7 +176,7 @@ media_room() {
   if [[ -n "$unread" ]]; then
     NOW="These installer files are missing or cannot be read:"$'\n'"${unread%$'\n'}"
     KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
-    PLAN="-- Put them back (owner root, mode 644), or set GRID_MEDIA / DB_MEDIA again:  $SELF --settings  (choose e)."$'\n'"-- Then answer r."
+    PLAN="-- Put them back (owner root, mode 644), or set GRID_MEDIA / DB_MEDIA again:  $SELF --settings  (choose e)."$'\n'"-- Every folder above a file must be open to that user too. To see where it stops:  namei -l <file>"$'\n'"-- Then answer r."
     return 1
   fi
   [[ -z "$short" ]] && return 0

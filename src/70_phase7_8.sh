@@ -160,14 +160,21 @@ detect_built() {
 
 # ---- 7.1 ----
 adump_dir() { printf '%s/admin/%s/adump' "$ORACLE_BASE" "$STANDBY_UNIQUE"; }
-spfile_audit_dest() {
-  # audit_file_dest in the spfile of a standby that exists already (a copy made before, not by step 8.2 of this
-  # script, may keep the primary's own folder): empty when there is no spfile or no such line
+spfile_audit_raw() {
+  # audit_file_dest as written in the spfile of a standby that exists already (empty: no spfile, no such line)
   local f v; f=$(spfile_path); [[ -f "$f" ]] || return 0
-  v=$(grep -a -o -iE "^[*A-Za-z0-9_]*\.audit_file_dest='[^']+'" "$f" 2>/dev/null | tail -n 1 | sed "s/^[^']*'//; s/'\$//")
-  v=${v%/}
-  if [[ "$v" == /* ]] && v_path "$v"; then printf '%s' "$v"
-  elif [[ -n "$v" ]]; then warn "The spfile of the standby sets audit_file_dest to an unusual path ($v). The script does not use it; check it by hand." >&2; fi
+  # a line for this instance (SID.) wins over one for all (*.), as in the database; lines of other SIDs are not used
+  local all; all=$(grep -a -o -iE "^[*A-Za-z0-9_]*\.audit_file_dest='[^']+'" "$f" 2>/dev/null)
+  v=$(grep -i -- "^${STANDBY_SID}\." <<< "$all" | tail -n 1)
+  [[ -n "$v" ]] || v=$(grep -- '^\*\.' <<< "$all" | tail -n 1)
+  v=$(sed "s/^[^']*'//; s/'\$//" <<< "$v")
+  printf '%s' "${v%/}"
+}
+spfile_audit_dest() {
+  # the same, only when it is a plain absolute path (a copy made before, not by step 8.2 of this script, may
+  # keep the primary's own folder); an unusual one is handled by the check of 7.1 (a step by hand)
+  local v; v=$(spfile_audit_raw)
+  [[ "$v" == /* ]] && v_path "$v" && printf '%s' "$v"
   return 0
 }
 inst_dirs() {
@@ -175,7 +182,9 @@ inst_dirs() {
   adump_dir; printf '\n'
   # (only under ORACLE_BASE: a folder elsewhere, read from a file the oracle user owns, is not made by root)
   local a obr; a=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
-  [[ -n "$a" && ! ( -L "$a" && ! -e "$a" ) ]] && a=$(readlink -m -- "$a" 2>/dev/null || printf '%s' "$a")
+  # a link that points nowhere is left to the check (it says so); it is never a folder to make
+  [[ -n "$a" && -L "$a" && ! -e "$a" ]] && a=""
+  [[ -n "$a" ]] && a=$(readlink -m -- "$a" 2>/dev/null || printf '%s' "$a")
   [[ -n "$a" && "$a" != "$(readlink -m -- "$(adump_dir)" 2>/dev/null)" && "$a" == "$obr"/* ]] && printf '%s\n' "$a"
   [[ -n "$DIAG_DEST" ]] && printf '%s\n' "$DIAG_DEST"
   return 0
@@ -190,25 +199,94 @@ c_7_1() {
   done < <(inst_dirs)
   # an audit folder outside ORACLE_BASE (read from the spfile, a file the oracle user owns) is not created by
   # root: it is a step to do by hand, never passed with a warning (the instance does not start without it)
+  # an audit_file_dest in the spfile that is not a plain absolute path (".." parts, odd characters): by hand
+  local raw; raw=$(spfile_audit_raw)
+  if [[ -n "$raw" ]] && ! { [[ "$raw" == /* ]] && v_path "$raw"; }; then
+    NOW="The spfile of the standby sets audit_file_dest to an unusual path:  $(tr -cd '[:print:]' <<< "$raw")"$'\n'"The script does not use it. The instance needs a plain folder there to start."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Set audit_file_dest in the spfile of $STANDBY_SID to a plain folder under $ORACLE_BASE, for example:"$'\n'"--   $(adump_dir)"$'\n'"-- Then answer r."
+    return 1
+  fi
   local sa out="" obr broken=""; sa=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
   # a link that points nowhere: said as such (resolved, it would look like a folder to make)
   [[ -n "$sa" && -L "$sa" && ! -e "$sa" ]] && broken=$sa
   # the real place (a folder above may be a link, also one the oracle user made): judged and shown resolved,
   # against the resolved ORACLE_BASE; under it, it is in the list above (inst_dirs) and made there
   [[ -n "$sa" ]] && sa=$(readlink -m -- "$sa" 2>/dev/null || printf '%s' "$sa")
+  # resolved through links the oracle user may have made: checked again (a space, ';' or a newline from a link
+  # target must never reach a command shown for root)
+  if [[ -n "$sa" ]] && ! { [[ "$sa" == /* ]] && v_path "$sa"; }; then
+    NOW="audit_file_dest in the spfile of the standby leads, through links, to an unusual path:  $(tr -cd '[:print:]' <<< "$sa")"$'\n'"The script does not use it. The instance needs a plain folder there to start."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Set audit_file_dest in the spfile of $STANDBY_SID to a plain folder under $ORACLE_BASE, for example:"$'\n'"--   $(adump_dir)"$'\n'"-- Then answer r."
+    return 1
+  fi
   if [[ -n "$broken" ]]; then out=$broken
   elif [[ -n "$sa" && "$sa" != "$obr"/* ]] && ! { [[ -d "$sa" ]] && runuser -u "$ORACLE_USER" -- test -w "$sa"; }; then out=$sa; fi
   if [[ ${#I71[@]} -eq 0 && -n "$out" ]]; then
-    NOW="The spfile of the standby sets audit_file_dest to $out (outside $ORACLE_BASE)."$'\n'"It is missing or not writable by $ORACLE_USER. The instance does not start without it."
+    NOW="The spfile of the standby sets audit_file_dest to $out ($([[ -n "$broken" ]] && printf 'a link that points nowhere' || printf 'outside %s' "$ORACLE_BASE"))."$'\n'"It is missing or not writable by $ORACLE_USER. The instance does not start without it."
     KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
     # the path comes from a file the oracle user can change: no chown is suggested for a folder that exists, and a
     # system folder is never offered to that user
-    case "$out" in /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/tmp|/tmp/*|/home|/home/*|/srv|/srv/*|/opt|/run|/run/*)
-        PLAN="-- $out is a system folder: it must not be the audit folder of the database."$'\n'"-- Change audit_file_dest in the spfile of $STANDBY_SID to a folder under $ORACLE_BASE (for example"$'\n'"-- $(adump_dir)), then answer r." ;;
+    # (also the home folder of any other account: a folder there made for $ORACLE_USER could hold programs that
+    # account runs, for example ~/bin)
+    # why a folder is refused (the plan names it): a system folder, another account's home, a folder above an
+    # Oracle home or base (write access there would let the oracle user swap them), or a nearest existing folder
+    # that belongs to someone other than root or the oracle user
+    local oh_o hh why_no="" anc ao hx; oh_o=$(home_of "$ORACLE_USER"); [[ -n "$oh_o" ]] && oh_o=$(readlink -m -- "$oh_o" 2>/dev/null)
+    case "$out" in /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/tmp|/tmp/*|/home|/srv|/opt|/run|/run/*) why_no="a system folder" ;;
+      # under /home only the oracle user's own home: accounts from LDAP or sssd may be missing from getent
+      /home/*) [[ -n "$oh_o" && ( "$out" == "$oh_o" || "$out" == "$oh_o"/* ) ]] || why_no="under /home, outside the home folder of $ORACLE_USER" ;; esac
+    # another account's home (getent; without the oracle user's own home known, this test is left out: the owner
+    # test below still covers it)
+    if [[ -z "$why_no" && -n "$oh_o" ]]; then
+      while IFS=: read -r _ _ _ _ _ hh _; do
+        hh=$(readlink -m -- "$hh" 2>/dev/null); [[ -n "$hh" && "$hh" != / && "$hh" != "$oh_o" ]] || continue
+        [[ "$out" == "$hh" || "$out" == "$hh"/* ]] && { why_no="in the home folder of another account ($hh)"; break; }
+      done < <(getent passwd)
+    fi
+    if [[ -z "$why_no" ]]; then
+      for hx in "$ORACLE_BASE" "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"} ${GRID_BASE:+"$GRID_BASE"}; do
+        hx=$(readlink -m -- "$hx" 2>/dev/null); [[ -n "$hx" && ( "$hx" == "$out" || "$hx" == "$out"/* ) ]] && { why_no="$( [[ "$hx" == "$out" ]] && printf "an Oracle home or base itself" || printf "a folder above %s" "$hx")"; break; }
+      done
+    fi
+    if [[ -z "$why_no" ]]; then
+      anc=$out; while [[ ! -e "$anc" && "$anc" != / ]]; do anc=$(dirname "$anc"); done
+      ao=$(stat -c '%U' -- "$anc" 2>/dev/null)
+      if [[ "$anc" != "$out" && -e "$anc" && ! -d "$anc" ]]; then why_no="under $anc, which is not a folder"
+      elif [[ -z "$ao" ]]; then why_no="under $anc, whose owner cannot be read"
+      elif [[ "$ao" != root && "$ao" != "$ORACLE_USER" ]]; then
+        if [[ "$anc" == "$out" ]]; then why_no="a folder that belongs to ${ao:-an unknown owner}"; else why_no="under $anc, which belongs to ${ao:-an unknown owner}"; fi
+      fi
+    fi
+    # a root mkdir and chown only when no one but root can change any folder on the way (else the oracle user
+    # could put a link in place before root runs them: chown would follow it). Otherwise the oracle user makes
+    # the folder itself when it can, and the path is refused when it cannot
+    local root_ok=0 mk_ora=0 cd cm co
+    if [[ -z "$why_no" && ! -e "$out" && ! -L "$out" ]]; then
+      root_ok=1; cd=$anc
+      while :; do
+        IFS=' ' read -r co cm <<< "$(stat -c '%U %a' -- "$cd" 2>/dev/null)"
+        [[ -n "$co" ]] || { root_ok=0; why_no="under $cd, whose owner and mode cannot be read"; break; }
+        [[ "$co" == root && "$cm" =~ ^[0-7]+$ ]] && (( (8#$cm & 8#022) == 0 )) || { root_ok=0; break; }
+        [[ "$cd" == / ]] && break
+        cd=$(dirname "$cd")
+      done
+      if [[ $root_ok -eq 0 && -z "$why_no" ]]; then
+        if runuser -u "$ORACLE_USER" -- test -w "$anc" 2>/dev/null; then mk_ora=1
+        else why_no="under $cd, which users other than root can change"; fi
+      fi
+    fi
+    local out_sys=0; [[ -n "$why_no" ]] && out_sys=1
+    case "$out_sys" in 1)
+        PLAN="-- $out is $why_no: it must not be the audit folder."$'\n'"-- Change audit_file_dest in the spfile of $STANDBY_SID to a folder under $ORACLE_BASE (for example"$'\n'"-- $(adump_dir)), then answer r." ;;
       *) if [[ -n "$broken" || -e "$out" || -L "$out" ]] && [[ ! -d "$out" ]]; then
            PLAN="-- $out is there, but it is not a folder (a file or a broken link). Check what it is:  ls -l $out"$'\n'"-- Change audit_file_dest in the spfile to a folder under $ORACLE_BASE. Then answer r."
          elif [[ -e "$out" ]]; then
            PLAN="-- $out exists, but $ORACLE_USER cannot write to it. Check who owns it and why:  ls -ld $out"$'\n'"-- Give $ORACLE_USER write access only if the folder is meant for this database,"$'\n'"-- or change audit_file_dest in the spfile. Then answer r."
+         elif [[ $mk_ora -eq 1 ]]; then
+           MANUAL_HOW="$ORACLE_USER"
+           PLAN="-- The script does not create a folder outside $ORACLE_BASE that comes from the spfile."$'\n'"-- As $ORACLE_USER (not as root: users other than root can change $cd):"$'\n'"mkdir -p $out"$'\n'"-- (or change audit_file_dest in the spfile). Then answer r."
          else
            PLAN="-- The script does not create a folder outside $ORACLE_BASE that comes from the spfile."$'\n'"mkdir -p $out"$'\n'"chown $ORACLE_USER:$INSTALL_GROUP $out"$'\n'"-- (or change audit_file_dest in the spfile). Then answer r."
          fi ;;
@@ -716,6 +794,10 @@ dup_prechecks() {
     PRE_FIX="Files of an unfinished copy are still on this server. Clean them up first (step 7.2)"; return 1
   fi
   PRE_INFO+="Standby instance $STANDBY_SID is in NOMOUNT"$'\n'
+  # TDE settings that could not be read: not known whether the copy needs a wallet (never taken as "no TDE")
+  if [[ ${TDE_UNREAD:-0} -eq 1 ]]; then need_ssh && tde_read
+    [[ $TDE_UNREAD -eq 0 ]] || { PRE_FIX="The TDE settings of the primary cannot be read${TDE_ERR:+ ($TDE_ERR)} (step 6.3)"; return 1; }
+  fi
   if tde_autologin_missing; then PRE_FIX="The TDE keystore of the standby has no auto-login file (cwallet.sso)."$'\n'"The copy and redo apply would stop with ORA-28365 (step 6.3)"; return 1; fi
   # the folders of this server must not be the storage of the primary (NOFILENAMECHECK would overwrite it)
   if [[ -n "$(fs_dirs)" && "$MODE" == "run" ]]; then

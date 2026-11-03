@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.16"
+readonly SCRIPT_VERSION="5.18"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -224,6 +224,7 @@ user_stop() {
 }
 STOPPED_BY_USER=0
 fatal() {
+  tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
   _log FATAL "$*"
@@ -274,7 +275,10 @@ on_signal() {
 A running installer, root script or RMAN copy goes on by itself. Run the script again later."
 }
 
+TTY_RESTORE=""     # the terminal settings before a hidden question (put back on any exit: Ctrl+C, signal, error)
+tty_restore() { [[ -n "$TTY_RESTORE" ]] && { stty "$TTY_RESTORE" < "${PROMPT_IN:-/dev/tty}" 2>/dev/null; TTY_RESTORE=""; }; return 0; }
 cleanup() {
+  tty_restore
   local f
   for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
     [[ -n "$f" ]] || continue
@@ -348,10 +352,10 @@ confirm_word() {
 ask_secret() {
   # $1 prompt. Result in SECRET.
   # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
-  local st=""; st=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
+  TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
   local rc=0; IFS= read -rs SECRET < "$PROMPT_IN" || rc=$?
-  [[ -n "$st" ]] && stty "$st" < "$PROMPT_IN" 2>/dev/null
+  tty_restore
   [[ $rc -eq 0 ]] || fatal "No answer could be read for: $1  (run the script in an interactive terminal, for example ssh -t)"
   printf '\n'
   _log ASK "$1  -> (hidden)"
@@ -904,8 +908,11 @@ record() {
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
-  { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
-    && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"
+  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
+    && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"; }; then
+    # the next run would show an old result for this step: said once
+    [[ ${PROGRESS_WARNED:-0} -eq 1 ]] || { PROGRESS_WARNED=1; warn "The progress file $PROGRESS_FILE cannot be written. The next run may show old results."; }
+  fi
   chmod 600 "$PROGRESS_FILE" 2>/dev/null
   return 0
 }
@@ -1308,6 +1315,7 @@ run_step() {
     if [[ $drc -eq 0 ]]; then
       NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
       # done, but the result cannot really be checked yet: waiting (checked again in a later run)
+      if [[ $rc -eq 0 && $CHECK_WAITS -eq 2 ]] && is_optional "$id"; then wait_msg "Done, not checked yet. $NOW"; record "$id" SKIPPED_OPTIONAL; return 0; fi
       if [[ $rc -eq 0 && $CHECK_WAITS -ne 0 ]]; then wait_msg "Done, not checked yet. $NOW"; record "$id" WAITS; return 0; fi
       if [[ $rc -eq 0 ]]; then
         ok_lines "Done. ${DONE_MSG:-$NOW}"
@@ -1397,6 +1405,10 @@ summary() {
     done
   fi
   declare -F journal_run_summary >/dev/null && journal_run_summary
+  # what the start-at-boot unit reported at this boot: shown in every summary (also when 9.7 did not run now)
+  # (not again when step 9.7 ran in this run: it showed them)
+  local be=""; [[ ${BOOT_ERR_SHOWN:-0} -eq 1 ]] || be=$(boot_errors_now 2>/dev/null)
+  [[ -n "$be" ]] && printf '\n  %sAt this boot, the start-at-boot unit reported:%s\n%s\n  To see it all:  journalctl -p err -u %s\n' "$C_Y" "$C_N" "$(sed 's/^/    /' <<< "$be")" "$(unit_name)"
   printf '\n  Log:        %s\n' "$LOG_FILE"
   [[ -s "$ACTIONS_FILE" ]] && printf '  Commands:   %s\n' "$ACTIONS_FILE"
   printf '  %s\n' "$(primary_note)"
@@ -2756,10 +2768,28 @@ open_ssh() {
 # A program found this way is used only when it belongs to the user that runs
 # the process and nobody else can change it.
 #------------------------------------------------------------------------------
-PS_OUT=""; DB_PMON_PID=""; ASM_PMON_PID=""; AUDIT_DEST=""; DIAG_DEST=""; TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""
+PS_OUT=""; DB_PMON_PID=""; ASM_PMON_PID=""; AUDIT_DEST=""; DIAG_DEST=""; TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0
 PRIM_CLOCK_OFFSET=0    # primary clock minus this server's clock (seconds)
 DISC_NOTES=()          # things worth telling the user (oratab differs, env missing, ...)
 
+tde_read() {
+  # the TDE wallet of the primary -> TDE_INFO, WALLET_ROOT, TDE_CONFIG. TDE_UNREAD=1 when a query failed: an empty
+  # answer is "no wallet", a failed query is "not known" (step 6.3 asks again and says so). Used by the discovery
+  # and by 6.3, so both read the same columns (wallet_type: a LOCAL auto-login wallet opens only where it was made)
+  TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0; TDE_ERR=""; WROOT_BAD=""
+  if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  elif prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  else TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT"); fi
+  if [[ $DB_MAJOR -ge 18 ]]; then
+    if prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name in ('wallet_root','tde_configuration');"; then
+      local wn wv
+      while IFS='|' read -r wn wv; do
+        case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { WROOT_BAD=$WALLET_ROOT; WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
+      done <<< "$SQL_OUT"
+    else TDE_UNREAD=1; [[ -n "$TDE_ERR" ]] || TDE_ERR=$(ora_errors "$SQL_OUT"); fi
+  fi
+  return 0
+}
 parse_id_line() {
   # "uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba)"
   # -> sets PID_UID PID_PGROUP PID_GROUPS(name:gid,...)
@@ -3138,18 +3168,9 @@ Assuming LISTENER, port $PORT, service $want."
   fi
 
   # ---- TDE (12.1+ view; an empty answer means no wallet). 18c+: wallet_root / tde_configuration
-  TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""
-  # wallet_type (12.1.0.2+): LOCAL_AUTOLOGIN wallets open only on the host that made them
-  if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
-  else prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;" && TDE_INFO=$SQL_OUT; fi
-  if [[ $DB_MAJOR -ge 18 ]] && prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name in ('wallet_root','tde_configuration');"; then
-    local wn wv
-    while IFS='|' read -r wn wv; do
-      case "$wn" in wallet_root) [[ "$wv" != "-" ]] && WALLET_ROOT=${wv%/}; [[ -z "$WALLET_ROOT" ]] || v_path "$WALLET_ROOT" || { DISC_NOTES+=("wallet_root on the primary is '$WALLET_ROOT', which is not a folder.
-Copy the TDE wallet by hand in step 6.3.");WALLET_ROOT=""; } ;; tde_configuration) [[ "$wv" != "-" ]] && TDE_CONFIG=$wv ;; esac
-
-    done <<< "$SQL_OUT"
-  fi
+  tde_read
+  [[ -n "$WROOT_BAD" ]] && DISC_NOTES+=("wallet_root on the primary is '$WROOT_BAD', which is not a folder.
+Copy the TDE wallet by hand in step 6.3.")
 
   local n; for n in "${DISC_NOTES[@]+"${DISC_NOTES[@]}"}"; do warn "$n"; done
   set_primary_how
@@ -3731,10 +3752,10 @@ hugepages_kb() {
   local n sz; n=$(awk '/^HugePages_Total:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); sz=$(awk '/^Hugepagesize:/{print $2}' "$MEMINFO_FILE" 2>/dev/null)
   num "$n" && num "$sz" && printf '%s' $(( n * sz )) || printf 0
 }
-LIM_MEMLOCK_NEED=0   # KB: the SGA of the primary when it runs only in HugePages (use_large_pages=ONLY); set by 2.4
+LIM_MEMLOCK_NEED=0   # KB: the SGA of the primary when it runs only in HugePages (use_large_pages=ONLY or AUTO_ONLY); set by 2.4
 lim_min() {
   # memlock (KB): the SGA in HugePages must be lockable: at least the HugePages set here, and the SGA of the
-  # primary when it needs HugePages (ONLY). Without either, the SGA is not locked: any value is enough
+  # primary when it needs HugePages (ONLY or AUTO_ONLY). Without either, the SGA is not locked: any value is enough
   local h
   case "$1" in nofile) printf 65536 ;; nproc) printf 16384 ;; stack) printf 32768 ;;
     memlock) h=$(hugepages_kb); [[ ${LIM_MEMLOCK_NEED:-0} -gt $h ]] && h=$LIM_MEMLOCK_NEED; printf '%s' "$h" ;;
@@ -3778,7 +3799,7 @@ c_2_4() {
   # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
   # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
   local who g v over="" w wf wp wl ulp sga
-  # the primary needs HugePages for its SGA (use_large_pages=ONLY): memlock must cover that SGA here too
+  # the primary needs HugePages for its SGA (use_large_pages=ONLY or AUTO_ONLY): memlock must cover that SGA here too
   LIM_MEMLOCK_NEED=0; local lmnote="" lm_need=0
   if ssh_alive && prim_sql "select upper(value) from v\$parameter where name='use_large_pages';"; then
     ulp=$(first_line)
@@ -3835,10 +3856,21 @@ d_2_4() {
 }
 
 # ---- 2.5 folders ----
+root_holds() {
+  # 0 when only root can change the entry $2 in folder $1: $1 belongs to root and is not writable by group or
+  # others, or it is sticky and $2 is there already, owned by root and not a link (nobody else can rename it)
+  local o m; IFS=' ' read -r o m <<< "$(stat -c '%U %a' -- "$1" 2>/dev/null)"
+  [[ "$o" == root && "$m" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$m & 8#022) == 0 )) && return 0
+  (( (8#$m & 8#1000) != 0 )) && [[ -d "$2" && ! -L "$2" && "$(stat -c '%U' -- "$2" 2>/dev/null)" == root ]]
+}
 make_dir() {
   # $1 path, $2 owner. Creates missing components owned by $2 (group INSTALL_GROUP, 775).
   # Changes the owner of an existing directory only when it is empty. Never recursive, never through a link.
-  local path=$1 owner=$2 p="" comp
+  # Root acts only while no one else can change the folders on the way (root_holds, from / down). Below a
+  # folder another user can change (for example the oracle base, or a group-writable /u01/app), the rest is made
+  # as $2 itself: a link put in place there between two steps then leads nowhere $2 could not write anyway
+  local path=$1 owner=$2 p="" par="/" comp held=1
   local -a parts=()
   # "." or ".." parts would make the system-folder test below meaningless (/u01/../etc)
   [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { bad "$path is not a plain absolute path. It is not created or changed."; return 1; }
@@ -3853,11 +3885,24 @@ make_dir() {
       local lo; lo=$(stat -c '%U' "$p")
       [[ "$lo" == "root" ]] || { bad "$p is a symbolic link owned by $lo. It is not used."; return 1; }
     fi
-    if [[ ! -e "$p" ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1; say "Created $p"; journal DIR "$p" "owner $owner"; fi
+    [[ $held -eq 1 ]] && ! root_holds "$par" "$p" && held=0
+    if [[ ! -e "$p" && ! -L "$p" ]]; then
+      if [[ $held -eq 1 ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1
+      else
+        runuser -u "$owner" -- mkdir -m 775 -- "$p" 2>/dev/null && runuser -u "$owner" -- chgrp -h "$INSTALL_GROUP" -- "$p" 2>/dev/null \
+          || { bad "$p cannot be made by $owner (the folder above can be changed by users other than root, so root does not make it). Make it, as $owner:  mkdir -p $path"; return 1; }
+      fi
+      say "Created $p"; journal DIR "$p" "owner $owner"
+    fi
     [[ -d "$p" ]] || { bad "$p exists, but it is not a folder. It is not changed."; return 1; }
+    par=$p
   done
   [[ -L "$path" ]] && { warn "$path is a symbolic link. Its owner is not changed."; return 0; }
-  if dir_empty "$path"; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"; fi
+  if dir_empty "$path"; then
+    # the mode is set as the new owner: a link swapped in after chown -h then points only where $owner may write
+    if [[ $held -eq 1 ]]; then chown -h "$owner:$INSTALL_GROUP" "$path" && chmod 775 "$path"
+    else chown -h "$owner:$INSTALL_GROUP" "$path" && runuser -u "$owner" -- chmod 775 -- "$path"; fi
+  fi
 }
 dir_specs() {
   if use_grid; then printf '%s\n' "$GRID_BASE:$GRID_USER" "$GRID_HOME:$GRID_USER"; fi
@@ -4037,58 +4082,20 @@ fw_path_note() {
   return 0
 }
 local_fw_rules() {
-  # firewalld is not active: rules of nftables or iptables on this server for incoming traffic (read-only; a
-  # note, the real test is the connect from the primary). Named: a drop or reject rule for the port itself; or
-  # a general drop (policy drop, drop/reject rules) with no accept rule for the port.
-  local inp="" r
-  local all=""
-  # "all" = every chain but the output and forward ones (an accept there is not for incoming traffic)
-  command -v nft >/dev/null 2>&1 && { r=$(nft list ruleset 2>/dev/null); inp=$(awk '/hook input/ { i = 1 } i && /^[[:space:]]*}/ { i = 0 } i { print }' <<< "$r")
-    all=$(awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }' <<< "$r"); }
-  command -v iptables >/dev/null 2>&1 && { r=$(iptables -S 2>/dev/null); all+=$'\n'$(grep -vE '^-(P|A) (OUTPUT|FORWARD)' <<< "$r"); inp+=$'\n'$(grep -E '^-(P|A) INPUT' <<< "$r"); }
-  grep -q '[^[:space:]]' <<< "$inp" || return 0
-  # named sets, verdict maps, port ranges and "!=" are not read here: an accept rule written that way may cover the
-  # port, so then "no accept" is not claimed (such a construct elsewhere changes nothing)
-  local unread='dports? (@|vmap|!=)|dports?[[:space:]]+[0-9]+[-:][0-9]+|--match-set' acc_unread=0
-  grep -E "$unread" <<< "$all" | grep -qiE 'accept|vmap' && acc_unread=1
-  # a rule that names the port (dport / --dport / --dports list, nft set { 22, 1521 }); only the number is read
-  local pre="(dports?|--dports?)[[:space:]]+([{][^}]*|[0-9,:]*,)?[[:space:]]*\b$PORT\b"
-  # (a rule for udp or for one destination address is not this port of this server)
-  local notmine='udp|(^| )-d |daddr|--dst'
-  r=$(grep -E "$pre" <<< "$inp" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
-  if [[ -n "$r" ]]; then
-    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld drops or rejects port $PORT:"$'\n'"  $r"
-    return 0
-  fi
-  # the input chain accepts the port: a drop elsewhere is not looked at
-  grep -E "$pre" <<< "$inp" | grep -qiE 'accept' && return 0
-  # in another chain (it may be one the input chain jumps to; this is not followed)
-  r=$(grep -E "$pre" <<< "$all" | grep -vE "$notmine" | grep -Ei '(drop|reject)' | head -n 1 | sed 's/^[[:space:]]*//')
-  if [[ -n "$r" ]]; then
-    NOW+=$'\n'"Note: a firewall rule on this server outside firewalld, in a chain other than input, may drop port $PORT"$'\n'"(if the input chain jumps to it):  $r"
-    return 0
-  fi
-  # an accept for the port anywhere (also in a chain the input chain jumps to): no note
-  grep -E "$pre" <<< "$all" | grep -qiE 'accept' && return 0
-  [[ $acc_unread -eq 1 ]] && return 0
-  # a general drop (not the usual "ct state invalid drop", which drops only broken packets)
-  # rules for one protocol or one interface count (they cover the port too); rules for some addresses or other
-  # ports do not
-  # a drop for all TCP (or every protocol) counts; one for another protocol, one interface, some addresses,
-  # flags, rates or sets does not
-  # (the reject answer, "--reject-with icmp-host-prohibited" or "reject with icmpx ...", is not a match: cut off
-  # before the test; the shown rule is the whole line)
-  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$inp" \
-      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|^-A INPUT( .*)? -j (DROP|REJECT)' \
-      | while IFS= read -r l; do
-          c=$(sed -E 's/(--reject-with|reject with) .*//' <<< "$l")
-          grep -qE '(saddr|daddr|dport|sport|ct state|ct status|iifname|oifname|(^| )iif |(^| )oif |(^| )-s |(^| )-d |(^| )-i |(^| )-o |--dport|--sport|--src|--dst|--ctstate|--state|--match-set|tcp flags|--tcp-flags|limit|recent|nfproto|icmp|udp|sctp|l4proto [^t]|protocol [^t]|! -p )' <<< "$c" && continue
-          # -p: only tcp, all, 0 or 6 cover this port
-          if [[ "$c" =~ (^|[[:space:]])-p[[:space:]]+([^[:space:]]+) ]] && ! [[ "${BASH_REMATCH[2]}" =~ ^(tcp|all|0|6)$ ]]; then continue; fi
-          printf '%s\n' "$l"
-        done | head -n 1 | sed 's/^[[:space:]]*//')
+  # firewalld is not active: rules of nftables or iptables on this server (read-only). They are not judged here
+  # (sets, maps, jumps and scopes make a sure verdict impossible): the drop and reject rules are shown, so the
+  # admin can see at once whether one of them stops port $PORT. The real test is the connect from the primary.
+  local r="" rules="" myif
+  command -v nft >/dev/null 2>&1 && rules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
+  command -v iptables >/dev/null 2>&1 && rules+=$'\n'$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  # (not "ct state invalid ... drop": it only drops broken packets)
+  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
+      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)' \
+      | sed 's/^[[:space:]]*//' | head -n 3)
   [[ -n "$r" ]] || return 0
-  NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject incoming traffic"$'\n'"(for example:  $r), and no rule that accepts port $PORT."$'\n'"Check that $PORT/tcp is allowed:  nft list ruleset  (or:  iptables -S INPUT)"
+  myif=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
+  NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject traffic, for example:"$'\n'"$(sed 's/^/  /' <<< "$r")"
+  NOW+=$'\n'"Check that they let port $PORT/tcp from $PRIMARY_IP in${myif:+ (on $myif, the interface of $STANDBY_IP)}:  nft list ruleset  (or:  iptables -S)"
   return 0
 }
 FW_PATH_DONE=0      # 1 only inside 4.9 (it runs the check of 2.9 quietly, without this probe)
@@ -5373,7 +5380,9 @@ media_room() {
     if [[ $x == grid ]]; then fl=$1; dest=$GRID_HOME; else fl=$2; dest=$DB_HOME; fi
     [[ -n "$fl" ]] || continue
     local -a mfl=(); IFS=',' read -ra mfl <<< "$fl"
-    for f in "${mfl[@]}"; do [[ -r "$f" ]] || unread+="  $f"$'\n'; done
+    # readable by the user who unpacks it (root reads any file; the unzip runs as the owner of the home)
+    local uu; [[ $x == grid ]] && uu=$GRID_USER || uu=$ORACLE_USER
+    for f in "${mfl[@]}"; do [[ -r "$f" ]] && runuser -u "$uu" -- test -r "$f" 2>/dev/null || unread+="  $f  (as $uu)"$'\n'; done
     zmb=$(for f in "${mfl[@]}"; do stat -c '%s' -- "$f" 2>/dev/null; done | awk '{s += $1} END {printf "%d", s / 1048576}')
     # staged media (12.x): unpacked into the stage folder, then installed into the home: both count
     local dd; for dd in $(media_is_staged "$fl" && printf '%s ' "$(stage_dir "$x")"; printf '%s' "$dest"); do
@@ -5389,7 +5398,7 @@ media_room() {
   if [[ -n "$unread" ]]; then
     NOW="These installer files are missing or cannot be read:"$'\n'"${unread%$'\n'}"
     KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
-    PLAN="-- Put them back (owner root, mode 644), or set GRID_MEDIA / DB_MEDIA again:  $SELF --settings  (choose e)."$'\n'"-- Then answer r."
+    PLAN="-- Put them back (owner root, mode 644), or set GRID_MEDIA / DB_MEDIA again:  $SELF --settings  (choose e)."$'\n'"-- Every folder above a file must be open to that user too. To see where it stops:  namei -l <file>"$'\n'"-- Then answer r."
     return 1
   fi
   [[ -z "$short" ]] && return 0
@@ -6894,7 +6903,7 @@ find_dest() {
   [[ -n "$DEST_N" ]] || return 1
   # a second free one (not DEST_N), for the duplex folder when log_archive_dest is moved (4.4)
   DEST_FREE2=""
-  for ((n = 3; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
+  for ((n = 2; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
   return 0
 }
 c_4_4() {
@@ -6986,7 +6995,15 @@ c_4_6() {
     [[ -n "$fdg" ]] || fdg=$DATA_DG
     PLAN="alter system set db_recovery_file_dest_size=${gb}G scope=both;
 alter system set db_recovery_file_dest='+${fdg^^}' scope=both;"
-    PLAN+=$'\n'"-- Size: $why."$'\n'"-- Disk group: $(if [[ $dgq -ne 0 ]]; then printf 'the one of the datafiles (the disk groups of the primary could not be read)'; elif [[ "${fdg^^}" == "${DATA_DG^^}" ]]; then printf 'the one of the datafiles (no FRA or RECO disk group found)'; else printf 'the one named for it'; fi). Check that it has the space."
+    # the free space of that disk group on the primary (read-only), against the size
+    local ufm=""; prim_sql "select to_char(usable_file_mb) from v\$asm_diskgroup_stat where name=upper('${fdg^^}');" && ufm=$(first_line)
+    # (negative on a NORMAL or HIGH redundancy group that has lost room for a failure: no usable space)
+    if [[ "$ufm" =~ ^-[0-9]+$ ]]; then why+=" (+${fdg^^} has no usable space now: add space first)"
+    elif num "$ufm"; then
+      if [[ $ufm -lt $(( gb * 1024 )) ]]; then why+=" (+${fdg^^} has only $(human_mb "$ufm") usable: make it smaller, or add space)"
+      else why+=" (+${fdg^^} has $(human_mb "$ufm") usable)"; fi
+    fi
+    PLAN+=$'\n'"-- Size: $why."$'\n'"-- Disk group: $(if [[ $dgq -ne 0 ]]; then printf 'the one of the datafiles (the disk groups of the primary could not be read)'; elif [[ "${fdg^^}" == "${DATA_DG^^}" ]]; then printf 'the one of the datafiles (no FRA or RECO disk group found)'; else printf 'the one named for it'; fi).$(num "$ufm" || [[ "$ufm" =~ ^-[0-9]+$ ]] || printf ' Its usable space could not be read: check it.')"
   else
     PLAN="-- A folder with enough space, owned by $ORACLE_USER, for example:
 host mkdir -p ${ORACLE_BASE:-/u01/app/oracle}/fast_recovery_area
@@ -7269,7 +7286,7 @@ net_dir_note() {
   # plan, and asked also with --yes
   local d r; d=$(dirname "$1"); [[ -L "$d" ]] || return 0
   r=$(readlink -e -- "$d" 2>/dev/null) || return 0
-  PLAN+=$'\n'"Note: $d is a link to $r. That folder may be shared with other homes or servers:"$'\n'"the change is made there."
+  PLAN+=$'\n'"-- Note: $d is a link to $r. That folder may be shared with other homes or servers."
   YES_HOLD=1
   return 0
 }
@@ -7422,6 +7439,7 @@ ORACLE_HOME (database home, not Grid):
     PLAN="-- Edit the file the link points to. SID_LIST_$SB_LSNR must hold this entry:"$'\n'"$(sid_desc_block)"
     ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
     PLAN+=$'\n'"-- Then answer r."
+    net_dir_note "$f"
     return 1
   fi
   if ! use_grid && ! lsnr_has_desc; then
@@ -7504,6 +7522,7 @@ $(sid_desc_block)"
       (ORACLE_HOME = $DB_HOME)
     )"
   ! use_grid && ! lsnr_has_desc && PLAN+=$'\n'"-- and this listener address:"$'\n'"$(lsnr_desc_block)"
+  net_dir_note "$f"
   return 1
 }
 lsnr_reload_flag() { printf '%s/listener_reload_due' "$STATE_DIR"; }
@@ -7568,6 +7587,7 @@ srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
 srvctl stop listener -listener $SB_LSNR
 srvctl start listener -listener $SB_LSNR"
     fi
+    net_dir_note "$(lsnr_file)"
     return 1
   fi
   # step 5.1 changed listener.ora while the listener ran: an old entry of this SID may still show, so the reload
@@ -7649,6 +7669,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
 --   $f
 -- The entry must be:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$(tns_file)"
     return 1
   fi
   if tns_alias_present "$T_ALIAS"; then
@@ -7679,6 +7700,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
 --   $f
 -- Fix the entry. Check the brackets and the host name:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$(tns_file)"
     return 1
   fi
   NOW="The alias $T_ALIAS is missing from tnsnames.ora:"$'\n'"  $f"
@@ -7687,6 +7709,7 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
     PLAN="-- Add this to the file the link points to, then answer r:
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+    net_dir_note "$f"
     return 1
   fi
   PLAN="Add this to tnsnames.ora (a backup is kept):
@@ -7924,13 +7947,21 @@ sqlnet_has_wallet() {
   norm "$(sed 's/#.*//' "$f")" | grep -qE "\(DIRECTORY=\"?$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "${d^^}")/?\"?\)"
 }
 c_6_3() {
+  # the wallet query of the discovery failed: asked again now; still failing = not known (never "no wallet")
+  if [[ ${TDE_UNREAD:-0} -eq 1 ]]; then
+    need_ssh || return 2
+    tde_read
+    [[ $TDE_UNREAD -eq 0 ]] || { NOW="Cannot read the TDE settings of the primary${TDE_ERR:+ ($TDE_ERR)}. Whether it uses TDE is not known."; return 2; }
+  fi
+  # wallet_root of the primary that is not a plain folder: the wallet (and tde_seps) are copied by hand
+  [[ -n "${WROOT_BAD:-}" ]] && { NOW="wallet_root on the primary is '$WROOT_BAD', which is not a plain folder."$'\n'"Copy the TDE wallet to the same place for the standby by hand."; return 2; }
   [[ -n "$TDE_INFO" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   if awk -F'|' 'toupper($1)!="FILE" && toupper($3)!="NOT_AVAILABLE"' <<< "$TDE_INFO" | grep -q .; then
     NOW="The primary uses a TDE keystore that is not a file (HSM or OKV):"$'\n'"$TDE_INFO"
     PLAN="Set up the same keystore for $STANDBY_UNIQUE on this server, as your HSM or OKV vendor describes."
     return 2
   fi
-  local -a dirs=(); local d f; mapfile -t dirs < <(tde_dirs)
+  local -a dirs=(); local d f seps_note=""; mapfile -t dirs < <(tde_dirs)
   [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   # 18c+: the password for "IDENTIFIED BY EXTERNAL STORE" is in WALLET_ROOT/tde_seps
   # (a folder that cannot be read is not left out silently: the password in it would be missing here)
@@ -7945,7 +7976,7 @@ c_6_3() {
     if [[ "$sx" == YES ]]; then
       prim_probe lsdir "$WALLET_ROOT/tde_seps" || { NOW="Cannot list $WALLET_ROOT/tde_seps on the primary. The ssh user must be able to read it."; return 2; }
       if grep -qx 'cwallet.sso' <<< "$RUN_OUT"; then dirs+=("$WALLET_ROOT/tde_seps")
-      elif grep -q '[^[:space:]]' <<< "$RUN_OUT"; then warn "$WALLET_ROOT/tde_seps on the primary has no cwallet.sso. It is not copied."; fi
+      elif grep -q '[^[:space:]]' <<< "$RUN_OUT"; then seps_note="$WALLET_ROOT/tde_seps on the primary has no cwallet.sso. It is not copied (no external-store password to take)."; warn "$seps_note"; fi
     fi
   fi
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
@@ -7990,6 +8021,7 @@ c_6_3() {
 --   $(sqlnet_file)
 -- Change the ENCRYPTION_WALLET_LOCATION line to:
 ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"
+        net_dir_note "$(sqlnet_file)"
         return 1
       else
         TDE_SQLNET=1
@@ -8025,6 +8057,7 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
     NOW="The TDE wallet is the same as on the primary:$have"
     [[ -n "$WALLET_ROOT" ]] && NOW+=$'\n'"wallet_root=$WALLET_ROOT comes to the standby with the spfile." || NOW+=$'\n'"The wallet location ${dirs[0]} is set in:"$'\n'"  $(sqlnet_file)"
+    [[ -n "$seps_note" ]] && NOW+=$'\n'"Note: $seps_note"
     return 0
   fi
   NOW="The primary uses TDE.${miss:+ Missing here:$miss}${diff:+ Different here:$diff}"
@@ -8280,14 +8313,21 @@ detect_built() {
 
 # ---- 7.1 ----
 adump_dir() { printf '%s/admin/%s/adump' "$ORACLE_BASE" "$STANDBY_UNIQUE"; }
-spfile_audit_dest() {
-  # audit_file_dest in the spfile of a standby that exists already (a copy made before, not by step 8.2 of this
-  # script, may keep the primary's own folder): empty when there is no spfile or no such line
+spfile_audit_raw() {
+  # audit_file_dest as written in the spfile of a standby that exists already (empty: no spfile, no such line)
   local f v; f=$(spfile_path); [[ -f "$f" ]] || return 0
-  v=$(grep -a -o -iE "^[*A-Za-z0-9_]*\.audit_file_dest='[^']+'" "$f" 2>/dev/null | tail -n 1 | sed "s/^[^']*'//; s/'\$//")
-  v=${v%/}
-  if [[ "$v" == /* ]] && v_path "$v"; then printf '%s' "$v"
-  elif [[ -n "$v" ]]; then warn "The spfile of the standby sets audit_file_dest to an unusual path ($v). The script does not use it; check it by hand." >&2; fi
+  # a line for this instance (SID.) wins over one for all (*.), as in the database; lines of other SIDs are not used
+  local all; all=$(grep -a -o -iE "^[*A-Za-z0-9_]*\.audit_file_dest='[^']+'" "$f" 2>/dev/null)
+  v=$(grep -i -- "^${STANDBY_SID}\." <<< "$all" | tail -n 1)
+  [[ -n "$v" ]] || v=$(grep -- '^\*\.' <<< "$all" | tail -n 1)
+  v=$(sed "s/^[^']*'//; s/'\$//" <<< "$v")
+  printf '%s' "${v%/}"
+}
+spfile_audit_dest() {
+  # the same, only when it is a plain absolute path (a copy made before, not by step 8.2 of this script, may
+  # keep the primary's own folder); an unusual one is handled by the check of 7.1 (a step by hand)
+  local v; v=$(spfile_audit_raw)
+  [[ "$v" == /* ]] && v_path "$v" && printf '%s' "$v"
   return 0
 }
 inst_dirs() {
@@ -8295,7 +8335,9 @@ inst_dirs() {
   adump_dir; printf '\n'
   # (only under ORACLE_BASE: a folder elsewhere, read from a file the oracle user owns, is not made by root)
   local a obr; a=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
-  [[ -n "$a" && ! ( -L "$a" && ! -e "$a" ) ]] && a=$(readlink -m -- "$a" 2>/dev/null || printf '%s' "$a")
+  # a link that points nowhere is left to the check (it says so); it is never a folder to make
+  [[ -n "$a" && -L "$a" && ! -e "$a" ]] && a=""
+  [[ -n "$a" ]] && a=$(readlink -m -- "$a" 2>/dev/null || printf '%s' "$a")
   [[ -n "$a" && "$a" != "$(readlink -m -- "$(adump_dir)" 2>/dev/null)" && "$a" == "$obr"/* ]] && printf '%s\n' "$a"
   [[ -n "$DIAG_DEST" ]] && printf '%s\n' "$DIAG_DEST"
   return 0
@@ -8310,25 +8352,94 @@ c_7_1() {
   done < <(inst_dirs)
   # an audit folder outside ORACLE_BASE (read from the spfile, a file the oracle user owns) is not created by
   # root: it is a step to do by hand, never passed with a warning (the instance does not start without it)
+  # an audit_file_dest in the spfile that is not a plain absolute path (".." parts, odd characters): by hand
+  local raw; raw=$(spfile_audit_raw)
+  if [[ -n "$raw" ]] && ! { [[ "$raw" == /* ]] && v_path "$raw"; }; then
+    NOW="The spfile of the standby sets audit_file_dest to an unusual path:  $(tr -cd '[:print:]' <<< "$raw")"$'\n'"The script does not use it. The instance needs a plain folder there to start."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Set audit_file_dest in the spfile of $STANDBY_SID to a plain folder under $ORACLE_BASE, for example:"$'\n'"--   $(adump_dir)"$'\n'"-- Then answer r."
+    return 1
+  fi
   local sa out="" obr broken=""; sa=$(spfile_audit_dest); obr=$(readlink -m -- "$ORACLE_BASE" 2>/dev/null || printf '%s' "$ORACLE_BASE")
   # a link that points nowhere: said as such (resolved, it would look like a folder to make)
   [[ -n "$sa" && -L "$sa" && ! -e "$sa" ]] && broken=$sa
   # the real place (a folder above may be a link, also one the oracle user made): judged and shown resolved,
   # against the resolved ORACLE_BASE; under it, it is in the list above (inst_dirs) and made there
   [[ -n "$sa" ]] && sa=$(readlink -m -- "$sa" 2>/dev/null || printf '%s' "$sa")
+  # resolved through links the oracle user may have made: checked again (a space, ';' or a newline from a link
+  # target must never reach a command shown for root)
+  if [[ -n "$sa" ]] && ! { [[ "$sa" == /* ]] && v_path "$sa"; }; then
+    NOW="audit_file_dest in the spfile of the standby leads, through links, to an unusual path:  $(tr -cd '[:print:]' <<< "$sa")"$'\n'"The script does not use it. The instance needs a plain folder there to start."
+    KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+    PLAN="-- Set audit_file_dest in the spfile of $STANDBY_SID to a plain folder under $ORACLE_BASE, for example:"$'\n'"--   $(adump_dir)"$'\n'"-- Then answer r."
+    return 1
+  fi
   if [[ -n "$broken" ]]; then out=$broken
   elif [[ -n "$sa" && "$sa" != "$obr"/* ]] && ! { [[ -d "$sa" ]] && runuser -u "$ORACLE_USER" -- test -w "$sa"; }; then out=$sa; fi
   if [[ ${#I71[@]} -eq 0 && -n "$out" ]]; then
-    NOW="The spfile of the standby sets audit_file_dest to $out (outside $ORACLE_BASE)."$'\n'"It is missing or not writable by $ORACLE_USER. The instance does not start without it."
+    NOW="The spfile of the standby sets audit_file_dest to $out ($([[ -n "$broken" ]] && printf 'a link that points nowhere' || printf 'outside %s' "$ORACLE_BASE"))."$'\n'"It is missing or not writable by $ORACLE_USER. The instance does not start without it."
     KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
     # the path comes from a file the oracle user can change: no chown is suggested for a folder that exists, and a
     # system folder is never offered to that user
-    case "$out" in /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/tmp|/tmp/*|/home|/home/*|/srv|/srv/*|/opt|/run|/run/*)
-        PLAN="-- $out is a system folder: it must not be the audit folder of the database."$'\n'"-- Change audit_file_dest in the spfile of $STANDBY_SID to a folder under $ORACLE_BASE (for example"$'\n'"-- $(adump_dir)), then answer r." ;;
+    # (also the home folder of any other account: a folder there made for $ORACLE_USER could hold programs that
+    # account runs, for example ~/bin)
+    # why a folder is refused (the plan names it): a system folder, another account's home, a folder above an
+    # Oracle home or base (write access there would let the oracle user swap them), or a nearest existing folder
+    # that belongs to someone other than root or the oracle user
+    local oh_o hh why_no="" anc ao hx; oh_o=$(home_of "$ORACLE_USER"); [[ -n "$oh_o" ]] && oh_o=$(readlink -m -- "$oh_o" 2>/dev/null)
+    case "$out" in /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/tmp|/tmp/*|/home|/srv|/opt|/run|/run/*) why_no="a system folder" ;;
+      # under /home only the oracle user's own home: accounts from LDAP or sssd may be missing from getent
+      /home/*) [[ -n "$oh_o" && ( "$out" == "$oh_o" || "$out" == "$oh_o"/* ) ]] || why_no="under /home, outside the home folder of $ORACLE_USER" ;; esac
+    # another account's home (getent; without the oracle user's own home known, this test is left out: the owner
+    # test below still covers it)
+    if [[ -z "$why_no" && -n "$oh_o" ]]; then
+      while IFS=: read -r _ _ _ _ _ hh _; do
+        hh=$(readlink -m -- "$hh" 2>/dev/null); [[ -n "$hh" && "$hh" != / && "$hh" != "$oh_o" ]] || continue
+        [[ "$out" == "$hh" || "$out" == "$hh"/* ]] && { why_no="in the home folder of another account ($hh)"; break; }
+      done < <(getent passwd)
+    fi
+    if [[ -z "$why_no" ]]; then
+      for hx in "$ORACLE_BASE" "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"} ${GRID_BASE:+"$GRID_BASE"}; do
+        hx=$(readlink -m -- "$hx" 2>/dev/null); [[ -n "$hx" && ( "$hx" == "$out" || "$hx" == "$out"/* ) ]] && { why_no="$( [[ "$hx" == "$out" ]] && printf "an Oracle home or base itself" || printf "a folder above %s" "$hx")"; break; }
+      done
+    fi
+    if [[ -z "$why_no" ]]; then
+      anc=$out; while [[ ! -e "$anc" && "$anc" != / ]]; do anc=$(dirname "$anc"); done
+      ao=$(stat -c '%U' -- "$anc" 2>/dev/null)
+      if [[ "$anc" != "$out" && -e "$anc" && ! -d "$anc" ]]; then why_no="under $anc, which is not a folder"
+      elif [[ -z "$ao" ]]; then why_no="under $anc, whose owner cannot be read"
+      elif [[ "$ao" != root && "$ao" != "$ORACLE_USER" ]]; then
+        if [[ "$anc" == "$out" ]]; then why_no="a folder that belongs to ${ao:-an unknown owner}"; else why_no="under $anc, which belongs to ${ao:-an unknown owner}"; fi
+      fi
+    fi
+    # a root mkdir and chown only when no one but root can change any folder on the way (else the oracle user
+    # could put a link in place before root runs them: chown would follow it). Otherwise the oracle user makes
+    # the folder itself when it can, and the path is refused when it cannot
+    local root_ok=0 mk_ora=0 cd cm co
+    if [[ -z "$why_no" && ! -e "$out" && ! -L "$out" ]]; then
+      root_ok=1; cd=$anc
+      while :; do
+        IFS=' ' read -r co cm <<< "$(stat -c '%U %a' -- "$cd" 2>/dev/null)"
+        [[ -n "$co" ]] || { root_ok=0; why_no="under $cd, whose owner and mode cannot be read"; break; }
+        [[ "$co" == root && "$cm" =~ ^[0-7]+$ ]] && (( (8#$cm & 8#022) == 0 )) || { root_ok=0; break; }
+        [[ "$cd" == / ]] && break
+        cd=$(dirname "$cd")
+      done
+      if [[ $root_ok -eq 0 && -z "$why_no" ]]; then
+        if runuser -u "$ORACLE_USER" -- test -w "$anc" 2>/dev/null; then mk_ora=1
+        else why_no="under $cd, which users other than root can change"; fi
+      fi
+    fi
+    local out_sys=0; [[ -n "$why_no" ]] && out_sys=1
+    case "$out_sys" in 1)
+        PLAN="-- $out is $why_no: it must not be the audit folder."$'\n'"-- Change audit_file_dest in the spfile of $STANDBY_SID to a folder under $ORACLE_BASE (for example"$'\n'"-- $(adump_dir)), then answer r." ;;
       *) if [[ -n "$broken" || -e "$out" || -L "$out" ]] && [[ ! -d "$out" ]]; then
            PLAN="-- $out is there, but it is not a folder (a file or a broken link). Check what it is:  ls -l $out"$'\n'"-- Change audit_file_dest in the spfile to a folder under $ORACLE_BASE. Then answer r."
          elif [[ -e "$out" ]]; then
            PLAN="-- $out exists, but $ORACLE_USER cannot write to it. Check who owns it and why:  ls -ld $out"$'\n'"-- Give $ORACLE_USER write access only if the folder is meant for this database,"$'\n'"-- or change audit_file_dest in the spfile. Then answer r."
+         elif [[ $mk_ora -eq 1 ]]; then
+           MANUAL_HOW="$ORACLE_USER"
+           PLAN="-- The script does not create a folder outside $ORACLE_BASE that comes from the spfile."$'\n'"-- As $ORACLE_USER (not as root: users other than root can change $cd):"$'\n'"mkdir -p $out"$'\n'"-- (or change audit_file_dest in the spfile). Then answer r."
          else
            PLAN="-- The script does not create a folder outside $ORACLE_BASE that comes from the spfile."$'\n'"mkdir -p $out"$'\n'"chown $ORACLE_USER:$INSTALL_GROUP $out"$'\n'"-- (or change audit_file_dest in the spfile). Then answer r."
          fi ;;
@@ -8836,6 +8947,10 @@ dup_prechecks() {
     PRE_FIX="Files of an unfinished copy are still on this server. Clean them up first (step 7.2)"; return 1
   fi
   PRE_INFO+="Standby instance $STANDBY_SID is in NOMOUNT"$'\n'
+  # TDE settings that could not be read: not known whether the copy needs a wallet (never taken as "no TDE")
+  if [[ ${TDE_UNREAD:-0} -eq 1 ]]; then need_ssh && tde_read
+    [[ $TDE_UNREAD -eq 0 ]] || { PRE_FIX="The TDE settings of the primary cannot be read${TDE_ERR:+ ($TDE_ERR)} (step 6.3)"; return 1; }
+  fi
   if tde_autologin_missing; then PRE_FIX="The TDE keystore of the standby has no auto-login file (cwallet.sso)."$'\n'"The copy and redo apply would stop with ORA-28365 (step 6.3)"; return 1; fi
   # the folders of this server must not be the storage of the primary (NOFILENAMECHECK would overwrite it)
   if [[ -n "$(fs_dirs)" && "$MODE" == "run" ]]; then
@@ -9273,16 +9388,21 @@ adg_note() {
 
 # ---- 9.1 ----
 srv_dgs() { asm_dgs | paste -sd, -; }
-ASM_DGS=""
+ASM_DGS=""; ASM_MISSING=""
 asm_dg_names() {
   # the disk groups of this server -> ASM_DGS (upper case, one per line; may be empty). 1 = they cannot be read
   # (a failed query is never taken as "none")
-  ASM_DGS=""
+  ASM_DGS=""; ASM_MISSING=""
   sql_asm "select name from v\$asm_diskgroup;" || return 1
   ASM_DGS=$(tr -d ' \t\r' <<< "$SQL_OUT" | tr '[:lower:]' '[:upper:]' | grep -v '^$')
-  # a list without a disk group the standby needs is not complete (ASM started before its disks, for example):
-  # taken as "cannot be read", never as "the others are gone"
-  local g; for g in ${SRV_NEEDED_DGS:-$(srv_dgs | tr ',' ' ')}; do grep -Fqx -- "${g^^}" <<< "$ASM_DGS" || { ASM_DGS=""; return 1; }; done
+  # v$asm_diskgroup lists every disk group whose disks ASM sees, mounted or not. One the standby needs that is
+  # not there (ASM started before its disks, for example): the list is taken as not complete ("cannot be read"),
+  # never as "the others are gone"
+  local g
+  for g in $(srv_dgs | tr ',' ' '); do
+    grep -Fqx -- "$g" <<< "$ASM_DGS" || ASM_MISSING+=" $g"
+  done
+  [[ -z "$ASM_MISSING" ]] || { ASM_DGS=""; return 1; }
   return 0
 }
 dg_union() {
@@ -9319,23 +9439,27 @@ c_9_1() {
     # the domain of the primary's db_domain (an empty one in the registration is a missing one)
     local cdom; cdom=$(sed -n 's/^Domain:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | sed 's/[[:space:]]*$//'); REG_OLD_DOM=$cdom
     [[ -z "$PRIMARY_DOMAIN" || "${cdom,,}" == "${PRIMARY_DOMAIN,,}" ]] || bad_items+=" domain"
-    # the other way round: a registered disk group this server does not have, a domain the primary does not set
-    # a registered disk group this server does not have: Oracle Restart may not start the standby. It is taken
-    # out of the list by the action (srvctl modify; the others stay). A list that cannot be read: waiting
+    # the other way round: registered disk groups ASM here does not see, a domain the primary does not set.
+    # A list that cannot be read: waiting
     local x have_dg="" dg_unread=0
     if asm_dg_names; then have_dg=$ASM_DGS; else dg_unread=1; fi
-    [[ $dg_unread -eq 1 && -n "$cdg" ]] && DG_DEAD_NOTE="The disk groups of this server could not be read: whether all registered ones ($cdg) exist is not checked."
-    if [[ $dg_unread -eq 0 ]]; then
-      local dead="" keepdg=""
-      for x in ${cdg//,/ }; do if grep -Fqx -- "$x" <<< "$have_dg"; then keepdg+="${keepdg:+,}$x"; else dead+=" $x"; fi; done
-      if [[ -n "$dead" ]]; then
-        [[ "$bad_items" == *diskgroup* ]] || bad_items+=" diskgroup"; REG_NEW_DG=$(dg_union "$keepdg" "$(srv_dgs)")
-        DG_DEAD_NOTE="The registration names disk group(s) this server does not have:$dead"
-      fi
+    if [[ $dg_unread -eq 1 && -n "$cdg" ]]; then
+      if [[ -n "$ASM_MISSING" ]]; then DG_DEAD_NOTE="ASM here does not show the disk group(s)${ASM_MISSING} the standby needs (are their disks there?): whether all registered ones ($cdg) exist is not checked."
+      else DG_DEAD_NOTE="The disk groups of this server could not be read: whether all registered ones ($cdg) exist is not checked."; fi
     fi
-    [[ -z "$PRIMARY_DOMAIN" && -n "$cdom" ]] && warn "The registration has the domain $cdom, but the primary sets no db_domain. It is kept; check it."
+    # registered disk groups (besides the needed ones) that ASM here does not see: named. They are not taken out
+    # by the script: one whose disks come later would be lost from the registration
+    local dead="" live=""
+    if [[ $dg_unread -eq 0 ]]; then
+      for x in ${cdg//,/ }; do if grep -Fqx -- "$x" <<< "$have_dg"; then live+="${live:+,}$x"; else dead+=" $x"; fi; done
+      [[ -n "$dead" ]] && warn "The registration names disk group(s) that ASM here does not see:$dead"$'\n'"If they are gone for good, set the list by hand (as $ORACLE_USER):  srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"
+    fi
+    [[ -z "$PRIMARY_DOMAIN" && -n "$cdom" ]] && warn "The registration has the domain $cdom, but the primary sets no db_domain."$'\n'"It is kept: the domain only forms the service names, and changing it may cut clients that use them."$'\n'"If it is not wanted, change it by hand:  srvctl modify database -db $STANDBY_UNIQUE -domain <new>"
     if [[ -z "$bad_items" ]]; then
-      NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"
+      NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"
+      # (on the first line: the run summary and the progress file keep it)
+      [[ -n "$dead" ]] && NOW+="; it still names disk group(s) ASM here does not see:$dead"
+      NOW+=$'\n'"spfile: $spf"
       [[ -n "$DG_DEAD_NOTE" ]] && { NOW+=$'\n'"$DG_DEAD_NOTE"; CHECK_WAITS=1; }
       return 0
     fi
@@ -9346,6 +9470,14 @@ c_9_1() {
     if [[ $dg_unread -eq 1 && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
       NOW+=$'\n'"The registration is changed when the disk groups of this server can be read again (ASM running)."
       return 2
+    fi
+    # a new registration with a disk group ASM does not see could fail (its resource may be gone), and then the
+    # old one could not be put back either: the list is set by hand first
+    if [[ -n "$dead" && "$bad_items" =~ (spfile|role|instance) ]]; then
+      NOW+=$'\n'"A new registration is needed, but it names disk group(s) that ASM here does not see:$dead"
+      KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      PLAN="-- If those disk groups are gone for good, take them out of the registration first:"$'\n'"srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"$'\n'"-- If their disks only come later, wait until ASM sees them. Then answer r."
+      return 1
     fi
     REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
     # start option, home and password file are changed in place (the running standby is not stopped);
@@ -9434,10 +9566,9 @@ srv_new_args() {
     [[ "$sto" =~ ^[A-Za-z]+$ ]] && { keep+=(-stopoption "$sto"); SRV_KEPT+=(-stopoption "$sto"); }
     odg=$(_cfgv "$1" 'Disk Groups' | tr -d ' \t\r')
     if [[ "$odg" =~ ^[A-Za-z0-9_\$#,]+$ ]]; then
-      # only the old disk groups this server has (one it does not have would stop Oracle Restart from starting it)
-      local x ok=""
-      if asm_dg_names; then for x in ${odg//,/ }; do grep -Fqx -- "${x^^}" <<< "$ASM_DGS" && ok+="${ok:+,}$x"; done; odg=$ok
-      else SRV_DG_UNREAD=$odg; odg=""; fi
+      # kept as they are (9.1 stops before a new registration that names a disk group ASM does not see; the list
+      # cannot be checked when ASM cannot be read: then named, and the action stops before in that case)
+      asm_dg_names || SRV_DG_UNREAD=$odg
       dgs=$(dg_union "$dgs" "$odg"); [[ "$dgs" != "$(dg_union "$(srv_dgs)" "")" ]] && SRV_KEPT+=(-diskgroup "$dgs")
     elif [[ -n "$odg" ]]; then SRV_DG_LOST=$odg; fi
     odom=$(_cfgv "$1" 'Domain')
@@ -9453,7 +9584,9 @@ srv_new_args() {
 srv_add() {
   # $1 (optional) saved "srvctl config database" of an earlier registration: see srv_new_args
   srv_new_args "${1:-}"
-  [[ -n "$SRV_DG_UNREAD" ]] && warn "The disk groups of this server cannot be read, so the old ones ($SRV_DG_UNREAD) are not kept."$'\n'"Add them again when ASM runs:  srvctl modify database -db $STANDBY_UNIQUE -diskgroup <list>"
+  # ASM stopped answering after the check (during stop/remove): no new registration with an unchecked list. The
+  # caller puts the old registration back
+  if [[ -n "$SRV_DG_UNREAD" && -n "${1:-}" ]]; then bad "The disk groups of this server cannot be read now (old ones: $SRV_DG_UNREAD). The new registration is not added."; return 1; fi
   [[ -n "$SRV_DG_LOST" ]] && warn "The disk groups of the old registration cannot be read ($SRV_DG_LOST). Only the ones the standby needs are set:"$'\n'"$(srv_dgs). Add others again with:  srvctl modify database -db $STANDBY_UNIQUE -diskgroup <list>"
   run_logged "srvctl add database" as_oracle "$DB_HOME/bin/srvctl" add database "${SRV_NEW[@]}" || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   [[ ${#SRV_KEPT[@]} -gt 0 ]] && say "Kept from the old registration: ${SRV_KEPT[*]}"
@@ -9478,6 +9611,9 @@ d_9_1() {
     local old="$STATE_DIR/srvctl_old_${STANDBY_UNIQUE}_$RUN_ID.txt"
     run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
     ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
+    # the disk groups are read again right before (ASM may have stopped since the check): no new registration
+    # that would lose the old disk groups
+    if ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
     run_logged "srvctl stop" as_oracle "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     if ! srv_add "$old"; then
@@ -9695,6 +9831,14 @@ c_9_8() {
   [[ $ARCH_POLICY_OK -eq 1 ]] || PLAN="As $ORACLE_USER on this server:"$'\n'"  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;"
   [[ "$tst" == off ]] && PLAN+="${PLAN:+$'\n'}systemctl enable $(arch_timer)"$'\n'"systemctl start $(arch_timer)"
   [[ "$tst" == failed ]] && PLAN+="${PLAN:+$'\n'}Run the clean-up once now, to see that it works again:"$'\n'"systemctl reset-failed $(arch_service)"$'\n'"systemctl start $(arch_service)"
+  if [[ "$tst" == files ]]; then
+    # files that are there but different (a schedule set by hand, for example) are named: they are replaced
+    local af differ=""
+    for af in "/etc/systemd/system/$(arch_timer)|$(arch_timer_text)" "/etc/systemd/system/$(arch_service)|$(arch_service_text)" "$(arch_script)|$(arch_script_text)"; do
+      [[ -f "${af%%|*}" && "$(cat "${af%%|*}")" != "${af#*|}" ]] && differ+="  ${af%%|*}"$'\n'
+    done
+    [[ -n "$differ" ]] && PLAN+="${PLAN:+$'\n'}These files are there but different (for example a time set by hand). They are replaced; a backup is kept:"$'\n'"${differ%$'\n'}"
+  fi
   [[ "$tst" == files ]] && PLAN+="${PLAN:+$'\n'}Add a daily systemd timer $(arch_timer) at 04:30."$'\n'"It runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';"$'\n'"Logs that are not applied yet are kept."
   USING="Nothing is changed on the primary. Its own policy belongs to its backups.
 To see it there:  rman target /  ->  show archivelog deletion policy;
@@ -9819,7 +9963,7 @@ c_9_6() {
   local n=0
   while true; do
     rfs_running && { NOW="RFS is receiving redo from the primary"; return 0; }
-    n=$((n + 1)); [[ $n -ge 6 || "$MODE" == "check" ]] && break
+    n=$((n + 1)); [[ $n -gt 6 || "$MODE" == "check" ]] && break
     say "Waiting for RFS ($n of 6)"; nap 10
   done
   NOW="No RFS process on this server yet"
@@ -9893,6 +10037,7 @@ dropin_text() {
 }
 C97_FIX=""
 DGERR_PREV=""
+BOOT_ERR_SHOWN=0
 c_9_7() {
   C97_FIX=""
   command -v systemctl >/dev/null 2>&1 || { NOW="systemd is not found. Start the standby by hand after each reboot."; return 2; }
@@ -9903,9 +10048,8 @@ c_9_7() {
     if use_grid; then NOW="$(unit_name) is enabled."$'\n'"It starts apply after Oracle Restart mounts the standby."
     else NOW="$(unit_name) is enabled."$'\n'"At boot: listener, startup mount, apply. At shutdown: a clean stop."; fi
     # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
-    local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
-    berr=$(sed 's/^<[0-7]>//' <<< "$berr")
-    [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
+    local berr; berr=$(boot_errors_now)
+    [[ -n "$berr" ]] && { warn "At its last start, $(unit_name) reported:"$'\n'"$berr"; BOOT_ERR_SHOWN=1; }
     # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here.
     # A stopped listener or apply is started by the action of this step (asked first); a wrong role is not touched.
     local_state
@@ -9936,6 +10080,7 @@ c_9_7() {
         [[ "$LSTATE" == STARTED ]] && NOW+=$'\n'"It is started (NOMOUNT) but not mounted yet."
         # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
         NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
+        NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"
         CHECK_WAITS=1; return 0
       fi
     fi
@@ -9995,6 +10140,13 @@ c_9_7() {
   else PLAN+=$'\n'"A running standby stays as it is (redo apply is started if it is not running);"$'\n'"a standby that is down is started: listener, startup mount, redo apply."; fi
   USING="The standby is only mounted."$'\n'"Opening it read-only while apply runs needs the Active Data Guard license."
   return 1
+}
+boot_errors_now() {
+  # what the boot unit reported at the start of this boot (empty when nothing, no unit or no journal)
+  command -v journalctl >/dev/null 2>&1 && declare -F unit_name >/dev/null || return 0
+  [[ -n "${STANDBY_SID:-}" ]] || return 0
+  systemctl is-enabled --quiet "$(unit_name)" 2>/dev/null || return 0
+  journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}' | sed 's/^<[0-7]>//; s/DG-BOOT-ERROR: //'
 }
 boot_err_hint() {
   # the unit stays active after an error at boot (so the shutdown stays clean): its errors are in the journal
@@ -10163,9 +10315,10 @@ c_10_4() {
         if [[ "$last" =~ ^[0-9]{14}$ && "$prev" =~ ^[0-9]{14}$ && "$last" > "$prev" ]]; then
           # the messages newer than the last run (they hold ORA- codes, so the query "fails" by the usual rule:
           # its lines are used only when the session itself worked)
-          local nm="" mq="select message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > to_date('$prev','YYYYMMDDHH24MISS') order by timestamp desc) where rownum <= 3;"
+          local nm="" mq="select 'DGMSG:'||message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > to_date('$prev','YYYYMMDDHH24MISS') order by timestamp desc) where rownum <= 3;"
           sql_local "$mq" || true
-          grep -qE 'ORA-0(1034|1012|3113|3114|1017)|SP2-|TNS-' <<< "$SQL_OUT" || nm=$(sed 's/^[[:space:]]*//' <<< "$SQL_OUT" | grep -v '^$' | head -n 3 | sed 's/^/  /')
+          # only lines of the view (marked DGMSG:), never sqlplus' own error text
+          nm=$(sed -n 's/^[[:space:]]*DGMSG://p' <<< "$SQL_OUT" | head -n 3 | sed 's/^/  /')
           w+=$'\n'"New Data Guard error messages came since the last run (the newest at ${last:0:4}-${last:4:2}-${last:6:2} ${last:8:2}:${last:10:2}),"$'\n'"though none in the last 15 minutes${nm:+:}"${nm:+$'\n'"$nm"}
           [[ -n "$nm" ]] || w+=$'\n'"To see them:  select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
         else
@@ -10412,7 +10565,9 @@ EXPECT firewall-cmd --zone=<zone> --query-port=$PO/tcp  shows yes
        "Connection refused" is fine at this point (no listener yet); no answer at all
        means a firewall blocks the port: in the network, or rules here outside firewalld
        (nft list ruleset). "No route to host": a wrong address, or a reject by a firewall.
-       With firewalld not running, other rules here that drop traffic are named as a note.
+       With firewalld not running, up to three rules here that drop or reject traffic are
+       shown as a note (nft or iptables). The script does not judge them: check that they
+       let port $PO/tcp from the primary in.
 EOF
   ;;
   2.10) cat <<EOF
@@ -10942,6 +11097,12 @@ EXPECT The audit folder of the standby and the diagnostic_dest of the primary ex
        and are writable by $OU. A standby that exists already: also the audit_file_dest
        set in its spfile, when it is another folder. Under the Oracle base the script makes it;
        outside it, it is a step to do by hand (mkdir, chown $OU:$IG).
+       Refused as the audit folder: a system folder (/, /usr, /etc, /tmp, /opt, /run ...,
+       and /home and /srv themselves), a folder under /home outside the home of $OU,
+       the home of another account, an Oracle home or base (Grid too) or a folder above one,
+       and a folder whose nearest existing part belongs to a user other than root or $OU.
+       A root step (mkdir, chown) is shown only when no one but root can change the folders
+       on the way; otherwise $OU makes the folder itself when it can, or it is refused.
 EOF
   ;;
   7.2) cat <<EOF
@@ -11145,6 +11306,7 @@ EOF
     printf '       or the step looks again for up to 6 times %s seconds while Oracle Restart mounts it\n' "${POLL_WAIT:-20}"
     printf '       (Grid; if step 9.2 had mounted it in this run, it stopped: that is reported instead).\n'
     printf '       An OPEN standby: the unit does not start apply there (Active Data Guard license).\n'
+    printf '       What the unit reported at this boot is also shown at the end of every run.\n'
     printf '       Errors at boot go to the journal with priority "err":\n'
     printf '         journalctl -p err -u <unit>\n'
     printf '       The unit stays active after such an error on purpose: only an active unit runs its\n'

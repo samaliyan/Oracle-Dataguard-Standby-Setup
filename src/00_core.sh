@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.16"
+readonly SCRIPT_VERSION="5.18"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -224,6 +224,7 @@ user_stop() {
 }
 STOPPED_BY_USER=0
 fatal() {
+  tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
   _log FATAL "$*"
@@ -274,7 +275,10 @@ on_signal() {
 A running installer, root script or RMAN copy goes on by itself. Run the script again later."
 }
 
+TTY_RESTORE=""     # the terminal settings before a hidden question (put back on any exit: Ctrl+C, signal, error)
+tty_restore() { [[ -n "$TTY_RESTORE" ]] && { stty "$TTY_RESTORE" < "${PROMPT_IN:-/dev/tty}" 2>/dev/null; TTY_RESTORE=""; }; return 0; }
 cleanup() {
+  tty_restore
   local f
   for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
     [[ -n "$f" ]] || continue
@@ -348,10 +352,10 @@ confirm_word() {
 ask_secret() {
   # $1 prompt. Result in SECRET.
   # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
-  local st=""; st=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
+  TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
   local rc=0; IFS= read -rs SECRET < "$PROMPT_IN" || rc=$?
-  [[ -n "$st" ]] && stty "$st" < "$PROMPT_IN" 2>/dev/null
+  tty_restore
   [[ $rc -eq 0 ]] || fatal "No answer could be read for: $1  (run the script in an interactive terminal, for example ssh -t)"
   printf '\n'
   _log ASK "$1  -> (hidden)"

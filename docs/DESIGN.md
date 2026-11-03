@@ -112,6 +112,12 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   in the check, manual plan). /etc/oratab as a link is written through only when safe_link_target accepts it: the
   link owned by root, the target a regular file of root or an Oracle owner, every folder above it owned by root and
   writable only by root.
+- Folders (5.18): make_dir acts as root (install -d, chown, chmod) only while no one but root can change the
+  folders on the way down from / (root_holds: owned by root and not writable by group or others, or sticky with the
+  next part already root's). Below the first folder another user can change, the rest is made as the future owner
+  (runuser mkdir), and the mode of an existing empty folder is set as that owner. 7.1 shows a root mkdir/chown for
+  an audit_file_dest outside the Oracle base only under the same condition, for the resolved path, which must pass
+  v_path again; otherwise the oracle user makes it, or the path is refused with the reason.
 - Boot script (5.14): it never starts apply on an OPEN standby (Active Data Guard). Its errors carry the "<3>"
   prefix (journal priority err, for monitoring). The unit stays active after an error on purpose: a failed unit
   does not run ExecStop, and the stop is the clean shutdown of the standby.

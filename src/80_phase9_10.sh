@@ -22,16 +22,21 @@ adg_note() {
 
 # ---- 9.1 ----
 srv_dgs() { asm_dgs | paste -sd, -; }
-ASM_DGS=""
+ASM_DGS=""; ASM_MISSING=""
 asm_dg_names() {
   # the disk groups of this server -> ASM_DGS (upper case, one per line; may be empty). 1 = they cannot be read
   # (a failed query is never taken as "none")
-  ASM_DGS=""
+  ASM_DGS=""; ASM_MISSING=""
   sql_asm "select name from v\$asm_diskgroup;" || return 1
   ASM_DGS=$(tr -d ' \t\r' <<< "$SQL_OUT" | tr '[:lower:]' '[:upper:]' | grep -v '^$')
-  # a list without a disk group the standby needs is not complete (ASM started before its disks, for example):
-  # taken as "cannot be read", never as "the others are gone"
-  local g; for g in ${SRV_NEEDED_DGS:-$(srv_dgs | tr ',' ' ')}; do grep -Fqx -- "${g^^}" <<< "$ASM_DGS" || { ASM_DGS=""; return 1; }; done
+  # v$asm_diskgroup lists every disk group whose disks ASM sees, mounted or not. One the standby needs that is
+  # not there (ASM started before its disks, for example): the list is taken as not complete ("cannot be read"),
+  # never as "the others are gone"
+  local g
+  for g in $(srv_dgs | tr ',' ' '); do
+    grep -Fqx -- "$g" <<< "$ASM_DGS" || ASM_MISSING+=" $g"
+  done
+  [[ -z "$ASM_MISSING" ]] || { ASM_DGS=""; return 1; }
   return 0
 }
 dg_union() {
@@ -68,23 +73,27 @@ c_9_1() {
     # the domain of the primary's db_domain (an empty one in the registration is a missing one)
     local cdom; cdom=$(sed -n 's/^Domain:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | sed 's/[[:space:]]*$//'); REG_OLD_DOM=$cdom
     [[ -z "$PRIMARY_DOMAIN" || "${cdom,,}" == "${PRIMARY_DOMAIN,,}" ]] || bad_items+=" domain"
-    # the other way round: a registered disk group this server does not have, a domain the primary does not set
-    # a registered disk group this server does not have: Oracle Restart may not start the standby. It is taken
-    # out of the list by the action (srvctl modify; the others stay). A list that cannot be read: waiting
+    # the other way round: registered disk groups ASM here does not see, a domain the primary does not set.
+    # A list that cannot be read: waiting
     local x have_dg="" dg_unread=0
     if asm_dg_names; then have_dg=$ASM_DGS; else dg_unread=1; fi
-    [[ $dg_unread -eq 1 && -n "$cdg" ]] && DG_DEAD_NOTE="The disk groups of this server could not be read: whether all registered ones ($cdg) exist is not checked."
-    if [[ $dg_unread -eq 0 ]]; then
-      local dead="" keepdg=""
-      for x in ${cdg//,/ }; do if grep -Fqx -- "$x" <<< "$have_dg"; then keepdg+="${keepdg:+,}$x"; else dead+=" $x"; fi; done
-      if [[ -n "$dead" ]]; then
-        [[ "$bad_items" == *diskgroup* ]] || bad_items+=" diskgroup"; REG_NEW_DG=$(dg_union "$keepdg" "$(srv_dgs)")
-        DG_DEAD_NOTE="The registration names disk group(s) this server does not have:$dead"
-      fi
+    if [[ $dg_unread -eq 1 && -n "$cdg" ]]; then
+      if [[ -n "$ASM_MISSING" ]]; then DG_DEAD_NOTE="ASM here does not show the disk group(s)${ASM_MISSING} the standby needs (are their disks there?): whether all registered ones ($cdg) exist is not checked."
+      else DG_DEAD_NOTE="The disk groups of this server could not be read: whether all registered ones ($cdg) exist is not checked."; fi
     fi
-    [[ -z "$PRIMARY_DOMAIN" && -n "$cdom" ]] && warn "The registration has the domain $cdom, but the primary sets no db_domain. It is kept; check it."
+    # registered disk groups (besides the needed ones) that ASM here does not see: named. They are not taken out
+    # by the script: one whose disks come later would be lost from the registration
+    local dead="" live=""
+    if [[ $dg_unread -eq 0 ]]; then
+      for x in ${cdg//,/ }; do if grep -Fqx -- "$x" <<< "$have_dg"; then live+="${live:+,}$x"; else dead+=" $x"; fi; done
+      [[ -n "$dead" ]] && warn "The registration names disk group(s) that ASM here does not see:$dead"$'\n'"If they are gone for good, set the list by hand (as $ORACLE_USER):  srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"
+    fi
+    [[ -z "$PRIMARY_DOMAIN" && -n "$cdom" ]] && warn "The registration has the domain $cdom, but the primary sets no db_domain."$'\n'"It is kept: the domain only forms the service names, and changing it may cut clients that use them."$'\n'"If it is not wanted, change it by hand:  srvctl modify database -db $STANDBY_UNIQUE -domain <new>"
     if [[ -z "$bad_items" ]]; then
-      NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"$'\n'"spfile: $spf"
+      NOW="Registered in Oracle Restart: role PHYSICAL_STANDBY, instance $STANDBY_SID"
+      # (on the first line: the run summary and the progress file keep it)
+      [[ -n "$dead" ]] && NOW+="; it still names disk group(s) ASM here does not see:$dead"
+      NOW+=$'\n'"spfile: $spf"
       [[ -n "$DG_DEAD_NOTE" ]] && { NOW+=$'\n'"$DG_DEAD_NOTE"; CHECK_WAITS=1; }
       return 0
     fi
@@ -95,6 +104,14 @@ c_9_1() {
     if [[ $dg_unread -eq 1 && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
       NOW+=$'\n'"The registration is changed when the disk groups of this server can be read again (ASM running)."
       return 2
+    fi
+    # a new registration with a disk group ASM does not see could fail (its resource may be gone), and then the
+    # old one could not be put back either: the list is set by hand first
+    if [[ -n "$dead" && "$bad_items" =~ (spfile|role|instance) ]]; then
+      NOW+=$'\n'"A new registration is needed, but it names disk group(s) that ASM here does not see:$dead"
+      KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      PLAN="-- If those disk groups are gone for good, take them out of the registration first:"$'\n'"srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"$'\n'"-- If their disks only come later, wait until ASM sees them. Then answer r."
+      return 1
     fi
     REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
     # start option, home and password file are changed in place (the running standby is not stopped);
@@ -183,10 +200,9 @@ srv_new_args() {
     [[ "$sto" =~ ^[A-Za-z]+$ ]] && { keep+=(-stopoption "$sto"); SRV_KEPT+=(-stopoption "$sto"); }
     odg=$(_cfgv "$1" 'Disk Groups' | tr -d ' \t\r')
     if [[ "$odg" =~ ^[A-Za-z0-9_\$#,]+$ ]]; then
-      # only the old disk groups this server has (one it does not have would stop Oracle Restart from starting it)
-      local x ok=""
-      if asm_dg_names; then for x in ${odg//,/ }; do grep -Fqx -- "${x^^}" <<< "$ASM_DGS" && ok+="${ok:+,}$x"; done; odg=$ok
-      else SRV_DG_UNREAD=$odg; odg=""; fi
+      # kept as they are (9.1 stops before a new registration that names a disk group ASM does not see; the list
+      # cannot be checked when ASM cannot be read: then named, and the action stops before in that case)
+      asm_dg_names || SRV_DG_UNREAD=$odg
       dgs=$(dg_union "$dgs" "$odg"); [[ "$dgs" != "$(dg_union "$(srv_dgs)" "")" ]] && SRV_KEPT+=(-diskgroup "$dgs")
     elif [[ -n "$odg" ]]; then SRV_DG_LOST=$odg; fi
     odom=$(_cfgv "$1" 'Domain')
@@ -202,7 +218,9 @@ srv_new_args() {
 srv_add() {
   # $1 (optional) saved "srvctl config database" of an earlier registration: see srv_new_args
   srv_new_args "${1:-}"
-  [[ -n "$SRV_DG_UNREAD" ]] && warn "The disk groups of this server cannot be read, so the old ones ($SRV_DG_UNREAD) are not kept."$'\n'"Add them again when ASM runs:  srvctl modify database -db $STANDBY_UNIQUE -diskgroup <list>"
+  # ASM stopped answering after the check (during stop/remove): no new registration with an unchecked list. The
+  # caller puts the old registration back
+  if [[ -n "$SRV_DG_UNREAD" && -n "${1:-}" ]]; then bad "The disk groups of this server cannot be read now (old ones: $SRV_DG_UNREAD). The new registration is not added."; return 1; fi
   [[ -n "$SRV_DG_LOST" ]] && warn "The disk groups of the old registration cannot be read ($SRV_DG_LOST). Only the ones the standby needs are set:"$'\n'"$(srv_dgs). Add others again with:  srvctl modify database -db $STANDBY_UNIQUE -diskgroup <list>"
   run_logged "srvctl add database" as_oracle "$DB_HOME/bin/srvctl" add database "${SRV_NEW[@]}" || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   [[ ${#SRV_KEPT[@]} -gt 0 ]] && say "Kept from the old registration: ${SRV_KEPT[*]}"
@@ -227,6 +245,9 @@ d_9_1() {
     local old="$STATE_DIR/srvctl_old_${STANDBY_UNIQUE}_$RUN_ID.txt"
     run_logged "srvctl config (before the new registration)" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
     ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
+    # the disk groups are read again right before (ASM may have stopped since the check): no new registration
+    # that would lose the old disk groups
+    if ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
     run_logged "srvctl stop" as_oracle "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     if ! srv_add "$old"; then
@@ -444,6 +465,14 @@ c_9_8() {
   [[ $ARCH_POLICY_OK -eq 1 ]] || PLAN="As $ORACLE_USER on this server:"$'\n'"  rman target /  ->  CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;"
   [[ "$tst" == off ]] && PLAN+="${PLAN:+$'\n'}systemctl enable $(arch_timer)"$'\n'"systemctl start $(arch_timer)"
   [[ "$tst" == failed ]] && PLAN+="${PLAN:+$'\n'}Run the clean-up once now, to see that it works again:"$'\n'"systemctl reset-failed $(arch_service)"$'\n'"systemctl start $(arch_service)"
+  if [[ "$tst" == files ]]; then
+    # files that are there but different (a schedule set by hand, for example) are named: they are replaced
+    local af differ=""
+    for af in "/etc/systemd/system/$(arch_timer)|$(arch_timer_text)" "/etc/systemd/system/$(arch_service)|$(arch_service_text)" "$(arch_script)|$(arch_script_text)"; do
+      [[ -f "${af%%|*}" && "$(cat "${af%%|*}")" != "${af#*|}" ]] && differ+="  ${af%%|*}"$'\n'
+    done
+    [[ -n "$differ" ]] && PLAN+="${PLAN:+$'\n'}These files are there but different (for example a time set by hand). They are replaced; a backup is kept:"$'\n'"${differ%$'\n'}"
+  fi
   [[ "$tst" == files ]] && PLAN+="${PLAN:+$'\n'}Add a daily systemd timer $(arch_timer) at 04:30."$'\n'"It runs $(arch_script) as $ORACLE_USER:"$'\n'"  rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';"$'\n'"Logs that are not applied yet are kept."
   USING="Nothing is changed on the primary. Its own policy belongs to its backups.
 To see it there:  rman target /  ->  show archivelog deletion policy;
@@ -568,7 +597,7 @@ c_9_6() {
   local n=0
   while true; do
     rfs_running && { NOW="RFS is receiving redo from the primary"; return 0; }
-    n=$((n + 1)); [[ $n -ge 6 || "$MODE" == "check" ]] && break
+    n=$((n + 1)); [[ $n -gt 6 || "$MODE" == "check" ]] && break
     say "Waiting for RFS ($n of 6)"; nap 10
   done
   NOW="No RFS process on this server yet"
@@ -642,6 +671,7 @@ dropin_text() {
 }
 C97_FIX=""
 DGERR_PREV=""
+BOOT_ERR_SHOWN=0
 c_9_7() {
   C97_FIX=""
   command -v systemctl >/dev/null 2>&1 || { NOW="systemd is not found. Start the standby by hand after each reboot."; return 2; }
@@ -652,9 +682,8 @@ c_9_7() {
     if use_grid; then NOW="$(unit_name) is enabled."$'\n'"It starts apply after Oracle Restart mounts the standby."
     else NOW="$(unit_name) is enabled."$'\n'"At boot: listener, startup mount, apply. At shutdown: a clean stop."; fi
     # what went wrong at the last start (since this boot): shown, the apply itself is checked in 9.4 and 10.x
-    local berr; berr=$(journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}')
-    berr=$(sed 's/^<[0-7]>//' <<< "$berr")
-    [[ -n "$berr" ]] && warn "At its last start, $(unit_name) reported:"$'\n'"${berr//DG-BOOT-ERROR: /}"
+    local berr; berr=$(boot_errors_now)
+    [[ -n "$berr" ]] && { warn "At its last start, $(unit_name) reported:"$'\n'"$berr"; BOOT_ERR_SHOWN=1; }
     # the unit stays active on purpose (so the shutdown still stops the standby): what it started is checked here.
     # A stopped listener or apply is started by the action of this step (asked first); a wrong role is not touched.
     local_state
@@ -685,6 +714,7 @@ c_9_7() {
         [[ "$LSTATE" == STARTED ]] && NOW+=$'\n'"It is started (NOMOUNT) but not mounted yet."
         # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
         NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
+        NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"
         CHECK_WAITS=1; return 0
       fi
     fi
@@ -744,6 +774,13 @@ c_9_7() {
   else PLAN+=$'\n'"A running standby stays as it is (redo apply is started if it is not running);"$'\n'"a standby that is down is started: listener, startup mount, redo apply."; fi
   USING="The standby is only mounted."$'\n'"Opening it read-only while apply runs needs the Active Data Guard license."
   return 1
+}
+boot_errors_now() {
+  # what the boot unit reported at the start of this boot (empty when nothing, no unit or no journal)
+  command -v journalctl >/dev/null 2>&1 && declare -F unit_name >/dev/null || return 0
+  [[ -n "${STANDBY_SID:-}" ]] || return 0
+  systemctl is-enabled --quiet "$(unit_name)" 2>/dev/null || return 0
+  journalctl -u "$(unit_name)" -b --no-pager -o cat 2>/dev/null | awk '/^Start(ing|ed) / {n = 0; next} /DG-BOOT-ERROR/ {e[++n] = $0} END {for (i = 1; i <= n && i <= 3; i++) print e[i]}' | sed 's/^<[0-7]>//; s/DG-BOOT-ERROR: //'
 }
 boot_err_hint() {
   # the unit stays active after an error at boot (so the shutdown stays clean): its errors are in the journal
@@ -912,9 +949,10 @@ c_10_4() {
         if [[ "$last" =~ ^[0-9]{14}$ && "$prev" =~ ^[0-9]{14}$ && "$last" > "$prev" ]]; then
           # the messages newer than the last run (they hold ORA- codes, so the query "fails" by the usual rule:
           # its lines are used only when the session itself worked)
-          local nm="" mq="select message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > to_date('$prev','YYYYMMDDHH24MISS') order by timestamp desc) where rownum <= 3;"
+          local nm="" mq="select 'DGMSG:'||message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > to_date('$prev','YYYYMMDDHH24MISS') order by timestamp desc) where rownum <= 3;"
           sql_local "$mq" || true
-          grep -qE 'ORA-0(1034|1012|3113|3114|1017)|SP2-|TNS-' <<< "$SQL_OUT" || nm=$(sed 's/^[[:space:]]*//' <<< "$SQL_OUT" | grep -v '^$' | head -n 3 | sed 's/^/  /')
+          # only lines of the view (marked DGMSG:), never sqlplus' own error text
+          nm=$(sed -n 's/^[[:space:]]*DGMSG://p' <<< "$SQL_OUT" | head -n 3 | sed 's/^/  /')
           w+=$'\n'"New Data Guard error messages came since the last run (the newest at ${last:0:4}-${last:4:2}-${last:6:2} ${last:8:2}:${last:10:2}),"$'\n'"though none in the last 15 minutes${nm:+:}"${nm:+$'\n'"$nm"}
           [[ -n "$nm" ]] || w+=$'\n'"To see them:  select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
         else
