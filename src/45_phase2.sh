@@ -335,8 +335,8 @@ dir_specs() {
   printf '%s\n' "$INVENTORY_DIR:$GRID_USER" "$ORACLE_BASE:$ORACLE_USER" "$DB_HOME:$ORACLE_USER"
 }
 existing_parent() { local p=$1; while [[ ! -e "$p" && "$p" != "/" ]]; do p=$(dirname "$p"); done; printf '%s' "$p"; }
-mnt_of() { df --output=target -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1; }
-free_mb_of() { local f; f=$(df -m --output=avail -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1 | tr -d ' '); num "$f" && printf '%s' "$f" || printf '0'; }
+mnt_of() { timeout 30 df --output=target -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1; }
+free_mb_of() { local f; f=$(timeout 30 df -m --output=avail -- "$(existing_parent "$1")" 2>/dev/null | tail -n 1 | tr -d ' '); num "$f" && printf '%s' "$f" || printf '0'; }
 c_2_5() {
   users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   local d own miss="" wrong="" fixw=""
@@ -425,7 +425,8 @@ d_2_6() {
   backup_file /etc/hosts || return 1
   local tmp h want fq
   tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-  cp -- /etc/hosts "$tmp" 2>/dev/null || : > "$tmp"
+  # a missing /etc/hosts starts empty; one that cannot be copied (a full /tmp) stops here: never written short
+  if [[ -e /etc/hosts ]]; then cp -- /etc/hosts "$tmp" || { bad "Cannot copy /etc/hosts to $tmp. Nothing was changed."; return 1; }; fi
   # take each name (and this server's full name) off every line whose address is not the right one
   while IFS='|' read -r h want; do
     [[ -n "$h" ]] || continue
@@ -445,7 +446,11 @@ d_2_6() {
   done <<< "$H_FIX"
   # a last line without its newline gets one first (else the new line would be glued to it)
   [[ -s "$tmp" && -n "$(tail -c 1 -- "$tmp")" ]] && printf '\n' >> "$tmp"
-  local l; while IFS= read -r l; do [[ -n "$l" ]] && ! grep -qxF -- "$l" "$tmp" && printf '%s\n' "$l" >> "$tmp"; done <<< "$H_TODO"
+  local l; while IFS= read -r l; do
+    [[ -n "$l" ]] && ! grep -qxF -- "$l" "$tmp" && { printf '%s\n' "$l" >> "$tmp" || { bad "Cannot write $tmp. Nothing was changed."; return 1; }; }
+  done <<< "$H_TODO"
+  # a file that had lines never becomes empty
+  [[ ! -s /etc/hosts || -s "$tmp" ]] || { bad "The new /etc/hosts would be empty. Nothing was changed."; return 1; }
   # written in place: the file keeps its owner, mode and SELinux label; a failed write puts the backup back
   cat -- "$tmp" > /etc/hosts || { [[ -f "/etc/hosts.bak_$RUN_ID" ]] && cat -- "/etc/hosts.bak_$RUN_ID" > /etc/hosts; bad "/etc/hosts could not be written. The old content was put back."; return 1; }
   rm -f -- "$tmp"
@@ -467,6 +472,8 @@ $STANDBY_IP    $STANDBY_HOST"
     PLAN_UNDO="put back the line '$pip    $STANDBY_HOST' in /etc/hosts on the primary"
     return 1
   fi
+  # the ssh call itself failed (or timed out): not known, nothing is asked of the primary's /etc/hosts
+  [[ $PROBE_REACHED -eq 1 && $PROBE_TIMED_OUT -ne 1 ]] || { NOW="The primary could not be asked how it resolves $STANDBY_HOST. Answer r to check again."; return 2; }
   NOW="The primary does not resolve $STANDBY_HOST"
   PRIMARY_HOW_STEP="root  ->  shell"
   PLAN="echo '$STANDBY_IP    $STANDBY_HOST' >> /etc/hosts"
@@ -553,11 +560,17 @@ c_2_9() {
   return 1
 }
 d_2_9() {
-  local c; while IFS= read -r c; do
+  # the journal names only the rules this step added (a rule that was there before, saved or running, is not
+  # removed by the undo: it may belong to something else)
+  local c perm=0 run=0 obj=""
+  while IFS= read -r c; do
     [[ -n "$c" ]] || continue
-    run_cmds <<< "$c" || return 1
-    [[ "$c" == *--permanent* && "$c" =~ --zone=([A-Za-z0-9_-]+)\ --add-port=([0-9]+/tcp) ]] && journal FWPORT "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+    run_cmds <<< "$c" || { [[ -n "$obj" ]] && journal FWPORT "$obj" "permanent=$perm runtime=$run"; return 1; }
+    [[ "$c" =~ --zone=([A-Za-z0-9_-]+)\ --add-port=([0-9]+/tcp) ]] || continue
+    obj="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+    if [[ "$c" == *--permanent* ]]; then perm=1; else run=1; fi
   done <<< "$PLAN"
+  [[ -n "$obj" ]] && journal FWPORT "$obj" "permanent=$perm runtime=$run"
   return 0
 }
 
@@ -1234,7 +1247,7 @@ storage_not_shared() {
   for d in $(fs_dirs); do
     ok=0; why=""; plan=""; key=""
     [[ -d "$d" ]] || { [[ -z "$info2" ]] && info2="Folder $d does not exist yet (step 2.14)"; np=1; continue; }
-    fst=$(df --output=fstype -- "$d" 2>/dev/null | tail -n 1 | tr -d ' ')
+    fst=$(timeout 30 df --output=fstype -- "$d" 2>/dev/null | tail -n 1 | tr -d ' ')
     net=0; case "$fst" in nfs*|cifs|smb*|fuse.*|ceph|glusterfs|9p|lustre|afs) net=1 ;; esac
     # this server: device or export (without a [subvolume] part), file system UUID, disk ids
     lid=$(findmnt -n -o SOURCE,UUID --target "$d" 2>/dev/null | head -n 1); lsrc=${lid%% *}; lsrc=${lsrc%%\[*}
@@ -1446,7 +1459,9 @@ mem_probe() {
   prim_sql "select to_char(bytes) from v\$sgainfo where name='Maximum SGA Size';" && smax=$(first_line)
   if num "$smax"; then [[ $smax -gt $MEM_SGA ]] && MEM_SGA=$smax
   elif [[ $MEM_SGA -eq 0 && $MEM_MT -eq 0 ]]; then return 2; fi
-  local kb; kb=$(awk '/^MemTotal:/{print $2}' "$MEMINFO_FILE" 2>/dev/null); num "$kb" || kb=0
+  local kb; kb=$(awk '/^MemTotal:/{print $2}' "$MEMINFO_FILE" 2>/dev/null)
+  # the RAM of this server must be known: without it, "enough RAM" would be a guess
+  num "$kb" && [[ $kb -gt 0 ]] || { SQL_OUT="MemTotal could not be read from $MEMINFO_FILE"; return 2; }
   MEM_RAM_MB=$(( kb / 1024 ))
   local sga_mb=$(( MEM_SGA / 1048576 )) pga_mb=$(( MEM_PGA / 1048576 )) mt_mb=$(( MEM_MT / 1048576 )) mmt_mb=$(( mmt / 1048576 )) need_mb shm_need=0
   # automatic memory (memory_target > 0) holds the SGA and the PGA; otherwise they are added.
@@ -1517,7 +1532,10 @@ c_2_16() {
   copy_finished 2>/dev/null && { NOW="The RMAN copy already ran. The memory was checked before it started."; return 0; }
   need_ssh || return 2
   local rc=0; mem_probe || rc=$?
-  if [[ $rc -eq 2 ]]; then local e; e=$(ora_errors "$SQL_OUT"); NOW="Cannot read the memory settings of the primary${e:+: $e}"; return 2; fi
+  if [[ $rc -eq 2 ]]; then
+    if [[ "$SQL_OUT" == "MemTotal could not be read"* ]]; then NOW="The RAM of this server cannot be read ($SQL_OUT)"; return 2; fi
+    local e; e=$(ora_errors "$SQL_OUT"); NOW="Cannot read the memory settings of the primary${e:+: $e}"; return 2
+  fi
   if [[ $rc -eq 0 ]]; then
     NOW="Enough RAM:"$'\n'"$MEM_INFO"
     [[ -n "$MEM_WARN" ]] && NOW+=$'\n'"Warning: $MEM_WARN"

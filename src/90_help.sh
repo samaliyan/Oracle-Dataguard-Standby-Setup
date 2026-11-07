@@ -412,11 +412,11 @@ RUN    12.2 and newer:
        $GH/gridSetup.sh -executeConfigTools -responseFile <file> -silent
        12.1:
        $GH/cfgtoollogs/configToolAllCommands RESPONSE_FILE=<file with the ASM passwords>
-EXPECT crsctl stat res -t  shows ora.asm, ora.$SL.lsnr and ora.${DD^^}.dg ONLINE
+EXPECT $GH/bin/crsctl stat res -t  shows ora.asm, ora.$SL.lsnr and ora.${DD^^}.dg ONLINE
 IF     HAS is stopped, as root:
        $GH/bin/crsctl start has
        ASM is offline:
-       crsctl start res ora.asm
+       $GH/bin/crsctl start res ora.asm
 EOF
   ;;
   3.5) cat <<EOF
@@ -461,20 +461,20 @@ EOF
   3.9) cat <<EOF
 TITLE  Oracle Restart resources ONLINE
 WHERE  This server ($S), as $GU
-RUN    crsctl stat res -t
-       crsctl start res <name>      (for each OFFLINE resource)
+RUN    $GH/bin/crsctl stat res -t
+       $GH/bin/crsctl start res <name>      (for each OFFLINE resource)
        If the listener is missing:
-       srvctl add listener -listener $SL -endpoints TCP:$PO ; srvctl start listener -listener $SL
+       $GH/bin/srvctl add listener -listener $SL -endpoints TCP:$PO ; $GH/bin/srvctl start listener -listener $SL
 EXPECT ONLINE: ora.asm, ora.$SL.lsnr, and ora.<DG>.dg for $DGS
 EOF
   ;;
   3.10) cat <<EOF
 TITLE  Listener port equal to primary ($PO)
-WHERE  This server ($S), as $GU
+WHERE  This server ($S), as $GU (only with Grid; without Grid this step is not needed)
 WHY    The listener here is always $SL (Grid creates it).
        Only its port must match the primary.
-RUN    srvctl modify listener -listener $SL -endpoints TCP:$PO
-       srvctl stop listener -listener $SL ; srvctl start listener -listener $SL
+RUN    $GH/bin/srvctl modify listener -listener $SL -endpoints TCP:$PO
+       $GH/bin/srvctl stop listener -listener $SL ; $GH/bin/srvctl start listener -listener $SL
 EXPECT lsnrctl status $SL  shows (PORT=$PO)
 EOF
   ;;
@@ -501,7 +501,7 @@ WHERE  The primary ($P), SQL*Plus as sysdba
 RUN    $PSQL
        select value from v\$parameter where name='spfile';
        -- empty: the primary runs from a text pfile. Create an spfile first (one restart):
-       --   create pfile='/tmp/init<SID>_before_dg.ora' from memory;
+       --   create pfile='?/dbs/init${PS}_before_dg.ora' from memory;
        --   create spfile from memory;
        --   then restart
        select log_mode, force_logging from v\$database;
@@ -700,7 +700,7 @@ RUN    On the primary, find the file:
        If the name starts with +, on the primary as $GU
        (export ORACLE_HOME=$GH ORACLE_SID=+ASM):
          rm -f /tmp/orapw_for_standby_$SID
-         \$ORACLE_HOME/bin/asmcmd pwcopy '<file_name>' /tmp/orapw_for_standby_$SID
+         (umask 077; \$ORACLE_HOME/bin/asmcmd pwcopy '<file_name>' /tmp/orapw_for_standby_$SID)
          chgrp $IG /tmp/orapw_for_standby_$SID ; chmod 640 /tmp/orapw_for_standby_$SID
        On this server, as root:
          scp ${PRIMARY_SSH_USER:-oracle}@$P:<file or /tmp copy> $DBH/dbs/orapw$SID

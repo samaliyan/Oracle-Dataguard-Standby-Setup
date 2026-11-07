@@ -304,9 +304,10 @@ rsp_set() {
     # the same plain-text test as the replacement (no regular expression: the dots in the keys stay dots)
     if DG_K=$k awk 'BEGIN{k=ENVIRON["DG_K"]} { t=$0; sub(/^[[:space:]]*/, "", t); if (index(t, k "=") == 1) f=1 } END { exit !f }' "$f"; then
       local rc=0
-      ( umask 077; DG_K=$k DG_V=$v awk 'BEGIN{k=ENVIRON["DG_K"]; v=ENVIRON["DG_V"]}
+      # the value may be a password: it reaches awk through a pipe, never in its environment or arguments
+      ( umask 077; DG_K=$k awk 'BEGIN{k=ENVIRON["DG_K"]; if ((getline v < "/dev/fd/3") <= 0) v = ""}
         { t=$0; sub(/^[[:space:]]*/, "", t)
-          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" > "$f.new" ) && cat "$f.new" > "$f" || rc=1
+          if (index(t, k "=") == 1) { print k "=" v; next } print }' "$f" 3< <(printf '%s\n' "$v") > "$f.new" ) && cat "$f.new" > "$f" || rc=1
       rm -f -- "$f.new"          # it may hold a password: never left behind
       return $rc
     fi
@@ -320,7 +321,9 @@ make_rsp() {
   RSP_TEMPLATE=$tpl
   [[ -f "$tpl" ]] || { bad "The response file template is not in the media: $tpl"; return 1; }
   secure_rsp "$name" || return 1
-  ( umask 077; set -C; cat "$tpl" > "$RSP" ) || return 1
+  # read as its owner: the media folder belongs to $2, who could put a link to a root-only file in its place
+  # (the copy is given to $2 later)
+  ( umask 077; set -C; runuser -u "$2" -- cat -- "$tpl" > "$RSP" ) || { bad "The response file template cannot be read as $2: $tpl"; return 1; }
   RSP_MISSING=""
 }
 ver_lt() {
@@ -474,9 +477,28 @@ installer_done_record() {
   esac
   return 0
 }
+root_prog_ok() {
+  # $1 a program of an Oracle home that root must run (root.sh, orainstRoot.sh, crsctl, setasmgidwrap). Oracle
+  # requires it, so it cannot be avoided; but only a real file that root, oracle or grid own, in a folder of
+  # theirs, and that neither group nor others can change. Else it is said, and nothing runs
+  # (group write is accepted only for the Oracle install group: oraInventory is 770 grid:oinstall by design)
+  local f=$1 d x u g m ok=1; d=$(dirname -- "$f")
+  [[ ! -L "$f" && -f "$f" && ! -L "$d" ]] || ok=0
+  for x in "$f" "$d"; do
+    [[ $ok -eq 1 ]] || break
+    IFS=' ' read -r u g m <<< "$(stat -c '%U %G %a' -- "$x" 2>/dev/null)"
+    [[ ( "$u" == root || "$u" == "$ORACLE_USER" || "$u" == "$GRID_USER" ) && "$m" =~ ^[0-7]+$ ]] || { ok=0; break; }
+    (( (8#$m & 8#002) == 0 )) || { ok=0; break; }
+    (( (8#$m & 8#020) == 0 )) || [[ "$g" == "$INSTALL_GROUP" || "$g" == root ]] || ok=0
+  done
+  [[ $ok -eq 1 ]] && return 0
+  bad "Not run as root: $f (or its folder) is a link, belongs to another user, or others can change it. Check:  ls -ld $d $f"
+  return 1
+}
 run_root_script() {
   # root scripts get no input: their questions (local bin folder, TFA) take the default answer
   [[ -x "$1" ]] || { bad "Root script not found: $1"; return 1; }
+  root_prog_ok "$1" || return 1
   local out; out="$LOG_DIR/root_$(basename "$(dirname "$1")")_$(basename "$1" .sh)_$RUN_ID.log"
   if run_long "root script $1" "$out" "" root "$1" < /dev/null; then say "$1 finished without error."; return 0; fi
   bad "$1 failed. The last lines of its output:"; printf '%s\n' "$RUN_OUT" | tail -n 15 | hint
@@ -604,7 +626,9 @@ sw_empty_folder() {
   local d=$1
   sw_folder_ok "$d" || { bad "Not emptied: $d is not a software folder of this setup, or a program of it runs."; return 1; }
   [[ -d "$d" ]] || return 0
-  find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf --one-file-system -- {} + || return 1
+  # find -delete works relative to the folders it has open (no path is read again): a folder above that the
+  # software owner swaps for a link meanwhile cannot lead the deletion anywhere else
+  find "$d" -xdev -mindepth 1 ! -path "$d/lost+found" ! -path "$d/lost+found/*" -delete || return 1
   journal DELETED "$d" "cannot be undone: the content of this software folder was deleted (it is installed again)"
   say "Emptied $d"
   _log CHANGE "emptied the software folder $d"
@@ -879,7 +903,7 @@ d_3_2() {
   fi
   [[ -x "$GRID_HOME/gridSetup.sh" ]] && { new_opatch "$GRID_HOME" as_grid "$GRID_USER" || return 1; }
   ask_asm_password || return 1
-  make_rsp "$(grid_template)" || return 1
+  make_rsp "$(grid_template)" "$GRID_USER" || return 1
   write_grid_rsp || { remove_rsp "$RSP"; return 1; }
   local inst irc=0 rsp=$RSP; inst=$(grid_installer)
   local -a ru=(); mapfile -t ru < <(ru_args grid)
@@ -964,7 +988,7 @@ d_3_4() {
       ask_asm_password || return 1
       local crc=0
       if [[ -x "$GRID_HOME/gridSetup.sh" ]]; then
-        make_rsp "$(grid_template)" || return 1
+        make_rsp "$(grid_template)" "$GRID_USER" || return 1
         write_grid_rsp || { remove_rsp "$RSP"; return 1; }
         local rsp=$RSP; JOB_KEEP=$rsp
         run_installer "Grid configuration tools" as_grid -ignorePrereqFailure "$GRID_HOME/gridSetup.sh" -executeConfigTools -responseFile "$rsp" -silent -waitforcompletion || crc=1
@@ -980,6 +1004,7 @@ d_3_4() {
       fi
       return $crc ;;
     HAS_DOWN)
+      root_prog_ok "$GRID_HOME/bin/crsctl" || return 1
       run_logged "crsctl start has" timeout 300 "$GRID_HOME/bin/crsctl" start has || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
       # ASM may take minutes after the stack starts (many disks): up to 5 minutes, then a clear failure
       # measured in time (each check itself may take a while), with a line every minute
@@ -1223,7 +1248,7 @@ d_3_6() {
   local inst irc=0; inst=$(db_installer)
   [[ "$inst" == "$DB_HOME/runInstaller" ]] || kind=staged
   [[ "$kind" == "image" && $DB_MAJOR -ge 18 ]] && { new_opatch "$DB_HOME" as_oracle "$ORACLE_USER" || return 1; }
-  make_rsp "$(db_template)" || return 1
+  make_rsp "$(db_template)" "$ORACLE_USER" || return 1
   write_db_rsp "$kind" || { remove_rsp "$RSP"; return 1; }
   local rsp=$RSP
   local -a ru=(); [[ $DB_MAJOR -ge 18 ]] && mapfile -t ru < <(ru_args)
@@ -1342,10 +1367,10 @@ srvctl start listener -listener $SB_LSNR"
   return 1
 }
 d_3_10() {
-  run_logged "srvctl modify listener" as_grid "$GRID_HOME/bin/srvctl" modify listener -listener "$SB_LSNR" -endpoints "TCP:$PORT" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+  run_logged "srvctl modify listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" modify listener -listener "$SB_LSNR" -endpoints "TCP:$PORT" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   journal LSNRPORT "$SB_LSNR" "old=${L310_CUR:-unknown} new=$PORT"
-  run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$SB_LSNR" || true
-  run_logged "srvctl start listener" as_grid "$GRID_HOME/bin/srvctl" start listener -listener "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+  run_logged "srvctl stop listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" stop listener -listener "$SB_LSNR" || true
+  run_logged "srvctl start listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" start listener -listener "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
 }
 
 # ---- 3.11 same software level as primary ----

@@ -22,7 +22,7 @@ prim_ssh() {
   # $1 = remote command built by prim_probe / prim_sql only. stdin is passed through.
   # A stuck remote command (a hung NFS path, a wedged listener) ends after PROBE_TIMEOUT seconds (exit 124).
   # ControlMaster=no: a ControlMaster setting in root's ~/.ssh/config must not turn this call into a new master
-  timeout --foreground "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
+  timeout --foreground "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
 }
 PROBE_TIMEOUT=300
 
@@ -85,14 +85,15 @@ prim_probe() {
   err=$(mktemp); CLEANUP_FILES+=("$err")
   # a stuck remote command (a hung NFS path, a wedged listener) must not stop the script for ever
   out=$(prim_ssh "echo $PROBE_MARK; $cmd" < /dev/null 2>"$err") || rc=$?
-  PROBE_TIMED_OUT=0; PROBE_ERR=""
+  PROBE_TIMED_OUT=0; PROBE_ERR=""; PROBE_REACHED=0
   [[ $rc -eq 124 ]] && { printf 'no answer from the primary within %s s (%s)\n' "$PROBE_TIMEOUT" "$p" >> "$err"; PROBE_TIMED_OUT=1; warn "The primary did not answer in time ($p). The result of this check is unknown.
 Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
   { printf '%s\n' "$out"; printf -- '--- stderr ---\n'; cat "$err"; printf '(exit code %s)\n' "$rc"; } | log_block "PRIMARY probe $p: $cmd"
   PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
   rm -f "$err"
-  if [[ "$out" == *"$PROBE_MARK"* ]]; then RUN_OUT=${out#*"$PROBE_MARK"}; RUN_OUT=${RUN_OUT#$'\n'}
-  else RUN_OUT=""; [[ $rc -eq 0 ]] && rc=1; fi
+  # PROBE_REACHED: the command ran on the primary (the marker came back); else ssh itself failed
+  if [[ "$out" == *"$PROBE_MARK"* ]]; then RUN_OUT=${out#*"$PROBE_MARK"}; RUN_OUT=${RUN_OUT#$'\n'}; PROBE_REACHED=1
+  else RUN_OUT=""; PROBE_REACHED=0; [[ $rc -eq 0 ]] && rc=1; fi
   return $rc
 }
 readonly PROBE_MARK="__DG_PROBE_OUTPUT__"
@@ -102,11 +103,11 @@ prim_scp() {
   # Copy ONE file FROM primary to this server over the existing connection (read-only on primary).
   local src=$1 dst=$2
   v_path "$src" || fatal "Safety stop: invalid path on the primary: $src"
-  run_logged "scp from primary: $src -> $dst" timeout --foreground 600 scp -q -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes "$PRIMARY_SSH_USER@$PRIMARY_IP:$src" "$dst" < /dev/null && return 0
+  run_logged "scp from primary: $src -> $dst" timeout --foreground 600 scp -q -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP:$src" "$dst" < /dev/null && return 0
   local rc=$?
   # OL9 scp uses the SFTP protocol; a primary without the sftp subsystem needs the old protocol (-O)
   if [[ ${OS_MAJOR:-0} -ge 9 ]] && grep -qiE 'subsystem|sftp|connection closed' <<< "$RUN_OUT"; then
-    run_logged "scp (old protocol) from primary: $src -> $dst" timeout --foreground 600 scp -O -q -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes "$PRIMARY_SSH_USER@$PRIMARY_IP:$src" "$dst" < /dev/null && return 0
+    run_logged "scp (old protocol) from primary: $src -> $dst" timeout --foreground 600 scp -O -q -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP:$src" "$dst" < /dev/null && return 0
     rc=$?
   fi
   [[ $rc -eq 124 ]] && RUN_OUT+=$'\n'"no answer from the primary within 600 s"

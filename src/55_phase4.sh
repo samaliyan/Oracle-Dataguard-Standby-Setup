@@ -116,8 +116,8 @@ c_4_2() {
   PLAN=$SRL_STMTS
   USING="Per thread: online log groups + 1, each as large as the largest online log"
   local gl; gl=$(grep -oE 'group [0-9]+' <<< "$SRL_STMTS" | awk '{print $2}' | paste -sd',' -)
-  if [[ -n "$gl" ]]; then PLAN_UNDO="alter database drop standby logfile group <n>;  for groups $gl, then delete their files"
-  else PLAN_UNDO="alter database drop standby logfile group <n>;  for each new group. To list them:  select group#,thread#,bytes from v\$standby_log;"; fi
+  if [[ -n "$gl" ]]; then PLAN_UNDO="(for groups $gl, then delete their files)  alter database drop standby logfile group <n>;"
+  else PLAN_UNDO="(for each new group; to list them: select group#,thread#,bytes from v\$standby_log)  alter database drop standby logfile group <n>;"; fi
   return 1
 }
 
@@ -195,7 +195,7 @@ find_dest() {
 c_4_4() {
   need_ssh || return 2
   # log_archive_dest may have been moved on the primary since it was read (answer r): read it again
-  if [[ -n "$OLD_ARCH_DEST" ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
+  if [[ -n "$OLD_ARCH_DEST" || ( -z "$ARCH_LOC" && -z "$FRA_LOC" ) ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
   find_dest || { NOW="No free log_archive_dest_N on the primary"; return 2; }
   p_param "log_archive_dest_$DEST_N" || { NOW="Query on the primary failed"; return 2; }
   if has_token "$PVAL" "SERVICE=${STANDBY_TNS^^}" && has_token "$PVAL" "DB_UNIQUE_NAME=${STANDBY_UNIQUE^^}"; then
@@ -209,6 +209,18 @@ c_4_4() {
   NOW="log_archive_dest_$DEST_N = $(disp_val "$PVAL")"
   [[ "$DEST_N" != "2" ]] && NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"
   PLAN=""
+  # no local destination named at all (no recovery area, no log_archive_dest, no log_archive_dest_N LOCATION): the
+  # primary archives to its built-in default folder. A first log_archive_dest_N may end that default, and then
+  # archiving stops: an explicit local destination comes first
+  if [[ -z "$ARCH_LOC" && -z "$FRA_LOC" && -z "$OLD_ARCH_DEST" ]]; then
+    NOW+=$'\n'"The primary names no local archive destination (no recovery area, no LOCATION): it uses the built-in default."
+    PLAN="-- First give the primary an explicit local archive destination, the folder it archives to now
+-- (see: archive log list), for example:
+-- (log_archive_dest_<M>: one that is empty now, not $DEST_N; check with: show parameter log_archive_dest_)
+alter system set log_archive_dest_<M>='location=<archive folder or +RECO> valid_for=(all_logfiles,all_roles)' scope=both;
+-- (or set a recovery area, step 4.6). Then:
+"
+  fi
   if [[ -n "$OLD_ARCH_DEST" ]]; then
     NOW+=$'\n'"The primary uses the old parameter log_archive_dest."$'\n'"log_archive_dest_N cannot be used together with it (ORA-16018)."
     # the duplex folder exactly as written (p_param changes the case)
@@ -298,7 +310,7 @@ alter system set db_recovery_file_dest='${ORACLE_BASE:-/u01/app/oracle}/fast_rec
     PLAN+=$'\n'"-- Size: $why. Check that the folder has the space."
   fi
   PLAN+=$'\n'"-- The archived logs of the primary then go there. Then answer r here."
-  PLAN_UNDO="alter system reset db_recovery_file_dest scope=both; alter system reset db_recovery_file_dest_size scope=both;  only after the archived logs in it are backed up"
+  PLAN_UNDO="(only after the archived logs in it are backed up)  alter system reset db_recovery_file_dest scope=both; alter system reset db_recovery_file_dest_size scope=both;"
   return 1
 }
 
@@ -327,8 +339,8 @@ startup"
     else
       PLAN+="alter system set remote_login_passwordfile=exclusive scope=spfile;
 -- Then restart the primary at a quiet time."$'\n'
-      if [[ -z "$rlp" || "$rlp" == "-" ]]; then PLAN_UNDO="alter system reset remote_login_passwordfile scope=spfile;  then restart"
-      else PLAN_UNDO="alter system set remote_login_passwordfile=$rlp scope=spfile;  then restart"; fi
+      if [[ -z "$rlp" || "$rlp" == "-" ]]; then PLAN_UNDO="(then restart)  alter system reset remote_login_passwordfile scope=spfile;"
+      else PLAN_UNDO="(then restart)  alter system set remote_login_passwordfile=$rlp scope=spfile;"; fi
     fi
   fi
   if [[ "$n" -lt 1 ]]; then
@@ -435,6 +447,8 @@ c_4_9() {
   local cls=MISSING
   prim_probe tnsping "$DB_HOME" "$PRIMARY_TNS_ADMIN" "$STANDBY_TNS" || true
   [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="tnsping on the primary gave no answer within 120 seconds. Answer r to check again."; return 2; }
+  # tnsping always prints its banner: no output at all is a failed ssh call, not a missing alias
+  [[ $PROBE_REACHED -eq 1 && -n "${RUN_OUT//[[:space:]]/}" ]] || { NOW="tnsping could not be run on the primary (no output). Answer r to check again."; return 2; }
   cls=$(tnsping_class "$RUN_OUT")
   PLAN_UNDO="remove the $STANDBY_TNS entry from $PRIMARY_TNS_ADMIN/tnsnames.ora, or put back the backup if you changed an existing entry"
   if [[ "$cls" == "OK" || "$cls" == "NOLISTENER" || "$cls" == "BLOCKED" ]] && grep -qi 'TNSNAMES adapter' <<< "$RUN_OUT"; then
@@ -525,7 +539,7 @@ c_4_11() {
       CHECK_WAITS=2; return 0
     fi
   fi
-  [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW="The primary did not answer in time. Answer r to check again."; return 2; }
+  [[ $PROBE_TIMED_OUT -eq 1 || $PROBE_REACHED -ne 1 ]] && { NOW="The primary did not answer. Answer r to check again."; return 2; }
   local sid home
   sid=$(grep -E 'ORACLE_SID=' <<< "$RUN_OUT" | tail -n 1 | sed -E 's/.*ORACLE_SID=//; s/["'"'"']//g; s/[[:space:]].*//')
   home=$(grep -E 'ORACLE_HOME=' <<< "$RUN_OUT" | tail -n 1 | sed -E 's/.*ORACLE_HOME=//; s/["'"'"']//g; s/[[:space:]].*//')

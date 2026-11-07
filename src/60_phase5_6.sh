@@ -304,7 +304,7 @@ $(lsnr_home)/bin/lsnrctl stop $SB_LSNR ; $(lsnr_home)/bin/lsnrctl start $SB_LSNR
     if use_grid; then
       # an Oracle Restart listener: the same change as step 3.10 (asked first, also with --yes: it restarts the listener)
       KIND_NOW=""; L52_GRIDPORT=1; YES_HOLD=1
-      L310_CUR=$(as_grid "$GRID_HOME/bin/srvctl" config listener -listener "$SB_LSNR" 2>/dev/null | sed -n 's/.*End points:[[:space:]]*TCP:\([0-9]*\).*/\1/Ip' | head -n 1)
+      L310_CUR=$(as_grid timeout 600 "$GRID_HOME/bin/srvctl" config listener -listener "$SB_LSNR" 2>/dev/null | sed -n 's/.*End points:[[:space:]]*TCP:\([0-9]*\).*/\1/Ip' | head -n 1)
       PLAN="As $GRID_USER (the listener restarts; connections to it are cut for a moment):
 srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
 srvctl stop listener -listener $SB_LSNR
@@ -551,7 +551,7 @@ Install it here (owner $ORACLE_USER:$INSTALL_GROUP, mode 640):
     fi
     NOW+=$'\n'"The primary password file is in ASM: $pfile"
     KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
-    PLAN="asmcmd pwcopy '$pfile' $t
+    PLAN="rm -f $t && test ! -e $t && (umask 077; asmcmd pwcopy '$pfile' $t)
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
         PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
@@ -597,7 +597,7 @@ d_6_1() {
   fetch_primary_file "$PW_SRC" "$tmp" || return 1
   local existed=0; [[ -e "$d" ]] && existed=1
   backup_file "$d" "$ORACLE_USER" || return 1
-  install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 640 "$tmp" "$d" || { bad "Cannot install $d"; return 1; }
+  install_as "$ORACLE_USER" "$INSTALL_GROUP" 640 "$tmp" "$d" || { bad "Cannot install $d"; return 1; }
   rm -f "$tmp"
   journal_file_written "$d" "$existed"
   DONE_MSG="The primary password file is installed here:"$'\n'"  $d"
@@ -807,7 +807,7 @@ d_6_3() {
     fetch_primary_file "$f" "$tmp" || return 1
     local existed=0; [[ -e "$f" ]] && existed=1
     backup_file "$f" "$ORACLE_USER" || return 1
-    install -o "$ORACLE_USER" -g "$INSTALL_GROUP" -m 600 "$tmp" "$f" || return 1
+    install_as "$ORACLE_USER" "$INSTALL_GROUP" 600 "$tmp" "$f" || return 1
     rm -f "$tmp"; say "Installed $f"; journal_file_written "$f" "$existed"
     # a new ewallet.p12 (for example after a new master key) makes an auto-login file that was made HERE
     # outdated (ORA-28374): it is moved aside and made again. One that comes from the primary is copied anyway.

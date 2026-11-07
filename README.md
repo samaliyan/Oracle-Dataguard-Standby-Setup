@@ -49,7 +49,7 @@ step of that part. The same parts work from the command line:
 Before each step the script shows what it found and what it will do, and asks:
 
 ```
-[y] do it   [s] skip (I do it myself)   [h] help   [q] quit
+[y] Yes, do it   [s] Skip   [h] Help   [q] Quit
 ```
 
 ## Phases
@@ -84,7 +84,8 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
                       or steps such as 2.1-2.4 (phase 1 runs first, so the primary must be reachable)
 --settings            review or edit the saved standby values
 --yes                 answer y for the actions on this server; disk erasure, clean-up, the copy, the
-                      host key, passwords and the restart steps (9.1-9.3, 9.7) are still asked
+                      host key, passwords, the listener restart (3.10), the restart steps (9.1-9.3,
+                      9.7) and the deletion setting of archived logs (9.8) are still asked
 --status              result of every phase and step so far (connects to nothing)
 --show-changes [step] every change made on this server, with its undo
 --undo <step>         undo the changes of a step (asks before each one)

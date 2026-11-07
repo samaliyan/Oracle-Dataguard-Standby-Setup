@@ -146,7 +146,7 @@ CUR=C; echo "== C. Second run on the finished server changes nothing"
 rc=$(run $T/c.txt)
 check "exit 0" "[[ $rc -eq 0 ]]"
 check "no step DONE now except ssh/discovery/sys password" "! grep -E '^    [0-9.]+ +done ' $T/c.txt | grep -vE '^    1\.[235] ' | grep -q ."
-check "settings accepted without question (same as accepted)" "grep -q 'Same settings as you accepted before' $T/c.txt && ! grep -q '\[a\] accept' $T/c.txt"
+check "settings accepted without question (same as accepted)" "grep -q 'Same settings as you accepted before' $T/c.txt && ! grep -q '\[a\] Accept' $T/c.txt"
 check "no installer, no rman, no parted, no groupadd" "! grep -qE '^(gridSetup|runInstaller|rman|parted)' $T/state/calls.log"
 check "primary still safe" "safe_primary"
 
@@ -159,7 +159,7 @@ check "--from 9.3 starts at 9.3" "grep -q 'Step 9.3  ' $T/d2.txt && ! grep -q 'S
 rc=$(run $T/d3.txt --from 11); check "--from 11 rejected" "[[ $rc -ne 0 ]] && grep -q 'Use --from' $T/d3.txt"
 rc=$(run $T/d4.txt --from 3.99); check "--from 3.99 (no such step) rejected" "[[ $rc -eq 2 ]] && grep -q 'There is no step 3.99' $T/d4.txt"
 rc=$(run $T/d5.txt --from 5.1 --only 10); check "--from with --only rejected" "[[ $rc -eq 2 ]] && grep -q 'not both' $T/d5.txt"
-rc=$(run $T/d6.txt --from 9.1); check "--from 9.1 does not ask the sys password, says all OK" "! grep -q 'sys password (same on primary' $T/d6.txt && grep -q 'Standby setup is complete' $T/d6.txt"
+rc=$(run $T/d6.txt --from 9.1); check "--from 9.1 does not ask the sys password, says all OK" "! grep -q 'sys password of the primary' $T/d6.txt && grep -q 'Standby setup is complete' $T/d6.txt"
 
 CUR=E; echo "== E. --check on an empty server changes nothing"
 fresh empty
@@ -168,7 +168,7 @@ check "exit non-zero (work to do)" "[[ $rc -ne 0 ]]"
 check "no groups/users created" "! getent group oinstall >/dev/null && ! id oracle >/dev/null 2>&1"
 check "no dnf/oracleasm configure/parted" "! grep -qE \"^(dnf|parted) |'-u', 'grid'\" $T/state/calls.log"
 check "no settings file written" "[[ ! -f $T/varlib/settings.conf ]]"
-check "no [y] do it prompt" "! grep -q '\[y\] do it' $T/e.txt"
+check "no [y] do it prompt" "! grep -q '\[y\] Yes, do it' $T/e.txt"
 check "TODO items listed" "grep -qE '^    2\.1 +to do' $T/e.txt"
 check "check mode: waiting steps are WAIT, not FAIL" "grep -q 'Checked after step 2.2 is done' $T/e.txt && ! grep -q 'Not possible yet' $T/e.txt && grep -qE '^    2\.5 +waiting' $T/e.txt"
 check "check mode: legend explains TODO / WAITS / PROBLEM" "grep -q 'Only .problem. steps need your attention' $T/e.txt"
@@ -231,9 +231,9 @@ check "h shows help of the current step" "grep -qE 'Help .{1,3} Step 2\.1 ' $T/h
 fresh empty; rc=$(DG_TEST_CTRLC_AT=3.4 run $T/h4.txt)
 check "Ctrl-C -> stopped, message" "[[ $rc -ne 0 ]] && grep -q 'Interrupted' $T/h4.txt"
 check "Ctrl-C: no response file left, ssh closed" "! ls -d /tmp/dg_rsp.* 2>/dev/null | grep -q . && [[ ! -e $T/varlib/ssh_ctl ]]"
-out=$(cd $T && bash ./dg_standby_setup.sh --help-step all 2>&1); n=$(grep -cE 'Help .{1,3} Step [0-9]' <<< "$out")
+out=$(cd $T && DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log bash ./dg_standby_setup.sh --help-step all 2>&1); n=$(grep -cE 'Help .{1,3} Step [0-9]' <<< "$out")
 check "--help-step all prints every step (72)" "[[ $n -eq 72 ]]"
-check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\" || true"
+check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.9 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help 2>&1); check "--help shows usage" "grep -q -- '--primary' <<< \"\$out\""
 for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 2.16 3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11 5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2 9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4; do
@@ -326,7 +326,7 @@ check "read-only home already used -> not converted" "grep -q 'The script does n
 CUR=O; echo "== O. Settings"
 fresh; rc=$(DG_TEST_QUIT_AT=2.1 run $T/o1.txt)
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/o2.txt --primary 127.0.0.2)
-check "saved settings reused without asking IP" "! grep -q 'IP address (or host name)' $T/o2.txt && grep -q 'Same settings as you accepted before' $T/o2.txt"
+check "saved settings reused without asking IP" "! grep -q 'IP address or host name of the primary' $T/o2.txt && grep -q 'Same settings as you accepted before' $T/o2.txt"
 rc=$(DG_TEST_QUIT_AT=1.2 run $T/o3.txt --primary 127.0.0.7)
 check "other primary IP -> saved settings not used, kept as a copy" "grep -q 'The saved settings are for another primary, so they are not used. A copy ends in' $T/o3.txt && ls $T/varlib/settings.conf.127.0.0.2_* >/dev/null 2>&1"
 fresh; jset $P "d['extra_pmon']=['OTHERDB']"
@@ -704,7 +704,7 @@ CUR=W; echo "== W. Field report 1 (check mode on a real server)"
 # W1 software installed here, no instance yet: check mode shows no PROBLEM for 1.4 / 4.2 / 7.6
 fresh; jset $S "d['instances']={}"
 rc=$(run $T/w1.txt --check)
-check "check mode, software installed, no instance: 4.2 query works, 7.4/7.6 wait for 7.2" "! grep -q 'ORA-00937' $T/w1.txt && ! grep -qE '^  (1\.4|4\.2|7\.6) +PROBLEM' $T/w1.txt && grep -qE '^    7\.6 +waiting' $T/w1.txt && grep -qE '^    7\.4 +waiting' $T/w1.txt"
+check "check mode, software installed, no instance: 4.2 query works, 7.4/7.6 wait for 7.2" "! grep -q 'ORA-00937' $T/w1.txt && ! grep -qE '^ +(1\.4|4\.2|7\.6) +problem' $T/w1.txt && grep -qE '^    7\.6 +waiting' $T/w1.txt && grep -qE '^    7\.4 +waiting' $T/w1.txt"
 # W2 Grid home inside the Grid base on primary (works there): kept, only noted
 fresh; jset $P "d['grid_base']='$T/u01/app'"
 rc=$(run $T/w2.txt --check)
@@ -721,7 +721,7 @@ rc=$(run $T/x1.txt)
 check "no [y] question before the settings (1.2, 1.3 only read)" "! sed -n '/Step 1.2  /,/Step 1.4  /p' $T/x1.txt | grep -q '\[y\] Yes, do it'"
 check "progress board at the start, with the legend" "grep -q '  Progress' $T/x1.txt && grep -q 'Nothing is set up yet' $T/x1.txt"
 check "phase 4 offered first after phase 1" "grep -q 'Do phase 4 (primary) first' $T/x1.txt"
-check "one box with every primary command of phase 4 (batch)" "grep -q 'steps need commands on the primary. They are shown together below, in order.' $T/x1.txt && grep -q -- '-- Step 4.2: Standby redo logs' $T/x1.txt && grep -q -- '-- Undo, if ever needed: alter database drop standby logfile' $T/x1.txt"
+check "one box with every primary command of phase 4 (batch)" "grep -q 'steps need commands on the primary. They are shown together below, in order.' $T/x1.txt && grep -q -- '-- Step 4.2: Standby redo logs' $T/x1.txt && grep -qE -- '-- Undo, if ever needed: .*alter database drop standby logfile' $T/x1.txt"
 check "run-mode summary has a legend and the changes of this run" "grep -qE '[0-9]+ already ok, [0-9]+ done in this run' $T/x1.txt && grep -q 'ok = was already correct' $T/x1.txt && grep -q 'Changes on this server in this run' $T/x1.txt"
 check "end hints: archivelog deletion, password file, reboot" "grep -qi 'archivelog deletion policy' $T/x1.txt && grep -q 'Plan one reboot' $T/x1.txt"
 check "journal records the primary commands with their undo" "grep -q '|PRIMARY|4.4|' $T/varlib/changes.log && grep -q 'alter system reset log_archive_dest_2' $T/varlib/changes.log"
@@ -1618,6 +1618,14 @@ EOF
 }
 fresh; ut_518b > $T/ut_518b.txt
 check "unit: below a folder another user owns, folders are made as their owner (never by root); one the owner cannot make is said, nothing made" "[[ \$(cat $T/ut_518b.txt) == 'oracle:oinstall none said oracle' ]]"
+# final audit
+fresh empty; rc=$(run $T/z150a.txt)
+jset $S "d['instances']['PRODDB_STBY']['no_ms']=1"
+rc=$(run $T/z150.txt --only 9.4)
+check "9.4: no v\$managed_standby (newer release) -> v\$dataguard_process is used, apply seen" "[[ \$(res 9.4 $T/z150.txt) == OK ]] && ! grep -q 'ORA-00942' $T/z150.txt"
+jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
+rc=$(run $T/z151.txt --only 9.4 --check)
+check "9.4: no v\$managed_standby and no MRP -> not OK" "[[ \$(res 9.4 $T/z151.txt) != OK ]]"
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
 for f in "${FAILED[@]}"; do echo "  - $f"; done

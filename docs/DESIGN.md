@@ -1,4 +1,4 @@
-# dg_standby_setup.sh 5.0 - design
+# dg_standby_setup.sh 5.19 - design
 
 Runs as root on the future STANDBY. Builds a physical standby of one primary database.
 Never changes the primary: primary work is printed, then re-checked read-only.
@@ -118,6 +118,11 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   (runuser mkdir), and the mode of an existing empty folder is set as that owner. 7.1 shows a root mkdir/chown for
   an audit_file_dest outside the Oracle base only under the same condition, for the resolved path, which must pass
   v_path again; otherwise the oracle user makes it, or the path is refused with the reason.
+- Programs of an Oracle home run as root (5.19): root.sh, orainstRoot.sh, crsctl start has and setasmgidwrap are
+  required by Oracle and cannot be avoided. root_prog_ok runs them only when the file and its folder are not links,
+  belong to root, oracle or grid, are not writable by others, and are group-writable only for the install group.
+  Files root puts into folders of oracle (password file, wallet) are written by oracle itself (install_as); the undo
+  of a file in a folder of oracle or grid is done as that user.
 - Boot script (5.14): it never starts apply on an OPEN standby (Active Data Guard). Its errors carry the "<3>"
   prefix (journal priority err, for monitoring). The unit stays active after an error on purpose: a failed unit
   does not run ExecStop, and the stop is the clean shutdown of the standby.

@@ -132,7 +132,11 @@ undo_text() {
     USER)       printf 'by hand: userdel -r %s   (this also removes its home folder)' "$obj" ;;
     USERMOD)    printf 'by hand: the groups of %s were changed (%s). Set them back with usermod if needed.' "$obj" "$det" ;;
     PKG)        printf 'by hand, usually not wanted: %s remove %s' "$PKG" "$obj" ;;
-    FWPORT)     printf 'auto: firewall-cmd --permanent --zone=%s --remove-port=%s ; firewall-cmd --zone=%s --remove-port=%s' "${obj%%:*}" "${obj#*:}" "${obj%%:*}" "${obj#*:}" ;;
+    FWPORT)     local fp fr; fp=$(detail_field "$det" permanent); fr=$(detail_field "$det" runtime); [[ -z "$fp$fr" ]] && { fp=1; fr=1; }
+                printf 'auto:'
+                [[ "$fp" == 1 ]] && printf ' firewall-cmd --permanent --zone=%s --remove-port=%s' "${obj%%:*}" "${obj#*:}"
+                [[ "$fp" == 1 && "$fr" == 1 ]] && printf ' ;'
+                [[ "$fr" == 1 ]] && printf ' firewall-cmd --zone=%s --remove-port=%s' "${obj%%:*}" "${obj#*:}" ;;
     SERVICE)    printf 'nothing: %s was enabled and started. Every server should have a time service.' "$obj" ;;
     ASMCFG)     printf 'by hand: oracleasm configure -d ; systemctl disable oracleasm   (only if no ASM disk uses ASMLib)' ;;
     SETTING)    printf 'in the settings file: %s' "$det" ;;
@@ -259,7 +263,7 @@ _hint_after_restore() {
   esac
   return 0
 }
-_db_registered() { use_grid && [[ -x "$DB_HOME/bin/srvctl" ]] && run_logged "srvctl config" as_oracle "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" >/dev/null 2>&1; }
+_db_registered() { use_grid && [[ -x "$DB_HOME/bin/srvctl" ]] && run_logged "srvctl config" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" >/dev/null 2>&1; }
 _undo_obj_ok() {
   # the journal is root-only, but its fields are checked again before anything is run with them
   local kind=$1 obj=$2 det=$3 x
@@ -327,7 +331,11 @@ undo_one() {
     NEW)
       [[ -e "$obj" || -L "$obj" ]] || { say "$obj is already gone."; return 0; }
       m=$(detail_field "$det" md5); _undo_file_ok "$obj" "$m" || return 2
-      rm -f -- "$obj" || return 1
+      # in a folder of another user (oracle, grid): removed as that user, so a folder swapped for a link meanwhile
+      # cannot lead root elsewhere
+      local po; po=$(stat -c '%U' -- "$(dirname -- "$obj")" 2>/dev/null)
+      if [[ -n "$po" && "$po" != root ]]; then runuser -u "$po" -- rm -f -- "$obj" || return 1
+      else rm -f -- "$obj" || return 1; fi
       say "Removed $obj"; _hint_after_restore "$obj"; return 0 ;;
     APPEND)
       [[ -f "$obj" ]] || { say "$obj is already gone."; return 0; }
@@ -359,12 +367,19 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       local lead keep_nl=0; lead=$(detail_field "$det" lead)
       [[ "$lead" == "1" && $cur_len -gt $((off + len)) ]] && keep_nl=1
       tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-      { head -c "$off" -- "$obj"; [[ $keep_nl -eq 1 ]] && printf '\n'; tail -c +$((off + len + 1)) -- "$obj"; } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+      # a file of another user is also read as that user (a link put in its place cannot show root-only text)
+      if [[ "$u" == "root" ]]; then
+        { head -c "$off" -- "$obj"; [[ $keep_nl -eq 1 ]] && printf '\n'; tail -c +$((off + len + 1)) -- "$obj"; } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+      else
+        runuser -u "$u" -- sh -c 'head -c "$1" -- "$2" && { [ "$3" != 1 ] || printf "\n"; } && tail -c +"$4" -- "$2"' sh "$off" "$obj" "$keep_nl" "$((off + len + 1))" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+      fi
       if [[ "$u" == "root" ]]; then cat "$tmp" > "$obj" || { rm -f -- "$tmp"; return 1; }
       # root reads the private temp copy; the owner writes its own file (the copy is never made readable for others)
       else runuser -u "$u" -- sh -c 'cat > "$1"' sh "$obj" < "$tmp" || { rm -f -- "$tmp"; return 1; }; fi
       rm -f -- "$tmp"
-      if [[ $off -eq 0 && ! -s "$obj" ]]; then rm -f -- "$obj"; say "Removed $obj. It held only the added block."
+      if [[ $off -eq 0 && ! -s "$obj" ]]; then
+        if [[ "$u" == "root" ]]; then rm -f -- "$obj"; else runuser -u "$u" -- rm -f -- "$obj"; fi
+        say "Removed $obj. It held only the added block."
       else say "Removed the block that was added to $obj."; fi
       _hint_after_restore "$obj"; return 0 ;;
     EDIT)
@@ -372,7 +387,9 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       [[ -n "$b" && "$b" != "-" ]] || { say "There is no exact backup for this change. Compare $obj with its .bak_ copies and fix it by hand."; return 2; }
       [[ -f "$b" ]] || { bad "The backup $b is gone. Fix $obj by hand."; return 2; }
       _undo_file_ok "$obj" "$m" || return 2
-      cp -p --remove-destination -- "$b" "$obj" || return 1
+      local po; po=$(stat -c '%U' -- "$(dirname -- "$obj")" 2>/dev/null)
+      if [[ -n "$po" && "$po" != root ]]; then runuser -u "$po" -- cp -p --remove-destination -- "$b" "$obj" || return 1
+      else cp -p --remove-destination -- "$b" "$obj" || return 1; fi
       say "Put back $obj from $b"; _hint_after_restore "$obj"; return 0 ;;
     RENAME)
       local to; to=$(detail_field "$det" to)
@@ -385,8 +402,12 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       if rmdir -- "$obj" 2>/dev/null; then say "Removed the empty folder $obj"; return 0; fi
       say "$obj is not empty. It is left as it is."; return 2 ;;
     FWPORT)
-      run_cmds <<< "firewall-cmd --permanent --zone=${obj%%:*} --remove-port=${obj#*:}
-firewall-cmd --zone=${obj%%:*} --remove-port=${obj#*:}" ;;
+      # only what the step added (entries written before 5.19 have no detail: both, as then)
+      local fp fr; fp=$(detail_field "$det" permanent); fr=$(detail_field "$det" runtime)
+      [[ -z "$fp$fr" ]] && { fp=1; fr=1; }
+      [[ "$fp" == 1 ]] && { run_cmds <<< "firewall-cmd --permanent --zone=${obj%%:*} --remove-port=${obj#*:}" || return 1; }
+      [[ "$fr" == 1 ]] && { run_cmds <<< "firewall-cmd --zone=${obj%%:*} --remove-port=${obj#*:}" || return 1; }
+      return 0 ;;
     UNIT)
       if [[ ! -f "/etc/systemd/system/$obj" ]] && ! systemctl cat "$obj" >/dev/null 2>&1; then say "$obj is already gone."; return 0; fi
       if [[ "$obj" == *.timer ]]; then
@@ -399,20 +420,22 @@ firewall-cmd --zone=${obj%%:*} --remove-port=${obj#*:}" ;;
       systemctl reset-failed "$obj" 2>/dev/null || true
       say "$obj is disabled: it no longer starts at boot. The running standby was not stopped."; return 0 ;;
     LSNRRES)
-      run_logged "srvctl config listener" as_grid "$GRID_HOME/bin/srvctl" config listener -listener "$obj" >/dev/null 2>&1 || { say "Listener $obj is not registered. It is already gone."; return 0; }
-      run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$obj" || true
-      run_logged "srvctl remove listener" as_grid "$GRID_HOME/bin/srvctl" remove listener -listener "$obj" || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
+      run_logged "srvctl config listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" config listener -listener "$obj" >/dev/null 2>&1 || {
+        grep -qE 'PRCN-2044|PRCR-1001|PRCD-1120|could not be found|does not exist' <<< "$RUN_OUT" || { bad "srvctl gave no clear answer for listener $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
+        say "Listener $obj is not registered. It is already gone."; return 0; }
+      run_logged "srvctl stop listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" stop listener -listener "$obj" || true
+      run_logged "srvctl remove listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" remove listener -listener "$obj" || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
       say "Listener $obj removed from Oracle Restart."; return 0 ;;
     LSNRPORT)
       local old; old=$(detail_field "$det" old); num "$old" || return 2
-      run_logged "srvctl modify listener" as_grid "$GRID_HOME/bin/srvctl" modify listener -listener "$obj" -endpoints "TCP:$old" || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
-      run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$obj" || true
-      run_logged "srvctl start listener" as_grid "$GRID_HOME/bin/srvctl" start listener -listener "$obj" || true
+      run_logged "srvctl modify listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" modify listener -listener "$obj" -endpoints "TCP:$old" || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
+      run_logged "srvctl stop listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" stop listener -listener "$obj" || true
+      run_logged "srvctl start listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" start listener -listener "$obj" || true
       say "Listener $obj is back on port $old."; return 0 ;;
     LSNRSTART)
       if [[ "$(detail_field "$det" via)" == srvctl ]]; then
         # an Oracle Restart listener is stopped through Oracle Restart (lsnrctl would leave the resource behind)
-        if run_logged "srvctl stop listener" as_grid "$GRID_HOME/bin/srvctl" stop listener -listener "$obj"; then say "Listener $obj stopped."; return 0; fi
+        if run_logged "srvctl stop listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" stop listener -listener "$obj"; then say "Listener $obj stopped."; return 0; fi
         grep -qE 'PRCC-1016|PRCR-1005|not running' <<< "$RUN_OUT" && { say "Listener $obj was not running."; return 0; }
         bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1
       fi
@@ -434,10 +457,12 @@ Trying shutdown abort."; sql_local "shutdown abort" || return 1; }
       fi
       say "Instance $obj is down."; return 0 ;;
     SRVCTL)
-      run_logged "srvctl config" as_oracle "$DB_HOME/bin/srvctl" config database -db "$obj" >/dev/null 2>&1 || { say "$obj is not registered. It is already gone."; return 0; }
-      run_logged "srvctl status" as_oracle "$DB_HOME/bin/srvctl" status database -db "$obj" || true
+      run_logged "srvctl config" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$obj" >/dev/null 2>&1 || {
+        grep -qE 'PRCD-1120|PRCR-1001|could not be found|does not exist' <<< "$RUN_OUT" || { bad "srvctl gave no clear answer for $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
+        say "$obj is not registered. It is already gone."; return 0; }
+      run_logged "srvctl status" as_oracle timeout 600 "$DB_HOME/bin/srvctl" status database -db "$obj" || true
       grep -q 'is running' <<< "$RUN_OUT" && { run_logged "srvctl stop" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" stop database -db "$obj" -stopoption immediate || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }; }
-      run_logged "srvctl remove" as_oracle "$DB_HOME/bin/srvctl" remove database -db "$obj" -noprompt || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
+      run_logged "srvctl remove" as_oracle timeout 600 "$DB_HOME/bin/srvctl" remove database -db "$obj" -noprompt || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
       say "$obj removed from Oracle Restart. The database files are not touched."; return 0 ;;
     SRL)
       _state_or_2 || return 2

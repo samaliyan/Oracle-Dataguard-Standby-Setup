@@ -648,7 +648,7 @@ batch_primary_steps() {
   need_ssh || return 0
   BATCH_ERR=$(mktemp /tmp/dg_batch.XXXXXX) && CLEANUP_FILES+=("$BATCH_ERR") || BATCH_ERR=/dev/null
   exec {BATCH_TTY}>&1      # a stop inside a quiet check (Ctrl+C, safety stop) still reaches the screen (fatal)
-  local in41=0 in47=0 wbefore=${#WARN_LIST[@]}
+  local in41=0 in47=0 inedit=0 wbefore=${#WARN_LIST[@]}
   for id in "$@"; do
     step_in_range "$id" || continue
     cf="c_${id//./_}"; declare -F "$cf" >/dev/null || continue
@@ -657,6 +657,7 @@ batch_primary_steps() {
     NOW=""; PLAN=""; PLAN_UNDO=""; USING=""; KIND_NOW=""; PRIMARY_HOW_STEP=""; NEED_SYS=0; CHECK_WAITS=0; CUR_STEP=$id
     "$cf" >/dev/null 2>"$BATCH_ERR"; rc=$?
     [[ -s "$BATCH_ERR" && "$BATCH_ERR" != /dev/null ]] && log_block "quiet check $id (stderr)" < "$BATCH_ERR"
+    [[ $rc -eq 1 && ( "$id" == "4.9" || "$id" == "4.10" ) ]] && inedit=1
     [[ $rc -eq 1 && -n "$PLAN" && "${KIND_NOW:-primary}" == "primary" ]] || continue
     primary_pending_add "$id" "$PLAN_UNDO"
     # file changes in a shell, not SQL, grouped by the user; only plans that are commands (an entry to edit by
@@ -702,7 +703,7 @@ batch_primary_steps() {
     for ((fj = fi2; fj < ${#fhow[@]}; fj++)); do [[ "${fhow[$fj]}" == "$u" ]] && fb+="${fplan[$fj]}"$'\n\n'; done
     printf '%s' "${fb%$'\n\n'}" | print_commands "Then, in a shell on the PRIMARY ($PRIMARY_HOST)" "$u"
   done
-  say "Edits of a file by hand (the static listener entry of 4.10, a changed alias in 4.9), if needed, follow on their own."
+  [[ $inedit -eq 1 ]] && say "Edits of a file by hand (the static listener entry of 4.10, a changed alias in 4.9), if needed, follow on their own."
   CUR_STEP=""
   say "Afterwards the script checks every step again."
   PRIMARY_BOX_NOTE=1; say "${C_D}The same commands are saved in $ACTIONS_FILE${C_N}"

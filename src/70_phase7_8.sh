@@ -37,6 +37,7 @@ standby_complete() {
   # (a new datafile on primary, an OFFLINE file) are reported, never treated as a failed copy.
   SC_INFO=""
   local_state
+  [[ "$LSTATE" == "ERROR" ]] && { SC_INFO="the state of the standby instance cannot be read ($(ora_errors "$SQL_OUT"))"; return 2; }
   if [[ "$LSTATE" != "MOUNTED" && "$LSTATE" != "OPEN" ]]; then
     if [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]]; then
       # only the record: the files are checked when the standby is mounted (step 9.2 mounts it)
@@ -901,13 +902,17 @@ dup_prechecks() {
   [[ -n "$CF_LIST" ]] || { PRE_FIX="The primary returned no control file names"; return 1; }
   # every datafile and tempfile is created in its own disk group (or with its own name in a folder)
   prim_sql "select 'D|'||file#||'|'||name from v\$datafile union all select 'T|'||file#||'|'||name from v\$tempfile;" || { PRE_FIX="Cannot read the datafile names of the primary"; return 1; }
-  local k fno fname
+  local k fno fname odd=""
   while IFS='|' read -r k fno fname; do
-    num "$fno" && [[ "$fname" =~ ^[+/][A-Za-z0-9_./-]+$ ]] || continue
+    [[ -n "$k$fno$fname" ]] || continue
+    # a name with other characters cannot be put into the RMAN script safely: said here, before the copy starts
+    # (skipped, RMAN would try the primary's own name on this server and fail late in the copy)
+    num "$fno" && [[ "$fname" =~ ^[+/][A-Za-z0-9_./-]+$ ]] || { odd+="  $(tr -cd '[:print:]' <<< "$fname")"$'\n'; continue; }
     local what=datafile; [[ "$k" == "T" ]] && what=tempfile
     if [[ "$fname" == +* ]]; then NEWNAMES+="  set newname for $what $fno to '$(norm_loc "$fname")';"$'\n'
     elif [[ "$(basename "$fname")" != o1_mf_* ]]; then NEWNAMES+="  set newname for $what $fno to '$fname';"$'\n'; fi
   done <<< "$SQL_OUT"
+  [[ -z "$odd" ]] || { PRE_FIX="File names on the primary with characters the script does not put into the RMAN script:"$'\n'"${odd%$'\n'}"$'\n'"Rename them on the primary (or copy by hand with your own RMAN script)"; return 1; }
   # files that already exist at the target paths: an earlier copy of this standby, or something else?
   if [[ "$MODE" == "run" && ! -f "$STATE_DIR/existing_files_ok" ]]; then
     local ex="" exn=0 ef
@@ -950,7 +955,8 @@ dup_prechecks() {
   DUP_EXTRA+="      set audit_file_dest='$(adump_dir)'"$'\n'
   # redo transport destination used on primary for this standby (the standby gets the same N back to primary)
   find_dest || { PRE_FIX="Cannot read log_archive_dest_N on the primary"; return 1; }
-  p_param log_archive_config && P_DG_CONFIG=$PVAL || P_DG_CONFIG=""
+  p_param log_archive_config || { PRE_FIX="Cannot read log_archive_config of the primary"; return 1; }
+  P_DG_CONFIG=$PVAL
   dg_config_names_ok "$P_DG_CONFIG" || { PRE_FIX="log_archive_config of the primary cannot be read safely: $P_DG_CONFIG. Check step 4.3."; return 1; }
   # primary parameters that do not fit the standby
   prim_sql "select name||'|'||value from v\$parameter where value is not null and (name like 'db_create_online_log_dest%' or name like 'log_archive_dest%' or name in ('log_archive_duplex_dest','remote_listener','local_listener','fal_client','db_file_name_convert','log_file_name_convert','dg_broker_start','instance_name','service_names'));" || { PRE_FIX="Cannot read the parameters of the primary"; return 1; }
@@ -979,7 +985,7 @@ dup_prechecks() {
     elif [[ "$pname" == "log_file_name_convert" ]]; then
       HAS_LFNC=1
     elif [[ "$pname" == "dg_broker_start" && "${pval^^}" == "TRUE" ]]; then
-      DUP_EXTRA+="      set dg_broker_start='FALSE'"$'\n'; PRE_INFO+="The primary uses the Data Guard broker. It stays off on the standby until you add it there."$'\n'
+      DUP_EXTRA+="      set dg_broker_start='FALSE'"$'\n'; PRE_INFO+="The primary uses the Data Guard broker. It stays off on the standby until you add it there."$'\n'"Under the broker, set log_archive_dest_N on neither database by hand: clear what steps 4.4 and 9.5"$'\n'"set before ADD DATABASE (else ORA-16698), and let the broker manage transport."$'\n'
     elif [[ "$pname" == "instance_name" && "${pval^^}" != "${STANDBY_SID^^}" ]]; then
       DUP_EXTRA+="      set instance_name='$STANDBY_SID'"$'\n'; PRE_INFO+="instance_name of the primary is $pval. The standby gets $STANDBY_SID."$'\n'
     elif [[ "$pname" == "service_names" ]]; then
@@ -1043,6 +1049,7 @@ c_8_1() {
   PLAN="$PRE_FIX"; return 1
 }
 d_8_1() {
+  root_prog_ok "$GRID_HOME/bin/setasmgidwrap" || return 1
   run_logged "setasmgidwrap" "$GRID_HOME/bin/setasmgidwrap" "o=$DB_HOME/bin/oracle" || { bad "setasmgidwrap failed: ${RUN_OUT%%$'\n'*}"; return 1; }
   journal ASMGID "$DB_HOME/bin/oracle" "by hand, only if wanted, as root: chgrp $PRE_ASMGID_OLD $DB_HOME/bin/oracle ; chmod 6751 $DB_HOME/bin/oracle  (the group it had before)"
   say "$DB_HOME/bin/oracle now has group $(stat -c '%G' "$DB_HOME/bin/oracle" 2>/dev/null)."
@@ -1136,7 +1143,10 @@ d_8_2() {
     # "Finished" in the RMAN output is not the whole proof: the standby itself is looked at first. Only a
     # verified copy gets the "duplicate" marker (otherwise later steps would take the standby as built)
     local vr=0; dup_verify "$rlog" || vr=$?
-    [[ $vr -eq 1 ]] && return 1
+    # RMAN finished, but the copy is not right: no marker (nothing takes it as built), and no "unfinished copy"
+    # record either, so its files are never offered for deletion by the script (the DBA decides; step 7.2 shows
+    # the commands)
+    if [[ $vr -eq 1 ]]; then rm -f -- "$STATE_DIR/dup_attempt"; return 1; fi
     if [[ $vr -eq 2 ]]; then
       # recorded as a finished copy that is not checked yet: the next look at the mounted standby compares it
       dup_success_record copied
@@ -1171,6 +1181,8 @@ dup_verify() {
   local rl=${1:-the RMAN log}
   DUP_VERIFIED=""
   local_state
+  # a failed query says nothing about the copy: not checked now (it is compared at the next check)
+  [[ "$LSTATE" == "ERROR" ]] && { warn "The new standby could not be read after the copy."; return 2; }
   [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { bad "RMAN reported success, but the standby is not mounted ($LSTATE)."; printf 'See the alert log of %s and:  %s\n' "$STANDBY_SID" "$rl" | hint; return 1; }
   adg_note "$LSTATE"
   sql_local "select database_role from v\$database;" || { warn "The new standby could not be read after the copy ($(ora_errors "$SQL_OUT"))."; return 2; }

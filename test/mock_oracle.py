@@ -195,6 +195,13 @@ def local_sql(q, st, sid):
         return "ORA-01507: database not mounted" if s == "started" else inst.get("role", "PHYSICAL STANDBY")
     if "i.instance_name||'|'||i.status" in l:
         return f"{sid}|MOUNTED|PHYSICAL STANDBY" if s == "mounted" else "ORA-01507: database not mounted"
+    # a release without v$managed_standby (set "no_ms"): only v$dataguard_process answers
+    if inst.get("no_ms") and "v$managed_standby" in l: return "ORA-00942: table or view does not exist"
+    if "v$dataguard_process where upper(name) like 'mrp%'" in l: return str(inst.get("mrp", 0))
+    if "v$dataguard_process where upper(role) like 'rfs%'" in l:
+        pri = load(PRI)
+        en = any(k.startswith("log_archive_dest_state_") and str(v).upper() == "ENABLE" for k, v in pri["params"].items())
+        return "1" if en and inst.get("mrp") else "0"
     if "v$managed_standby where process like 'mrp%'" in l: return str(inst.get("mrp", 0))
     if "recovery_mode" in l and "v$archive_dest_status" in l:
         return inst.get("recovery_mode", "MANAGED REAL TIME APPLY")

@@ -224,7 +224,9 @@ one of  # & ; \\ \`  or a non-ASCII character."
     if prim_sql_as_sys "$tgt" "select 1 from dual;"; then
       SYS_VERIFIED=1; DONE_MSG="The sys password works on the primary"
       mask_pending
-      if [[ ${#SYS_PW} -lt 8 ]] || grep -qiF -- "$SYS_PW" <<< "$ORACLE_USER $GRID_USER $DB_HOME $ORACLE_BASE $PRIMARY_SID $STANDBY_SID"; then
+      # tested in bash: an external grep would show the password in the process list
+      local hay="$ORACLE_USER $GRID_USER $DB_HOME $ORACLE_BASE $PRIMARY_SID $STANDBY_SID"
+      if [[ ${#SYS_PW} -lt 8 || "${hay,,}" == *"${SYS_PW,,}"* ]]; then
         warn "The sys password is short, or it is part of a name or path.
 The log replaces it with ***** everywhere, so some names in the log look odd."
       fi

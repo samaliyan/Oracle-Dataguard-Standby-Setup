@@ -56,7 +56,7 @@ for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
    4) Database software only               3.6 - 3.11
    5) Primary changes for the DBA          phase 4
    6) Choose steps                         e.g. 2.1-2.4
-   7) Daily sync check                     phase 10
+   7) Health check (daily)                 phase 10
    8) Status, changes and undo
 ```
 
@@ -72,12 +72,12 @@ for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
 پیش از هر مرحله، اسکریپت نشان می‌دهد چه چیزی پیدا کرده و چه کاری می‌خواهد بکند. بعد با این گزینه‌ها از شما می‌پرسد:
 
 ```
-[y] do it   [s] skip   [h] help   [q] quit
+[y] Yes, do it   [s] Skip   [h] Help   [q] Quit
 ```
 
 ## فرمان‌های مفید
 
-اجرای کارهای همین سرور بدون پرسیدن تک‌تک آن‌ها. پاک‌کردن دیسک، کپی دیتابیس، کلید سرور اصلی، رمزها و مرحله‌هایی که استندبای را دوباره راه می‌اندازند همچنان پرسیده می‌شوند:
+اجرای کارهای همین سرور بدون پرسیدن تک‌تک آن‌ها. این موارد همچنان پرسیده می‌شوند: پاک‌کردن دیسک، کپی دیتابیس، کلید سرور اصلی، رمزها، راه‌اندازی دوباره‌ی listener، مرحله‌هایی که استندبای را دوباره راه می‌اندازند، و تنظیم پاک‌شدن archived log ها:
 
 ```bash
 ./dg_standby_setup.sh --yes

@@ -114,7 +114,11 @@ parse_args() {
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
       --yes) YES_MODE=1 ;;
-      --show-changes) SHOW_CHANGES=all; [[ $# -ge 2 && "$2" =~ ^[0-9]+\.[0-9]+$ ]] && { SHOW_CHANGES=$2; shift; } ;;
+      --show-changes) SHOW_CHANGES=all
+        if [[ $# -ge 2 && "$2" != -* ]]; then
+          valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit 2; }
+          SHOW_CHANGES=$2; shift
+        fi ;;
       --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
       --from)
         [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit 2; }
@@ -124,7 +128,7 @@ parse_args() {
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
       --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit 2; }; shift ;;
-      --help-step) [[ $# -ge 2 ]] || { usage; exit 2; }; HELP_STEP=$2; shift ;;
+      --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit 2; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
       *) printf 'Unknown option: %s\n\n' "$1"; usage; exit 2 ;;
     esac
@@ -248,6 +252,8 @@ menu_records() {
        say "First, what it would undo:"
        show_changes_cli "$st"
        confirm "Undo the changes of step $st now? Each change is asked again before it is undone." || return 0
+       # from here changes are made: Ctrl+C is a stop in the middle (fatal), not a quit at the menu
+       trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
        UNDO_STEP=$st; run_undo ;;
   esac
   return 0
@@ -267,7 +273,7 @@ start_menu() {
     menu_line 4 "Database software only" "3.6 - 3.11"
     menu_line 5 "Primary changes for the DBA" "phase 4"
     menu_line 6 "Choose steps" "e.g. 2.1-2.4"
-    menu_line 7 "Daily sync check" "phase 10"
+    menu_line 7 "Health check (daily)" "phase 10"
     menu_line 8 "Status, changes and undo" ""
     printf '   q) Quit\n\n'
     CUR_STEP=""
@@ -303,7 +309,8 @@ start_menu() {
   elif [[ -n "$ONLY_PHASE" ]]; then say "This run: phase $ONLY_PHASE only. Phase 1 (the primary) runs first."; fi
   if [[ $yesq -eq 1 && $YES_MODE -eq 0 ]]; then
     say "${C_D}With --yes, the actions on this server are done without asking. Still asked: disk erasure,"
-    say "clean-up, the copy, the host key, passwords and the restart steps.${C_N}"
+    say "clean-up, the copy, the host key, passwords, the listener restart (3.10), the restart steps"
+    say "(9.1-9.3, 9.7) and the deletion setting of archived logs (9.8).${C_N}"
     ask "Answer y automatically for this server (--yes)?  [y] Yes   [N] No   [q] Quit"
     case "${ANSWER,,}" in
       y|yes) YES_MODE=1; _log INFO "--yes chosen in the menu"; ok "Mode: setup, --yes: actions on this server without asking" ;;
@@ -395,12 +402,14 @@ main() {
 
   while [[ -z "$PRIMARY_IP" ]]; do
     ask "IP address or host name of the primary"
+    [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
     valid_value ip "$ANSWER" && [[ "${ANSWER,,}" != "h" ]] && PRIMARY_IP=$ANSWER || say "This is not a valid IP address or host name."
   done
   if [[ $first_run -eq 1 && -z "$CLI_USER" ]]; then
     say "The ssh user must own the database on the primary and be able to run  sqlplus / as sysdba."
     while true; do
       ask "OS user for ssh on the primary [oracle]"
+      [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
       ANSWER=${ANSWER:-oracle}
       valid_value name "$ANSWER" && [[ "$ANSWER" != "root" ]] && { PRIMARY_SSH_USER=$ANSWER; break; }
       say "This is not a valid user name. root is not allowed."

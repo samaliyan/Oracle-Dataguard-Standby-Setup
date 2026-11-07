@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.18"
+readonly SCRIPT_VERSION="5.19"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -68,7 +68,8 @@ LASTRUN_FILE=""           # STATE_DIR/last_run: when the last run was, how it en
 LONG_ADVICE_SHOWN=0
 # Optional passwords from the environment (for unattended tests): copied into
 # non-exported variables and removed from the environment at once, so no child
-# process (runuser, root.sh, installers, ssh) can see them.
+# process (runuser, root.sh, installers, ssh) can see them. The environment the script
+# was started with still holds them (readable by root in /proc/<pid>/environ): for tests only.
 ENV_SYS_PW=${DG_SYS_PASSWORD:-}; ENV_ASM_PW=${DG_ASM_PASSWORD:-}
 unset DG_SYS_PASSWORD DG_ASM_PASSWORD
 # seconds; a hung sqlplus never blocks the script forever (also sent to the primary, so it must be a number)
@@ -112,15 +113,16 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 mask_pw() {
   # Replace every occurrence of the sys and ASM passwords with *****
   if [[ -n "$SYS_PW" || -n "$ASM_PW" ]]; then
-    DG_MASK1="$SYS_PW" DG_MASK2="$ASM_PW" awk '
+    # the passwords reach awk through a pipe (printf is a builtin): never in its arguments or environment
+    awk '
       function mask(s, p,   out, i) {
         if (p == "") return s
         out = ""
         while ((i = index(s, p)) > 0) { out = out substr(s, 1, i - 1) "*****"; s = substr(s, i + length(p)) }
         return out s
       }
-      BEGIN { p1 = ENVIRON["DG_MASK1"]; p2 = ENVIRON["DG_MASK2"] }
-      { print mask(mask($0, p1), p2); fflush() }'
+      BEGIN { if ((getline p1 < "/dev/fd/3") <= 0) p1 = ""; if ((getline p2 < "/dev/fd/3") <= 0) p2 = "" }
+      { print mask(mask($0, p1), p2); fflush() }' 3< <(printf '%s\n%s\n' "$SYS_PW" "$ASM_PW")
   else
     cat
   fi
@@ -262,7 +264,7 @@ fatal() {
 on_signal() {
   # the terminal was closed (ssh session dropped) or the script was told to stop
   _log FATAL "Signal $1 received"
-  trap '' HUP TERM INT
+  trap '' HUP TERM INT QUIT PIPE
   [[ -n "$TAIL_PID" ]] && { pkill -P "$TAIL_PID" 2>/dev/null; kill "$TAIL_PID" 2>/dev/null; }
   if job_alive; then
     _log INFO "The job '$JOB_TITLE' (pid $JOB_PID) keeps running in its own session; output $JOB_OUT"
@@ -296,6 +298,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'on_signal HUP' HUP
 trap 'on_signal TERM' TERM
+trap 'on_signal QUIT' QUIT
+# a closed pipe (script | tee, and the ssh session drops) must not kill the script before its clean-up: handled
+# like a dropped terminal (a handler, not "ignore": programs started later keep the normal SIGPIPE)
+trap 'on_signal PIPE' PIPE
 trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
 
 #------------------------------------------------------------------------------
@@ -306,7 +312,10 @@ ask() {
   while true; do
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
-      printf '\n'; fatal "No answer could be read for: $1
+      printf '\n'
+      # Ctrl+D in a terminal is a stop; no terminal at all is a wrong way to run it
+      { [[ -t 0 ]] || { : < /dev/tty; } 2>/dev/null; } && fatal "Stopped: no answer (Ctrl+D) for: $1"
+      fatal "No answer could be read for: $1
 This script asks questions. Run it in an interactive terminal, for example:  ssh -t root@$(hostname -s 2>/dev/null)"
     fi
     _log ASK "$1  -> $ANSWER"
@@ -389,7 +398,10 @@ oracle_tmp() {
   findmnt -n -o OPTIONS --target /tmp 2>/dev/null | tr ',' '\n' | grep -qx noexec || return 0
   local t; t="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")/dg_tmp"
   [[ "$t" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 0
-  [[ -d "$t" ]] || { install -d -o root -g root -m 1777 "$t" 2>/dev/null || return 0; }
+  # plain mkdir (never through a link someone else put there), then mode and owner checked before use
+  # made with its final mode in one call: root never runs chmod on a path others could swap
+  if [[ ! -e "$t" && ! -L "$t" ]]; then ( umask 0; mkdir -m 1777 -- "$t" ) 2>/dev/null || return 0; fi
+  [[ ! -L "$t" && -d "$t" && "$(stat -c '%U %a' -- "$t" 2>/dev/null)" == "root 1777" ]] || return 0
   printf '%s' "$t"
 }
 build_envs() {
@@ -664,12 +676,13 @@ If this run stops, the next run will not know that $title is still running."
     fi
     if (( n % 300 == 0 )); then
       say "Programs of the job still run after $((n * 2 / 60)) minutes: $(pgrep -s "$jpid" -l 2>/dev/null | head -n 5 | tr '\n' ' ')"
-      ask_choice "[k] Keep waiting   [c] Continue without them (they keep running)" "kc"
-      [[ "$ANSWER" == "c" ]] && break
+      # the command itself has not ended (no exit code yet; once it is there the loop ends above): going on would
+      # let a later step take the files of a running copy for leftovers, so there is no "continue" here
+      say "The command itself has not ended. Ctrl+C offers to leave it running and stop this script."
     fi
   done
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
-  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc" "$JOB_FILE"; JOB_PID=""
+  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"; job_running "$jpid" || rm -f -- "$JOB_FILE"; JOB_PID=""
   num "$rc" || { rc=1; bad "$title was stopped before it finished."; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
   JOB_KEEP=""
@@ -739,6 +752,15 @@ write_as() {
   return 0
 }
 
+install_as() {
+  # $1 user, $2 group, $3 mode, $4 private source file of root, $5 target in a folder of $1. Like install -o -g -m,
+  # but written by $1 itself (temp file and rename in the target folder): root never chmods or chowns a path
+  # there, so a link swapped in meanwhile cannot lead root to another file
+  [[ -L "$5" ]] && { bad "Not changed: $5 is a symbolic link."; return 1; }
+  runuser -u "$1" -- sh -c 'umask 077; t=$(mktemp "$(dirname "$1")/.dgtmp.XXXXXX") || exit 1
+    if cat > "$t" && chgrp "$2" "$t" && chmod "$3" "$t" && mv -f -- "$t" "$1"; then exit 0; fi
+    rm -f -- "$t"; exit 1' sh "$5" "$2" "$3" < "$4"
+}
 safe_link_target() {
   # $1 a symbolic link -> prints the file it points to, when writing through it is safe: the link is owned by
   # root, the target is a regular file of root, $ORACLE_USER or $GRID_USER, and every folder above the target is
