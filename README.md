@@ -18,6 +18,12 @@ together with its undo command. The script then checks the result, again read-on
 | Primary storage | ASM, file system, or both |
 | Grid Infrastructure | Oracle Restart on the standby when the primary uses ASM. Owned by a separate `grid` user or by `oracle` |
 
+## Download
+
+Take `dg_standby_setup-<version>.sh` from the latest release on the
+[Releases](../../releases) page (each release also has a `.sha256` checksum), and rename it to
+`dg_standby_setup.sh` if you like. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+
 ## Quick start
 
 Copy the script to the **standby** server and run it as `root`:
@@ -73,28 +79,111 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 ./dg_standby_setup.sh --only 4
 ```
 
-## Options
+## Command reference
 
-```
---primary <ip>        primary IP or host name
---user <name>         ssh user on the primary (default oracle, never root)
---check               report only; changes nothing in Oracle, the OS or the primary
---from <step>         continue from a step
---only <part>         run one part, then stop: a phase (10 = health check), os, grid, db, primary,
-                      or steps such as 2.1-2.4 (phase 1 runs first, so the primary must be reachable)
---health              unattended health check (cron, monitoring): no questions, no changes, one line per
-                      check; exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN
---roll-forward        bring a standby that cannot catch up up to date from the primary with RMAN
-                      (18c and later), instead of a new copy
---settings            review or edit the saved standby values
---yes                 answer y for the actions on this server; disk erasure, clean-up, the copy, the
-                      host key, passwords, the listener restart (3.10), the restart steps (9.1-9.3,
-                      9.7) and the deletion setting of archived logs (9.8) are still asked
---status              result of every phase and step so far (connects to nothing)
---show-changes [step] every change made on this server, with its undo
---undo <step>         undo the changes of a step (asks before each one)
---help-step <step>    the manual commands of a step ("all" for every step)
-```
+Run every command as `root` on the **standby** server. Only one run at a time is possible (a lock).
+None of them changes the primary.
+
+| Command | In short |
+|---|---|
+| `./dg_standby_setup.sh` | Menu: full setup or one part; continues where the last run stopped |
+| `--check` | Look and report only; changes nothing |
+| `--primary <ip>` / `--user <name>` | Primary address and its ssh user, without being asked |
+| `--from <step>` | Continue from one step |
+| `--only <part>` | One phase, part or step range, then stop |
+| `--yes` | Do the actions on this server without the [y] question (the risky ones are still asked) |
+| `--settings` | Review or edit the saved values, then stop |
+| `--status` | Result of every phase and step so far; connects to nothing |
+| `--show-changes [step]` | Every change made on this server, with its undo |
+| `--undo <step>` | Undo the changes of one step |
+| `--help-step <step>` | The manual way of a step (`all` for every step, `health` for --health) |
+| `--health` | Unattended health check for cron or monitoring (exit 0/1/2/3) |
+| `--roll-forward` | Bring a standby that cannot catch up up to date from the primary (18c+) |
+| `-h`, `--help` | Short help |
+
+### `./dg_standby_setup.sh` (no option)
+Opens a menu: the full setup, or one part (OS preparation, Grid, database software, the primary changes,
+chosen steps, the daily check). On a later run it continues where it stopped; done steps are only
+checked again. Each step shows what it found and what it will do, then asks
+`[y] Yes, do it  [s] Skip  [h] Help  [q] Quit`. Commands for the primary are shown; you run them there
+and answer `r`, and the script checks the result.
+
+### `--check`
+Runs every check and reports what is missing, without changing anything in Oracle, the OS or the primary,
+and without touching the saved progress. It still asks for the ssh and sys passwords (to read the primary).
+Start with it on a new server.
+
+### `--primary <ip>` and `--user <name>`
+Give the primary's IP address or host name and the OS user for ssh there (default `oracle`, never `root`),
+so the first questions are not asked. Example: `./dg_standby_setup.sh --primary 10.0.0.5 --user oracle`.
+
+### `--from <step>`
+Starts at a step, for example `--from 6.1`, and goes on to the end. Phase 1 (connection and settings)
+always runs first. Step 10.7 is only reachable with `--roll-forward`.
+
+### `--only <part>`
+Runs one part and stops after its last step. Phase 1 runs first, so the primary must be reachable.
+- a phase: `--only 4` (the changes on the primary, can be done early), `--only 10` (the health check)
+- a part: `os` (phase 2), `grid` (3.1-3.5), `db` (3.6-3.11), `primary` (phase 4)
+- steps: `--only 3.6`, `--only 2.1-2.4`, `--only 2-3`
+
+### `--yes`
+Answers `y` for the actions on this server. Still asked, every time: erasing disks, moving leftovers
+aside, a half-unpacked software folder, the RMAN copy (the word `DUPLICATE`), the primary's host key,
+passwords, the listener restart (3.10), the standby restart steps (9.1, 9.2, 9.3, 9.7) and the deletion
+setting of archived logs (9.8). Typical use: `--check` first, put the installer zips in place, then `--yes`.
+
+### `--settings`
+Shows the saved standby values (names, folders, disk groups, channels, `HEALTH_LAG_MAX`,
+`DUP_SECTION_SIZE` and so on) and lets you edit them in `$EDITOR`, then stops. Changed values are checked
+and must be accepted again on the next run.
+
+### `--status`
+Prints the result of every phase and step from the saved progress (ok, done, waiting, failed, skipped).
+Connects to nothing, so it also works when the primary is down.
+
+### `--show-changes [step]`
+Lists every change the script made on this server (files written, settings, users, disks, services,
+database changes), each with how it is undone. With a step number, only that step: `--show-changes 6.1`.
+
+### `--undo <step>`
+Undoes the changes of one step, newest first, and asks before each one. A file is restored only when it
+is still what the script wrote; something that may hold data is never removed. Changes on the primary are
+shown for you to undo there.
+
+### `--help-step <step>`
+How to do a step by hand: where, as which user, the commands, the expected result. `--help-step all`
+prints every step; `--help-step health` explains `--health`. The commands use your saved names.
+
+### `--health`
+The checks of phase 10 for cron or a monitoring agent: no questions, no changes, no terminal needed.
+Checks, in this order: the standby instance (down is CRITICAL at once), 10.1 transport and apply lag
+(and whether data from the primary still arrives), 10.2 archive gap (and whether missing logs are still on
+the primary), 10.3 last log on both sides, 10.4 redo apply and real-time apply, 10.5 NOLOGGING blocks,
+10.6 patch level of both database homes. A problem in 10.1-10.4 is checked once more after 60 seconds.
+Prints one line per check; details go to `health_<time>.log` (14 days, at most 500 files).
+Exit code: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (could not check, another run active, after a
+switchover, or a wrong option). The checks on the primary need an ssh key of root (see below).
+
+### `--roll-forward`
+For a standby that cannot catch up (archived logs it needs were deleted on the primary) or after
+NOLOGGING work: runs `RECOVER STANDBY DATABASE FROM SERVICE` (18c and later) instead of a new copy.
+Asks for the sys password and the word `ROLLFORWARD`; never runs with `--yes` or `--check`.
+Checks first, and stops on any doubt: standby mounted, no RMAN session or long job running, broker off,
+static listener entry, auto-login wallet for an encrypted standby, both RMAN logins, and that RMAN can
+find the standby's datafiles again. Afterwards it sets the standby redo logs and RMAN settings again and
+starts redo apply. If the terminal closes meanwhile, the next `--roll-forward` checks and finishes it
+without running RMAN again. On 12.1/12.2 it shows the manual way.
+
+### Settings that change behaviour
+- `HEALTH_LAG_MAX`: lag in seconds that `--health` accepts (empty = 300, at least 30).
+- `DUP_SECTION_SIZE`: section size of the RMAN copy, for example `32G`. Empty = automatic (32G when a
+  datafile is 64 GB or more and there is more than one channel; needs COMPATIBLE 12.0+), `0` = never.
+- `AUX_CHANNELS`: channels of the RMAN copy.
+
+### Exit codes
+`0` every step OK; `1` stopped, or some steps are not OK or skipped (normal for `--check` on a new
+server); `2` wrong option or unknown step. With `--health`: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN.
 
 ## Daily check from cron
 
@@ -148,8 +237,10 @@ Files:
 
 ```
 dg_standby_setup.sh   the ready-to-use script (built from src/)
-src/                  source, split by phase; concatenated in file-name order
+src/                  source, split by phase; build.sh joins them in a fixed order
 build.sh              rebuilds dg_standby_setup.sh from src/
+CHANGELOG.md          what changed in each version
+.github/workflows/    attaches dg_standby_setup-<version>.sh to each published release
 test/                 scenario tests against mock Oracle, ssh, installers and OS tools
 docs/DESIGN.md        design notes
 ```
