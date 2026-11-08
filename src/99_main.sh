@@ -24,6 +24,11 @@ Usage
   dg_standby_setup.sh --only grid          Run a part only:  os (phase 2), grid (3.1-3.5),
                                            db (3.6-3.11), primary (phase 4), or steps such as
                                            2.1-2.4, 3.6 or 2-3. It stops after the last one.
+  dg_standby_setup.sh --health             Health check for cron or monitoring: no questions, no changes,
+                                           one line per check. Exit 0 OK, 1 WARNING, 2 CRITICAL,
+                                           3 UNKNOWN. Needs an ssh key to the primary (--help-step health)
+  dg_standby_setup.sh --roll-forward       Bring a standby that cannot catch up up to date from the primary
+                                           (RMAN, 18c and later), instead of a new copy (--help-step 10.7)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
   dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
                                            that erases (disks, leftovers, a half-unpacked software folder),
@@ -50,7 +55,7 @@ Few questions, not unattended
     - the commands on the primary (shown, never run by the script), and r when they are done
     - the ssh and sys passwords (typed, never saved), and the host key of the primary
     - erasing disks, moving leftovers aside, the RMAN copy (the word DUPLICATE) and the restart steps
-  The script is not meant to run without a person.
+  The setup is not meant to run without a person. Only --health is (for example from cron).
 
 Phases
    1 Connect to the primary          6 Password file and TDE wallet
@@ -64,7 +69,7 @@ Phases
 Files
   Settings   $STATE_DIR/settings.conf (last accepted copy: settings.accepted)
   Progress   $STATE_DIR/progress, and changes.log for --undo
-  Logs       $LOG_DIR/run_<date>.log
+  Logs       $LOG_DIR/run_<date>.log  (--health: health_<date>.log, kept 14 days)
              actions_<date>.txt: the commands shown for you
              duplicate_<date>.rman and .log, installer and root script output
   Editor     The settings open in \$EDITOR (default vi).
@@ -73,6 +78,7 @@ Exit codes
   0  Every step is OK
   1  Stopped, or some steps are not OK or skipped (normal for --check on a new server)
   2  Wrong option or unknown step
+  With --health:  0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check, or a wrong option)
 EOF
 }
 
@@ -108,41 +114,57 @@ range_word() { [[ "$1" == *.* ]] && printf 'step %s' "$1" || printf 'phase %s' "
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --primary) [[ $# -ge 2 ]] && valid_value ip "$2" || { printf 'Missing or invalid value for --primary\n'; exit 2; }; CLI_IP=$2; shift ;;
-      --user) [[ $# -ge 2 ]] && valid_value name "$2" && [[ "$2" != "root" ]] || { printf 'Missing or invalid value for --user. Give the Oracle software owner, not root.\n'; exit 2; }; CLI_USER=$2; shift ;;
+      --primary) [[ $# -ge 2 ]] && valid_value ip "$2" || { printf 'Missing or invalid value for --primary\n'; exit $PX; }; CLI_IP=$2; shift ;;
+      --user) [[ $# -ge 2 ]] && valid_value name "$2" && [[ "$2" != "root" ]] || { printf 'Missing or invalid value for --user. Give the Oracle software owner, not root.\n'; exit $PX; }; CLI_USER=$2; shift ;;
       --check) MODE="check" ;;
+      --health) HEALTH=1 ;;
+      --roll-forward) ROLL_FORWARD=1 ;;
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
       --yes) YES_MODE=1 ;;
       --show-changes) SHOW_CHANGES=all
         if [[ $# -ge 2 && "$2" != -* ]]; then
-          valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit 2; }
+          valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit $PX; }
           SHOW_CHANGES=$2; shift
         fi ;;
-      --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
+      --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit $PX; }; UNDO_STEP=$2; shift ;;
       --from)
-        [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit 2; }
+        [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit $PX; }
         FROM_STEP=$2; FROM_SEEN=1
         [[ "$FROM_STEP" == *.0 ]] && FROM_STEP=${FROM_STEP%.0}     # N.0 is the same as N (the start of phase N)
-        if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit 2; }
+        if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit $PX; }
+          on_demand "$FROM_STEP" && { printf 'Step %s runs only with --roll-forward.\n' "$FROM_STEP"; exit $PX; }
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
-      --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit 2; }; shift ;;
-      --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit 2; }; HELP_STEP=$2; shift ;;
+      --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit $PX; }
+              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward.\n'; exit $PX; }
+              shift ;;
+      --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit $PX; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) printf 'Unknown option: %s\n\n' "$1"; usage; exit 2 ;;
+      *) printf 'Unknown option: %s\n\n' "$1"; usage; exit $PX ;;
     esac
     shift
   done
-  [[ -n "$ONLY_TEXT" && -n "$FROM_SEEN" ]] && { printf 'Use either --from or --only, not both.\n'; exit 2; }
+  [[ -n "$ONLY_TEXT" && -n "$FROM_SEEN" ]] && { printf 'Use either --from or --only, not both.\n'; exit $PX; }
+  # --roll-forward: phase 1 (connection, settings, sys password), then step 10.7 and the checks of phase 10
+  if [[ $ROLL_FORWARD -eq 1 ]]; then
+    if [[ "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_TEXT" || -n "$UNDO_STEP" || $REVIEW_SETTINGS -eq 1 || $YES_MODE -eq 1 || $HEALTH -eq 1 ]]; then
+      printf '%s\n' '--roll-forward cannot be combined with --check, --yes, --only, --from, --undo, --settings, --status, --show-changes or --health.'; exit $PX
+    fi
+    parse_only 10 || exit $PX
+  fi
+  # --health is a whole mode of its own (exit 3 = "unknown" for a monitoring system, never 2 = "critical")
+  if [[ $HEALTH -eq 1 && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_TEXT" || -n "$UNDO_STEP" || $REVIEW_SETTINGS -eq 1 || $YES_MODE -eq 1 || -n "$CLI_IP" || -n "$CLI_USER" || -n "$HELP_STEP" || ${ROLL_FORWARD:-0} -eq 1 ) ]]; then
+    printf '%s\n' '--health cannot be combined with other options.'; exit 3
+  fi
   if [[ -n "$UNDO_STEP" && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_PHASE" || $REVIEW_SETTINGS -eq 1 ) ]]; then
-    printf '%s\n' '--undo cannot be combined with other options. To see first what it would do:  --show-changes STEP'; exit 2
+    printf '%s\n' '--undo cannot be combined with other options. To see first what it would do:  --show-changes STEP'; exit $PX
   fi
   # --settings alone: review the settings and stop (phase 1 only)
   [[ $REVIEW_SETTINGS -eq 1 && -z "$FROM_STEP" && -z "$ONLY_PHASE" ]] && ONLY_PHASE=1
   return 0
 }
-STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""; FROM_SEEN=""
+STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""; FROM_SEEN=""; ROLL_FORWARD=0; PX=2
 
 dir_safe() {
   # $1 directory: owned by root, not writable by others (it holds the lock, the settings, the password file copy)
@@ -227,7 +249,8 @@ menu_next() {
   for i in "${HELP_IDS[@]}"; do
     [[ "$i" == 1.* ]] && continue
     is_optional "$i" && continue
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU) ;; *) printf 'next: %s' "$i"; return 0 ;; esac
+    on_demand "$i" && continue
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|NOT_ON_RELEASE) ;; *) printf 'next: %s' "$i"; return 0 ;; esac
   done
   printf 'all done'
 }
@@ -323,19 +346,24 @@ start_menu() {
 
 main() {
   [[ $# -eq 0 ]] && MENU_OK=1
+  # a wrong command line is exit 2, but 3 (unknown) with --health: 2 means "critical" to a monitoring system
+  local a; PX=2; for a in "$@"; do [[ "$a" == "--health" ]] && PX=3; done
   parse_args "$@"
   if [[ -n "$HELP_STEP" ]]; then help_cli "$HELP_STEP"; exit 0; fi
-  [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit 1; }
-  cd / || exit 1
+  # a failure to start is "unknown" (3) for --health, as for a monitoring system (fd 7: its output, see health_out)
+  local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }
+  [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit $ef; }
+  cd / || exit $ef
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
-  { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit 1; }
-  dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit 1; }
+  { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
+  dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit $ef; }
   # it holds settings and password-file copies: only root reads it (only the script's own folder is changed)
   [[ "$(basename "$STATE_DIR")" == dg_standby_setup ]] && chmod 700 "$STATE_DIR" 2>/dev/null
-  dir_safe "$LOG_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nroot writes the logs there.\n' "$LOG_DIR"; exit 1; }
+  dir_safe "$LOG_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nroot writes the logs there.\n' "$LOG_DIR"; exit $ef; }
   SETTINGS_FILE="$STATE_DIR/settings.conf"; ACCEPTED_FILE="$STATE_DIR/settings.accepted"; JOB_FILE="$STATE_DIR/job"
   PROGRESS_FILE="$STATE_DIR/progress"; LASTRUN_FILE="$STATE_DIR/last_run"; JOURNAL_FILE="$STATE_DIR/changes.log"
+  [[ $HEALTH -eq 1 ]] && { health_main; exit 3; }
   if [[ $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" ]]; then
     # read-only views: no lock, no log, no connection
     init_settings; [[ -f "$SETTINGS_FILE" ]] && load_settings soft >/dev/null 2>&1
@@ -431,7 +459,7 @@ main() {
   CUR_STEP=""
   summary
   local id bad_n=0
-  for id in "${STEP_ORDER[@]}"; do case "${STEP_RESULT[$id]}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) ;; *) bad_n=$((bad_n + 1)) ;; esac; done
+  for id in "${STEP_ORDER[@]}"; do case "${STEP_RESULT[$id]}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) ;; *) bad_n=$((bad_n + 1)) ;; esac; done
   write_last_run "$([[ $bad_n -eq 0 ]] && printf 'ended, every step OK' || printf 'ended, %s step(s) not OK' "$bad_n")"
   if [[ "$MODE" == "run" && $bad_n -eq 0 ]]; then
     if [[ -z "$ONLY_PHASE" ]] && [[ -z "$FROM_STEP" || "${FROM_STEP%%.*}" -le 9 ]] && [[ -n "${STEP_RESULT[10.1]:-}" ]]; then

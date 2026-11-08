@@ -20,12 +20,13 @@ ORACLE_GROUPS:list GRID_GROUPS:list GROUP_GIDS:list
 LOCS:locs DATA_DG:opt_name FRA_LOC:opt_loc FRA_MB:num ARCH_LOC:opt_loc PRIMARY_DB_MB:num
 STANDBY_HOST:name STANDBY_IP:ip STANDBY_UNIQUE:dbname STANDBY_SID:name STANDBY_SERVICE:name
 PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_MEDIA:opt_paths RU_DIR:opt_path OPATCH_ZIP:opt_path AUX_CHANNELS:num REDO_BLOCKSIZE:redobs
+HEALTH_LAG_MAX:num DUP_SECTION_SIZE:secsize
 "
 # may be empty
-readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
+readonly OPTIONAL_KEYS=" HEALTH_LAG_MAX DUP_SECTION_SIZE PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
 # values the user may change (everything else is read from the primary at every run)
 readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
-readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE "
+readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE HEALTH_LAG_MAX DUP_SECTION_SIZE "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
 SETTINGS_FILE=""; ACCEPTED_FILE=""
@@ -49,6 +50,7 @@ valid_value() {
     dbname)    [[ "$v" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ;;
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
     redobs)    [[ -z "$v" || "$v" == "512" || "$v" == "4096" ]] ;;
+    secsize)   [[ -z "$v" || "$v" == "0" || "$v" =~ ^[1-9][0-9]{0,4}[MG]$ ]] ;;
     ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
                  # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
                  [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
@@ -108,6 +110,8 @@ load_settings() {
     if [[ -z "$spec" ]]; then DROPPED_KEYS+=" $key"; continue; fi
     # values that are derived again when empty (the settings file says so for a new standby name)
     if [[ -z "$val" && "$DERIVED_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
+    # a key that may be empty (an optional value, for example HEALTH_LAG_MAX) is empty: its default applies
+    if [[ -z "$val" && "$OPTIONAL_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
     if ! valid_value "$spec" "$val"; then
       # a typo in a value you may edit is an error; it is never ignored silently
       if is_standby_key "$key" || assumed_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
@@ -141,6 +145,9 @@ save_settings() {
     printf '# must reach it. PRIMARY_TNS / STANDBY_TNS: alias names written into tnsnames.ora on both servers.\n'
     printf '# REDO_BLOCKSIZE: 512 or 4096, normally empty. Only when the redo block size of the primary cannot be\n'
     printf '# read: it is then used for the ASM disks (steps 2.13, 3.5). The copy (step 8.1) still needs it read.\n'
+    printf '# HEALTH_LAG_MAX: seconds of lag that --health accepts (empty = 300). DUP_SECTION_SIZE: section size of\n'
+    printf '# the RMAN copy, for example 32G (empty = automatic: 32G when a datafile is 64 GB or more and there is more\n'
+    printf '# than one channel; 0 = none).\n'
     for k in $STANDBY_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done
     printf '\n# ---- Connection (change with --primary / --user, or here between runs) ----\n'
     printf 'PRIMARY_IP=%s\nPRIMARY_SSH_USER=%s\n' "$PRIMARY_IP" "$PRIMARY_SSH_USER"
@@ -197,6 +204,7 @@ validate_settings() {
     if [[ "$OPTIONAL_KEYS" != *" $v "* ]]; then
       [[ -n "${!v}" ]] || { bad "$v is empty."; bad_n=1; continue; }
     fi
+    [[ -z "${!v}" && "$OPTIONAL_KEYS" == *" $v "* ]] && continue
     valid_value "$t" "${!v}" || { bad "$v has an invalid value: ${!v}"; bad_n=1; }
   done
   for v in DB_HOME ORACLE_BASE GRID_HOME GRID_BASE INVENTORY_DIR; do

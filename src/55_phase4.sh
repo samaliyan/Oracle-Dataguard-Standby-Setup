@@ -7,6 +7,8 @@ P_ORL_COUNT=0; P_ORL_BYTES=0; PVAL=""; SRL_BLOCKSIZE=""
 
 need_ssh() {
   ssh_alive && return 0
+  # --health never opens the interactive connection (it would ask for a password)
+  [[ ${HEALTH:-0} -eq 1 ]] && { NOW="Not checked: $([[ -n "$HEALTH_SSH_ERR" ]] && printf 'no ssh to the primary (see the note below)' || printf 'the ssh connection to the primary was lost')"; return 1; }
   if [[ $SSH_OPEN -eq 1 ]]; then
     # the connection was open before (for example it timed out during a long duplicate)
     warn "The ssh connection to the primary was closed. Reconnecting."

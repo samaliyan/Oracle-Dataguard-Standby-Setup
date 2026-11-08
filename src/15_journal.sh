@@ -112,7 +112,7 @@ later_steps_active() {
   while IFS= read -r l; do
     local kind; IFS='|' read -r _ _ _ step kind _ <<< "$l"
     [[ "$step" =~ ^[0-9]+\.[0-9]+$ ]] || continue
-    case "$kind" in SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE) continue ;; esac     # nothing to undo there
+    case "$kind" in SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD) continue ;; esac     # nothing to undo there
     [[ $(step_num "$step") -gt $(step_num "$1") ]] && return 0
   done < <(journal_entries)
   return 1
@@ -160,6 +160,7 @@ undo_text() {
     INSTANCE)   printf 'auto: shut down the instance %s (srvctl stop database if it is registered, else shutdown immediate)' "$obj" ;;
     DUPLICATE)  printf 'by hand: shutdown abort, then remove the files of %s on this server only, NEVER those of the primary. Details:  %s --help-step 8.2' "$obj" "$SELF" ;;
     DUPLICATE_DONE) printf 'nothing separate: the copied standby %s goes with the DUPLICATE line' "$obj" ;;
+    ROLLFWD)    printf 'nothing to undo: the standby %s was brought up to date from the primary (RMAN)' "$obj" ;;
     SRVCTL)     printf 'auto: srvctl stop database -db %s ; srvctl remove database -db %s -noprompt   (the database files stay)' "$obj" "$obj" ;;
     SRL)        printf 'auto: drop the standby log group(s) %s on this server (apply is stopped for it)' "$det" ;;
     MRP)        printf 'auto: alter database recover managed standby database cancel' ;;
@@ -218,7 +219,7 @@ change_word() {
     GROUP) printf 'group' ;; USER|USERMOD) printf 'user' ;; PKG) printf 'package' ;; FWPORT) printf 'firewall' ;;
     SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
-    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|SRL|MRP) printf 'database' ;;
+    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
     SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
@@ -498,7 +499,7 @@ undo_cli() {
   printf '\n  %sUndo of step %s%s  %s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")"
   printf '      The changes are undone newest first, one at a time. Nothing on the primary is touched.\n'
   if later_steps_active "$step"; then
-    local later; later=$(journal_entries | awk -F'|' -v s="$step" '$4 ~ /^[0-9]+\.[0-9]+$/ && $5 !~ /^(SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE)$/ {split($4,a,"."); split(s,b,"."); if (a[1]*100+a[2] > b[1]*100+b[2]) print $4}' | sort -t. -k1,1n -k2,2n -u | paste -sd' ' -)
+    local later; later=$(journal_entries | awk -F'|' -v s="$step" '$4 ~ /^[0-9]+\.[0-9]+$/ && $5 !~ /^(SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD)$/ {split($4,a,"."); split(s,b,"."); if (a[1]*100+a[2] > b[1]*100+b[2]) print $4}' | sort -t. -k1,1n -k2,2n -u | paste -sd' ' -)
     warn "Later steps have changes that build on this one: $later.
 Undo them first, the last one first:  --undo ${later##* }"
     confirm_word "Undo step $step anyway?" "UNDO" || { printf '      Undo not started.\n'; return 1; }
@@ -523,7 +524,7 @@ Undo them first, the last one first:  --undo ${later##* }"
           if confirm "Mark it as undone by you, so it is no longer listed"; then journal UNDONE "$seq" "$kind $obj (by you)"; n_done=$((n_done + 1)); UNDO_N_DONE=$n_done
           else n_left=$((n_left + 1)); fi
         fi ;;
-      SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE)
+      SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD)
         say "Nothing to do for this line." ;;
       *)
         say "Undo this change by hand, with the command above."

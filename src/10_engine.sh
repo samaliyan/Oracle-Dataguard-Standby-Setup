@@ -64,13 +64,13 @@ phase_header() {
 result_label() {
   case "$1" in
     OK) printf 'ok' ;; DONE) printf 'done' ;; DONE_BY_YOU) printf 'done by you' ;; SKIPPED) printf 'skipped' ;;
-    SKIPPED_OPTIONAL) printf 'skipped (optional)' ;; FAILED_SKIPPED) printf 'failed, skipped' ;; FAILED) printf 'failed' ;;
+    SKIPPED_OPTIONAL) printf 'skipped (optional)' ;; NOT_ON_RELEASE) printf 'n/a (release)' ;; FAILED_SKIPPED) printf 'failed, skipped' ;; FAILED) printf 'failed' ;;
     WAITS) printf 'waiting' ;; RUNNING) printf 'running' ;; TODO) printf 'to do' ;; PROBLEM) printf 'problem' ;;
     UNDONE) printf 'undone' ;; NOT_FINISHED) printf 'stopped here' ;; *) printf '%s' "$1" ;;
   esac
 }
 result_color() {
-  case "$1" in OK|DONE|DONE_BY_YOU) printf '%s' "$C_G" ;; SKIPPED_OPTIONAL|WAITS) printf '%s' "$C_D" ;; RUNNING) printf '%s' "$C_C" ;;
+  case "$1" in OK|DONE|DONE_BY_YOU) printf '%s' "$C_G" ;; SKIPPED_OPTIONAL|NOT_ON_RELEASE|WAITS) printf '%s' "$C_D" ;; RUNNING) printf '%s' "$C_C" ;;
     TODO) printf '%s' "$C_M" ;; SKIPPED|UNDONE) printf '%s' "$C_Y" ;; *) printf '%s' "$C_R" ;; esac
 }
 
@@ -116,8 +116,9 @@ phase_done_result() {
   local p=$1 i n=0 ok=0 bad=0
   for i in "${HELP_IDS[@]}"; do
     [[ "${i%%.*}" == "$p" ]] || continue
+    on_demand "$i" && continue
     n=$((n + 1))
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) ok=$((ok + 1)) ;; "") ;; *) bad=$((bad + 1)) ;; esac
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) ok=$((ok + 1)) ;; "") ;; *) bad=$((bad + 1)) ;; esac
   done
   if [[ $ok -eq $n ]]; then printf 'DONE'
   elif [[ $ok -eq 0 && $bad -eq 0 ]]; then printf '-'
@@ -136,13 +137,13 @@ print_progress_board() {
   done
   local nopen=0
   for i in "${HELP_IDS[@]}"; do
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|"") ;;
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|"") ;;
       *) nopen=$((nopen + 1))
          if [[ $nopen -le 8 ]]; then
            open+="$(printf '      %-5s %s%-16s%s %s' "$i" "$(result_color "${LAST_RESULT[$i]}")" "$(result_label "${LAST_RESULT[$i]}")" "$C_N" "$(step_title_of "$i" 2>/dev/null | cut -c1-44)")"$'\n'
            [[ -n "${LAST_REASON[$i]:-}" ]] && open+="            ${C_D}${LAST_REASON[$i]:0:100}${C_N}"$'\n'
          fi
-         [[ -n "$first" || "$i" == 1.* ]] || first=$i ;;
+         [[ -n "$first" || "$i" == 1.* ]] || on_demand "$i" || first=$i ;;
     esac
   done
   [[ $nopen -gt 8 ]] && open+="      ... and $((nopen - 8)) more"$'\n'
@@ -175,10 +176,10 @@ print_progress_board() {
 }
 step_ok_anywhere() {
   # 0 when step $1 is done: in this run, or (when it did not run now) in an earlier run
-  case "${STEP_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) return 0 ;; "") ;; *) return 1 ;; esac
+  case "${STEP_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) return 0 ;; "") ;; *) return 1 ;; esac
   # started in this run but not finished (the run stopped inside it): not done
   [[ " ${STEP_ORDER[*]+${STEP_ORDER[*]}} " == *" $1 "* ]] && return 1
-  case "${LAST_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) return 0 ;; esac
+  case "${LAST_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) return 0 ;; esac
   return 1
 }
 next_cmd() {
@@ -197,6 +198,8 @@ next_cmd() {
   # a failed copy, is a deliberate "go back there")
   [[ -n "$RESUME_STEP" && "$RESUME_STEP" != 1.* ]] && nx=$RESUME_STEP
   [[ -n "$nx" ]] || return 0
+  # the step on demand (10.7) goes on only with its own option
+  on_demand "$nx" && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
   # a range (--only 2.1-2.4, grid, db): the same range again, from the step that is not done
   if [[ -n "$TO_STEP" && "$nx" == *.* ]] && [[ $(step_num "$nx") -ge $(step_num "$FROM_STEP") && $(step_num "$nx") -le $(step_num "$TO_STEP") ]]; then
@@ -231,6 +234,9 @@ write_last_run() {
 # Steps that are useful but not needed for a working standby (switchover preparation)
 readonly OPTIONAL_STEPS=" 4.8 4.10 4.11 "
 is_optional() { [[ "$OPTIONAL_STEPS" == *" $1 "* ]]; }
+# steps that run only when asked for (10.7: --roll-forward): never "next", never needed for a phase to be done
+readonly ON_DEMAND_STEPS=" 10.7 "
+on_demand() { [[ "$ON_DEMAND_STEPS" == *" $1 "* ]]; }
 skip_record() {
   # (phase 1: the waiters ask once anyway, for example to type the sys password with [p])
   [[ "$1" == 1.* ]] || AUTO_WAIT["step $1"]=1
@@ -381,6 +387,10 @@ run_step() {
     if [[ $rc -eq 0 && $CHECK_WAITS -eq 1 ]]; then
       wait_msg "$NOW"; record "$id" WAITS; return 0
     fi
+    # 3: the check does not exist for this release (10.5 on 12.1): nothing to wait for and nothing wrong
+    if [[ $rc -eq 0 && $CHECK_WAITS -eq 3 ]]; then
+      wait_msg "$NOW"; record "$id" NOT_ON_RELEASE; return 0
+    fi
     if [[ $rc -eq 0 && $CHECK_WAITS -eq 2 ]]; then
       # only an optional step can be left out; any other step that cannot be checked waits
       wait_msg "$NOW"; if is_optional "$id"; then record "$id" SKIPPED_OPTIONAL; else record "$id" WAITS; fi; return 0
@@ -497,7 +507,7 @@ run_step() {
     _log DO "[$id] start"
     JOURNAL_STEP_ENTRIES=0
     drc=0; "$dofn" || drc=$?
-    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $SELF --from $id"; return 0; fi
+    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $(on_demand "$id" && printf '%s --roll-forward' "$SELF" || printf '%s --from %s' "$SELF" "$id")"; return 0; fi
     if [[ $drc -eq 0 ]]; then
       NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
       # done, but the result cannot really be checked yet: waiting (checked again in a later run)
@@ -552,7 +562,7 @@ summary() {
   for id in "${STEP_ORDER[@]}"; do
     r=${STEP_RESULT[$id]:-"NOT_FINISHED"}
     case "$r" in
-      OK) n_ok=$((n_ok + 1)) ;;
+      OK|NOT_ON_RELEASE) n_ok=$((n_ok + 1)) ;;
       SKIPPED_OPTIONAL) n_opt=$((n_opt + 1)) ;;
       DONE|DONE_BY_YOU) n_done=$((n_done + 1)) ;;
       SKIPPED) n_skip=$((n_skip + 1)) ;;
@@ -564,7 +574,7 @@ summary() {
     col=$(result_color "$r")
     printf '    %-5s %s%-18s%s %s\n' "$id" "$col" "$(result_label "$r")" "$C_N" "${STEP_TITLE[$id]}"
     case "$r" in
-      OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|TODO) ;;
+      OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|TODO) ;;
       *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '          %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:100}" "$C_N"
          [[ -n "$first_bad" ]] || first_bad=$id ;;
     esac

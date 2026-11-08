@@ -678,7 +678,7 @@ phase_7() {
 #------------------------------------------------------------------------------
 # PHASE 8  RMAN active duplicate
 #------------------------------------------------------------------------------
-DUP_EXTRA=""; PRE_OK=0; PRE_INFO=""; NEWNAMES=""
+DUP_EXTRA=""; PRE_OK=0; PRE_INFO=""; NEWNAMES=""; DUP_SECTION=""
 
 CF_LIST=""
 srl_plan_space() {
@@ -995,6 +995,27 @@ dup_prechecks() {
   # same paths on both servers: MRP tries to clear the online logs and prints ORA-19527/ORA-00312 in the alert
   # log at every start. A convert pair that matches nothing stops that noise (Oracle note 352879.1).
   [[ ${HAS_LFNC:-0} -eq 1 ]] || DUP_EXTRA+="      set log_file_name_convert='/__dg_no_rename__','/__dg_no_rename__'"$'\n'
+  # section size: one big datafile (a bigfile tablespace) is otherwise copied by one channel only, however many
+  # there are. DUP_SECTION_SIZE: empty = automatic (32G when a datafile is 64 GB or more and there is more than
+  # one channel), 0 = never, or a size such as 16G
+  DUP_SECTION=""
+  if [[ "${DUP_SECTION_SIZE:-}" == "0" ]]; then :
+  elif [[ -n "${DUP_SECTION_SIZE:-}" ]]; then DUP_SECTION=$DUP_SECTION_SIZE
+  elif [[ ${AUX_CHANNELS:-1} -gt 1 ]]; then
+    prim_sql "select round(max(bytes)/1048576) from v\$datafile;" || { PRE_FIX="Cannot read the size of the datafiles of the primary"; return 1; }
+    local maxdf; maxdf=$(first_line)
+    num "$maxdf" || { PRE_FIX="Unexpected answer for the largest datafile of the primary: $maxdf"; return 1; }
+    [[ $maxdf -ge 65536 ]] && DUP_SECTION=32G
+  fi
+  # sections need backup sets, and those need COMPATIBLE 12.0 or higher (a primary upgraded from 11.2 may keep 11.2)
+  if [[ -n "$DUP_SECTION" ]]; then
+    p_param compatible || { PRE_FIX="Cannot read compatible of the primary"; return 1; }
+    if ! [[ "$PVAL" =~ ^([0-9]+)\. ]] || [[ ${BASH_REMATCH[1]} -lt 12 ]]; then
+      if [[ -n "${DUP_SECTION_SIZE:-}" ]]; then PRE_FIX="DUP_SECTION_SIZE is set, but compatible of the primary is $PVAL (sections need 12.0 or higher). Set DUP_SECTION_SIZE=0"; return 1; fi
+      PRE_INFO+="compatible of the primary is $PVAL: the copy runs without sections (they need 12.0 or higher)"$'\n'; DUP_SECTION=""
+    fi
+  fi
+  [[ -n "$DUP_SECTION" ]] && PRE_INFO+="Large datafiles are copied in sections of $DUP_SECTION by the $AUX_CHANNELS channel(s) of the copy (DUP_SECTION_SIZE in the settings)"$'\n'
   # the whole RMAN text is parsed by RMAN itself before anything starts (no connection needed); once per run
   if [[ "$MODE" == "run" && "${RMAN_PREFLIGHT_OK:-}" != "$(rman_script | md5sum | cut -c1-12)" ]]; then
     # the script holds no password (the connect lines are not in it); rman reads it as the database owner
@@ -1059,6 +1080,9 @@ d_8_1() {
 rman_script() {
   local i ch="" d1="" ll="''"
   for ((i = 1; i <= AUX_CHANNELS; i++)); do ch+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
+  # with a section size RMAN copies through backup sets, which needs at least as many auxiliary channels as
+  # channels on the primary: one channel there, named here, so a PARALLELISM configured on the primary does not count
+  [[ -n "${DUP_SECTION:-}" ]] && ch="  allocate channel p1 device type disk;"$'\n'"$ch"
   if [[ "$ARCH_LOC" == "USE_DB_RECOVERY_FILE_DEST" ]]; then d1="location=use_db_recovery_file_dest"
   elif [[ -n "$ARCH_LOC" ]]; then d1="location=$ARCH_LOC"; fi
   local dgc; dgc=$(lac_merged "${P_DG_CONFIG:-}")
@@ -1067,7 +1091,8 @@ rman_script() {
   cat <<EOF
 run {
 ${ch}${NEWNAMES}  duplicate target database for standby from active database
-    dorecover
+${DUP_SECTION:+    section size $DUP_SECTION
+}    dorecover
     spfile
       set db_unique_name='$STANDBY_UNIQUE'
       set control_files=$CF_LIST

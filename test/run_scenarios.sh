@@ -232,7 +232,7 @@ fresh empty; rc=$(DG_TEST_CTRLC_AT=3.4 run $T/h4.txt)
 check "Ctrl-C -> stopped, message" "[[ $rc -ne 0 ]] && grep -q 'Interrupted' $T/h4.txt"
 check "Ctrl-C: no response file left, ssh closed" "! ls -d /tmp/dg_rsp.* 2>/dev/null | grep -q . && [[ ! -e $T/varlib/ssh_ctl ]]"
 out=$(cd $T && DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log bash ./dg_standby_setup.sh --help-step all 2>&1); n=$(grep -cE 'Help .{1,3} Step [0-9]' <<< "$out")
-check "--help-step all prints every step (72)" "[[ $n -eq 72 ]]"
+check "--help-step all prints every step (75) and the help of --health" "[[ $n -eq 75 ]] && grep -q 'Unattended health check' <<< \"\$out\""
 check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.9 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help 2>&1); check "--help shows usage" "grep -q -- '--primary' <<< \"\$out\""
@@ -1626,6 +1626,129 @@ check "9.4: no v\$managed_standby (newer release) -> v\$dataguard_process is use
 jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
 rc=$(run $T/z151.txt --only 9.4 --check)
 check "9.4: no v\$managed_standby and no MRP -> not OK" "[[ \$(res 9.4 $T/z151.txt) != OK ]]"
+# 5.20: new checks 10.5 and 10.6, --health, --roll-forward, section size
+fresh empty; rc=$(run $T/z200.txt)
+check "phase 10: NOLOGGING (10.5) and patch level (10.6) OK; the switchover readiness command is shown" "[[ \$(res 10.5 $T/z200.txt) == OK && \$(res 10.6 $T/z200.txt) == OK ]] && grep -q 'alter database switchover to PRODDB_STBY verify;' $T/z200.txt"
+check "copy of a small database: no section size, no channel on the primary" "ls $T/log/duplicate_*.rman >/dev/null && ! grep -q 'section size' $T/log/duplicate_*.rman && ! grep -q 'allocate channel p1' $T/log/duplicate_*.rman"
+jset $P "d['root_key']=1"
+rc=$(run $T/z201.txt --health)
+check "--health, all well: exit 0, one line per check, a log readable by root only (640)" "[[ $rc == 0 ]] && grep -q 'Result: OK (exit 0)' $T/z201.txt && [[ \$(grep -cE '^  OK +10\.[1-6] ' $T/z201.txt) == 6 ]] && [[ \$(stat -c %a $T/log/health_*.log | sort -u) == 640 ]]"
+check "--health asks nothing and opens no password connection" "! grep -q '\\[y\\]\\|password of' $T/z201.txt && grep -q 'master opened by .* with a key' $T/state/primary_cmds.log"
+jset $P "d['root_key']=0"
+rc=$(run $T/z202.txt --health)
+check "--health without an ssh key: local checks done, the primary ones UNKNOWN (exit 3) with a note" "[[ $rc == 3 ]] && grep -qE '^  OK +10\.1 ' $T/z202.txt && grep -qE '^  UNKNOWN +10\.3 ' $T/z202.txt && grep -q 'needs a key for root' $T/z202.txt"
+jset $P "d['root_key']=1"
+jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:00:00|+00 00:00:01|900'"
+rc=$(run $T/z203.txt --health)
+check "--health: lag 0 but no data from the primary for 15 minutes -> CRITICAL (exit 2)" "[[ $rc == 2 ]] && grep -qE '^  CRITICAL +10\.1 .*No data from the primary for 900 seconds' $T/z203.txt"
+jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:10:00|+00 00:10:00|5'"
+jset $P "d['dest_err']='2|ERROR|ORA-16191: Primary log shipping client not logged on standby'"
+rc=$(run $T/z204.txt --health)
+check "--health: lag too high -> the primary's destination error and its usual cause are in the log" "[[ $rc == 2 ]] && grep -q 'log_archive_dest_2 for this standby: ERROR, error: ORA-16191' \$(ls -t $T/log/health_*.log | head -1) && grep -q 'password file differs' \$(ls -t $T/log/health_*.log | head -1)"
+jset $P "del d['dest_err']"
+jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:00:00|+00 00:00:01|5'"
+jset $S "d['instances']['PRODDB_STBY']['nonlogged']='2 64'"
+rc=$(run $T/z205.txt --health)
+check "--health: nonlogged blocks -> CRITICAL, the RMAN repair in the log" "[[ $rc == 2 ]] && grep -qE '^  CRITICAL +10\.5 ' $T/z205.txt && grep -q 'recover database nonlogged block' \$(ls -t $T/log/health_*.log | head -1)"
+jset $S "d['instances']['PRODDB_STBY']['nonlogged']='0 0'"
+jset $P "d['force_logging_now']='NO'"
+rc=$(run $T/z206.txt --health)
+check "--health: force logging off at the primary -> WARNING (exit 1)" "[[ $rc == 1 ]] && grep -qE '^  WARNING +10\.5 .*force logging is off' $T/z206.txt"
+jset $P "d['force_logging_now']='STANDBY NOLOGGING FOR DATA AVAILABILITY'"
+rc=$(run $T/z207.txt --health)
+check "--health: STANDBY NOLOGGING (set on purpose, 18c+) is no warning" "[[ $rc == 0 ]] && grep -qE '^  OK +10\.5 .*set on purpose' $T/z207.txt"
+jset $P "del d['force_logging_now']"
+mkdir -p $T/u01/app/oracle/product/19.0.0/dbhome_1/inventory/oneoffs/36000001
+rc=$(run $T/z208.txt --health)
+check "--health: a patch only on the standby -> WARNING with its number" "[[ $rc == 1 ]] && grep -qE '^  WARNING +10\.6 ' $T/z208.txt && grep -q 'only here: 36000001' \$(ls -t $T/log/health_*.log | head -1)"
+rm -rf $T/u01/app/oracle/product/19.0.0/dbhome_1/inventory/oneoffs/36000001
+jset $S "d['instances']['PRODDB_STBY']['state']='idle'"
+rc=$(run $T/z209.txt --health)
+check "--health: standby instance down -> CRITICAL at once, no other check" "[[ $rc == 2 ]] && grep -q 'Standby instance: not running' $T/z209.txt && ! grep -qE '^  [A-Z]+ +10\.' $T/z209.txt"
+jset $S "d['instances']['PRODDB_STBY']['state']='mounted'"
+jset $S "d['instances']['PRODDB_STBY']['dg_stats_seq']=['+00 00:10:00|+00 00:10:00|5','+00 00:00:00|+00 00:00:01|5']"
+rc=$(run $T/z209b.txt --health)
+check "--health: a lag peak that is gone 60 seconds later -> checked once more, OK" "[[ $rc == 0 ]] && grep -q 'checked once more in 60 seconds: 10.1' \$(ls -t $T/log/health_*.log | head -1)"
+jset $S "del d['instances']['PRODDB_STBY']['dg_stats_seq']"
+jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:10:00|+00 00:10:00|5'"
+sed -i 's/^HEALTH_LAG_MAX=.*/HEALTH_LAG_MAX=900/' $T/varlib/settings.conf
+rc=$(run $T/z209c.txt --health)
+check "--health: HEALTH_LAG_MAX=900 accepts a lag of 10 minutes" "[[ $rc == 0 ]]"
+sed -i 's/^HEALTH_LAG_MAX=.*/HEALTH_LAG_MAX=/' $T/varlib/settings.conf
+jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:00:00|+00 00:00:01|5'"
+rc=$(run $T/z210.txt --health --check); rc2=$(run $T/z211.txt --health --bogus)
+check "--health with another option, or a wrong one: exit 3 (unknown), never 2 (critical)" "[[ $rc == 3 && $rc2 == 3 ]]"
+( flock $T/varlib/lock -c 'sleep 8' ) & lp=$!; sleep 1
+rc=$(run $T/z212.txt --health); wait $lp
+check "--health while a setup run holds the lock -> UNKNOWN, nothing checked" "[[ $rc == 3 ]] && grep -q 'Another run of this script' $T/z212.txt"
+setsid bash -c "echo \$\$ > $T/jp.pid; exec sleep 30" & sleep 1; jp=$(cat $T/jp.pid)
+printf '%s|RMAN roll forward|%s|||%s|10.7\n' "$jp" "$T/log/rf_x.log" "$(cat /proc/sys/kernel/random/boot_id)" > $T/varlib/job
+rc=$(run $T/z213.txt --health); kill $jp 2>/dev/null; rm -f $T/varlib/job $T/jp.pid
+check "--health while a long job runs (maintenance) -> UNKNOWN" "[[ $rc == 3 ]] && grep -q 'Maintenance is running: RMAN roll forward' $T/z213.txt"
+printf '%s|0\n' "$T/log/x.log" > $T/varlib/rollforward_pending
+rc=$(run $T/z213b.txt --health); rm -f $T/varlib/rollforward_pending
+check "--health: a roll forward that ended but is not finished -> CRITICAL, --roll-forward named" "[[ $rc == 2 ]] && grep -qE '^  CRITICAL +10\.7 .*--roll-forward' $T/z213b.txt"
+jset $S "d['instances']['PRODDB_STBY']['gap_rows']=['1 30-35']"
+jset $P "d['gap_have']=2"
+rc=$(run $T/z214.txt --only 10 --check)
+check "10.2: a gap whose logs are gone from the primary -> restore them there, or --roll-forward" "grep -q 'no longer on the disk of the primary' $T/z214.txt && grep -q 'thread 1, sequence 30 to 35' $T/z214.txt && grep -q -- '--roll-forward' $T/z214.txt"
+jset $P "del d['gap_have']"
+rc=$(run $T/z214b.txt --only 10 --check)
+check "10.2: a gap whose logs are still on the primary -> no word of lost logs (fal_server sends them)" "grep -q 'Archive gap' $T/z214b.txt && ! grep -q 'no longer on the disk' $T/z214b.txt"
+jset $S "d['instances']['PRODDB_STBY']['gap_rows']=[]"
+rc=$(DG_TEST_PSYS=10.7 run $T/z215.txt --roll-forward)
+check "--roll-forward: checks pass (OMF names), RMAN rolls forward once, redo apply runs again" "[[ \$(res 10.7 $T/z215.txt) == DONE ]] && [[ \$(grep -c 'rman rollforward' $T/state/calls.log) == 1 ]] && [[ \$(res 10.4 $T/z215.txt) == OK ]] && grep -q 'Redo apply stopped' $T/z215.txt"
+check "--roll-forward: the sys password is in no log or file" "! grep -rq 'Welcome_123' $T/log $T/varlib"
+check "--roll-forward afterwards: standby redo log entries of the primary dropped and added again, catalog/crosscheck, deletion policy set again" "grep -q 'rman crosscheck' $T/state/calls.log && python3 -c \"import json,sys; d=json.load(open('$S')); i=d['instances']['PRODDB_STBY']; sys.exit(0 if i.get('dropped') and i.get('srl',0)>0 and d.get('rman_adp')=='TO APPLIED ON STANDBY' else 1)\""
+check "--roll-forward afterwards: journal entries of 9.3/9.8/9.4 under their own steps (an undo of 10.7 does not stop apply)" "! awk -F'|' '\$4==\"10.7\" && \$5!=\"ROLLFWD\"' $T/varlib/changes.log | grep -q ."
+rc=$(run $T/z215b.txt --from 10.7); rc2=$(run $T/z215c.txt --only 10.7)
+check "--from 10.7 / --only 10.7: refused, --roll-forward named" "[[ $rc == 2 && $rc2 == 2 ]] && grep -q 'runs only with --roll-forward' $T/z215b.txt"
+jset $S "d['instances']['PRODDB_STBY']['rman_sessions']=1"
+rc=$(DG_TEST_PSYS=10.7 run $T/z215d.txt --roll-forward)
+check "--roll-forward: another RMAN session on the standby -> not started" "grep -q 'An RMAN session is connected' $T/z215d.txt && [[ \$(grep -c 'rman rollforward' $T/state/calls.log) == 1 ]]"
+jset $S "d['instances']['PRODDB_STBY']['rman_sessions']=0"
+# a roll forward that ended while no run watched (terminal closed): checked and finished by the next run, RMAN not again
+printf 'Starting recover\nFinished recover\n' > $T/log/rollforward_old.log; printf '0\n' > $T/log/rollforward_old.log.rc
+printf '%s|\n' "$T/log/rollforward_old.log" > $T/varlib/rollforward_pending
+printf '%s|RMAN roll forward|%s|||%s|10.7\n' "999999" "$T/log/rollforward_old.log" "$(cat /proc/sys/kernel/random/boot_id)" > $T/varlib/job
+jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
+rc=$(DG_TEST_PSYS=10.7 run $T/z215e.txt --roll-forward)
+check "a roll forward that ended unwatched: next --roll-forward checks it, finishes the clean-up, starts apply, no new RMAN run" "grep -q 'has ended without error' $T/z215e.txt && [[ \$(res 10.7 $T/z215e.txt) == DONE && \$(res 10.4 $T/z215e.txt) == OK ]] && [[ \$(grep -c 'rman rollforward' $T/state/calls.log) == 1 ]] && [[ ! -e $T/varlib/rollforward_pending ]]"
+jset $S "d['instances']['PRODDB_STBY']['cfd']='-'"
+rc=$(DG_TEST_PSYS=10.7 run $T/z216.txt --roll-forward)
+check "--roll-forward: other file names, no convert, no OMF -> refused, RMAN not started" "grep -q 'neither db_file_name_convert nor' $T/z216.txt && [[ \$(grep -c 'rman rollforward' $T/state/calls.log) == 1 ]]"
+jset $S "d['instances']['PRODDB_STBY']['cfd']='+DATA'"
+jset $S "d['instances']['PRODDB_STBY']['broker']='TRUE'"
+rc=$(DG_TEST_PSYS=10.7 run $T/z217.txt --roll-forward)
+check "--roll-forward: the broker runs on the standby -> refused, the dgmgrl way is shown" "grep -q \"set state='APPLY-OFF'\" $T/z217.txt && [[ \$(grep -c 'rman rollforward' $T/state/calls.log) == 1 ]]"
+jset $S "d['instances']['PRODDB_STBY']['broker']='FALSE'"
+jset $T/state/env.json "d['rf_fail']=1"
+rc=$(DG_TEST_PSYS=10.7 run $T/z218.txt --roll-forward)
+check "--roll-forward: RMAN fails -> step failed, the output named, apply not started again by the script" "grep -q 'The roll forward did not finish' $T/z218.txt && [[ \$(res 10.7 $T/z218.txt) != DONE && \$(res 10.4 $T/z218.txt) != OK ]]"
+jset $T/state/env.json "d['rf_fail']=0"
+rc=$(run $T/z219.txt --roll-forward --check)
+check "--roll-forward with --check: refused (exit 2)" "[[ $rc == 2 ]] && grep -q 'cannot be combined' $T/z219.txt"
+fresh empty
+rc=$(run $T/z222.txt --health)
+check "--health before any setup: UNKNOWN (exit 3), says why" "[[ $rc == 3 ]] && grep -q 'No settings yet' $T/z222.txt"
+ut_520() { bash <<EOF
+SELF=x PORT=1521
+source <(sed -n '/^dg_error_hint()/,/^}/p' $T/dg_standby_setup.sh)
+a=\$(dg_error_hint "ORA-16191 and ORA-01017 then ORA-28374, ORA-99999")
+printf '%s\n' "\$a" | wc -l
+printf '%s\n' "\$a" | grep -c 'password file differs'
+printf '%s\n' "\$a" | grep -c 'TDE wallet'
+EOF
+}
+ut_520 > $T/ut_520.txt
+check "unit: error hints - one line per cause, unknown codes give nothing" "[[ \$(tr '\n' ' ' < $T/ut_520.txt) == '2 1 1 ' ]]"
+fresh empty; jset $P "d['max_df_mb']=70000"
+rc=$(run $T/z220.txt)
+check "copy with a datafile of 64 GB or more: section size 32G and one channel on the primary" "grep -q 'section size 32G' $T/log/duplicate_*.rman && grep -q 'allocate channel p1 device type disk' $T/log/duplicate_*.rman && grep -q 'copied in sections of 32G' $T/z220.txt"
+fresh empty; jset $P "d['max_df_mb']=70000"
+rc=$(run $T/z221a.txt --only 1); sed -i 's/^DUP_SECTION_SIZE=.*/DUP_SECTION_SIZE=0/' $T/varlib/settings.conf
+rc=$(run $T/z221.txt)
+check "DUP_SECTION_SIZE=0: no section size even for a big datafile" "ls $T/log/duplicate_*.rman >/dev/null && ! grep -q 'section size' $T/log/duplicate_*.rman"
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
 for f in "${FAILED[@]}"; do echo "  - $f"; done

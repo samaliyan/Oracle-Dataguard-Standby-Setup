@@ -163,6 +163,7 @@ def main():
             elif w == "DELETE": w = E("DG_TEST_DELETE", w)
             elif w == "CLEAN": w = E("DG_TEST_CLEAN", w)
             elif w == "IGNORE": w = E("DG_TEST_IGNORE", w)
+            elif w == "ROLLFORWARD": w = E("DG_TEST_RF", w)
             elif w.startswith("/dev/"): w = E("DG_TEST_DISKWORD", w)
             send(w); continue
         if "[w] Watch until it ends" in bt: send("w"); continue

@@ -65,7 +65,7 @@ Before each step the script shows what it found and what it will do, and asks:
 | 7 | Start the standby instance in NOMOUNT and test all four logins |
 | 8 | RMAN active duplicate |
 | 9 | Register with Oracle Restart, start redo apply and redo shipping, start at boot, archive log clean-up |
-| 10 | Check: transport and apply lag, errors (can be run daily) |
+| 10 | Check: lag (and whether data still arrives), gaps, redo apply, NOLOGGING blocks, patch level; known errors explained (daily, or unattended with `--health`) |
 
 Phase 4 can be done first, to batch all primary changes into one maintenance window:
 
@@ -80,8 +80,12 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 --user <name>         ssh user on the primary (default oracle, never root)
 --check               report only; changes nothing in Oracle, the OS or the primary
 --from <step>         continue from a step
---only <part>         run one part, then stop: a phase (10 = daily sync check), os, grid, db, primary,
+--only <part>         run one part, then stop: a phase (10 = health check), os, grid, db, primary,
                       or steps such as 2.1-2.4 (phase 1 runs first, so the primary must be reachable)
+--health              unattended health check (cron, monitoring): no questions, no changes, one line per
+                      check; exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN
+--roll-forward        bring a standby that cannot catch up up to date from the primary with RMAN
+                      (18c and later), instead of a new copy
 --settings            review or edit the saved standby values
 --yes                 answer y for the actions on this server; disk erasure, clean-up, the copy, the
                       host key, passwords, the listener restart (3.10), the restart steps (9.1-9.3,
@@ -91,6 +95,32 @@ Phase 4 can be done first, to batch all primary changes into one maintenance win
 --undo <step>         undo the changes of a step (asks before each one)
 --help-step <step>    the manual commands of a step ("all" for every step)
 ```
+
+## Daily check from cron
+
+```bash
+# root's crontab on the standby
+17 6 * * *  /root/dg_standby_setup.sh --health >/dev/null || /usr/local/bin/my-alert "Data Guard standby needs attention"
+```
+
+The checks on the primary need ssh with a key of root (no password can be typed from cron); without it the
+local checks still run and the others show UNKNOWN. A restricted key is best, for example in
+`~/.ssh/authorized_keys` of the oracle user on the primary:
+`from="<standby address>",no-pty,no-port-forwarding ssh-ed25519 AAAA...`.
+Details are in `/var/log/dg_standby_setup/health_<time>.log` (kept 14 days, at most 500 files). A problem in
+the lag, gap, last-log or apply check is checked once more after 60 seconds before it is reported.
+HEALTH_LAG_MAX in the settings sets the accepted lag (300 seconds by default, at least 30).
+
+## When the standby cannot catch up
+
+If archived logs the standby needs were deleted on the primary, step 10.2 says so and names two ways: restore
+them on the primary from its backup, or (18c and later) `./dg_standby_setup.sh --roll-forward`. That runs
+`RECOVER STANDBY DATABASE FROM SERVICE`: the standby fetches only what it misses, as incremental backups.
+Before it starts, the script checks that the standby is mounted, that RMAN can find the standby's files again
+afterwards, that no other RMAN session or long job runs, that the broker is off, that the listener has a
+static entry for the standby, that an encrypted standby has an auto-login wallet, and that both RMAN logins
+work. Afterwards it sets the standby's own standby redo logs and RMAN settings again and starts redo apply.
+Try it once on a test standby before you need it.
 
 ## Safety design
 
@@ -126,7 +156,7 @@ docs/DESIGN.md        design notes
 
 ## Tests
 
-`test/run_scenarios.sh` runs over 490 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
+`test/run_scenarios.sh` runs over 520 scenarios against mocks of the primary, the standby, sqlplus/RMAN,
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 

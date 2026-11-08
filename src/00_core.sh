@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.19"
+readonly SCRIPT_VERSION="5.20"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -203,6 +203,7 @@ primary_note() {
 go_on_cmd() {
   # the command that goes on at step (or phase) $1 and stays inside the part of this run (--only, a range, the menu)
   local s=$1 lo
+  [[ "$s" == 10.7 ]] && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$TO_STEP" ]]; then
     # a bare phase N starts at N.0. Inside the range, or before it: from there up to the end of the range (the
     # same range when it starts there), so the waited-for step and the rest of the range run in one go (on
@@ -226,6 +227,8 @@ user_stop() {
 }
 STOPPED_BY_USER=0
 fatal() {
+  # --health: no summary, no "to continue" hints, and the exit code of "unknown" for the monitoring system
+  if [[ ${HEALTH:-0} -eq 1 ]] && declare -F health_exit >/dev/null; then _log FATAL "$*"; health_exit UNKNOWN "$*"; fi
   tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
@@ -290,7 +293,7 @@ cleanup() {
     rm -f -- "$f"
     [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
-  if [[ $SSH_OPEN -eq 1 && -n "$SSH_CTL" ]]; then
+  if [[ ( $SSH_OPEN -eq 1 || ${HEALTH_SSH_OPEN:-0} -eq 1 ) && -n "$SSH_CTL" ]]; then
     ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
     rm -f -- "$SSH_CTL"
   fi
@@ -309,6 +312,7 @@ trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
 #------------------------------------------------------------------------------
 ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
+  [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
@@ -360,6 +364,7 @@ confirm_word() {
 
 ask_secret() {
   # $1 prompt. Result in SECRET.
+  [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
   TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
@@ -550,6 +555,12 @@ job_finish_late() {
         say "The RMAN copy did NOT finish: $(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')"
         say "Step 7.2 of a normal run shows how to clean up this server."
       fi ;;
+    "RMAN roll forward")
+      # not judged here: the next run with --roll-forward checks the standby, finishes the clean-up and starts
+      # redo apply (stopped for the roll forward). Its exit code is kept for that run
+      jok=0
+      [[ -f "$STATE_DIR/rollforward_pending" ]] && printf '%s|%s\n' "$JOB_OUT" "${rc:-}" > "$STATE_DIR/rollforward_pending"
+      say "Redo apply is stopped since the roll forward. To check the result and start redo apply again:  $SELF --roll-forward" ;;
     "Grid installer"*|"Grid configuration tools"*|"Database installer"*)
       if [[ "$rc" == "0" || "$rc" == "6" ]] && declare -F installer_done_record >/dev/null; then
         installer_done_record "$JOB_TITLE"; say "'$JOB_TITLE' had finished without error. Its result is recorded."
@@ -573,7 +584,8 @@ job_finish_late() {
   # (an unzip is only a part of its step: the step itself is judged by its next check)
   if [[ "$JOB_TITLE" != unzip\ * && -n "${JOB_STEP:-}" && "$JOB_STEP" =~ ^[0-9]+\.[0-9]+$ ]] && declare -F record >/dev/null; then
     STEP_TITLE[$JOB_STEP]=${STEP_TITLE[$JOB_STEP]:-$(step_title_of "$JOB_STEP" 2>/dev/null)}
-    if [[ $jok -eq 1 ]]; then NOW="$JOB_TITLE ended without error (recorded later)"; record "$JOB_STEP" DONE
+    if [[ "$JOB_TITLE" == "RMAN roll forward" ]]; then NOW="$JOB_TITLE ended (exit code ${rc:-unknown}); not checked yet: run with --roll-forward"; record "$JOB_STEP" WAITS
+    elif [[ $jok -eq 1 ]]; then NOW="$JOB_TITLE ended without error (recorded later)"; record "$JOB_STEP" DONE
     else NOW="$JOB_TITLE ended with exit code ${rc:-unknown}"; record "$JOB_STEP" FAILED; fi
     unset "STEP_RESULT[$JOB_STEP]"      # this run checks the step again itself
   fi

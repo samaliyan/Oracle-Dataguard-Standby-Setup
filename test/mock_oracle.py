@@ -134,6 +134,16 @@ def primary_sql(q, pri):
     if "version_full" in l: return pri["version"]
     if "from v$version" in l: return pri.get("banner", "Oracle Database 21c Enterprise Edition Release 21.0.0.0.0 - Production")
     if "log_mode||'|'||force_logging" in l: return f"{pri['log_mode']}|{pri['force_logging']}"
+    if l.strip() == "select force_logging from v$database;": return pri.get("force_logging_now", pri["force_logging"])
+    if "from gv$archive_dest where upper(db_unique_name)" in l:
+        d = pri.get("dest_err")
+        return "" if d is None else f"DEST:{d}"
+    if "select round(max(bytes)/1048576) from v$datafile;" in l: return str(pri.get("max_df_mb", 1000))
+    if "'f:'||file#||'|'||name from v$datafile" in l:
+        if "pfiles" in pri: return "\n".join(f"F:{r}" for r in pri["pfiles"])
+        return "\n".join(f"F:{i}|+DATA/PRODDB/DATAFILE/f{i}.{255+i}.1" for i in range(1, 4))
+    m = re.search(r"from v\$archived_log where thread#=(\d+) and sequence# between (\d+) and (\d+) and deleted='no'", l)
+    if m: return str(pri.get("gap_have", int(m.group(3)) - int(m.group(2)) + 1))
     m = re.search(r"from v\$archive_dest where dest_id=(\d+)", l)
     if m and m.group(1) != "2":
         en = pri["params"].get(f"log_archive_dest_state_{m.group(1)}", "").upper() == "ENABLE"
@@ -141,7 +151,7 @@ def primary_sql(q, pri):
     if "v$parameter where name='spfile'" in l: return pri.get("spfile", "+DATA/PRODDB/PARAMETERFILE/spfile.270.1")
     m = re.search(r"v\$parameter where name='([a-z_0-9]+)'", l)
     if m:
-        v = pri["params"].get(m.group(1), None)
+        v = pri["params"].get(m.group(1), {"compatible": "19.0.0"}.get(m.group(1)))
         if "upper(value)" in l: return (v or "").upper()
         return v if v else "-"
     if "v$pwfile_users" in l: return "1" if pri["sys_in_pwfile"] else "0"
@@ -271,7 +281,26 @@ def local_sql(q, st, sid):
         inst["mrp"] = 0; st["instances"][sid] = inst; return ""
     if "recover managed standby database disconnect" in l:
         inst["mrp"] = 1; st["instances"][sid] = inst; return ""
-    if "v$dataguard_stats" in l: return "+00 00:00:00|+00 00:00:01"
+    if "v$dataguard_stats" in l:
+        seq = inst.get("dg_stats_seq")
+        if seq and "datum_time" in l:
+            inst["dg_stats_seq"] = seq[1:] or seq; st["instances"][sid] = inst; save(STB, st)
+            return seq[0]
+        v = inst.get("dg_stats", "+00 00:00:00|+00 00:00:01|5")
+        return v if "datum_time" in l else "|".join(v.split("|")[:2])
+    m = re.search(r"'m:'\|\|member from v\$logfile where group#=(\d+) and type='standby'", l)
+    if m: return f"M:+DATA/PRODDB/ONLINELOG/group_{m.group(1)}.300.1"
+    if "from v$nonlogged_block" in l: return inst.get("nonlogged", "0 0")
+    if "select upper(value) from v$parameter where name='dg_broker_start'" in l: return inst.get("broker", "FALSE")
+    if "from v$session where upper(program) like 'rman%'" in l: return str(inst.get("rman_sessions", 0))
+    if "name in ('db_create_file_dest','db_file_name_convert')" in l:
+        return "\n".join([f"db_create_file_dest|{inst.get('cfd', '+DATA')}", f"db_file_name_convert|{inst.get('dfnc', '-')}"])
+    if "'f:'||file#||'|'||name from v$datafile" in l:
+        if "sfiles" in inst: return "\n".join(f"F:{r}" for r in inst["sfiles"])
+        return "\n".join(f"F:{i}|+DATA/PRODDB_STBY/DATAFILE/f{i}.{255+i}.1" for i in range(1, 4))
+    if "wallet_type||'|'||status from v$encryption_wallet" in l: return inst.get("wallet", "AUTOLOGIN|OPEN")
+    if "select flashback_on from v$database" in l: return inst.get("flashback", "NO")
+    if "database_role||'|'||controlfile_type from v$database" in l: return inst.get("role_cf", "PHYSICAL STANDBY|STANDBY")
     if "select count(*) from v$datafile_header where error is not null;" in l:
         if inst.get("hdr_fail"): return "ORA-00210: cannot open the specified control file"
         return str(inst.get('df_errors', 0))
@@ -281,7 +310,8 @@ def local_sql(q, st, sid):
         import socket
         host = "otherhost" if st.get("stby_tns_wrong") else socket.gethostname()
         return f"{sid}|{host}|" + {"started": "STARTED", "mounted": "MOUNTED"}[s]
-    if "count(*) from v$archive_gap" in l: return "0"
+    if "count(*) from v$archive_gap" in l: return str(len(inst.get("gap_rows", [])))
+    if "thread#||' '||low_sequence#||'-'||high_sequence# from v$archive_gap" in l: return "\n".join(inst.get("gap_rows", []))
     if "max(sequence#)" in l: return str(load(PRI)["seq"])
     return "MOCK-UNKNOWN-LOCAL ORA-00900: invalid SQL statement"
 
@@ -452,6 +482,25 @@ def rman():
     if "configure archivelog deletion policy" in data.lower():
         st["rman_adp"] = "TO APPLIED ON STANDBY"; save(STB, st)
         print("new RMAN configuration parameters:\nCONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;\nnew RMAN configuration parameters are successfully stored"); return 0
+    if "crosscheck archivelog all" in data.lower() and "connect" not in data.lower():
+        with open(os.path.join(STATE_DIR, "calls.log"), "a") as f: f.write("rman crosscheck\n")
+        print("validation succeeded for archived log\nCrosschecked 3 objects"); return 0
+    if "recover standby database from service" in data.lower():
+        pw = re.search(r'connect target sys/"([^"]*)"@(\S+)', data)
+        with open(os.path.join(STATE_DIR, "calls.log"), "a") as f: f.write("rman rollforward\n")
+        if not pw or pw.group(1) != cfg["pw"]: print("RMAN-00571: ===\nORA-01017: invalid username/password; logon denied"); return 1
+        # RECOVER STANDBY DATABASE needs the standby as target
+        if pw.group(2).lower() != cfg["stby_tns"]: print("RMAN-05146: must be connected to standby database to issue RECOVER STANDBY DATABASE"); return 1
+        if cfg.get("rf_fail"):
+            print("Starting recover at 24-OCT-26\nRMAN-00571: ===\nRMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============\nRMAN-03002: failure of recover command\nORA-19573: cannot obtain exclusive enqueue")
+            return 1
+        inst = st["instances"].get(cfg["sid"], {"state": "idle"})
+        inst["state"] = "mounted"; inst["mrp"] = 0; inst["rolled"] = inst.get("rolled", 0) + 1
+        st["instances"][cfg["sid"]] = inst
+        st["rman_adp"] = "-"     # the primary's control file came with the primary's RMAN settings
+        save(STB, st)
+        print("Starting recover at 24-OCT-26\nrestoring the standby control file\nchannel ORA_DISK_1: restore complete\nstarting media recovery\nFinished recover at 24-OCT-26")
+        return 0
     if 'connect target sys/"' not in data or 'connect auxiliary sys/"' not in data:
         print("RMAN-00571: no connect"); return 1
     if "duplicate target database" not in data and "run {" not in data:

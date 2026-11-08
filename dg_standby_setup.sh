@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.19"
+readonly SCRIPT_VERSION="5.20"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -203,6 +203,7 @@ primary_note() {
 go_on_cmd() {
   # the command that goes on at step (or phase) $1 and stays inside the part of this run (--only, a range, the menu)
   local s=$1 lo
+  [[ "$s" == 10.7 ]] && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$TO_STEP" ]]; then
     # a bare phase N starts at N.0. Inside the range, or before it: from there up to the end of the range (the
     # same range when it starts there), so the waited-for step and the rest of the range run in one go (on
@@ -226,6 +227,8 @@ user_stop() {
 }
 STOPPED_BY_USER=0
 fatal() {
+  # --health: no summary, no "to continue" hints, and the exit code of "unknown" for the monitoring system
+  if [[ ${HEALTH:-0} -eq 1 ]] && declare -F health_exit >/dev/null; then _log FATAL "$*"; health_exit UNKNOWN "$*"; fi
   tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
@@ -290,7 +293,7 @@ cleanup() {
     rm -f -- "$f"
     [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
-  if [[ $SSH_OPEN -eq 1 && -n "$SSH_CTL" ]]; then
+  if [[ ( $SSH_OPEN -eq 1 || ${HEALTH_SSH_OPEN:-0} -eq 1 ) && -n "$SSH_CTL" ]]; then
     ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
     rm -f -- "$SSH_CTL"
   fi
@@ -309,6 +312,7 @@ trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
 #------------------------------------------------------------------------------
 ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
+  [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
@@ -360,6 +364,7 @@ confirm_word() {
 
 ask_secret() {
   # $1 prompt. Result in SECRET.
+  [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
   TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
@@ -550,6 +555,12 @@ job_finish_late() {
         say "The RMAN copy did NOT finish: $(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')"
         say "Step 7.2 of a normal run shows how to clean up this server."
       fi ;;
+    "RMAN roll forward")
+      # not judged here: the next run with --roll-forward checks the standby, finishes the clean-up and starts
+      # redo apply (stopped for the roll forward). Its exit code is kept for that run
+      jok=0
+      [[ -f "$STATE_DIR/rollforward_pending" ]] && printf '%s|%s\n' "$JOB_OUT" "${rc:-}" > "$STATE_DIR/rollforward_pending"
+      say "Redo apply is stopped since the roll forward. To check the result and start redo apply again:  $SELF --roll-forward" ;;
     "Grid installer"*|"Grid configuration tools"*|"Database installer"*)
       if [[ "$rc" == "0" || "$rc" == "6" ]] && declare -F installer_done_record >/dev/null; then
         installer_done_record "$JOB_TITLE"; say "'$JOB_TITLE' had finished without error. Its result is recorded."
@@ -573,7 +584,8 @@ job_finish_late() {
   # (an unzip is only a part of its step: the step itself is judged by its next check)
   if [[ "$JOB_TITLE" != unzip\ * && -n "${JOB_STEP:-}" && "$JOB_STEP" =~ ^[0-9]+\.[0-9]+$ ]] && declare -F record >/dev/null; then
     STEP_TITLE[$JOB_STEP]=${STEP_TITLE[$JOB_STEP]:-$(step_title_of "$JOB_STEP" 2>/dev/null)}
-    if [[ $jok -eq 1 ]]; then NOW="$JOB_TITLE ended without error (recorded later)"; record "$JOB_STEP" DONE
+    if [[ "$JOB_TITLE" == "RMAN roll forward" ]]; then NOW="$JOB_TITLE ended (exit code ${rc:-unknown}); not checked yet: run with --roll-forward"; record "$JOB_STEP" WAITS
+    elif [[ $jok -eq 1 ]]; then NOW="$JOB_TITLE ended without error (recorded later)"; record "$JOB_STEP" DONE
     else NOW="$JOB_TITLE ended with exit code ${rc:-unknown}"; record "$JOB_STEP" FAILED; fi
     unset "STEP_RESULT[$JOB_STEP]"      # this run checks the step again itself
   fi
@@ -900,13 +912,13 @@ phase_header() {
 result_label() {
   case "$1" in
     OK) printf 'ok' ;; DONE) printf 'done' ;; DONE_BY_YOU) printf 'done by you' ;; SKIPPED) printf 'skipped' ;;
-    SKIPPED_OPTIONAL) printf 'skipped (optional)' ;; FAILED_SKIPPED) printf 'failed, skipped' ;; FAILED) printf 'failed' ;;
+    SKIPPED_OPTIONAL) printf 'skipped (optional)' ;; NOT_ON_RELEASE) printf 'n/a (release)' ;; FAILED_SKIPPED) printf 'failed, skipped' ;; FAILED) printf 'failed' ;;
     WAITS) printf 'waiting' ;; RUNNING) printf 'running' ;; TODO) printf 'to do' ;; PROBLEM) printf 'problem' ;;
     UNDONE) printf 'undone' ;; NOT_FINISHED) printf 'stopped here' ;; *) printf '%s' "$1" ;;
   esac
 }
 result_color() {
-  case "$1" in OK|DONE|DONE_BY_YOU) printf '%s' "$C_G" ;; SKIPPED_OPTIONAL|WAITS) printf '%s' "$C_D" ;; RUNNING) printf '%s' "$C_C" ;;
+  case "$1" in OK|DONE|DONE_BY_YOU) printf '%s' "$C_G" ;; SKIPPED_OPTIONAL|NOT_ON_RELEASE|WAITS) printf '%s' "$C_D" ;; RUNNING) printf '%s' "$C_C" ;;
     TODO) printf '%s' "$C_M" ;; SKIPPED|UNDONE) printf '%s' "$C_Y" ;; *) printf '%s' "$C_R" ;; esac
 }
 
@@ -952,8 +964,9 @@ phase_done_result() {
   local p=$1 i n=0 ok=0 bad=0
   for i in "${HELP_IDS[@]}"; do
     [[ "${i%%.*}" == "$p" ]] || continue
+    on_demand "$i" && continue
     n=$((n + 1))
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) ok=$((ok + 1)) ;; "") ;; *) bad=$((bad + 1)) ;; esac
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) ok=$((ok + 1)) ;; "") ;; *) bad=$((bad + 1)) ;; esac
   done
   if [[ $ok -eq $n ]]; then printf 'DONE'
   elif [[ $ok -eq 0 && $bad -eq 0 ]]; then printf '-'
@@ -972,13 +985,13 @@ print_progress_board() {
   done
   local nopen=0
   for i in "${HELP_IDS[@]}"; do
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|"") ;;
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|"") ;;
       *) nopen=$((nopen + 1))
          if [[ $nopen -le 8 ]]; then
            open+="$(printf '      %-5s %s%-16s%s %s' "$i" "$(result_color "${LAST_RESULT[$i]}")" "$(result_label "${LAST_RESULT[$i]}")" "$C_N" "$(step_title_of "$i" 2>/dev/null | cut -c1-44)")"$'\n'
            [[ -n "${LAST_REASON[$i]:-}" ]] && open+="            ${C_D}${LAST_REASON[$i]:0:100}${C_N}"$'\n'
          fi
-         [[ -n "$first" || "$i" == 1.* ]] || first=$i ;;
+         [[ -n "$first" || "$i" == 1.* ]] || on_demand "$i" || first=$i ;;
     esac
   done
   [[ $nopen -gt 8 ]] && open+="      ... and $((nopen - 8)) more"$'\n'
@@ -1011,10 +1024,10 @@ print_progress_board() {
 }
 step_ok_anywhere() {
   # 0 when step $1 is done: in this run, or (when it did not run now) in an earlier run
-  case "${STEP_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) return 0 ;; "") ;; *) return 1 ;; esac
+  case "${STEP_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) return 0 ;; "") ;; *) return 1 ;; esac
   # started in this run but not finished (the run stopped inside it): not done
   [[ " ${STEP_ORDER[*]+${STEP_ORDER[*]}} " == *" $1 "* ]] && return 1
-  case "${LAST_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) return 0 ;; esac
+  case "${LAST_RESULT[$1]:-}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) return 0 ;; esac
   return 1
 }
 next_cmd() {
@@ -1033,6 +1046,8 @@ next_cmd() {
   # a failed copy, is a deliberate "go back there")
   [[ -n "$RESUME_STEP" && "$RESUME_STEP" != 1.* ]] && nx=$RESUME_STEP
   [[ -n "$nx" ]] || return 0
+  # the step on demand (10.7) goes on only with its own option
+  on_demand "$nx" && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
   # a range (--only 2.1-2.4, grid, db): the same range again, from the step that is not done
   if [[ -n "$TO_STEP" && "$nx" == *.* ]] && [[ $(step_num "$nx") -ge $(step_num "$FROM_STEP") && $(step_num "$nx") -le $(step_num "$TO_STEP") ]]; then
@@ -1067,6 +1082,9 @@ write_last_run() {
 # Steps that are useful but not needed for a working standby (switchover preparation)
 readonly OPTIONAL_STEPS=" 4.8 4.10 4.11 "
 is_optional() { [[ "$OPTIONAL_STEPS" == *" $1 "* ]]; }
+# steps that run only when asked for (10.7: --roll-forward): never "next", never needed for a phase to be done
+readonly ON_DEMAND_STEPS=" 10.7 "
+on_demand() { [[ "$ON_DEMAND_STEPS" == *" $1 "* ]]; }
 skip_record() {
   # (phase 1: the waiters ask once anyway, for example to type the sys password with [p])
   [[ "$1" == 1.* ]] || AUTO_WAIT["step $1"]=1
@@ -1217,6 +1235,10 @@ run_step() {
     if [[ $rc -eq 0 && $CHECK_WAITS -eq 1 ]]; then
       wait_msg "$NOW"; record "$id" WAITS; return 0
     fi
+    # 3: the check does not exist for this release (10.5 on 12.1): nothing to wait for and nothing wrong
+    if [[ $rc -eq 0 && $CHECK_WAITS -eq 3 ]]; then
+      wait_msg "$NOW"; record "$id" NOT_ON_RELEASE; return 0
+    fi
     if [[ $rc -eq 0 && $CHECK_WAITS -eq 2 ]]; then
       # only an optional step can be left out; any other step that cannot be checked waits
       wait_msg "$NOW"; if is_optional "$id"; then record "$id" SKIPPED_OPTIONAL; else record "$id" WAITS; fi; return 0
@@ -1333,7 +1355,7 @@ run_step() {
     _log DO "[$id] start"
     JOURNAL_STEP_ENTRIES=0
     drc=0; "$dofn" || drc=$?
-    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $SELF --from $id"; return 0; fi
+    if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $(on_demand "$id" && printf '%s --roll-forward' "$SELF" || printf '%s --from %s' "$SELF" "$id")"; return 0; fi
     if [[ $drc -eq 0 ]]; then
       NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
       # done, but the result cannot really be checked yet: waiting (checked again in a later run)
@@ -1388,7 +1410,7 @@ summary() {
   for id in "${STEP_ORDER[@]}"; do
     r=${STEP_RESULT[$id]:-"NOT_FINISHED"}
     case "$r" in
-      OK) n_ok=$((n_ok + 1)) ;;
+      OK|NOT_ON_RELEASE) n_ok=$((n_ok + 1)) ;;
       SKIPPED_OPTIONAL) n_opt=$((n_opt + 1)) ;;
       DONE|DONE_BY_YOU) n_done=$((n_done + 1)) ;;
       SKIPPED) n_skip=$((n_skip + 1)) ;;
@@ -1400,7 +1422,7 @@ summary() {
     col=$(result_color "$r")
     printf '    %-5s %s%-18s%s %s\n' "$id" "$col" "$(result_label "$r")" "$C_N" "${STEP_TITLE[$id]}"
     case "$r" in
-      OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|TODO) ;;
+      OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|TODO) ;;
       *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '          %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:100}" "$C_N"
          [[ -n "$first_bad" ]] || first_bad=$id ;;
     esac
@@ -1670,7 +1692,7 @@ later_steps_active() {
   while IFS= read -r l; do
     local kind; IFS='|' read -r _ _ _ step kind _ <<< "$l"
     [[ "$step" =~ ^[0-9]+\.[0-9]+$ ]] || continue
-    case "$kind" in SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE) continue ;; esac     # nothing to undo there
+    case "$kind" in SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD) continue ;; esac     # nothing to undo there
     [[ $(step_num "$step") -gt $(step_num "$1") ]] && return 0
   done < <(journal_entries)
   return 1
@@ -1718,6 +1740,7 @@ undo_text() {
     INSTANCE)   printf 'auto: shut down the instance %s (srvctl stop database if it is registered, else shutdown immediate)' "$obj" ;;
     DUPLICATE)  printf 'by hand: shutdown abort, then remove the files of %s on this server only, NEVER those of the primary. Details:  %s --help-step 8.2' "$obj" "$SELF" ;;
     DUPLICATE_DONE) printf 'nothing separate: the copied standby %s goes with the DUPLICATE line' "$obj" ;;
+    ROLLFWD)    printf 'nothing to undo: the standby %s was brought up to date from the primary (RMAN)' "$obj" ;;
     SRVCTL)     printf 'auto: srvctl stop database -db %s ; srvctl remove database -db %s -noprompt   (the database files stay)' "$obj" "$obj" ;;
     SRL)        printf 'auto: drop the standby log group(s) %s on this server (apply is stopped for it)' "$det" ;;
     MRP)        printf 'auto: alter database recover managed standby database cancel' ;;
@@ -1776,7 +1799,7 @@ change_word() {
     GROUP) printf 'group' ;; USER|USERMOD) printf 'user' ;; PKG) printf 'package' ;; FWPORT) printf 'firewall' ;;
     SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
-    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|SRL|MRP) printf 'database' ;;
+    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
     SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
@@ -2056,7 +2079,7 @@ undo_cli() {
   printf '\n  %sUndo of step %s%s  %s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")"
   printf '      The changes are undone newest first, one at a time. Nothing on the primary is touched.\n'
   if later_steps_active "$step"; then
-    local later; later=$(journal_entries | awk -F'|' -v s="$step" '$4 ~ /^[0-9]+\.[0-9]+$/ && $5 !~ /^(SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE)$/ {split($4,a,"."); split(s,b,"."); if (a[1]*100+a[2] > b[1]*100+b[2]) print $4}' | sort -t. -k1,1n -k2,2n -u | paste -sd' ' -)
+    local later; later=$(journal_entries | awk -F'|' -v s="$step" '$4 ~ /^[0-9]+\.[0-9]+$/ && $5 !~ /^(SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD)$/ {split($4,a,"."); split(s,b,"."); if (a[1]*100+a[2] > b[1]*100+b[2]) print $4}' | sort -t. -k1,1n -k2,2n -u | paste -sd' ' -)
     warn "Later steps have changes that build on this one: $later.
 Undo them first, the last one first:  --undo ${later##* }"
     confirm_word "Undo step $step anyway?" "UNDO" || { printf '      Undo not started.\n'; return 1; }
@@ -2081,7 +2104,7 @@ Undo them first, the last one first:  --undo ${later##* }"
           if confirm "Mark it as undone by you, so it is no longer listed"; then journal UNDONE "$seq" "$kind $obj (by you)"; n_done=$((n_done + 1)); UNDO_N_DONE=$n_done
           else n_left=$((n_left + 1)); fi
         fi ;;
-      SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE)
+      SERVICE|ROOHCTL|SETTING|DUPLICATE_DONE|ROLLFWD)
         say "Nothing to do for this line." ;;
       *)
         say "Undo this change by hand, with the command above."
@@ -2131,12 +2154,13 @@ ORACLE_GROUPS:list GRID_GROUPS:list GROUP_GIDS:list
 LOCS:locs DATA_DG:opt_name FRA_LOC:opt_loc FRA_MB:num ARCH_LOC:opt_loc PRIMARY_DB_MB:num
 STANDBY_HOST:name STANDBY_IP:ip STANDBY_UNIQUE:dbname STANDBY_SID:name STANDBY_SERVICE:name
 PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_MEDIA:opt_paths RU_DIR:opt_path OPATCH_ZIP:opt_path AUX_CHANNELS:num REDO_BLOCKSIZE:redobs
+HEALTH_LAG_MAX:num DUP_SECTION_SIZE:secsize
 "
 # may be empty
-readonly OPTIONAL_KEYS=" PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
+readonly OPTIONAL_KEYS=" HEALTH_LAG_MAX DUP_SECTION_SIZE PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
 # values the user may change (everything else is read from the primary at every run)
 readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
-readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE "
+readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE HEALTH_LAG_MAX DUP_SECTION_SIZE "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
 SETTINGS_FILE=""; ACCEPTED_FILE=""
@@ -2160,6 +2184,7 @@ valid_value() {
     dbname)    [[ "$v" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] ;;
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
     redobs)    [[ -z "$v" || "$v" == "512" || "$v" == "4096" ]] ;;
+    secsize)   [[ -z "$v" || "$v" == "0" || "$v" =~ ^[1-9][0-9]{0,4}[MG]$ ]] ;;
     ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
                  # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
                  [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
@@ -2219,6 +2244,8 @@ load_settings() {
     if [[ -z "$spec" ]]; then DROPPED_KEYS+=" $key"; continue; fi
     # values that are derived again when empty (the settings file says so for a new standby name)
     if [[ -z "$val" && "$DERIVED_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
+    # a key that may be empty (an optional value, for example HEALTH_LAG_MAX) is empty: its default applies
+    if [[ -z "$val" && "$OPTIONAL_KEYS" == *" $key "* ]]; then printf -v "$key" '%s' ""; continue; fi
     if ! valid_value "$spec" "$val"; then
       # a typo in a value you may edit is an error; it is never ignored silently
       if is_standby_key "$key" || assumed_key "$key"; then LOAD_ERR="Invalid value: $key=$val"; break; fi
@@ -2252,6 +2279,9 @@ save_settings() {
     printf '# must reach it. PRIMARY_TNS / STANDBY_TNS: alias names written into tnsnames.ora on both servers.\n'
     printf '# REDO_BLOCKSIZE: 512 or 4096, normally empty. Only when the redo block size of the primary cannot be\n'
     printf '# read: it is then used for the ASM disks (steps 2.13, 3.5). The copy (step 8.1) still needs it read.\n'
+    printf '# HEALTH_LAG_MAX: seconds of lag that --health accepts (empty = 300). DUP_SECTION_SIZE: section size of\n'
+    printf '# the RMAN copy, for example 32G (empty = automatic: 32G when a datafile is 64 GB or more and there is more\n'
+    printf '# than one channel; 0 = none).\n'
     for k in $STANDBY_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done
     printf '\n# ---- Connection (change with --primary / --user, or here between runs) ----\n'
     printf 'PRIMARY_IP=%s\nPRIMARY_SSH_USER=%s\n' "$PRIMARY_IP" "$PRIMARY_SSH_USER"
@@ -2308,6 +2338,7 @@ validate_settings() {
     if [[ "$OPTIONAL_KEYS" != *" $v "* ]]; then
       [[ -n "${!v}" ]] || { bad "$v is empty."; bad_n=1; continue; }
     fi
+    [[ -z "${!v}" && "$OPTIONAL_KEYS" == *" $v "* ]] && continue
     valid_value "$t" "${!v}" || { bad "$v has an invalid value: ${!v}"; bad_n=1; }
   done
   for v in DB_HOME ORACLE_BASE GRID_HOME GRID_BASE INVENTORY_DIR; do
@@ -6815,6 +6846,8 @@ P_ORL_COUNT=0; P_ORL_BYTES=0; PVAL=""; SRL_BLOCKSIZE=""
 
 need_ssh() {
   ssh_alive && return 0
+  # --health never opens the interactive connection (it would ask for a password)
+  [[ ${HEALTH:-0} -eq 1 ]] && { NOW="Not checked: $([[ -n "$HEALTH_SSH_ERR" ]] && printf 'no ssh to the primary (see the note below)' || printf 'the ssh connection to the primary was lost')"; return 1; }
   if [[ $SSH_OPEN -eq 1 ]]; then
     # the connection was open before (for example it timed out during a long duplicate)
     warn "The ssh connection to the primary was closed. Reconnecting."
@@ -8939,7 +8972,7 @@ phase_7() {
 #------------------------------------------------------------------------------
 # PHASE 8  RMAN active duplicate
 #------------------------------------------------------------------------------
-DUP_EXTRA=""; PRE_OK=0; PRE_INFO=""; NEWNAMES=""
+DUP_EXTRA=""; PRE_OK=0; PRE_INFO=""; NEWNAMES=""; DUP_SECTION=""
 
 CF_LIST=""
 srl_plan_space() {
@@ -9256,6 +9289,27 @@ dup_prechecks() {
   # same paths on both servers: MRP tries to clear the online logs and prints ORA-19527/ORA-00312 in the alert
   # log at every start. A convert pair that matches nothing stops that noise (Oracle note 352879.1).
   [[ ${HAS_LFNC:-0} -eq 1 ]] || DUP_EXTRA+="      set log_file_name_convert='/__dg_no_rename__','/__dg_no_rename__'"$'\n'
+  # section size: one big datafile (a bigfile tablespace) is otherwise copied by one channel only, however many
+  # there are. DUP_SECTION_SIZE: empty = automatic (32G when a datafile is 64 GB or more and there is more than
+  # one channel), 0 = never, or a size such as 16G
+  DUP_SECTION=""
+  if [[ "${DUP_SECTION_SIZE:-}" == "0" ]]; then :
+  elif [[ -n "${DUP_SECTION_SIZE:-}" ]]; then DUP_SECTION=$DUP_SECTION_SIZE
+  elif [[ ${AUX_CHANNELS:-1} -gt 1 ]]; then
+    prim_sql "select round(max(bytes)/1048576) from v\$datafile;" || { PRE_FIX="Cannot read the size of the datafiles of the primary"; return 1; }
+    local maxdf; maxdf=$(first_line)
+    num "$maxdf" || { PRE_FIX="Unexpected answer for the largest datafile of the primary: $maxdf"; return 1; }
+    [[ $maxdf -ge 65536 ]] && DUP_SECTION=32G
+  fi
+  # sections need backup sets, and those need COMPATIBLE 12.0 or higher (a primary upgraded from 11.2 may keep 11.2)
+  if [[ -n "$DUP_SECTION" ]]; then
+    p_param compatible || { PRE_FIX="Cannot read compatible of the primary"; return 1; }
+    if ! [[ "$PVAL" =~ ^([0-9]+)\. ]] || [[ ${BASH_REMATCH[1]} -lt 12 ]]; then
+      if [[ -n "${DUP_SECTION_SIZE:-}" ]]; then PRE_FIX="DUP_SECTION_SIZE is set, but compatible of the primary is $PVAL (sections need 12.0 or higher). Set DUP_SECTION_SIZE=0"; return 1; fi
+      PRE_INFO+="compatible of the primary is $PVAL: the copy runs without sections (they need 12.0 or higher)"$'\n'; DUP_SECTION=""
+    fi
+  fi
+  [[ -n "$DUP_SECTION" ]] && PRE_INFO+="Large datafiles are copied in sections of $DUP_SECTION by the $AUX_CHANNELS channel(s) of the copy (DUP_SECTION_SIZE in the settings)"$'\n'
   # the whole RMAN text is parsed by RMAN itself before anything starts (no connection needed); once per run
   if [[ "$MODE" == "run" && "${RMAN_PREFLIGHT_OK:-}" != "$(rman_script | md5sum | cut -c1-12)" ]]; then
     # the script holds no password (the connect lines are not in it); rman reads it as the database owner
@@ -9320,6 +9374,9 @@ d_8_1() {
 rman_script() {
   local i ch="" d1="" ll="''"
   for ((i = 1; i <= AUX_CHANNELS; i++)); do ch+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
+  # with a section size RMAN copies through backup sets, which needs at least as many auxiliary channels as
+  # channels on the primary: one channel there, named here, so a PARALLELISM configured on the primary does not count
+  [[ -n "${DUP_SECTION:-}" ]] && ch="  allocate channel p1 device type disk;"$'\n'"$ch"
   if [[ "$ARCH_LOC" == "USE_DB_RECOVERY_FILE_DEST" ]]; then d1="location=use_db_recovery_file_dest"
   elif [[ -n "$ARCH_LOC" ]]; then d1="location=$ARCH_LOC"; fi
   local dgc; dgc=$(lac_merged "${P_DG_CONFIG:-}")
@@ -9328,7 +9385,8 @@ rman_script() {
   cat <<EOF
 run {
 ${ch}${NEWNAMES}  duplicate target database for standby from active database
-    dorecover
+${DUP_SECTION:+    section size $DUP_SECTION
+}    dorecover
     spfile
       set db_unique_name='$STANDBY_UNIQUE'
       set control_files=$CF_LIST
@@ -10329,6 +10387,43 @@ phase_9() {
 #------------------------------------------------------------------------------
 # PHASE 10  Verify synchronization
 #------------------------------------------------------------------------------
+dg_error_hint() {
+  # $1 text with Oracle error codes (messages of v$dataguard_status, the error of a redo destination).
+  # Prints one line per known code: the usual cause and what to do. Codes it does not know give nothing.
+  local t=$1 seen="" c h
+  for c in $(grep -oE 'ORA-[0-9]{5}' <<< "$t" | sort -u); do
+    case "$c" in
+      ORA-16191|ORA-01017|ORA-01031)
+        h="password file differs between primary and standby (often after a sys password change on the primary): copy it again:  $SELF --only 6.1" ;;
+      ORA-28374)
+        h="TDE wallet here is missing a master key of the primary (often after a key change there): copy it again:  $SELF --only 6.3" ;;
+      ORA-28365|ORA-28417|ORA-28353)
+        h="TDE wallet here is not open (no auto-login wallet, or it cannot be read): see step 6.3" ;;
+      ORA-12541|ORA-12514|ORA-12528|ORA-12505)
+        h="the listener or the service of the standby is not reachable: check the listener here (steps 5.1 to 5.3)" ;;
+      ORA-12170|ORA-12535|ORA-12543|ORA-12547|ORA-03113|ORA-03135|ORA-16198)
+        h="network between the servers (firewall, routing, dropped connections): check port $PORT/tcp both ways (step 2.9)" ;;
+      ORA-00257|ORA-19809|ORA-19815|ORA-19804|ORA-16038)
+        h="archive destination or recovery area is full: free space, or check the clean-up of archived logs (step 9.8)" ;;
+      ORA-01274|ORA-01111)
+        h="a datafile added on the primary could not be created here (standby_file_management, space or path): see the alert log of the standby" ;;
+      ORA-16086)
+        h="the standby has no usable standby redo logs for the redo it receives: see step 9.3" ;;
+      ORA-16058)
+        h="the standby instance is not mounted: see step 9.2" ;;
+      ORA-16055|ORA-16401)
+        h="fetching a missing log (FAL) failed or a log was received twice: usually gone within minutes" ;;
+      ORA-16057|ORA-16047)
+        h="log_archive_config of the primary and of the standby do not name each other: see step 4.3" ;;
+      *) continue ;;
+    esac
+    # one line per cause (two codes of the same cause are named once)
+    grep -qxF -- "$h" <<< "$seen" && continue
+    seen+="$h"$'\n'
+    printf '  %s: %s\n' "$c" "$h"
+  done
+  return 0
+}
 lag_seconds() {
   local v=$1
   if [[ "$v" =~ ^\+?([0-9]+)[[:space:]]+([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
@@ -10337,16 +10432,44 @@ lag_seconds() {
 }
 c_10_1() {
   need_built || return 2
-  local tries=0 tl al tls als
+  # the limit: 60 seconds in a run in the terminal (it waits up to 2 minutes for a peak to pass); --health uses
+  # HEALTH_LAG_MAX of the settings (default 300 seconds), as a daily run must not raise an alarm for a peak
+  local lim=60; [[ ${HEALTH:-0} -eq 1 ]] && lim=$((10#${HEALTH_LAG_MAX:-300})); [[ $lim -lt 30 ]] && lim=30
+  local tries=0 tl al tls als age
   while true; do
-    sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
-    IFS='|' read -r tl al <<< "$(first_line)"
+    NOW=""
+    # datum_time: when the standby last received data from the primary. v$dataguard_stats keeps its last
+    # values when nothing arrives any more, so a lag of 0 on a broken link would look healthy without it
+    sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-')||'|'||nvl(to_char(max(case when name='transport lag' and datum_time is not null then round((sysdate-to_date(datum_time,'MM/DD/YYYY HH24:MI:SS'))*86400) end)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
+    IFS='|' read -r tl al age <<< "$(first_line)"
     tls=$(lag_seconds "$tl"); als=$(lag_seconds "$al")
-    if [[ $tls -ge 0 && $tls -le 60 && $als -ge 0 && $als -le 60 ]]; then NOW="Transport lag $tl, apply lag $al"; return 0; fi
+    if [[ $tls -ge 0 && $tls -le $lim && $als -ge 0 && $als -le $lim ]]; then
+      if [[ "$age" =~ ^[0-9]+$ && $age -gt $lim ]]; then
+        NOW="No data from the primary for $age seconds (the last lag values, transport $tl and apply $al, are old)"
+      else
+        NOW="Transport lag $tl, apply lag $al"; return 0
+      fi
+    fi
     tries=$((tries + 1)); [[ $tries -ge 12 || "$MODE" == "check" ]] && break
     say "Transport lag $tl, apply lag $al. Waiting 10 seconds ($tries of 12)"; nap 10
   done
-  NOW="The lag is too high or not known yet: transport '$tl', apply '$al'"
+  if [[ "$NOW" != "No data from the primary"* ]]; then NOW="The lag is too high or not known yet: transport '$tl', apply '$al' (limit $lim seconds)"; fi
+  # what the primary says about its redo destination for this standby (read-only): the most direct reason
+  # (the error column holds ORA- text, so the query "fails" by the usual rule: only its marked lines are used,
+  # and "no destination" is said only when the query itself worked)
+  if ssh_alive; then
+    local prc=0 dl did dst der
+    prim_sql "select distinct 'DEST:'||dest_id||'|'||status||'|'||nvl(error,'-') from gv\$archive_dest where upper(db_unique_name)=upper('$STANDBY_UNIQUE') and target='STANDBY';" || prc=1
+    # a RAC primary gives one line per instance: a line with an error first
+    dl=$(sed -n 's/^[[:space:]]*DEST://p' <<< "$SQL_OUT" | awk -F'|' '{print ($3 == "-" ? 1 : 0) "\t" $0}' | sort -k1,1n | cut -f2- | head -n 1)
+    if [[ "$dl" =~ ^[0-9]+\|[A-Z_\ ]+\| ]]; then
+      IFS='|' read -r did dst der <<< "$(tr -cd '[:print:]' <<< "$dl")"
+      NOW+=$'\n'"On the primary, log_archive_dest_$did for this standby: $dst$([[ "$der" != "-" ]] && printf ', error: %s' "$der")"
+      local hx; hx=$(dg_error_hint "$der"); [[ -n "$hx" ]] && NOW+=$'\n'"Usual cause:"$'\n'"$hx"
+    elif [[ $prc -eq 0 ]]; then
+      NOW+=$'\n'"No redo destination of the primary names db_unique_name=$STANDBY_UNIQUE (step 9.5 sets it)."
+    fi
+  fi
   PLAN="Empty values are normal for a few minutes after the setup.
 To force a log switch, on the primary as $ORACLE_USER in sqlplus / as sysdba:
   alter system switch logfile;
@@ -10359,9 +10482,29 @@ c_10_2_once() {
   num "$(first_line)" || { NOW="Unexpected answer: $(first_line)"; return 2; }
   [[ "$(first_line)" -eq 0 ]] && { NOW="No archive gap"; return 0; }
   sql_local "select thread#||' '||low_sequence#||'-'||high_sequence# from v\$archive_gap;" || true
-  NOW="Archive gap: $SQL_OUT"
+  local gaps; gaps=$(grep -E '^[[:space:]]*[0-9]+ [0-9]+-[0-9]+[[:space:]]*$' <<< "$SQL_OUT" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  NOW="Archive gap: ${gaps:-$SQL_OUT}"
   PLAN="fal_server usually fetches the missing logs within minutes. If the gap stays, check:
   grep -iE 'FAL|gap|ORA-' ${DIAG_DEST:-$ORACLE_BASE}/diag/rdbms/${STANDBY_UNIQUE,,}/$STANDBY_SID/trace/alert_$STANDBY_SID.log | tail -30"
+  # are the missing logs still on the disk of the primary? (fal_server can send only those; read-only)
+  local t r lo hi have gone=""
+  if [[ -n "$gaps" ]] && ssh_alive; then
+    while read -r t r; do
+      lo=${r%-*}; hi=${r#*-}
+      num "$t" && num "$lo" && num "$hi" || continue
+      prim_sql "select count(distinct sequence#) from v\$archived_log where thread#=$t and sequence# between $lo and $hi and deleted='NO' and status='A' and name is not null and standby_dest='NO' and resetlogs_change#=(select resetlogs_change# from v\$database);" || { gone=""; break; }
+      have=$(first_line); num "$have" || { gone=""; break; }
+      [[ $have -lt $((hi - lo + 1)) ]] && gone+="  thread $t, sequence $lo to $hi"$'\n'
+    done <<< "$gaps"
+  fi
+  if [[ -n "$gone" ]]; then
+    NOW+=$'\n'"Some of these logs are no longer on the disk of the primary, so fal_server cannot send them:"$'\n'"${gone%$'\n'}"
+    PLAN="-- 1) Restore them on the primary from its backup (RMAN there, as $ORACLE_USER), for each line above:"
+    while read -r t r; do PLAN+=$'\n'"restore archivelog from sequence ${r%-*} until sequence ${r#*-} thread $t;"; done <<< "$gaps"
+    PLAN+=$'\n'"--    fal_server then sends them within minutes."
+    if [[ ${DB_MAJOR:-0} -ge 18 ]]; then PLAN+=$'\n'"-- 2) Or, without the logs, roll the standby forward from the primary:  $SELF --roll-forward"
+    else PLAN+=$'\n'"-- 2) Or make a new copy of the standby (phase 8)."; fi
+  fi
   return 1
 }
 c_10_3_once() {
@@ -10428,14 +10571,16 @@ c_10_4() {
       local msgs=""
       # the messages hold ORA- codes themselves, so the query "fails" by the usual rule: its lines are shown anyway
       sql_local "select message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1/96 order by timestamp desc) where rownum <= 3;" || true
-      msgs=$(sed 's/^[[:space:]]*//' <<< "$SQL_OUT" | grep -v '^$' | head -n 3 | sed 's/^/  /')
+      msgs=$(sed 's/^[[:space:]]*//; s/[^[:print:]]//g' <<< "$SQL_OUT" | grep -v '^$' | head -n 3 | sed 's/^/  /')
       w+=$'\n'"$n Data Guard error message(s) in the last 15 minutes${msgs:+:}"${msgs:+$'\n'"$msgs"}
+      local hint_txt; hint_txt=$(dg_error_hint "$msgs"); [[ -n "$hint_txt" ]] && w+=$'\n'"Usual cause:"$'\n'"$hint_txt"
     else
       sql_local "select count(*) from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1;" && n=$(first_line) && num "$n" || { NOW+=$'\n'"Cannot read v\$dataguard_status: $(ora_errors "$SQL_OUT")"; return 2; }
       if [[ "$n" != "0" ]]; then
         # errors that keep coming between runs (newer than the ones the last run saw, but not in the last 15
         # minutes) are a condition, not a start-up message: waiting. The same old ones again: only shown
-        local last="" prev="" lf; lf="$STATE_DIR/dg_errors_seen_$STANDBY_SID"
+        # --health keeps its own memory: a daily run and an interactive one must not move each other's baseline
+        local last="" prev="" lf; lf="$STATE_DIR/dg_errors_seen_$([[ ${HEALTH:-0} -eq 1 ]] && printf 'health_')$STANDBY_SID"
         sql_local "select nvl(to_char(max(timestamp),'YYYYMMDDHH24MISS'),'-') from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > sysdate-1;" && last=$(first_line)
         [[ "$last" =~ ^[0-9]{14}$ || "$last" == "-" ]] || { NOW+=$'\n'"Cannot read the time of the newest Data Guard error: $(ora_errors "$SQL_OUT")"; return 2; }
         # the value of the previous run, read once per run (a second look in this run compares with it too)
@@ -10447,13 +10592,14 @@ c_10_4() {
           local nm="" mq="select 'DGMSG:'||message from (select message from v\$dataguard_status where severity in ('Error','Fatal') and timestamp > to_date('$prev','YYYYMMDDHH24MISS') order by timestamp desc) where rownum <= 3;"
           sql_local "$mq" || true
           # only lines of the view (marked DGMSG:), never sqlplus' own error text
-          nm=$(sed -n 's/^[[:space:]]*DGMSG://p' <<< "$SQL_OUT" | head -n 3 | sed 's/^/  /')
+          nm=$(sed -n 's/^[[:space:]]*DGMSG://p' <<< "$SQL_OUT" | sed 's/[^[:print:]]//g' | head -n 3 | sed 's/^/  /')
           w+=$'\n'"New Data Guard error messages came since the last run (the newest at ${last:0:4}-${last:4:2}-${last:6:2} ${last:8:2}:${last:10:2}),"$'\n'"though none in the last 15 minutes${nm:+:}"${nm:+$'\n'"$nm"}
           [[ -n "$nm" ]] || w+=$'\n'"To see them:  select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
+          local hint2; hint2=$(dg_error_hint "$nm"); [[ -n "$hint2" ]] && w+=$'\n'"Usual cause:"$'\n'"$hint2"
         else
           warn "$n Data Guard error message(s) on this standby in the last 24 hours (none in the last 15 minutes). To see them:"$'\n'"select timestamp, message from v\$dataguard_status where severity in ('Error','Fatal') order by timestamp;"
         fi
-        [[ "$MODE" != check && "$last" =~ ^[0-9]{14}$ ]] && { install -d -m 700 "$STATE_DIR" 2>/dev/null; printf '%s\n' "$last" > "$lf"; }
+        [[ ( "$MODE" != check || ${HEALTH:-0} -eq 1 ) && "$last" =~ ^[0-9]{14}$ ]] && { install -d -m 700 "$STATE_DIR" 2>/dev/null; printf '%s\n' "$last" > "$lf"; }
       fi
     fi
     if [[ -n "$w" ]]; then
@@ -10465,12 +10611,500 @@ c_10_4() {
   NOW="Redo apply (MRP) is not running"; PLAN="Start it (step 9.4), on this server:"$'\n'"  alter database recover managed standby database disconnect from session;"; return 1
 }
 
+# ---- 10.5 ----
+c_10_5() {
+  # NOLOGGING work on the primary writes no redo for the data: the standby gets only a note that those blocks
+  # are invalid, and the error shows only when the data is read (ORA-01578 / ORA-26040), often after a failover.
+  # The proof is the standby's list of such blocks (12.2 and later); force logging on the primary is advice.
+  # Read-only on both sides
+  need_built || return 2
+  need_ssh || return 2
+  prim_sql "select force_logging from v\$database;" || { NOW="Cannot read force_logging of the primary: $(ora_errors "$SQL_OUT")"; return 2; }
+  local fl n b fnote=""
+  fl=$(first_line | sed 's/[[:space:]]*$//')
+  [[ -n "$fl" ]] || { NOW="Cannot read force_logging of the primary (no answer)"; return 2; }
+  if [[ "${PRIMARY_VERSION:-0}" =~ ^12\.1 ]]; then
+    # 12.1 keeps no list of nonlogged blocks on a standby: only force logging can be looked at
+    fnote="12.1 keeps no list of nonlogged blocks: only force logging is checked."
+  else
+    sql_local "select count(*)||' '||nvl(sum(blocks),0) from v\$nonlogged_block;" || { NOW="Cannot read v\$nonlogged_block on the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+    read -r n b <<< "$(first_line)"
+    num "$n" && num "$b" || { NOW="Unexpected answer from the standby: $(first_line)"; return 2; }
+    if [[ $n -gt 0 ]]; then
+      NOW="$b block(s) in $n range(s) were changed on the primary without redo (NOLOGGING). They are not usable here."
+      KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server ($(hostname -s))"
+      PLAN="-- Fetch these blocks from the primary:
+-- 1) sqlplus / as sysdba:  alter database recover managed standby database cancel;
+-- 2) rman target /:        recover database nonlogged block;
+-- 3) sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
+-- So it does not happen again, on the primary:  alter database force logging;"
+      return 1
+    fi
+  fi
+  case "${fl^^}" in
+    YES) if [[ -n "$fnote" ]]; then NOW="Force logging is on at the primary. $fnote"; CHECK_WAITS=3; else NOW="No unrecoverable changes; force logging is on at the primary"; fi; return 0 ;;
+    "STANDBY NOLOGGING"*)
+      # 18c and later, set on purpose: the list of nonlogged blocks above is the proof for this standby
+      if [[ -n "$fnote" ]]; then NOW="The primary uses $fl (set on purpose). $fnote"; CHECK_WAITS=3; else NOW="No unrecoverable changes. The primary uses $fl (set on purpose)."; fi; return 0 ;;
+  esac
+  NOW="$([[ -n "$fnote" ]] && printf 'Force logging is off at the primary' || printf 'No unrecoverable changes so far, but force logging is off at the primary') (force_logging = $fl)."$'\n'"A NOLOGGING load there would leave unusable blocks on the standby. On the primary:  alter database force logging;"$'\n'"(Force logging set per PDB or per tablespace is not looked at here.)${fnote:+$'\n'$fnote}"
+  CHECK_WAITS=1
+  return 0
+}
+# ---- 10.6 ----
+c_10_6() {
+  # the patches of the database home here and on the primary (folder names in inventory/oneoffs, read-only on
+  # the primary). A difference is normal for a short time (standby-first patching), so it is "attention", not a
+  # failure; a home that cannot be read is "cannot check"
+  db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
+  need_ssh || return 2
+  local pp lp onlyp onlyh
+  pp=$(primary_patches "$DB_HOME") || { NOW="Cannot read $DB_HOME/inventory on the primary (the ssh user must be able to read it)"; return 2; }
+  [[ -d "$DB_HOME/inventory" ]] || { NOW="Cannot read $DB_HOME/inventory on this server"; return 2; }
+  lp=$(local_patches "$DB_HOME")
+  onlyp=$(comm -23 <(grep -v '^$' <<< "$pp") <(grep -v '^$' <<< "$lp") | paste -sd' ' -)
+  onlyh=$(comm -13 <(grep -v '^$' <<< "$pp") <(grep -v '^$' <<< "$lp") | paste -sd' ' -)
+  if [[ -z "$onlyp$onlyh" ]]; then
+    local np; np=$(grep -c . <<< "$lp")
+    NOW="The database homes have the same patches ($np $([[ $np -eq 1 ]] && printf 'patch' || printf 'patches'))"; return 0
+  fi
+  NOW="The database homes do not have the same patches:"
+  [[ -n "$onlyp" ]] && NOW+=$'\n'"  only on the primary: $onlyp"
+  [[ -n "$onlyh" ]] && NOW+=$'\n'"  only here: $onlyh"
+  NOW+=$'\n'"This is normal for a short time while a Release Update is applied standby first."$'\n'"Finish it on both servers; datapatch runs only on the primary. See:  $SELF --help-step 10.6"
+  CHECK_WAITS=1
+  return 0
+}
+# ---- 10.7 (only with --roll-forward) ----
+RF_DONE=0; RF_FINISH=0
+rf_pending_file() { printf '%s/rollforward_pending' "$STATE_DIR"; }
+rf_login_test() {
+  # RMAN logs in to the standby (as target, the way the roll forward does) and to the primary alias (the
+  # same credentials are used for FROM SERVICE). The password travels on stdin only
+  local ltmp lrc=0
+  ltmp=$(mktemp /tmp/dg_out.XXXXXXXX) || { NOW="Cannot create a temporary file"; return 2; }
+  CLEANUP_FILES+=("$ltmp")
+  { printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$PRIMARY_TNS"; printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"; printf 'exit\n'; } \
+    | as_oracle timeout 120 "$DB_HOME/bin/rman" > "$ltmp" 2>&1 || lrc=1
+  RUN_OUT=$(mask_pw < "$ltmp"); rm -f -- "$ltmp"
+  printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman login test (roll forward)"
+  grep -q 'connected to target database' <<< "$RUN_OUT" && grep -q 'connected to auxiliary database' <<< "$RUN_OUT" && return 0
+  NOW="RMAN cannot log in to both databases with the sys password: $(grep -E '(RMAN|ORA)-[0-9]+' <<< "$RUN_OUT" | head -n 2 | tr '\n' ' ')"
+  local hx; hx=$(dg_error_hint "$RUN_OUT"); [[ -n "$hx" ]] && NOW+=$'\n'"Usual cause:"$'\n'"$hx"
+  return 1
+}
+c_10_7() {
+  # RECOVER STANDBY DATABASE FROM SERVICE (18c and later): the standby fetches the changes it misses from the
+  # primary as incremental backups, instead of a whole new copy. Only when asked for (--roll-forward). Every
+  # condition is read first; any doubt stops before a change
+  [[ $RF_DONE -eq 1 ]] && { NOW="The standby was rolled forward in this run"; return 0; }
+  RF_FINISH=0
+  if job_alive; then NOW="A long job runs: $JOB_TITLE (session $JOB_PID). Wait for it to end."; return 2; fi
+  # a roll forward of an earlier run that ended while no run was watching (terminal closed): its result is
+  # checked and its clean-up done now; RMAN is not started again for it
+  local pf; pf=$(rf_pending_file)
+  if [[ -f "$pf" ]]; then
+    local plog prc
+    IFS='|' read -r plog prc < "$pf"
+    if [[ "$prc" == "0" && -f "$plog" ]] && ! grep -qE '^RMAN-0(3002|3009)|ERROR MESSAGE STACK' "$plog"; then
+      local_state
+      [[ "$LSTATE" == MOUNTED ]] || { NOW="The roll forward of an earlier run has ended, but the standby is not mounted ($LSTATE). Start it (step 9.2), then run again."; return 2; }
+      RF_FINISH=1
+      NOW="The roll forward of an earlier run has ended without error (output: $plog)."$'\n'"It was not checked yet, and redo apply is stopped."
+      PLAN="-- Check the standby, set its standby redo logs and RMAN settings again (9.3, 9.8) and start redo apply.
+-- RMAN is not run again."
+      return 1
+    fi
+    # it did not finish: said, and the roll forward may be started again (every check below runs first)
+    warn "The roll forward of an earlier run did not finish (exit code ${prc:-unknown}; output: ${plog:-unknown}). Redo apply is stopped."
+    rm -f -- "$pf"
+  fi
+  need_built || return 2
+  need_ssh || return 2
+  if [[ ${DB_MAJOR:-0} -lt 18 ]]; then
+    # not something to answer r to: the script cannot do it on this release (shown, recorded as waiting)
+    NOW="Release $DB_MAJOR has no single roll-forward command (it came with 18c). The script does not do it here."$'\n'"By hand: Oracle note 1987763.1 (stop redo apply; in RMAN  recover database from service $PRIMARY_TNS noredo;"$'\n'"restore the standby control file from service $PRIMARY_TNS; catalog and switch the datafiles; restore the"$'\n'"datafiles added since; start redo apply). Or make a new copy (phase 8)."
+    CHECK_WAITS=1; return 0
+  fi
+  local_state
+  case "$LSTATE" in
+    MOUNTED) ;;
+    OPEN) NOW="The standby is OPEN. The roll forward needs it mounted."; KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server, sqlplus / as sysdba"
+          PLAN="shutdown immediate"$'\n'"startup mount"; return 1 ;;
+    IDLE|STARTED) NOW="The standby instance is not mounted ($LSTATE). Start it first (step 9.2)."; return 2 ;;
+    *) NOW="The state of the standby instance cannot be read: $(ora_errors "$SQL_OUT")"; return 2 ;;
+  esac
+  # RMAN restarts the instance itself: it must find the server parameter file in the usual place
+  [[ -f "$DB_HOME/dbs/spfile$STANDBY_SID.ora" || -f "$DB_HOME/dbs/init$STANDBY_SID.ora" ]] \
+    || { NOW="Neither $DB_HOME/dbs/spfile$STANDBY_SID.ora nor init$STANDBY_SID.ora exists: RMAN could not restart the instance."; return 2; }
+  local v
+  sql_local "select upper(value) from v\$parameter where name='dg_broker_start';" || { NOW="Cannot read the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+  v=$(first_line)
+  if [[ "$v" == "TRUE" ]]; then
+    NOW="The Data Guard broker runs on the standby. It would start redo apply again during the roll forward, so the"$'\n'"script does not do it. By hand:  dgmgrl: edit database '$STANDBY_UNIQUE' set state='APPLY-OFF';"$'\n'"then  rman target sys@$STANDBY_TNS: recover standby database from service $PRIMARY_TNS;"$'\n'"then  dgmgrl: edit database '$STANDBY_UNIQUE' set state='APPLY-ON';"
+    CHECK_WAITS=1; return 0
+  fi
+  sql_local "select count(*) from v\$session where upper(program) like 'RMAN%';" && v=$(first_line) && num "$v" || { NOW="Cannot read the sessions of the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+  [[ $v -eq 0 ]] || { NOW="An RMAN session is connected to the standby ($v). Wait until it ends."; return 2; }
+  # the control file of the primary names the primary's files. RMAN finds the standby's own files again only
+  # when the names are the same, or a convert parameter or OMF (db_create_file_dest) tells where they are
+  local sfiles pfiles cfd="-" dfc="-" n vv how=""
+  sql_local "select name||'|'||nvl(value,'-') from v\$parameter where name in ('db_create_file_dest','db_file_name_convert');" || { NOW="Cannot read the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+  while IFS='|' read -r n vv; do n=${n//[[:space:]]/}; case "$n" in db_create_file_dest) cfd=$vv ;; db_file_name_convert) dfc=$vv ;; esac; done <<< "$SQL_OUT"
+  sql_local "select 'F:'||file#||'|'||name from v\$datafile order by file#;" || { NOW="Cannot read the datafiles of the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+  sfiles=$(sed -n 's/^[[:space:]]*F://p' <<< "$SQL_OUT")
+  prim_sql "select 'F:'||file#||'|'||name from v\$datafile order by file#;" || { NOW="Cannot read the datafiles of the primary: $(ora_errors "$SQL_OUT")"; return 2; }
+  pfiles=$(sed -n 's/^[[:space:]]*F://p' <<< "$SQL_OUT")
+  [[ -n "$sfiles" && -n "$pfiles" ]] || { NOW="No datafiles could be read on the standby or the primary"; return 2; }
+  # the files both have (a file added on the primary since, or an UNNAMED placeholder here, is restored anyway)
+  local same=1 fno fn pn
+  while IFS='|' read -r fno fn; do
+    [[ -n "$fno" ]] || continue
+    [[ "$fn" == *UNNAMED* ]] && continue
+    pn=$(grep -m1 "^$fno|" <<< "$pfiles" | cut -d'|' -f2-)
+    [[ -z "$pn" || "$pn" == "$fn" ]] || { same=0; break; }
+  done <<< "$sfiles"
+  if [[ $same -eq 1 ]]; then how="the datafiles have the same names on both servers"
+  elif [[ "$dfc" != "-" ]]; then how="db_file_name_convert of the standby maps the names"
+  elif [[ "$cfd" != "-" ]] && ! cut -d'|' -f2- <<< "$sfiles" | grep -v UNNAMED | grep -qviF -- "$cfd/" \
+       && ! cut -d'|' -f2- <<< "$sfiles" | grep -v UNNAMED | grep -qvE '^\+[^/]+/.+\.[0-9]+\.[0-9]+$|/o1_mf_[^/]+$'; then how="the standby's datafiles are Oracle-managed files in $cfd"
+  else
+    NOW="The standby's datafiles have other names than the primary's, and neither db_file_name_convert nor"$'\n'"Oracle-managed files (db_create_file_dest) would let RMAN find them again after the roll forward."$'\n'"The script does not roll this standby forward. Make a new copy (phase 8), or set db_file_name_convert on"$'\n'"the standby (scope=spfile, then restart) to map the primary's folders to the standby's, and run again."
+    CHECK_WAITS=1; return 0
+  fi
+  # TDE: RMAN restarts the instance; an encrypted standby needs a wallet that opens by itself
+  [[ ${TDE_UNREAD:-0} -eq 1 ]] && { NOW="Whether the primary uses TDE cannot be read (step 1.3), so the wallet of the standby cannot be judged."; return 2; }
+  if awk -F'|' '$3 == "OPEN" {f=1} END {exit !f}' <<< "$TDE_INFO"; then
+    sql_local "select wallet_type||'|'||status from v\$encryption_wallet;" || { NOW="Cannot read the wallet of the standby: $(ora_errors "$SQL_OUT")"; return 2; }
+    grep -qE '^[[:space:]]*(LOCAL_)?AUTOLOGIN\|OPEN[[:space:]]*$' <<< "$SQL_OUT" || { NOW="The primary uses TDE, but the wallet of the standby does not open by itself (no open AUTOLOGIN wallet). Step 6.3."; return 2; }
+  fi
+  # the alias of the standby must reach the instance while it is restarted: a static entry in the listener
+  run_logged "lsnrctl status" as_lsnr "$(lsnr_home)/bin/lsnrctl" status "$SB_LSNR" || true
+  grep -qE 'TNS-1254[0-9]|TNS-12541' <<< "$RUN_OUT" && { NOW="The listener here does not answer (step 5.3)."; return 2; }
+  grep -qiE "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT" || { NOW="The listener here has no static entry for $STANDBY_SID (needed while RMAN restarts the instance). Step 5.2."; return 2; }
+  need_sys || return 2
+  rf_login_test || return 2
+  local fb; sql_local "select flashback_on from v\$database;" && fb=$(first_line) || fb="?"
+  NOW="The standby can be rolled forward from the primary ($how)."
+  [[ "$fb" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
+  RF_FB=$fb
+  PLAN="-- 1) Redo apply is stopped, then RMAN, as $ORACLE_USER on this server:
+recover standby database from service $PRIMARY_TNS;
+-- RMAN restarts the standby instance, takes the control file of the primary, copies the datafiles added since,
+-- and fetches the changes as incremental backups. The primary is only read (it makes the backups RMAN fetches).
+-- 2) The control file then lists the primary's standby redo logs and RMAN settings: those log groups are dropped,
+--    or cleared when their files are on this server (standby_file_management is MANUAL for that moment), and the
+--    standby's own are added again (step 9.3);
+--    RMAN catalogs the recovery area and cross-checks the archived logs; the deletion policy is set again (9.8).
+-- 3) Redo apply is started again."
+  return 1
+}
+rf_after() {
+  # after RECOVER STANDBY DATABASE FROM SERVICE the control file is the primary's: it lists the primary's standby
+  # redo logs (with the primary's names), the primary's RMAN settings, and none of the archived logs here.
+  # 1) standby redo logs: the listed groups are dropped (only their entries: no file of this standby is named
+  #    there) and the standby's own are added again (step 9.3)
+  local rc=0 g groups mem m allhere
+  # redo apply must not run meanwhile (the boot script or a hand start may have started it since)
+  dg_proc_count MRP || { bad "Cannot tell whether redo apply runs: $(ora_errors "$SQL_OUT")"; return 1; }
+  if [[ $DGP_COUNT -ge 1 ]]; then
+    sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop redo apply: $(ora_errors "$SQL_OUT")"; return 1; }
+  fi
+  sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby redo logs: $(ora_errors "$SQL_OUT")"; return 1; }
+  groups=$(grep -oE '^[[:space:]]*[0-9]+' <<< "$SQL_OUT" | tr -d ' ')
+  if [[ -n "$groups" ]]; then
+    sql_local "alter system set standby_file_management=manual scope=memory;" || { bad "Cannot set standby_file_management: $(ora_errors "$SQL_OUT")"; return 1; }
+    for g in $groups; do
+      # a group whose files are on this server (the same paths on both servers) is cleared, so the files are used
+      # again; a group that names files of the primary only is dropped (its entry; no file here is named)
+      sql_local "select 'M:'||member from v\$logfile where group#=$g and type='STANDBY';" || { warn "Cannot read the members of group $g: $(ora_errors "$SQL_OUT")"; rc=1; continue; }
+      mem=$(sed -n 's/^[[:space:]]*M://p' <<< "$SQL_OUT"); allhere=1
+      [[ -n "$mem" ]] || allhere=0
+      while IFS= read -r m; do [[ -n "$m" && "$m" == /* && -f "$m" ]] || allhere=0; done <<< "$mem"
+      if [[ $allhere -eq 1 ]]; then
+        sql_local "alter database clear logfile group $g;" || { warn "Group $g could not be cleared: $(ora_errors "$SQL_OUT")"; rc=1; }
+      else
+        sql_local "alter database drop standby logfile group $g;" || { warn "Group $g could not be dropped: $(ora_errors "$SQL_OUT")"; rc=1; }
+      fi
+    done
+    sql_local "alter system set standby_file_management=auto scope=memory;" \
+      || { warn "Set it back by hand:  alter system set standby_file_management=auto scope=memory;"; rc=1; }
+  fi
+  if [[ $rc -eq 0 ]]; then d_9_3_wrap || rc=1; fi
+  # 2) the archived logs and backups here, as RMAN knows them: the recovery area is catalogued again and every
+  #    archived log is cross-checked (else the recovery area could not reclaim the old logs and fills up)
+  local fra t lrc=0
+  sql_local "select nvl(value,'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="-"
+  t=$(mktemp /tmp/dg_rman.XXXXXX) || { bad "Cannot create a temporary file in /tmp"; return 1; }; CLEANUP_FILES+=("$t")
+  { [[ "$fra" != "-" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
+    | as_oracle timeout 1800 "$DB_HOME/bin/rman" target / > "$t" 2>&1 || lrc=1
+  RUN_OUT=$(cat "$t"); rm -f -- "$t"
+  printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman catalog and crosscheck after the roll forward"
+  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; }
+  # 3) the deletion policy of the standby (step 9.8): the primary's came with its control file
+  local r8=0; c_9_8 >/dev/null 2>&1 || r8=$?
+  if [[ $r8 -eq 1 ]]; then d_9_8_wrap || rc=1
+  elif [[ $r8 -eq 2 ]]; then warn "The deletion policy of archived logs could not be checked (step 9.8)."; rc=1; fi
+  # 4) Oracle Restart: RMAN started the instance itself, outside Oracle Restart
+  if use_grid; then
+    run_logged "srvctl status" as_oracle timeout 600 "$DB_HOME/bin/srvctl" status database -db "$STANDBY_UNIQUE" || true
+    grep -qi 'is not running' <<< "$RUN_OUT" && warn "Oracle Restart shows $STANDBY_UNIQUE as not running (RMAN started it outside Oracle Restart)."$'\n'"At a quiet time, as $ORACLE_USER:  srvctl stop database -db $STANDBY_UNIQUE ; srvctl start database -db $STANDBY_UNIQUE -startoption mount"$'\n'"Then start redo apply again (step 9.4)."
+  fi
+  return $rc
+}
+# the steps' own functions, with their journal entries under their own step numbers
+d_9_3_wrap() { local CUR_STEP=9.3; d_9_3; }
+d_9_8_wrap() { local CUR_STEP=9.8; d_9_8; }
+d_10_7() {
+  local pf rlog rc=0; pf=$(rf_pending_file)
+  if [[ $RF_FINISH -eq 1 ]]; then
+    IFS='|' read -r rlog _ < "$pf"
+  else
+    confirm_word "Roll the standby forward from the primary now." "ROLLFORWARD" || { say "The roll forward was not started."; return 3; }
+    # apply must be stopped: a process list that cannot be read is no "not running"
+    dg_proc_count MRP || { bad "Cannot tell whether redo apply runs: $(ora_errors "$SQL_OUT")"; return 1; }
+    if [[ $DGP_COUNT -ge 1 ]]; then
+      sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop redo apply: $(ora_errors "$SQL_OUT")"; return 1; }
+      say "Redo apply stopped."
+    fi
+    rlog="$LOG_DIR/rollforward_$RUN_ID.log"
+    journal ROLLFWD "$STANDBY_UNIQUE" "RMAN roll forward from $PRIMARY_TNS (control file and datafiles of the standby refreshed)"
+    # a mark for a roll forward that ends while no run watches (its result is then checked by the next one)
+    install -d -m 700 "$STATE_DIR"; printf '%s|\n' "$rlog" > "$pf"
+    run_long "RMAN roll forward" "$rlog" 'Starting|Finished|ORA-|RMAN-|restor|recover|media recovery' oracle "$DB_HOME/bin/rman" < <(
+      printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"
+      printf 'recover standby database from service %s;\n' "$PRIMARY_TNS"
+      printf 'exit\n') || rc=$?
+  fi
+  if [[ $rc -ne 0 ]] || grep -qE '^RMAN-0(3002|3009)|ERROR MESSAGE STACK' "$rlog"; then
+    rm -f -- "$pf"
+    bad "The roll forward did not finish (exit code $rc; $(ora_errors "$(cat "$rlog")"))"
+    printf 'Full output: %s
+Redo apply was not started again. Look at the output, then run  %s --roll-forward  again,
+or start redo apply by hand (step 9.4).
+' "$rlog" "$SELF" | hint
+    return 1
+  fi
+  local_state
+  sql_local "select database_role||'|'||controlfile_type from v\$database;" || { bad "The standby cannot be read after the roll forward: $(ora_errors "$SQL_OUT")"; return 1; }
+  [[ "$(first_line)" == "PHYSICAL STANDBY|STANDBY" ]] || { bad "After the roll forward the database is not a mounted physical standby: $(first_line)"; return 1; }
+  # the changes of the steps that run now belong to those steps (an undo of 10.7 must not stop redo apply)
+  local cs=$CUR_STEP arc=0
+  rf_after || arc=1
+  rm -f -- "$pf"
+  # redo apply runs again in any case: a standby without its own standby redo logs still applies archived logs
+  CUR_STEP=9.4; d_9_4 || { CUR_STEP=$cs; bad "The roll forward worked, but redo apply did not start. Start it:  $SELF --only 9.4"; return 1; }
+  CUR_STEP=$cs
+  if [[ $arc -eq 1 ]]; then
+    bad "The standby was rolled forward and redo apply runs, but the clean-up after it did not finish (see above)."
+    printf 'Run the steps again to finish it:  %s --only 9.3-9.8
+' "$SELF" | hint
+    return 1
+  fi
+  RF_DONE=1
+  DONE_MSG="The standby was rolled forward from the primary: its standby redo logs and RMAN settings are set again, and redo apply runs. Output: $rlog"$'\n'"The temp files now have the primary's names. Check them before you open this standby or switch over to it."
+  [[ "${RF_FB:-}" == YES ]] && DONE_MSG+=$'\n'"Flashback database: turn it off and on again (its logs are not usable after the roll forward)."
+  return 0
+}
+switchover_verify_cmd() { printf 'alter database switchover to %s verify;' "$STANDBY_UNIQUE"; }
+phase10_footer() {
+  # every check of phase 10 OK: the standby is ready as far as this script can tell. The readiness check of
+  # Oracle itself runs on the primary and changes nothing there (12.1 and later): shown, never run
+  local id
+  for id in 10.1 10.2 10.3 10.4 10.5 10.6; do [[ "${STEP_RESULT[$id]:-}" == OK || ( "$id" == 10.5 && "${STEP_RESULT[$id]:-}" == NOT_ON_RELEASE ) ]] || return 0; done
+  printf '\n'
+  say "Before a planned switchover, Oracle can check the readiness. On the primary, in sqlplus / as sysdba:"
+  printf '  %s\n' "$(switchover_verify_cmd)"
+  say "It changes nothing. Problems are shown as errors there; the details are in the alert log of the primary."
+}
 phase_10() {
   phase_header 10 "Health check"
+  if [[ ${ROLL_FORWARD:-0} -eq 1 ]]; then
+    # the roll forward needs the sys password (RMAN logs in with it): asked first, as step 1.5 does
+    if [[ -z "$SYS_PW" ]]; then d_1_5 && record 1.5 DONE; fi
+    run_step 10.7 ask "Roll forward the standby from the primary" c_10_7 d_10_7
+  fi
   run_step 10.1 check "Transport and apply lag" c_10_1
   run_step 10.2 check "No archive gap" c_10_2
   run_step 10.3 check "Last log: primary and standby" c_10_3
   run_step 10.4 check "Redo apply is running" c_10_4
+  run_step 10.5 check "No unrecoverable (NOLOGGING) changes" c_10_5
+  run_step 10.6 check "Patch level: primary and standby" c_10_6
+  phase10_footer
+}
+
+#------------------------------------------------------------------------------
+# --health: the checks of phase 10, unattended (cron, a monitoring agent).
+# Never asks, never changes anything, needs no terminal. One line per check on stdout, the details in
+# $LOG_DIR/health_<time>.log. Exit code (the convention of Nagios-style monitoring):
+#   0 OK   1 WARNING (attention, nothing broken yet)   2 CRITICAL (a problem)   3 UNKNOWN (could not check)
+# Worst first: CRITICAL, then UNKNOWN, then WARNING.
+#------------------------------------------------------------------------------
+HEALTH=0; HEALTH_SSH_OPEN=0; HEALTH_SSH_ERR=""; HEALTH_LOG=""; HEALTH_REPORTED=0
+declare -A HEALTH_STATE=(); declare -A HEALTH_TEXT=(); HEALTH_ORDER=()
+
+# fd 7: the real stdout of the run (a check runs with its own output sent to the log; what it must say reaches
+# cron through fd 7 even then)
+health_out() { printf '%s\n' "$*" >&7; [[ -n "$HEALTH_LOG" ]] && printf '%s\n' "$*" >> "$HEALTH_LOG"; return 0; }
+
+health_exit() {
+  # $1 overall state when the run cannot go on (UNKNOWN), $2 the reason; or no arguments: the end of the run
+  local worst=OK id st code
+  # inside a command substitution (a fatal() deep in a check): only the log; the run itself reports
+  if [[ "${BASHPID:-$$}" != "$$" ]]; then [[ -n "${2:-}" && -n "$HEALTH_LOG" ]] && printf 'UNKNOWN: %s\n' "$2" >> "$HEALTH_LOG"; exit 3; fi
+  if [[ -n "${1:-}" ]]; then
+    [[ $HEALTH_REPORTED -eq 0 && ${#HEALTH_ORDER[@]} -gt 0 ]] && health_report
+    health_out "  UNKNOWN         $2"
+    worst=UNKNOWN
+  fi
+  for id in "${HEALTH_ORDER[@]+"${HEALTH_ORDER[@]}"}"; do
+    st=${HEALTH_STATE[$id]}
+    case "$st" in
+      CRITICAL) worst=CRITICAL ;;
+      UNKNOWN)  [[ "$worst" != CRITICAL ]] && worst=UNKNOWN ;;
+      WARNING)  [[ "$worst" == OK ]] && worst=WARNING ;;
+    esac      # SKIPPED (a check that does not exist for this release) counts as nothing
+  done
+  case "$worst" in OK) code=0 ;; WARNING) code=1 ;; CRITICAL) code=2 ;; *) code=3 ;; esac
+  health_out "Result: $worst (exit $code)${HEALTH_LOG:+. Details: $HEALTH_LOG}"
+  _log STOP "health result $worst"
+  exit "$code"
+}
+
+health_no_question() {
+  # every prompt ends here in --health: nothing in an unattended run may wait for an answer
+  health_exit UNKNOWN "A question would be needed (\"$1\"). Run the script in a terminal:  $SELF --only 10"
+}
+
+health_ssh() {
+  # a connection of its own (never the one of an interactive run), opened only with a key: BatchMode=yes
+  # never asks for a password. The same host-key rules as every other connection of the script
+  SSH_CTL="$STATE_DIR/ssh_ctl_health"
+  [[ -e "$SSH_CTL" ]] && timeout 10 ssh -o ControlPath="$SSH_CTL" -O exit "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
+  rm -f -- "$SSH_CTL"
+  local elog="$STATE_DIR/ssh_error_health.log"
+  : > "$elog"; chmod 600 "$elog"
+  if timeout 30 ssh -E "$elog" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=300 \
+       -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
+       -o ConnectTimeout=15 -o ServerAliveInterval=30 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null 9>&- \
+     && ssh_alive; then
+    HEALTH_SSH_OPEN=1; return 0
+  fi
+  local el; el=$(tail -n 1 "$elog" 2>/dev/null | tr -cd '[:print:]')
+  if [[ "$el" == *"Permission denied"* ]]; then HEALTH_SSH_ERR="ssh to $PRIMARY_SSH_USER@$PRIMARY_IP needs a key for root (no password can be typed here)"
+  else HEALTH_SSH_ERR="ssh to $PRIMARY_SSH_USER@$PRIMARY_IP failed${el:+: $el}"; fi
+  log_block "ssh error output (health)" < "$elog"
+  return 1
+}
+
+health_run_check() {
+  # $1 step id, $2 title, $3 check function. Called directly (not through run_step: no progress record,
+  # no prompt); the same per-check variables as run_step
+  local id=$1 title=$2 fn=$3 rc st first
+  NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""; CHECK_WAITS=0
+  CUR_STEP=$id
+  { printf '\n==== %s  %s ====\n' "$id" "$title"; } >> "$HEALTH_LOG"
+  rc=0; "$fn" >> "$HEALTH_LOG" 2>&1 || rc=$?
+  if [[ $rc -eq 0 && $CHECK_WAITS -eq 0 ]]; then st=OK
+  elif [[ $rc -eq 0 && $CHECK_WAITS -ge 2 ]]; then st=SKIPPED
+  elif [[ $rc -eq 0 ]]; then st=WARNING
+  elif [[ $rc -eq 1 ]]; then st=CRITICAL
+  else st=UNKNOWN; fi
+  { printf 'Result: %s\n%s\n' "$st" "$NOW"; [[ -n "$PLAN" && "$PLAN" != "$NOW" ]] && printf 'What to do:\n%s\n' "$PLAN"; } >> "$HEALTH_LOG"
+  first=${NOW%%$'\n'*}
+  # a first line that only announces a list ("...:") takes the first item with it
+  if [[ "$first" == *: && "$NOW" == *$'\n'* ]]; then local rest=${NOW#*$'\n'}; rest=${rest%%$'\n'*}; first="$first ${rest#"${rest%%[![:space:]]*}"}"; fi
+  [[ -n "$first" ]] || first="(no details)"
+  [[ -n "${HEALTH_STATE[$id]:-}" ]] || HEALTH_ORDER+=("$id")
+  HEALTH_STATE[$id]=$st
+  # not OK, and the first line only says what runs: the reason is on the next line
+  if [[ "$st" != OK && "$first" != *: && "$NOW" == *$'\n'* ]]; then local r2=${NOW#*$'\n'}; r2=${r2%%$'\n'*}; first="$first; ${r2#"${r2%%[![:space:]]*}"}"; fi
+  if [[ "$first" == "$title" ]]; then HEALTH_TEXT[$id]=$title; else HEALTH_TEXT[$id]="$title: $first"; fi
+}
+
+health_main() {
+  # a fixed environment: cron starts with almost none (runuser is in /sbin on Oracle Linux 7)
+  export PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" LANG=C LC_ALL=C
+  umask 077
+  exec 7>&1
+  MODE=check; PROBE_TIMEOUT=120
+  # the logs of --health: 14 days, and never more than the newest 500 (a run every few minutes)
+  find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -mtime +14 -delete 2>/dev/null
+  find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +500 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --
+  HEALTH_LOG="$LOG_DIR/health_$RUN_ID.log"
+  ( umask 027; : > "$HEALTH_LOG" ) 2>/dev/null || { HEALTH_LOG=""; health_exit UNKNOWN "Cannot write the log in $LOG_DIR. Is the file system full or read-only?"; }
+  LOG_FILE=$HEALTH_LOG
+  exec 7>&1
+  health_out "Data Guard health check of the standby on $(hostname -s 2>/dev/null), $(date '+%Y-%m-%d %H:%M:%S')  (dg_standby_setup.sh $SCRIPT_VERSION)"
+  # one run at a time: an interactive run may be changing things right now
+  exec 9> "$STATE_DIR/lock" || health_exit UNKNOWN "Cannot open $STATE_DIR/lock"
+  flock -n 9 || health_exit UNKNOWN "Another run of this script (a setup run or --health) is active on this server. The check was not done."
+  _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=health pid=$$"
+  init_settings
+  [[ -f "$SETTINGS_FILE" ]] || health_exit UNKNOWN "No settings yet: the standby was not set up with this script on this server."
+  load_settings soft || health_exit UNKNOWN "The settings cannot be used: $LOAD_ERR"
+  derive_standby_settings
+  [[ -n "$PRIMARY_IP" && -n "$STANDBY_UNIQUE" && -n "$DB_HOME" ]] || health_exit UNKNOWN "The settings are not complete. Run the setup in a terminal first."
+  users_ok || health_exit UNKNOWN "The Oracle users of the settings do not exist on this server."
+  build_envs
+  db_sw_ok || health_exit UNKNOWN "The database software is not installed here (phase 3)."
+  # a long job (the copy, a roll forward, an installer) is maintenance: the standby is not expected to be in sync
+  if job_alive >> "$HEALTH_LOG" 2>&1; then health_exit UNKNOWN "Maintenance is running: $JOB_TITLE (session $JOB_PID). The check was not done."; fi
+  # a roll forward that ended while no run watched: redo apply stays stopped until it is finished
+  if [[ -f "$STATE_DIR/rollforward_pending" ]]; then
+    HEALTH_STATE[10.7]=CRITICAL; HEALTH_TEXT[10.7]="A roll forward has ended but is not finished (redo apply is stopped). Run in a terminal:  $SELF --roll-forward"
+    HEALTH_ORDER+=(10.7)
+  fi
+  health_out "Standby $STANDBY_UNIQUE, primary $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}"
+
+  # the instance first: when it is down, every other check would only say "cannot check"
+  local_state >> "$HEALTH_LOG" 2>&1
+  case "$LSTATE" in
+    MOUNTED|OPEN) HEALTH_STATE[0.0]=OK; HEALTH_TEXT[0.0]="Standby instance: $LSTATE" ;;
+    ERROR) HEALTH_STATE[0.0]=UNKNOWN; HEALTH_TEXT[0.0]="Standby instance: its state cannot be read ($(ora_errors "$SQL_OUT"))" ;;
+    *) HEALTH_STATE[0.0]=CRITICAL; HEALTH_TEXT[0.0]="Standby instance: $([[ "$LSTATE" == IDLE ]] && printf 'not running' || printf 'state %s, not mounted' "$LSTATE")" ;;
+  esac
+  HEALTH_ORDER+=(0.0)
+  if [[ "${HEALTH_STATE[0.0]}" != OK ]]; then health_report; health_exit; fi
+  # after a switchover or failover this server is the primary: --health checks a standby
+  if sql_local "select database_role from v\$database;" >> "$HEALTH_LOG" 2>&1 && [[ "$(first_line)" == PRIMARY ]]; then
+    health_exit UNKNOWN "This server runs the PRIMARY now (after a switchover or failover). --health checks a standby."
+  fi
+  detect_built >> "$HEALTH_LOG" 2>&1
+  [[ $STANDBY_BUILT -eq 1 ]] || health_exit UNKNOWN "The standby database is not recorded as built here (phase 8). $SC_INFO"
+
+  health_ssh || _log WARN "health: $HEALTH_SSH_ERR"
+  local -a checks=("10.1|Transport and apply lag|c_10_1" "10.2|No archive gap|c_10_2_once" "10.3|Last log: primary and standby|c_10_3_once"
+                   "10.4|Redo apply is running|c_10_4" "10.5|No unrecoverable (NOLOGGING) changes|c_10_5" "10.6|Patch level: primary and standby|c_10_6")
+  local c id title fn
+  local -a again=()
+  for c in "${checks[@]}"; do IFS='|' read -r id title fn <<< "$c"; health_run_check "$id" "$title" "$fn"; done
+  # a short gap, a log or two behind, a lag peak: often gone within a minute. Those checks are done once more
+  # after 60 seconds before anything is reported (the patch check and NOLOGGING do not change in a minute)
+  for c in "${checks[@]:0:4}"; do
+    IFS='|' read -r id title fn <<< "$c"
+    [[ "${HEALTH_STATE[$id]}" == CRITICAL || "${HEALTH_STATE[$id]}" == WARNING ]] && again+=("$c")
+  done
+  if [[ ${#again[@]} -gt 0 ]]; then
+    printf '\n(checked once more in 60 seconds:%s)\n' "$(for c in "${again[@]}"; do printf ' %s' "${c%%|*}"; done)" >> "$HEALTH_LOG"
+    nap 60
+    # the connection may have dropped meanwhile: opened again (still only with a key)
+    [[ $HEALTH_SSH_OPEN -eq 1 ]] && ! ssh_alive && { health_ssh || _log WARN "health: $HEALTH_SSH_ERR"; }
+    for c in "${again[@]}"; do IFS='|' read -r id title fn <<< "$c"; health_run_check "$id" "$title" "$fn"; done
+  fi
+  health_report
+  health_exit
+}
+
+health_report() {
+  local id
+  HEALTH_REPORTED=1
+  [[ -n "$HEALTH_LOG" ]] && printf '\n==== Summary ====\n' >> "$HEALTH_LOG"
+  for id in "${HEALTH_ORDER[@]}"; do
+    health_out "$(printf '  %-9s %-5s %s' "${HEALTH_STATE[$id]}" "$([[ "$id" == 0.0 ]] || printf '%s' "$id")" "${HEALTH_TEXT[$id]}")"
+  done
+  [[ -n "$HEALTH_SSH_ERR" ]] && health_out "  Note: $HEALTH_SSH_ERR. The checks that need the primary were not done. See:  $SELF --help-step health"
+  return 0
 }
 
 #------------------------------------------------------------------------------
@@ -10483,7 +11117,7 @@ readonly HELP_IDS=(1.1 1.2 1.3 1.4 1.5 1.6
   3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11
   4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11
   5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2
-  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4)
+  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4 10.5 10.6 10.7)
 
 help_text() {
   local P=${PRIMARY_HOST:-<primary>} S=${STANDBY_HOST:-<standby>} SID=${STANDBY_SID:-<standby SID>}
@@ -11467,9 +12101,14 @@ EOF
 TITLE  Transport and apply lag
 WHERE  This server ($S), SQL*Plus as sysdba
 RUN    $SSQL
-       select name, value from v\$dataguard_stats where name in ('transport lag','apply lag');
-EXPECT +00 00:00:00 or a few seconds.
+       select name, value, datum_time, time_computed from v\$dataguard_stats where name in ('transport lag','apply lag');
+EXPECT Both lags 60 seconds or less (--health: HEALTH_LAG_MAX of the settings, 300 by default).
+       datum_time is when the standby last received data from the primary. When it does not
+       move, the lag values are old: nothing arrives, even if the lag shows 0.
        Right after setup the values can be empty for some minutes.
+IF     The lag is high: the script shows the state and error of the primary's destination for
+       this standby, with the usual cause of a known error. On the primary:
+       select dest_id, status, error from gv\$archive_dest where upper(db_unique_name)=upper('$SU');
 EOF
   ;;
   10.2) cat <<EOF
@@ -11511,6 +12150,84 @@ EXPECT MRP0 runs, at least one standby log is ACTIVE, and no Error or Fatal
        A view that cannot be read is a problem, not "running".
        Right after the setup, a few messages from the start of transport are
        normal (for example ORA-16401). New ones that keep coming are not.
+       For known error codes the usual cause and the step that fixes it are shown.
+EOF
+  ;;
+  10.5) cat <<EOF
+TITLE  No unrecoverable (NOLOGGING) changes
+WHERE  The primary ($P) and this server ($S), SQL*Plus as sysdba
+WHY    NOLOGGING work on the primary writes no redo for the data. The standby only learns that
+       the blocks are invalid; the error (ORA-01578, ORA-26040) shows when the data is read,
+       often only after a failover. Force logging on the primary prevents it.
+RUN    On the primary:  select force_logging from v\$database;
+       On this server (12.2 and later):  select count(*), sum(blocks) from v\$nonlogged_block;
+EXPECT force_logging YES (or STANDBY NOLOGGING ..., set on purpose) and no nonlogged blocks.
+       12.1 has no list of nonlogged blocks: only force logging is checked there.
+IF     Nonlogged blocks: fetch them from the primary, on this server:
+         sqlplus / as sysdba:  alter database recover managed standby database cancel;
+         rman target /:        recover database nonlogged block;
+         sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
+       Force logging off: on the primary  alter database force logging;
+       (force logging can also be set per PDB or per tablespace; check those if you use them).
+EOF
+  ;;
+  10.6) cat <<EOF
+TITLE  Patch level: primary and standby
+WHERE  Both servers, as $OU
+RUN    \$ORACLE_HOME/OPatch/opatch lspatches      (on the primary and here, database home)
+       The script compares the patch folders in $DBH/inventory/oneoffs (read-only).
+EXPECT The same patches in both database homes.
+IF     Different: normal for a short time while a Release Update is applied standby first
+       (Release Updates and patches marked Standby-First allow it). Finish it on both
+       servers; datapatch runs only on the primary. The Grid home is not compared here.
+       A RAC primary: only the node the script connects to is read.
+EOF
+  ;;
+  10.7) cat <<EOF
+TITLE  Roll forward the standby from the primary
+WHERE  This server ($S), as $OU; only with  --roll-forward
+WHY    When the standby cannot catch up (archived logs it needs were deleted on the primary),
+       or after NOLOGGING work: the standby fetches what it misses as incremental backups,
+       instead of a whole new copy. Needs 18c or later.
+RUN    sqlplus / as sysdba:   alter database recover managed standby database cancel;
+       rman target sys@$ST:   recover standby database from service $PT;
+       sqlplus / as sysdba:   alter database recover managed standby database disconnect from session;
+EXPECT RMAN restarts the standby instance, takes the control file of the primary, copies the
+       datafiles added since, and applies the changes. Then redo apply runs again.
+       The script checks first: the standby is mounted, no RMAN session or long job runs, the
+       broker is off on the standby, RMAN logs in to both databases, the listener has a static
+       entry for $SID, an encrypted standby has an auto-login wallet, and RMAN can find the
+       standby's datafiles again (same names, db_file_name_convert, or Oracle-managed files).
+       Afterwards the script drops the standby redo log entries that came with the primary's
+       control file and adds the standby's own (9.3), catalogs the recovery area, cross-checks
+       the archived logs, and sets the deletion policy again (9.8). The temp files then have
+       the primary's names: check them before you open or switch over to this standby.
+IF     12.1 / 12.2: not automated; see Oracle note 1987763.1. Flashback database on the
+       standby: its logs are not usable after it; turn it off and on again.
+       Test it once on a test standby before you need it on production.
+EOF
+  ;;
+  health) cat <<EOF
+TITLE  Unattended health check (--health)
+WHERE  This server ($S), as root, from cron or a monitoring agent
+WHY    The checks of phase 10 without questions and without changes. One line per check,
+       the details in $LOG_DIR/health_<time>.log (kept 14 days).
+RUN    $SELF --health
+       For example in root's crontab (no mail when all is well):
+         17 6 * * *  $SELF --health >/dev/null || <your alert command>
+       From a monitoring agent (NRPE and the like): allow 300 seconds (a problem is looked at
+       twice, 60 seconds apart), for example  check_nrpe ... -t 300
+EXPECT Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check), as monitoring systems
+       expect. CRITICAL counts first, then UNKNOWN, then WARNING.
+       A problem in 10.1 to 10.4 (lag, gap, last log, apply) is checked once more after
+       60 seconds before it is reported. HEALTH_LAG_MAX in the settings: the accepted lag in
+       seconds (300 if empty, at least 30). The standby instance is checked first: down is
+       CRITICAL at once. After a switchover (this server is the primary) the result is UNKNOWN.
+IF     The checks that need the primary need ssh without a password: a key of root for
+       ${PRIMARY_SSH_USER:-oracle}@$P. Best with a restricted key on the primary, in
+       ~/.ssh/authorized_keys there:  from="<this server's address>",no-pty,no-port-forwarding ssh-ed25519 ...
+       Without a key the local checks still run, and the others show UNKNOWN.
+       While another run of the script or a long job (copy, roll forward) runs: UNKNOWN.
 EOF
   ;;
   *) return 1 ;;
@@ -11523,7 +12240,7 @@ show_help() {
     printf '    No help for step "%s". All steps:  %s --help-step all\n' "$id" "$SELF"; return 1
   fi
   title=$(grep -m1 '^TITLE ' <<< "$txt"); title=${title:7}
-  local t="Help $S_DOT Step $id  $title" lbl
+  local t="Help $S_DOT $([[ "$id" == *.* ]] && printf 'Step ')$id  $title" lbl
   if [[ ${#t} -le 62 ]]; then printf '\n    %s%s %s %s%s\n' "$C_C" "$(rule 2)" "$t" "$(rule $((64 - ${#t})))" "$C_N"
   else printf '\n    %s%s %s%s\n    %s%s%s\n' "$C_C" "$(rule 2)" "$t" "$C_N" "$C_C" "$(rule 70)" "$C_N"; fi   # a long title: the rule goes under it
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -11552,7 +12269,7 @@ help_cli() {
   else
     printf '(no saved settings yet; showing placeholders)\n'
   fi
-  if [[ "$id" == "all" ]]; then for i in "${HELP_IDS[@]}"; do show_help "$i"; done
+  if [[ "$id" == "all" ]]; then for i in "${HELP_IDS[@]}" health; do show_help "$i"; done
   else show_help "$id" || exit 2; fi
 }
 
@@ -11582,6 +12299,11 @@ Usage
   dg_standby_setup.sh --only grid          Run a part only:  os (phase 2), grid (3.1-3.5),
                                            db (3.6-3.11), primary (phase 4), or steps such as
                                            2.1-2.4, 3.6 or 2-3. It stops after the last one.
+  dg_standby_setup.sh --health             Health check for cron or monitoring: no questions, no changes,
+                                           one line per check. Exit 0 OK, 1 WARNING, 2 CRITICAL,
+                                           3 UNKNOWN. Needs an ssh key to the primary (--help-step health)
+  dg_standby_setup.sh --roll-forward       Bring a standby that cannot catch up up to date from the primary
+                                           (RMAN, 18c and later), instead of a new copy (--help-step 10.7)
   dg_standby_setup.sh --settings           Review or edit the settings, then stop
   dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
                                            that erases (disks, leftovers, a half-unpacked software folder),
@@ -11608,7 +12330,7 @@ Few questions, not unattended
     - the commands on the primary (shown, never run by the script), and r when they are done
     - the ssh and sys passwords (typed, never saved), and the host key of the primary
     - erasing disks, moving leftovers aside, the RMAN copy (the word DUPLICATE) and the restart steps
-  The script is not meant to run without a person.
+  The setup is not meant to run without a person. Only --health is (for example from cron).
 
 Phases
    1 Connect to the primary          6 Password file and TDE wallet
@@ -11622,7 +12344,7 @@ Phases
 Files
   Settings   $STATE_DIR/settings.conf (last accepted copy: settings.accepted)
   Progress   $STATE_DIR/progress, and changes.log for --undo
-  Logs       $LOG_DIR/run_<date>.log
+  Logs       $LOG_DIR/run_<date>.log  (--health: health_<date>.log, kept 14 days)
              actions_<date>.txt: the commands shown for you
              duplicate_<date>.rman and .log, installer and root script output
   Editor     The settings open in \$EDITOR (default vi).
@@ -11631,6 +12353,7 @@ Exit codes
   0  Every step is OK
   1  Stopped, or some steps are not OK or skipped (normal for --check on a new server)
   2  Wrong option or unknown step
+  With --health:  0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check, or a wrong option)
 EOF
 }
 
@@ -11666,41 +12389,57 @@ range_word() { [[ "$1" == *.* ]] && printf 'step %s' "$1" || printf 'phase %s' "
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --primary) [[ $# -ge 2 ]] && valid_value ip "$2" || { printf 'Missing or invalid value for --primary\n'; exit 2; }; CLI_IP=$2; shift ;;
-      --user) [[ $# -ge 2 ]] && valid_value name "$2" && [[ "$2" != "root" ]] || { printf 'Missing or invalid value for --user. Give the Oracle software owner, not root.\n'; exit 2; }; CLI_USER=$2; shift ;;
+      --primary) [[ $# -ge 2 ]] && valid_value ip "$2" || { printf 'Missing or invalid value for --primary\n'; exit $PX; }; CLI_IP=$2; shift ;;
+      --user) [[ $# -ge 2 ]] && valid_value name "$2" && [[ "$2" != "root" ]] || { printf 'Missing or invalid value for --user. Give the Oracle software owner, not root.\n'; exit $PX; }; CLI_USER=$2; shift ;;
       --check) MODE="check" ;;
+      --health) HEALTH=1 ;;
+      --roll-forward) ROLL_FORWARD=1 ;;
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
       --yes) YES_MODE=1 ;;
       --show-changes) SHOW_CHANGES=all
         if [[ $# -ge 2 && "$2" != -* ]]; then
-          valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit 2; }
+          valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit $PX; }
           SHOW_CHANGES=$2; shift
         fi ;;
-      --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit 2; }; UNDO_STEP=$2; shift ;;
+      --undo) [[ $# -ge 2 ]] && valid_step "$2" || { printf 'Use --undo N.M with a step number. To list the steps:  --help-step all\n'; exit $PX; }; UNDO_STEP=$2; shift ;;
       --from)
-        [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit 2; }
+        [[ $# -ge 2 && "$2" =~ ^([1-9]|10)(\.[0-9]{1,2})?$ ]] || { printf 'Use --from N or --from N.M, for example --from 6.1\n'; exit $PX; }
         FROM_STEP=$2; FROM_SEEN=1
         [[ "$FROM_STEP" == *.0 ]] && FROM_STEP=${FROM_STEP%.0}     # N.0 is the same as N (the start of phase N)
-        if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit 2; }
+        if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit $PX; }
+          on_demand "$FROM_STEP" && { printf 'Step %s runs only with --roll-forward.\n' "$FROM_STEP"; exit $PX; }
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
-      --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit 2; }; shift ;;
-      --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit 2; }; HELP_STEP=$2; shift ;;
+      --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit $PX; }
+              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward.\n'; exit $PX; }
+              shift ;;
+      --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit $PX; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) printf 'Unknown option: %s\n\n' "$1"; usage; exit 2 ;;
+      *) printf 'Unknown option: %s\n\n' "$1"; usage; exit $PX ;;
     esac
     shift
   done
-  [[ -n "$ONLY_TEXT" && -n "$FROM_SEEN" ]] && { printf 'Use either --from or --only, not both.\n'; exit 2; }
+  [[ -n "$ONLY_TEXT" && -n "$FROM_SEEN" ]] && { printf 'Use either --from or --only, not both.\n'; exit $PX; }
+  # --roll-forward: phase 1 (connection, settings, sys password), then step 10.7 and the checks of phase 10
+  if [[ $ROLL_FORWARD -eq 1 ]]; then
+    if [[ "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_TEXT" || -n "$UNDO_STEP" || $REVIEW_SETTINGS -eq 1 || $YES_MODE -eq 1 || $HEALTH -eq 1 ]]; then
+      printf '%s\n' '--roll-forward cannot be combined with --check, --yes, --only, --from, --undo, --settings, --status, --show-changes or --health.'; exit $PX
+    fi
+    parse_only 10 || exit $PX
+  fi
+  # --health is a whole mode of its own (exit 3 = "unknown" for a monitoring system, never 2 = "critical")
+  if [[ $HEALTH -eq 1 && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_TEXT" || -n "$UNDO_STEP" || $REVIEW_SETTINGS -eq 1 || $YES_MODE -eq 1 || -n "$CLI_IP" || -n "$CLI_USER" || -n "$HELP_STEP" || ${ROLL_FORWARD:-0} -eq 1 ) ]]; then
+    printf '%s\n' '--health cannot be combined with other options.'; exit 3
+  fi
   if [[ -n "$UNDO_STEP" && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_PHASE" || $REVIEW_SETTINGS -eq 1 ) ]]; then
-    printf '%s\n' '--undo cannot be combined with other options. To see first what it would do:  --show-changes STEP'; exit 2
+    printf '%s\n' '--undo cannot be combined with other options. To see first what it would do:  --show-changes STEP'; exit $PX
   fi
   # --settings alone: review the settings and stop (phase 1 only)
   [[ $REVIEW_SETTINGS -eq 1 && -z "$FROM_STEP" && -z "$ONLY_PHASE" ]] && ONLY_PHASE=1
   return 0
 }
-STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""; FROM_SEEN=""
+STATUS_ONLY=0; SHOW_CHANGES=""; UNDO_STEP=""; FROM_SEEN=""; ROLL_FORWARD=0; PX=2
 
 dir_safe() {
   # $1 directory: owned by root, not writable by others (it holds the lock, the settings, the password file copy)
@@ -11785,7 +12524,8 @@ menu_next() {
   for i in "${HELP_IDS[@]}"; do
     [[ "$i" == 1.* ]] && continue
     is_optional "$i" && continue
-    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU) ;; *) printf 'next: %s' "$i"; return 0 ;; esac
+    on_demand "$i" && continue
+    case "${LAST_RESULT[$i]:-}" in OK|DONE|DONE_BY_YOU|NOT_ON_RELEASE) ;; *) printf 'next: %s' "$i"; return 0 ;; esac
   done
   printf 'all done'
 }
@@ -11881,19 +12621,24 @@ start_menu() {
 
 main() {
   [[ $# -eq 0 ]] && MENU_OK=1
+  # a wrong command line is exit 2, but 3 (unknown) with --health: 2 means "critical" to a monitoring system
+  local a; PX=2; for a in "$@"; do [[ "$a" == "--health" ]] && PX=3; done
   parse_args "$@"
   if [[ -n "$HELP_STEP" ]]; then help_cli "$HELP_STEP"; exit 0; fi
-  [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit 1; }
-  cd / || exit 1
+  # a failure to start is "unknown" (3) for --health, as for a monitoring system (fd 7: its output, see health_out)
+  local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }
+  [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit $ef; }
+  cd / || exit $ef
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
-  { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit 1; }
-  dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit 1; }
+  { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
+  dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit $ef; }
   # it holds settings and password-file copies: only root reads it (only the script's own folder is changed)
   [[ "$(basename "$STATE_DIR")" == dg_standby_setup ]] && chmod 700 "$STATE_DIR" 2>/dev/null
-  dir_safe "$LOG_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nroot writes the logs there.\n' "$LOG_DIR"; exit 1; }
+  dir_safe "$LOG_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nroot writes the logs there.\n' "$LOG_DIR"; exit $ef; }
   SETTINGS_FILE="$STATE_DIR/settings.conf"; ACCEPTED_FILE="$STATE_DIR/settings.accepted"; JOB_FILE="$STATE_DIR/job"
   PROGRESS_FILE="$STATE_DIR/progress"; LASTRUN_FILE="$STATE_DIR/last_run"; JOURNAL_FILE="$STATE_DIR/changes.log"
+  [[ $HEALTH -eq 1 ]] && { health_main; exit 3; }
   if [[ $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" ]]; then
     # read-only views: no lock, no log, no connection
     init_settings; [[ -f "$SETTINGS_FILE" ]] && load_settings soft >/dev/null 2>&1
@@ -11989,7 +12734,7 @@ main() {
   CUR_STEP=""
   summary
   local id bad_n=0
-  for id in "${STEP_ORDER[@]}"; do case "${STEP_RESULT[$id]}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL) ;; *) bad_n=$((bad_n + 1)) ;; esac; done
+  for id in "${STEP_ORDER[@]}"; do case "${STEP_RESULT[$id]}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) ;; *) bad_n=$((bad_n + 1)) ;; esac; done
   write_last_run "$([[ $bad_n -eq 0 ]] && printf 'ended, every step OK' || printf 'ended, %s step(s) not OK' "$bad_n")"
   if [[ "$MODE" == "run" && $bad_n -eq 0 ]]; then
     if [[ -z "$ONLY_PHASE" ]] && [[ -z "$FROM_STEP" || "${FROM_STEP%%.*}" -le 9 ]] && [[ -n "${STEP_RESULT[10.1]:-}" ]]; then

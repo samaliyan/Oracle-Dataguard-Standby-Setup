@@ -8,7 +8,7 @@ readonly HELP_IDS=(1.1 1.2 1.3 1.4 1.5 1.6
   3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11
   4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11
   5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2
-  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4)
+  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4 10.5 10.6 10.7)
 
 help_text() {
   local P=${PRIMARY_HOST:-<primary>} S=${STANDBY_HOST:-<standby>} SID=${STANDBY_SID:-<standby SID>}
@@ -992,9 +992,14 @@ EOF
 TITLE  Transport and apply lag
 WHERE  This server ($S), SQL*Plus as sysdba
 RUN    $SSQL
-       select name, value from v\$dataguard_stats where name in ('transport lag','apply lag');
-EXPECT +00 00:00:00 or a few seconds.
+       select name, value, datum_time, time_computed from v\$dataguard_stats where name in ('transport lag','apply lag');
+EXPECT Both lags 60 seconds or less (--health: HEALTH_LAG_MAX of the settings, 300 by default).
+       datum_time is when the standby last received data from the primary. When it does not
+       move, the lag values are old: nothing arrives, even if the lag shows 0.
        Right after setup the values can be empty for some minutes.
+IF     The lag is high: the script shows the state and error of the primary's destination for
+       this standby, with the usual cause of a known error. On the primary:
+       select dest_id, status, error from gv\$archive_dest where upper(db_unique_name)=upper('$SU');
 EOF
   ;;
   10.2) cat <<EOF
@@ -1036,6 +1041,84 @@ EXPECT MRP0 runs, at least one standby log is ACTIVE, and no Error or Fatal
        A view that cannot be read is a problem, not "running".
        Right after the setup, a few messages from the start of transport are
        normal (for example ORA-16401). New ones that keep coming are not.
+       For known error codes the usual cause and the step that fixes it are shown.
+EOF
+  ;;
+  10.5) cat <<EOF
+TITLE  No unrecoverable (NOLOGGING) changes
+WHERE  The primary ($P) and this server ($S), SQL*Plus as sysdba
+WHY    NOLOGGING work on the primary writes no redo for the data. The standby only learns that
+       the blocks are invalid; the error (ORA-01578, ORA-26040) shows when the data is read,
+       often only after a failover. Force logging on the primary prevents it.
+RUN    On the primary:  select force_logging from v\$database;
+       On this server (12.2 and later):  select count(*), sum(blocks) from v\$nonlogged_block;
+EXPECT force_logging YES (or STANDBY NOLOGGING ..., set on purpose) and no nonlogged blocks.
+       12.1 has no list of nonlogged blocks: only force logging is checked there.
+IF     Nonlogged blocks: fetch them from the primary, on this server:
+         sqlplus / as sysdba:  alter database recover managed standby database cancel;
+         rman target /:        recover database nonlogged block;
+         sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
+       Force logging off: on the primary  alter database force logging;
+       (force logging can also be set per PDB or per tablespace; check those if you use them).
+EOF
+  ;;
+  10.6) cat <<EOF
+TITLE  Patch level: primary and standby
+WHERE  Both servers, as $OU
+RUN    \$ORACLE_HOME/OPatch/opatch lspatches      (on the primary and here, database home)
+       The script compares the patch folders in $DBH/inventory/oneoffs (read-only).
+EXPECT The same patches in both database homes.
+IF     Different: normal for a short time while a Release Update is applied standby first
+       (Release Updates and patches marked Standby-First allow it). Finish it on both
+       servers; datapatch runs only on the primary. The Grid home is not compared here.
+       A RAC primary: only the node the script connects to is read.
+EOF
+  ;;
+  10.7) cat <<EOF
+TITLE  Roll forward the standby from the primary
+WHERE  This server ($S), as $OU; only with  --roll-forward
+WHY    When the standby cannot catch up (archived logs it needs were deleted on the primary),
+       or after NOLOGGING work: the standby fetches what it misses as incremental backups,
+       instead of a whole new copy. Needs 18c or later.
+RUN    sqlplus / as sysdba:   alter database recover managed standby database cancel;
+       rman target sys@$ST:   recover standby database from service $PT;
+       sqlplus / as sysdba:   alter database recover managed standby database disconnect from session;
+EXPECT RMAN restarts the standby instance, takes the control file of the primary, copies the
+       datafiles added since, and applies the changes. Then redo apply runs again.
+       The script checks first: the standby is mounted, no RMAN session or long job runs, the
+       broker is off on the standby, RMAN logs in to both databases, the listener has a static
+       entry for $SID, an encrypted standby has an auto-login wallet, and RMAN can find the
+       standby's datafiles again (same names, db_file_name_convert, or Oracle-managed files).
+       Afterwards the script drops the standby redo log entries that came with the primary's
+       control file and adds the standby's own (9.3), catalogs the recovery area, cross-checks
+       the archived logs, and sets the deletion policy again (9.8). The temp files then have
+       the primary's names: check them before you open or switch over to this standby.
+IF     12.1 / 12.2: not automated; see Oracle note 1987763.1. Flashback database on the
+       standby: its logs are not usable after it; turn it off and on again.
+       Test it once on a test standby before you need it on production.
+EOF
+  ;;
+  health) cat <<EOF
+TITLE  Unattended health check (--health)
+WHERE  This server ($S), as root, from cron or a monitoring agent
+WHY    The checks of phase 10 without questions and without changes. One line per check,
+       the details in $LOG_DIR/health_<time>.log (kept 14 days).
+RUN    $SELF --health
+       For example in root's crontab (no mail when all is well):
+         17 6 * * *  $SELF --health >/dev/null || <your alert command>
+       From a monitoring agent (NRPE and the like): allow 300 seconds (a problem is looked at
+       twice, 60 seconds apart), for example  check_nrpe ... -t 300
+EXPECT Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check), as monitoring systems
+       expect. CRITICAL counts first, then UNKNOWN, then WARNING.
+       A problem in 10.1 to 10.4 (lag, gap, last log, apply) is checked once more after
+       60 seconds before it is reported. HEALTH_LAG_MAX in the settings: the accepted lag in
+       seconds (300 if empty, at least 30). The standby instance is checked first: down is
+       CRITICAL at once. After a switchover (this server is the primary) the result is UNKNOWN.
+IF     The checks that need the primary need ssh without a password: a key of root for
+       ${PRIMARY_SSH_USER:-oracle}@$P. Best with a restricted key on the primary, in
+       ~/.ssh/authorized_keys there:  from="<this server's address>",no-pty,no-port-forwarding ssh-ed25519 ...
+       Without a key the local checks still run, and the others show UNKNOWN.
+       While another run of the script or a long job (copy, roll forward) runs: UNKNOWN.
 EOF
   ;;
   *) return 1 ;;
@@ -1048,7 +1131,7 @@ show_help() {
     printf '    No help for step "%s". All steps:  %s --help-step all\n' "$id" "$SELF"; return 1
   fi
   title=$(grep -m1 '^TITLE ' <<< "$txt"); title=${title:7}
-  local t="Help $S_DOT Step $id  $title" lbl
+  local t="Help $S_DOT $([[ "$id" == *.* ]] && printf 'Step ')$id  $title" lbl
   if [[ ${#t} -le 62 ]]; then printf '\n    %s%s %s %s%s\n' "$C_C" "$(rule 2)" "$t" "$(rule $((64 - ${#t})))" "$C_N"
   else printf '\n    %s%s %s%s\n    %s%s%s\n' "$C_C" "$(rule 2)" "$t" "$C_N" "$C_C" "$(rule 70)" "$C_N"; fi   # a long title: the rule goes under it
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1077,6 +1160,6 @@ help_cli() {
   else
     printf '(no saved settings yet; showing placeholders)\n'
   fi
-  if [[ "$id" == "all" ]]; then for i in "${HELP_IDS[@]}"; do show_help "$i"; done
+  if [[ "$id" == "all" ]]; then for i in "${HELP_IDS[@]}" health; do show_help "$i"; done
   else show_help "$id" || exit 2; fi
 }

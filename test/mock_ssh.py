@@ -266,6 +266,14 @@ def ssh():
             if o.get("_E"): open(o["_E"], "a").write(msg + "\n")
             else: print(msg, file=sys.stderr)
             return 255
+        # BatchMode=yes (--health): never a password prompt; only a key of root works ("root_key" in the state)
+        if o.get("BatchMode") == "yes":
+            if pri.get("root_key"):
+                open(ctl, "w").close(); log(CMDLOG, f"[master opened by {dest} with a key]"); return 0
+            msg = f"{dest}: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)."
+            if o.get("_E"): open(o["_E"], "a").write(msg + "\n")
+            else: print(msg, file=sys.stderr)
+            return 255
         for _ in range(3):
             sys.stderr.write(f"{dest}'s password: "); sys.stderr.flush()
             pw = sys.stdin.readline().rstrip("\n")

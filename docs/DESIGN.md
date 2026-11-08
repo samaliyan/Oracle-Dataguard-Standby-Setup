@@ -1,4 +1,4 @@
-# dg_standby_setup.sh 5.19 - design
+# dg_standby_setup.sh 5.20 - design
 
 Runs as root on the future STANDBY. Builds a physical standby of one primary database.
 Never changes the primary: primary work is printed, then re-checked read-only.
@@ -123,6 +123,26 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   belong to root, oracle or grid, are not writable by others, and are group-writable only for the install group.
   Files root puts into folders of oracle (password file, wallet) are written by oracle itself (install_as); the undo
   of a file in a folder of oracle or grid is done as that user.
+- --health (5.20): the checks of phase 10 for cron or a monitoring agent (src/85_health.sh). MODE=check, no
+  terminal, no prompt (every prompt function ends the run as UNKNOWN), its own lock attempt (busy: UNKNOWN), its
+  own log (health_<run>.log, 640, kept 14 days), its own ssh master opened with BatchMode=yes (a key only; the
+  interactive master is never touched) and its own memory of Data Guard errors. The instance is checked first
+  (down: CRITICAL, nothing else). Checks are called directly, not through run_step (no progress record). A
+  problem in 10.1-10.4 is checked once more after 60 seconds. Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN
+  (worst first: CRITICAL, UNKNOWN, WARNING); a start failure, a wrong option or fatal() give 3.
+- 10.1 also reads datum_time (no data from the primary for longer than the limit is a problem even with lag 0)
+  and, when the lag is high, the primary's destination for this standby (gv$archive_dest, read-only).
+- 10.5: v$nonlogged_block on the standby (12.2+) is the proof; force logging of the primary is advice
+  (WARNING); STANDBY NOLOGGING modes are accepted. 12.1: force logging only.
+- 10.6: patch folders of the database home here and on the primary (read-only); a difference is a WARNING.
+- dg_error_hint: known ORA- codes in 10.1 / 10.4 messages get one line with the usual cause and the step.
+- --roll-forward (10.7, 18c+): RECOVER STANDBY DATABASE FROM SERVICE, as a long job. Refused unless the standby
+  is mounted, no RMAN session or long job runs, the broker is off on the standby, RMAN logs in to both, the
+  listener has a static entry, an encrypted standby has an auto-login wallet, and RMAN can find the standby's
+  datafiles again (same names, db_file_name_convert, or all OMF under db_create_file_dest). Journal: ROLLFWD
+  (nothing to undo). 12.x: the manual way is shown.
+- Copy (8.2): SECTION SIZE (automatic 32G when a datafile is 64 GB or more and AUX_CHANNELS > 1; setting
+  DUP_SECTION_SIZE) with one explicit channel on the primary, so the auxiliary channels outnumber it.
 - Boot script (5.14): it never starts apply on an OPEN standby (Active Data Guard). Its errors carry the "<3>"
   prefix (journal priority err, for monitoring). The unit stays active after an error on purpose: a failed unit
   does not run ExecStop, and the stop is the clean shutdown of the standby.
