@@ -240,7 +240,7 @@ dg_standby_setup.sh   the ready-to-use script (built from src/)
 src/                  source, split by phase; build.sh joins them in a fixed order
 build.sh              rebuilds dg_standby_setup.sh from src/
 CHANGELOG.md          what changed in each version
-.github/workflows/    attaches dg_standby_setup-<version>.sh to each published release
+.github/workflows/    makes the release of each new version by itself (script, checksum, notes)
 test/                 scenario tests against mock Oracle, ssh, installers and OS tools
 docs/DESIGN.md        design notes
 ```
