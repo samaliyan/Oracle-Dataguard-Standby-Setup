@@ -1,0 +1,53 @@
+# Automatic release: whenever the files of the script reach the main branch (git push, or "Upload files" on
+# the GitHub web page) with a version that has no release yet, this makes the release v<version> by itself,
+# with the script attached as dg_standby_setup-<version>.sh, its SHA-256 checksum, and the notes of that version
+# from CHANGELOG.md. A version that already has a release is left alone (nothing is replaced).
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'build.sh'
+      - 'dg_standby_setup.sh'
+      - 'CHANGELOG.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build from src/ and read the version
+        run: |
+          bash ./build.sh
+          bash -n dg_standby_setup.sh
+          v=$(sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/\1/p' dg_standby_setup.sh)
+          if [ -z "$v" ]; then echo "SCRIPT_VERSION not found in dg_standby_setup.sh" >&2; exit 1; fi
+          echo "VER=$v" >> "$GITHUB_ENV"
+
+      - name: Make the release if this version has none yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VER" >/dev/null 2>&1; then
+            echo "Release v$VER exists already: nothing to do."
+            exit 0
+          fi
+          f="dg_standby_setup-$VER.sh"
+          cp dg_standby_setup.sh "$f"
+          chmod 750 "$f"
+          sha256sum "$f" > "$f.sha256"
+          # the notes: the section "## <version>" of CHANGELOG.md, up to the next "## "
+          awk -v v="## $VER" '$0 == v {on = 1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md 2>/dev/null || true
+          [ -s notes.md ] || echo "dg_standby_setup.sh version $VER" > notes.md
+          gh release create "v$VER" "$f" "$f.sha256" --title "$VER" --notes-file notes.md --target "$GITHUB_SHA"
