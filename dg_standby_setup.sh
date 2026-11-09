@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.23"
+readonly SCRIPT_VERSION="5.24"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -3686,9 +3686,9 @@ copy_minutes() {
   local rate=100
   if num "${NET_MBS:-}"; then
     rate=$NET_MBS; [[ "${1:-hi}" == hi ]] && rate=$(( NET_MBS * 2 / 3 ))
-    local cap=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt $cap ]] && rate=$cap
+    local cap=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt $cap ]] && rate=$cap
     [[ $rate -lt 1 ]] && rate=1
-  elif [[ "${1:-hi}" == lo ]]; then rate=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
+  elif [[ "${1:-hi}" == lo ]]; then rate=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
   printf '%s' $(( ${PRIMARY_DB_MB:-0} / rate / 60 + 1 ))
 }
 copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured%s' "$([[ "${MODE:-}" == check ]] && printf ' in check mode')"; }
@@ -3745,13 +3745,20 @@ chan_suggest() {
   [[ $p -gt $a ]] && p=$a
   printf '%s %s' "$p" "$a"
 }
-prim_channels() { local p=${PRIMARY_CHANNELS:-}; [[ -n "$p" ]] || p=${AUX_CHANNELS:-4}; [[ $p -gt ${AUX_CHANNELS:-4} ]] && p=${AUX_CHANNELS:-4}; printf '%s' "$p"; }
+# a channel count as a plain number: a value that is not 1..64 (08, abc, empty) gives $2 instead. The summary
+# and the copy plan use the counts before the settings are checked; raw "08" would be a bash error there.
+chan_n() { if [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 64 )); then printf '%s' $((10#$1)); else printf '%s' "$2"; fi; }
+prim_channels() {
+  local a p; a=$(chan_n "${AUX_CHANNELS:-}" 4); p=$(chan_n "${PRIMARY_CHANNELS:-}" "$a")
+  [[ $p -gt $a ]] && p=$a
+  printf '%s' "$p"
+}
 
 # ---- the RMAN parts that place the files (one source for the copy, and later for a restore) ----
 rman_channel_lines() {
   local i out=""
   for ((i = 1; i <= $(prim_channels); i++)); do out+="  allocate channel p$i device type disk;"$'\n'; done
-  for ((i = 1; i <= AUX_CHANNELS; i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
+  for ((i = 1; i <= $(chan_n "${AUX_CHANNELS:-}" 4); i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
   printf '%s' "$out"
 }
 place_newname_lines() {
@@ -11622,7 +11629,7 @@ dup_prechecks() {
   DUP_SECTION=""
   if [[ "${DUP_SECTION_SIZE:-}" == "0" ]]; then :
   elif [[ -n "${DUP_SECTION_SIZE:-}" ]]; then DUP_SECTION=$DUP_SECTION_SIZE
-  elif [[ ${AUX_CHANNELS:-1} -gt 1 ]]; then
+  elif [[ $(chan_n "${AUX_CHANNELS:-}" 1) -gt 1 ]]; then
     prim_sql "select round(max(bytes)/1048576) from v\$datafile;" || { PRE_FIX="Cannot read the size of the datafiles of the primary"; return 1; }
     local maxdf; maxdf=$(first_line)
     num "$maxdf" || { PRE_FIX="Unexpected answer for the largest datafile of the primary: $maxdf"; return 1; }

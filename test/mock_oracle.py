@@ -625,6 +625,10 @@ def rman():
         print("RMAN-03002: failure of Duplicate Db command\nRMAN-05501: auxiliary not started"); return 1
     print("Starting Duplicate Db at 24-OCT-26\nchannel a1: restored backup piece 1\nFinished Duplicate Db at 24-OCT-26")
     inst["state"] = "mounted"; inst["srl"] = st.get("srl_after_dup", 0); inst["datafiles"] = load(PRI).get("datafiles", 10)
+    # the standby's recovery area is what the duplicate set (a folder on file-system storage, +FRA with ASM);
+    # a value a test set itself is kept
+    m = re.search(r"set db_recovery_file_dest='([^']+)'", data)
+    if m and "fra_param" not in inst: inst["fra_param"] = m.group(1)
     if st.pop("fra_full_errs", None): inst["df_errors"] = 0
     st["instances"][cfg["sid"]] = inst
     spf = os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora")

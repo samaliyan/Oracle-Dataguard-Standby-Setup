@@ -83,6 +83,21 @@ combo() { # $1 tag, then env assignments for setup; runs empty server to the end
   ( export "$@"; run $T/r_$tag.txt ) >/dev/null
 }
 
+ut_lsnr_host_esc() { # step 3.9's listener.ora HOST fix, taken from the script: prints "<escaped old host>|<3 results>"
+  # (no Oracle needed; runs on bash 4.2 too: section A)
+  local d esc line cmd L39_BADHOST=old.example.com STANDBY_HOST=stby01 L39_LORA besc
+  d=$(mktemp -d); L39_LORA=$d/listener.ora
+  esc=$(grep -o "sed 's#\[\]\[[^']*'" $T/dg_standby_setup.sh | head -n 1)
+  line=$(grep -o "cp_add grid \"sed -i -E 's/(HOST.*" $T/dg_standby_setup.sh | head -n 1); line=${line#cp_add grid }; line=${line% ;;}
+  besc=$(printf '%s' "$L39_BADHOST" | eval "$esc")
+  printf '%s\n' 'L1 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = old.example.com)(PORT = 1521)))' \
+    'L2 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = oldxexample.com)(PORT = 1522)))' \
+    'L3 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = old.example.com.x)(PORT = 1523)))' > $L39_LORA
+  eval "cmd=$line"
+  [[ -n "$esc" && -n "$line" ]] && bash -c "$cmd" >/dev/null 2>&1
+  printf '%s|%s|%s|%s\n' "$besc" "$(grep -c '(HOST = stby01)(PORT = 1521)' $L39_LORA)" "$(grep -c '(HOST = oldxexample.com)' $L39_LORA)" "$(grep -c '(HOST = old.example.com.x)' $L39_LORA)"
+  rm -rf "$d"
+}
 #==============================================================================
 # Parts: the suite can be run in parts, e.g. one part per CI job (.github/workflows/ci.yml).
 #   run_scenarios.sh                    every section, in order
@@ -95,7 +110,7 @@ combo() { # $1 tag, then env assignments for setup; runs empty server to the end
 PARTS=(
   [1]="A B C D E F G H I J K"
   [2]="L M N O Q Z4 Z11"
-  [3]="P Z5 Z17 Z19"
+  [3]="P Z5 Z17 Z19 5.24"
   [4]="R Z16 Z21"
   [5]="S Z1 Z15"
   [6]="T U V Z3 5.22"
@@ -179,6 +194,8 @@ out=$(bash -c "fatal(){ echo FATAL:\$*; exit 1; }; run_logged(){ echo RUN; }; so
 check "prim_probe refuses an unknown probe name" "[[ '$out' == FATAL:* ]]"
 out=$(bash -c "fatal(){ echo FATAL:\$*; exit 1; }; run_logged(){ echo RUN; }; source $G; prim_probe hosts 'a\$(id)'" 2>&1); rm -f "$G"
 check "prim_probe refuses \$( ) in an argument" "[[ '$out' == FATAL:* ]]"
+ut_lsnr_host_esc > $T/ut_a_lhost.txt
+check "unit: 3.9 listener.ora HOST fix: old.example.com escaped to old\\.example\\.com; only that HOST is replaced" "[[ \$(cat $T/ut_a_lhost.txt) == 'old\\.example\\.com|1|1|1' ]]"
 
 fi
 #==============================================================================
@@ -2212,6 +2229,120 @@ check "3.9: listener and a disk group OFFLINE -> srvctl start listener / diskgro
 fresh; jset $S "d['asm_down']=1"
 rc=$(DG_TEST_QUIT_AT=3.5 run $T/r4.txt --only 3.4)
 check "3.4: ASM not ONLINE -> srvctl start asm (Will run shows it), never crsctl start res" "grep -A4 'Will run' $T/r4.txt | grep -q 'srvctl start asm' && ! grep -q \"'start', 'res'\" $T/state/calls.log"
+fi
+if part 5.24; then
+CUR=5.24; echo "== 5.24  Review fixes: force logging modes, 8.1 pre-checks, probes, clean-up script, 10.8, TDE, escaping"
+fresh
+# ---- 4.1: the STANDBY NOLOGGING modes keep the standby complete (as in 8.1 and 10.5); NO still needs force logging ----
+jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='STANDBY NOLOGGING FOR DATA AVAILABILITY'"
+rc=$(DG_TEST_QUIT_AT=4.1 run $T/r24a.txt --only 4.1)
+check "4.1: force_logging 'STANDBY NOLOGGING FOR DATA AVAILABILITY' -> OK, no 'alter database force logging' planned" "[[ \$(res 4.1 $T/r24a.txt) == OK ]] && grep -q 'force_logging is STANDBY NOLOGGING FOR DATA AVAILABILITY' $T/r24a.txt && ! grep -qi 'alter database force logging' $T/r24a.txt"
+jset $P "d['force_logging']='NO'"
+rc=$(DG_TEST_QUIT_AT=4.1 run $T/r24b.txt --only 4.1)
+check "4.1: force_logging NO -> 'alter database force logging;' planned, not OK" "grep -q '^ *alter database force logging;' $T/r24b.txt && [[ \$(res 4.1 $T/r24b.txt) != OK ]]"
+
+# ---- 8.1 pre-checks: the spfile of the primary, force logging, the release of the software here ----
+# (each run starts at 8.1 with the instance in NOMOUNT; these checks come before the logins of 7.4)
+pre81() { jset $S "d['instances']['PRODDB_STBY']={'state':'started'}"; jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='YES'"; }
+pre81; jset $P "d['spfile']=''"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24c.txt --from 8.1)
+check "8.1: the primary answers nothing for its spfile -> stops, 'could not be read' (never taken as an spfile)" "grep -q 'The spfile setting of the primary could not be read' $T/r24c.txt && [[ \$(res 8.1 $T/r24c.txt) != OK && \$(res 8.2 $T/r24c.txt) != DONE ]]"
+pre81; jset $P "d['spfile']='ORA-03113: end-of-file on communication channel'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24d.txt --from 8.1)
+check "8.1: the spfile query on the primary fails (ORA-03113) -> stops, 'could not be read'" "grep -q 'The spfile setting of the primary could not be read' $T/r24d.txt && grep -q 'ORA-03113' $T/r24d.txt && [[ \$(res 8.1 $T/r24d.txt) != OK ]]"
+pre81; jset $P "del d['spfile']; d['force_logging']='NO'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24e.txt --from 8.1)
+check "8.1: force logging switched off after 4.1 passed -> stops and shows 'alter database force logging;'" "grep -q 'FORCE LOGGING is off on the primary (force_logging = NO, step 4.1)' $T/r24e.txt && grep -q 'On the primary:  alter database force logging;' $T/r24e.txt && [[ \$(res 8.1 $T/r24e.txt) != OK ]]"
+pre81; jset $T/state/env.json "d['local_version']='21.3.0.0.0'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24f.txt --from 8.1)
+jset $T/state/env.json "d['local_version']='19.21.0.0.0'"
+check "8.1: the database software here is another release than the primary -> stops, step 3.11 named" "grep -q 'The database software here is another release: release 21.0 here, release 19 on the primary' $T/r24f.txt && grep -q 'same release as the primary (step 3.11)' $T/r24f.txt && [[ \$(res 8.1 $T/r24f.txt) != OK ]]"
+
+# ---- 4.4: a log_archive_dest_1 that already ships to the standby alias is used, no second destination ----
+fresh; jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='YES'; d['params']['log_archive_dest_1']='service=proddb_stby async valid_for=(online_logfiles,primary_role)'"
+rc=$(DG_TEST_QUIT_AT=4.4 run $T/r24g.txt --only 4.4)
+check "4.4: log_archive_dest_1 already names the standby alias -> that one is used, no log_archive_dest_2 planned" "grep -q 'log_archive_dest_1 already names the alias proddb_stby, so it is used' $T/r24g.txt && grep -q \"log_archive_dest_1='service=proddb_stby async\" $T/r24g.txt && ! grep -qE 'log_archive_dest(_state)?_2=' $T/r24g.txt"
+
+# ---- a channel number with a leading zero is an invalid value, never a bash error ----
+# (the settings saved by the runs above; the summary rejects the value on Enter, then q: the driver would press Enter for ever)
+sed -i 's/^PRIMARY_CHANNELS=.*/PRIMARY_CHANNELS=08/' $T/varlib/settings.conf
+rc=$(DG_TEST_SUMMARY=' ,q' run $T/r24i.txt --only 4.1)
+check "settings PRIMARY_CHANNELS=08 -> the invalid-value message, no 'value too great for base'" "grep -q 'PRIMARY_CHANNELS must be a number from 1 to 64' $T/r24i.txt && ! grep -q 'value too great for base' $T/r24i.txt && ! grep -qs 'value too great for base' $T/log/run_*.log"
+
+# ---- --check sends no 64 MB network measure to the primary ----
+fresh empty
+rc=$(run $T/r24h.txt --check)
+check "--check on an empty server: no 'dd if=/dev/zero' sent to the primary, 'not measured in check mode' said" "[[ -s $T/state/primary_cmds.log ]] && ! grep -q 'dd if=/dev/zero' $T/state/primary_cmds.log && grep -q 'not measured in check mode' $T/r24h.txt"
+
+# ---- login noise on the primary that looks like a probe marker ----
+fresh empty; jset $P "d['login_noise']='__DG_PROBE_deadbeef__'"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/r24j.txt)
+check "login noise like a marker (__DG_PROBE_deadbeef__) does not break reading the primary: 1.3 done, primary host read" "[[ \$(res 1.3 $T/r24j.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'Primary host: prim01[[:space:]]*\$' $T/r24j.txt && ! grep -q '__DG_PROBE_deadbeef__' $T/varlib/settings.conf"
+
+# ---- srv_notfound: the name is a literal (+ and . are no regex characters) ----
+ut_524_srv() { bash <<EOF
+source <(sed -n '/^srv_notfound()/,/^}/p' $T/dg_standby_setup.sh)
+RUN_OUT="PRCN-2044 : No listener exists ... 
+PRCR-1001 : Resource ora.lsnr+x.lsnr does not exist"; srv_notfound 'lsnr+x' && echo p1
+RUN_OUT="PRCN-2065 : Listener lsnr+x does not exist"; srv_notfound 'lsnr+x' && echo p2
+RUN_OUT="PRCN-2065 : Listener lsnrrx does not exist"; srv_notfound 'lsnr+x' && echo p3
+RUN_OUT="PRCD-1120 : The resource for database axb could not be found."; srv_notfound 'a.b' && echo p4
+RUN_OUT="PRCD-1120 : The resource for database a.b could not be found."; srv_notfound 'a.b' && echo p5
+EOF
+}
+ut_524_srv > $T/ut524s.txt
+check "unit: srv_notfound with '+' in the name: found for lsnr+x (ora.lsnr+x.lsnr, listener lsnr+x), not for lsnrrx" "grep -qx p1 $T/ut524s.txt && grep -qx p2 $T/ut524s.txt && ! grep -qx p3 $T/ut524s.txt"
+check "unit: srv_notfound 'a.b' does not match 'axb' (and does match a.b)" "! grep -qx p4 $T/ut524s.txt && grep -qx p5 $T/ut524s.txt"
+
+# ---- 3.9: the old HOST of listener.ora as a literal in the sed fix ----
+ut_lsnr_host_esc > $T/ut524h.txt
+check "unit: 3.9 listener.ora HOST fix: old.example.com escaped to old\\.example\\.com; only that HOST is replaced" "[[ \$(cat $T/ut524h.txt) == 'old\\.example\\.com|1|1|1' ]]"
+
+# ---- 6.3: a LOCAL auto-login wallet made on another host is on this server already ----
+fresh; jset $P "d['tde']=['FILE|$T/pwallet/|OPEN|LOCAL_AUTOLOGIN']; d['files']={'$T/pwallet/ewallet.p12':'EWALLET\\n','$T/pwallet/cwallet.sso':'LOCALSSO\\n'}"
+mkdir -p $T/pwallet; printf 'EWALLET\n' > $T/pwallet/ewallet.p12; touch -d '-1 hour' $T/pwallet/ewallet.p12; printf 'LOCALSSO foreign\n' > $T/pwallet/cwallet.sso
+chown -R oracle:oinstall $T/pwallet; chmod 700 $T/pwallet; chmod 600 $T/pwallet/*
+rc=$(DG_TEST_QUIT_AT=7.1 run $T/r24k.txt --from 6.1)
+check "6.3: a foreign LOCAL cwallet.sso here -> 'not usable here' (orapki cannot open it), moved aside as cwallet.sso.old_*, made again with -auto_login_local" "grep -q 'Not usable here' $T/r24k.txt && grep -q 'orapki cannot open it without a password' $T/r24k.txt && grep -q 'LOCALSSO foreign' $T/pwallet/cwallet.sso.old_* && grep -q 'MOCK-ORAPKI -auto_login_local' $T/pwallet/cwallet.sso && [[ \$(res 6.3 $T/r24k.txt) == DONE ]]"
+
+# ---- the nightly clean-up script (needs the oracle user: after the installed server above) refuses a deletion policy that is not TO APPLIED ON STANDBY ----
+ut_524_arch() { # $1 = the policy line the fake rman prints; prints the exit code of the script, then its output
+  local d=$T/ut524arch; rm -rf $d; mkdir -p $d/bin; chmod 755 $d $d/bin
+  printf '%s\n' "$1" > $d/pol; : > $d/del.log; chown oracle $d/del.log
+  cat > $d/bin/rman <<EOF
+#!/bin/bash
+in=\$(cat)
+if grep -q 'show archivelog deletion policy' <<< "\$in"; then
+  echo 'RMAN configuration parameters for database with db_unique_name PRODDB_STBY are:'; cat $d/pol
+else echo "DELETE RAN as \$(id -un): \$in" >> $d/del.log; echo 'deleted archived log'; fi
+EOF
+  chmod 755 $d/bin/rman
+  bash -c "source <(sed -n '/^arch_days()/p; /^arch_script_text()/,/^}/p' $T/dg_standby_setup.sh); STANDBY_UNIQUE=PRODDB_STBY STANDBY_SID=PRODDB_STBY ORACLE_USER=oracle DB_HOME=$d ARCH_CLEANUP_DAYS=1; arch_script_text" > $d/s.sh
+  chmod 755 $d/s.sh
+  local out rc=0; out=$($d/s.sh 2>&1) || rc=$?
+  printf '%s\n%s\n' "$rc" "$out"
+}
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DEVICE TYPE DISK;')
+printf '%s\n' "$o" > $T/ut524a.txt
+check "clean-up script: policy '... APPLIED ON ALL STANDBY BACKED UP 1 TIMES ...' -> refuses (exit not 0), prints the policy, deletes nothing" "[[ \$(head -n 1 $T/ut524a.txt) != 0 ]] && grep -q 'the deletion policy is not TO APPLIED ON STANDBY: nothing deleted' $T/ut524a.txt && grep -q 'BACKED UP 1 TIMES TO DEVICE TYPE DISK' $T/ut524a.txt && [[ ! -s $T/ut524arch/del.log ]]"
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;')
+printf '%s\n' "$o" > $T/ut524b.txt
+check "clean-up script: policy '... TO APPLIED ON ALL STANDBY;' -> the delete runs (as oracle), exit 0" "[[ \$(head -n 1 $T/ut524b.txt) == 0 ]] && grep -q 'DELETE RAN as oracle:' $T/ut524arch/del.log && grep -q \"delete noprompt archivelog all completed before 'sysdate-1'\" $T/ut524arch/del.log && grep -q '=== end (exit code 0) ===' $T/ut524b.txt"
+rm -rf $T/ut524arch
+
+# ---- 10.8 on a built standby: no clean-up chosen; the free space of the recovery area's disk group unreadable ----
+fresh empty; rc=$(run $T/r24l0.txt)
+check "a standby built from an empty server (base for the 10.8 tests)" "grep -q 'Standby setup is complete' $T/r24l0.txt"
+sed -i 's/^ARCH_CLEANUP=.*/ARCH_CLEANUP=/' $T/varlib/settings.conf
+rc=$(run $T/r24l.txt --only 10.8)
+check "10.8: ARCH_CLEANUP empty -> not OK (waiting: nothing deletes applied logs)" "grep -q 'Clean-up: not chosen yet (ARCH_CLEANUP is empty)' $T/r24l.txt && [[ \$(res 10.8 $T/r24l.txt) == WAITS ]]"
+rc=$(run $T/r24m.txt --health)
+check "--health: ARCH_CLEANUP empty -> 10.8 WARNING" "grep -qE 'WARNING +10\\.8' $T/r24m.txt"
+sed -i 's/^ARCH_CLEANUP=.*/ARCH_CLEANUP=timer/' $T/varlib/settings.conf
+jset $S "d['dg_free_total']='ORA-15001: diskgroup \"FRA\" does not exist or is not mounted'"
+rc=$(run $T/r24n.txt --only 10.8)
+check "10.8: recovery area in ASM, the disk group's free space query fails -> cannot check, not OK" "grep -q 'Cannot read the free space of disk group +FRA (recovery area +FRA)' $T/r24n.txt && [[ \$(res 10.8 $T/r24n.txt) != OK && \$(res 10.8 $T/r24n.txt) != WAITS ]]"
+jset $S "del d['dg_free_total']"
 fi
 parts_done
 echo

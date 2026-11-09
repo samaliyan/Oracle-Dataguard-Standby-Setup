@@ -1182,7 +1182,7 @@ dup_prechecks() {
   DUP_SECTION=""
   if [[ "${DUP_SECTION_SIZE:-}" == "0" ]]; then :
   elif [[ -n "${DUP_SECTION_SIZE:-}" ]]; then DUP_SECTION=$DUP_SECTION_SIZE
-  elif [[ ${AUX_CHANNELS:-1} -gt 1 ]]; then
+  elif [[ $(chan_n "${AUX_CHANNELS:-}" 1) -gt 1 ]]; then
     prim_sql "select round(max(bytes)/1048576) from v\$datafile;" || { PRE_FIX="Cannot read the size of the datafiles of the primary"; return 1; }
     local maxdf; maxdf=$(first_line)
     num "$maxdf" || { PRE_FIX="Unexpected answer for the largest datafile of the primary: $maxdf"; return 1; }
