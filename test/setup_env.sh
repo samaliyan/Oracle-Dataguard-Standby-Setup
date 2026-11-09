@@ -34,8 +34,17 @@ rm -rf "$T" /etc/oraInst.loc /etc/oracle /etc/security/limits.d/oracle-grid.conf
        /usr/local/sbin/dg_arch_cleanup_*.sh* /etc/systemd/system/dg-arch-cleanup-* /root/dg
 [[ -f /etc/oratab.dgt_orig ]] || { [[ -f /etc/oratab ]] && cp -p /etc/oratab /etc/oratab.dgt_orig || : > /etc/oratab.dgt_orig; }
 cp -p /etc/oratab.dgt_orig /etc/oratab 2>/dev/null || true
-for u in oracle grid; do id $u >/dev/null 2>&1 && userdel -r $u >/dev/null 2>&1 || true; done
+# userdel refuses a user that still has processes (a background job or a fake pmon of the scenario before):
+# then the user and its primary group stayed, and "groupadd oinstall" below failed
+for u in oracle grid; do
+  id $u >/dev/null 2>&1 || continue
+  pkill -KILL -u $u 2>/dev/null || true
+  for _ in $(seq 50); do pgrep -u $u >/dev/null || break; sleep 0.1; done
+  userdel -r $u >/dev/null 2>&1 || true
+  if id $u >/dev/null 2>&1; then echo "setup_env: cannot remove user $u; its processes:" >&2; ps -o pid,args -u $u >&2 || true; exit 1; fi
+done
 for g in $GROUPS_LIST; do getent group "${g%%:*}" >/dev/null && groupdel "${g%%:*}" >/dev/null 2>&1 || true; done
+for g in $GROUPS_LIST; do if getent group "${g%%:*}" >/dev/null; then echo "setup_env: cannot remove group ${g%%:*}" >&2; exit 1; fi; done
 
 mkdir -p "$T/state" "$T/log" "$T/rootbin" "$T/remotebin" "$T/stage" "$T/devs"
 chmod 777 "$T/state"
