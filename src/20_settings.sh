@@ -20,17 +20,18 @@ ORACLE_GROUPS:list GRID_GROUPS:list GROUP_GIDS:list
 LOCS:locs DATA_DG:opt_name FRA_LOC:opt_loc FRA_MB:num ARCH_LOC:opt_loc PRIMARY_DB_MB:num
 STANDBY_HOST:name STANDBY_IP:ip STANDBY_UNIQUE:dbname STANDBY_SID:name STANDBY_SERVICE:name
 PRIMARY_TNS:name STANDBY_TNS:name ASM_METHOD:asmmethod GRID_MEDIA:opt_paths DB_MEDIA:opt_paths RU_DIR:opt_path OPATCH_ZIP:opt_path AUX_CHANNELS:num REDO_BLOCKSIZE:redobs
-HEALTH_LAG_MAX:num DUP_SECTION_SIZE:secsize
+HEALTH_LAG_MAX:num DUP_SECTION_SIZE:secsize DATA_DEST:dest FRA_DEST:dest FRA_SIZE:gsize PRIMARY_CHANNELS:optnum PRIMARY_RUN:yesno
+ARCH_CLEANUP:archmode ARCH_CLEANUP_TIME:hhmm ARCH_CLEANUP_DAYS:days
 "
 # may be empty
-readonly OPTIONAL_KEYS=" HEALTH_LAG_MAX DUP_SECTION_SIZE PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
+readonly OPTIONAL_KEYS=" HEALTH_LAG_MAX DUP_SECTION_SIZE DATA_DEST FRA_DEST FRA_SIZE PRIMARY_CHANNELS ARCH_CLEANUP ARCH_CLEANUP_TIME ARCH_CLEANUP_DAYS PRIMARY_DOMAIN GRID_REL ORACLE_GROUPS GRID_GROUPS GRID_HOME GRID_BASE DATA_DG FRA_LOC ARCH_LOC ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP REDO_BLOCKSIZE "
 # values the user may change (everything else is read from the primary at every run)
 readonly DERIVED_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS AUX_CHANNELS "
-readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE HEALTH_LAG_MAX DUP_SECTION_SIZE "
+readonly STANDBY_KEYS=" STANDBY_HOST STANDBY_IP STANDBY_UNIQUE STANDBY_SID STANDBY_SERVICE PRIMARY_TNS STANDBY_TNS ASM_METHOD GRID_MEDIA DB_MEDIA RU_DIR OPATCH_ZIP AUX_CHANNELS REDO_BLOCKSIZE HEALTH_LAG_MAX DUP_SECTION_SIZE DATA_DEST FRA_DEST FRA_SIZE PRIMARY_CHANNELS PRIMARY_RUN ARCH_CLEANUP ARCH_CLEANUP_TIME ARCH_CLEANUP_DAYS "
 # settings files of version 3.x had these keys; they are converted or dropped
 readonly OLD_KEYS=" FRA_DG DATA_DISK FRA_DISK GRID_ZIP DB_ZIP "
 SETTINGS_FILE=""; ACCEPTED_FILE=""
-SETTINGS_UPGRADED=0; LOAD_ERR=""; DROPPED_KEYS=""
+SETTINGS_UPGRADED=0; LOAD_ERR=""; DROPPED_KEYS=""; PLACEMENT_KEPT=0
 
 all_setting_keys() { local s; for s in $SETTING_SPECS; do printf '%s\n' "${s%%:*}"; done; }
 is_standby_key() { [[ "$STANDBY_KEYS" == *" $1 "* ]]; }
@@ -38,7 +39,7 @@ is_standby_key() { [[ "$STANDBY_KEYS" == *" $1 "* ]]; }
 init_settings() {
   local k
   for k in $(all_setting_keys); do printf -v "$k" '%s' ""; done
-  AUX_CHANNELS=4
+  AUX_CHANNELS=4; PRIMARY_RUN=no
 }
 
 valid_value() {
@@ -51,6 +52,12 @@ valid_value() {
     asmmethod) [[ -z "$v" || "$v" == "asmlib" || "$v" == "udev" ]] ;;
     redobs)    [[ -z "$v" || "$v" == "512" || "$v" == "4096" ]] ;;
     secsize)   [[ -z "$v" || "$v" == "0" || "$v" =~ ^[1-9][0-9]{0,4}[MG]$ ]] ;;
+    dest)      [[ -z "$v" || "$v" == "same" || "$v" =~ ^\+[A-Za-z][A-Za-z0-9_]*$ || ( "$v" =~ ^/[A-Za-z0-9_./-]+$ && ! "$v" =~ (^|/)\.\.?(/|$) && "$v" != *//* ) ]] ;;
+    gsize)     [[ -z "$v" || "$v" =~ ^[1-9][0-9]{0,5}G$ ]] ;;
+    optnum)    [[ -z "$v" || "$v" =~ ^[0-9]{1,9}$ ]] ;;
+    archmode)  [[ -z "$v" || "$v" == timer || "$v" == crontab || "$v" == oracle || "$v" == none ]] ;;
+    hhmm)      [[ -z "$v" || "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] ;;
+    days)      [[ -z "$v" || ( "$v" =~ ^[0-9]{1,2}$ && 10#$v -le 30 ) ]] ;;
     ip)        if [[ "$v" =~ ^[0-9.]+$ ]]; then
                  # an IPv4 address: four numbers 0-255 (10.0.0 or 999.1.1.1 are refused)
                  [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
@@ -124,6 +131,13 @@ load_settings() {
     fatal "$SETTINGS_FILE: $LOAD_ERR
 Fix or delete the file, then run the script again."
   fi
+  # a settings file of 5.22 or older has no DATA_DEST: its standby, when one was built, keeps the primary's paths
+  # (that is how those versions copied; the record of a finished copy proves it was built). The new default (everything into the data disk group) is only for a copy
+  # that has not been made yet.
+  if [[ "$seen_keys" != *" DATA_DEST "* && -n "${DB_HOME:-}" && -n "${STANDBY_SID:-}" ]] \
+     && [[ -f "$DB_HOME/dbs/.dg_duplicate_done_$STANDBY_SID" ]]; then
+    DATA_DEST=same; FRA_DEST=same; SETTINGS_UPGRADED=1; PLACEMENT_KEPT=1
+  fi
   return 0
 }
 
@@ -141,13 +155,24 @@ save_settings() {
     printf '# GRID_MEDIA / DB_MEDIA: installer zip files (comma list). RU_DIR: an unzipped Release Update\n'
     printf '# that the installer applies (needed for 19c on Oracle Linux 9; with Grid use the GI Release Update,\n'
     printf '# it covers both homes). OPATCH_ZIP: the newest OPatch (p6880880_*.zip), needed with RU_DIR.\n'
-    printf '# AUX_CHANNELS: 1-16 (RMAN channels of the copy). STANDBY_HOST / STANDBY_IP: this server, as the primary\n'
+    printf '# AUX_CHANNELS: 1-64 (RMAN channels of the copy on this server). STANDBY_HOST / STANDBY_IP: this server, as the primary\n'
     printf '# must reach it. PRIMARY_TNS / STANDBY_TNS: alias names written into tnsnames.ora on both servers.\n'
     printf '# REDO_BLOCKSIZE: 512 or 4096, normally empty. Only when the redo block size of the primary cannot be\n'
     printf '# read: it is then used for the ASM disks (steps 2.13, 3.5). The copy (step 8.1) still needs it read.\n'
     printf '# HEALTH_LAG_MAX: seconds of lag that --health accepts (empty = 300). DUP_SECTION_SIZE: section size of\n'
     printf '# the RMAN copy, for example 32G (empty = automatic: 32G when a datafile is 64 GB or more and there is more\n'
     printf '# than one channel; 0 = none).\n'
+    printf '# DATA_DEST: where the database files go here: +DG (a disk group), same (the paths of the primary) or\n'
+    printf '# /folder; empty = automatic (the data disk group when this server has ASM). FRA_DEST: the same for the\n'
+    printf '# recovery area. FRA_SIZE: its size, for example 60G (empty = estimated from the redo of the primary).\n'
+    printf '# PRIMARY_CHANNELS: RMAN channels on the primary (empty = AUX_CHANNELS; never more than AUX_CHANNELS).\n'
+    printf '# PRIMARY_RUN: yes = the script may run the listed primary commands over ssh after you agree (step by step).\n'
+    printf '# ARCH_CLEANUP: how applied archived logs are deleted on the standby (step 9.8):\n'
+    printf '#   timer   a systemd timer every night (the default; it also runs after a missed time)\n'
+    printf '#   crontab a line in the crontab of the oracle user\n'
+    printf '#   oracle  only the recovery area itself deletes them when it needs space (only with the logs in the recovery area)\n'
+    printf '#   none    nothing (the disk fills up unless you delete them yourself)\n'
+    printf '# ARCH_CLEANUP_TIME: HH:MM (empty = 04:30). ARCH_CLEANUP_DAYS: keep applied logs this many days, 0-30 (empty = 1).\n'
     for k in $STANDBY_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done
     printf '\n# ---- Connection (change with --primary / --user, or here between runs) ----\n'
     printf 'PRIMARY_IP=%s\nPRIMARY_SSH_USER=%s\n' "$PRIMARY_IP" "$PRIMARY_SSH_USER"
@@ -236,7 +261,10 @@ validate_settings() {
   [[ ${#STANDBY_SID} -le 12 ]] || { bad "STANDBY_SID '$STANDBY_SID' is longer than 12 characters."; bad_n=1; }
   [[ "$STANDBY_SID" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { bad "STANDBY_SID must start with a letter and use only letters, digits and _."; bad_n=1; }
   [[ ${#STANDBY_UNIQUE} -le 30 ]] || { bad "STANDBY_UNIQUE is longer than 30 characters."; bad_n=1; }
-  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 16 ]] || { bad "AUX_CHANNELS must be a number from 1 to 16."; bad_n=1; }
+  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 64 ]] || { bad "AUX_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  [[ -z "$PRIMARY_CHANNELS" || ( "$PRIMARY_CHANNELS" -ge 1 && "$PRIMARY_CHANNELS" -le 64 ) ]] || { bad "PRIMARY_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  if [[ "$ARCH_CLEANUP" == oracle && "$(arch_dest_sb 2>/dev/null)" != USE_DB_RECOVERY_FILE_DEST ]]; then bad "ARCH_CLEANUP=oracle works only when the archived logs go to the recovery area. Here they go to $(arch_dest_sb 2>/dev/null). Use timer or crontab."; bad_n=1; fi
+  if [[ "$DATA_DEST" == +* || "$FRA_DEST" == +* ]] && ! use_grid; then bad "DATA_DEST or FRA_DEST names a disk group, but this standby has no ASM (the primary uses none)."; bad_n=1; fi
   [[ -z "$RU_DIR" || -d "$RU_DIR" ]] || { bad "RU_DIR $RU_DIR is not a folder."; bad_n=1; }
   if [[ -n "$RU_DIR" ]]; then
     [[ -n "$OPATCH_ZIP" && -f "$OPATCH_ZIP" ]] || { bad "RU_DIR needs OPATCH_ZIP, the newest OPatch zip (p6880880).
@@ -269,25 +297,25 @@ derive_standby_settings() {
   [[ -n "$PRIMARY_TNS" ]] || PRIMARY_TNS="${PRIMARY_UNIQUE,,}"
   [[ -n "$STANDBY_TNS" ]] || STANDBY_TNS="${STANDBY_UNIQUE,,}"
   [[ -n "$AUX_CHANNELS" ]] || AUX_CHANNELS=4
+  [[ -n "$PRIMARY_RUN" ]] || PRIMARY_RUN=no
 }
 
 # ---- helpers on LOCS ("+DATA:120000,/u02/oradata/X:5000") ----
 loc_list() { tr ',' '\n' <<< "$LOCS" | grep -v '^$'; }                    # loc:MB lines
 all_locs() {
-  # every storage location the standby needs: database files, recovery area, archive destination
-  loc_list | cut -d: -f1
-  [[ -n "$FRA_LOC" ]] && printf '%s\n' "$FRA_LOC"
-  [[ -n "$ARCH_LOC" && "$ARCH_LOC" != "USE_DB_RECOVERY_FILE_DEST" ]] && printf '%s\n' "$ARCH_LOC"
+  # every storage location the STANDBY needs: its database files, recovery area and archive destination
+  # (where they go here: see data_dest / fra_dest)
+  sb_loc_list | cut -d: -f1
+  local f a; f=$(fra_dest); a=$(arch_dest_sb)
+  [[ -n "$f" ]] && printf '%s\n' "$f"
+  [[ -n "$a" && "$a" != "USE_DB_RECOVERY_FILE_DEST" ]] && printf '%s\n' "$a"
   return 0
 }
 asm_dgs() { all_locs | grep '^+' | sed 's#^+##; s#/.*##' | tr '[:lower:]' '[:upper:]' | sort -u; }   # disk group names
 fs_dirs() { all_locs | grep '^/' | sort -u; }                                                          # directories
 fra_need_mb() {
-  # space the recovery area needs HERE: the primary size, but at most what is sensible for a standby
-  # (archived logs of some days). Step 8.1 sets db_recovery_file_dest_size to the space that is free.
-  local want=$FRA_MB min=$(( PRIMARY_DB_MB / 10 )); [[ $min -lt 10240 ]] && min=10240
-  [[ $want -gt $min ]] && want=$min
-  printf '%s' "$want"
+  # space the recovery area needs HERE (step 8.1 sets db_recovery_file_dest_size to it)
+  fra_size_mb
 }
 dg_need_mb() {
   # MB the disk group $1 must hold: database files in it, plus the recovery area when it is there
@@ -295,12 +323,12 @@ dg_need_mb() {
   while IFS= read -r l; do
     loc=${l%%:*}; mb=${l##*:}; loc=${loc#+}; loc=${loc%%/*}
     [[ "${loc^^}" == "$dg" ]] && total=$((total + mb))
-  done < <(loc_list | grep '^+')
-  local f=${FRA_LOC#+}; f=${f%%/*}
-  [[ "$FRA_LOC" == +* && "${f^^}" == "$dg" ]] && total=$((total + $(fra_need_mb)))
+  done < <(sb_loc_list | grep '^+')
+  local fd; fd=$(fra_dest); local f=${fd#+}; f=${f%%/*}
+  [[ "$fd" == +* && "${f^^}" == "$dg" ]] && total=$((total + $(fra_need_mb)))
   printf '%s' "$total"
 }
-loc_mb() { loc_list | awk -F: -v l="$1" '$1==l {s+=$2} END {print s+0}'; }  # MB needed in one location
+loc_mb() { sb_loc_list | awk -F: -v l="$1" '$1==l {s+=$2} END {print s+0}'; }  # MB needed in one location here
 single_owner() { [[ "$ORACLE_USER" == "$GRID_USER" ]]; }
 use_grid() { [[ "$USE_GRID" == "yes" ]]; }
 

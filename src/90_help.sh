@@ -8,7 +8,7 @@ readonly HELP_IDS=(1.1 1.2 1.3 1.4 1.5 1.6
   3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11
   4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11
   5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2
-  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4 10.5 10.6 10.7)
+  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4 10.5 10.6 10.7 10.8)
 
 help_text() {
   local P=${PRIMARY_HOST:-<primary>} S=${STANDBY_HOST:-<standby>} SID=${STANDBY_SID:-<standby SID>}
@@ -415,8 +415,8 @@ RUN    12.2 and newer:
 EXPECT $GH/bin/crsctl stat res -t  shows ora.asm, ora.$SL.lsnr and ora.${DD^^}.dg ONLINE
 IF     HAS is stopped, as root:
        $GH/bin/crsctl start has
-       ASM is offline:
-       $GH/bin/crsctl start res ora.asm
+       ASM is offline, as $GU:
+       $GH/bin/srvctl start asm
 EOF
   ;;
   3.5) cat <<EOF
@@ -462,10 +462,21 @@ EOF
 TITLE  Oracle Restart resources ONLINE
 WHERE  This server ($S), as $GU
 RUN    $GH/bin/crsctl stat res -t
-       $GH/bin/crsctl start res <name>      (for each OFFLINE resource)
+       For each resource that is OFFLINE (ora.* resources are started with srvctl, never crsctl):
+       $GH/bin/srvctl start asm
+       $GH/bin/srvctl start listener -listener $SL
+$(for g in $DGS; do printf '       %s/bin/srvctl start diskgroup -diskgroup %s\n' "$GH" "${g#+}"; done)
        If the listener is missing:
-       $GH/bin/srvctl add listener -listener $SL -endpoints TCP:$PO ; $GH/bin/srvctl start listener -listener $SL
-EXPECT ONLINE: ora.asm, ora.$SL.lsnr, and ora.<DG>.dg for $DGS
+       $GH/bin/srvctl add listener -listener $SL -endpoints TCP:$PO
+       $GH/bin/srvctl start listener -listener $SL
+EXPECT ONLINE: ora.asm, ora.$SL.lsnr, and the disk groups $DGS
+       ora.diskmon and ora.ons are OFFLINE in Oracle Restart. That is normal.
+IF     ora.$SL.lsnr is INTERMEDIATE (Not All Endpoints Registered): do not start it. First check, as root:
+       getent ahostsv4 $S
+       It must show an IPv4 address of this server, not nothing, 127.x or fe80::.
+       If not, add the line to /etc/hosts. Then, as $GU:
+       $GH/bin/srvctl stop listener -listener $SL
+       $GH/bin/srvctl start listener -listener $SL
 EOF
   ;;
   3.10) cat <<EOF
@@ -474,7 +485,8 @@ WHERE  This server ($S), as $GU (only with Grid; without Grid this step is not n
 WHY    The listener here is always $SL (Grid creates it).
        Only its port must match the primary.
 RUN    $GH/bin/srvctl modify listener -listener $SL -endpoints TCP:$PO
-       $GH/bin/srvctl stop listener -listener $SL ; $GH/bin/srvctl start listener -listener $SL
+       $GH/bin/srvctl stop listener -listener $SL
+       $GH/bin/srvctl start listener -listener $SL
 EXPECT lsnrctl status $SL  shows (PORT=$PO)
 EOF
   ;;
@@ -968,24 +980,28 @@ EOF
   ;;
   9.8) cat <<EOF
 TITLE  Clean-up of archived logs on the standby
-WHERE  This server ($S), as $OU (the timer as root)
+WHERE  This server ($S), as $OU (the timer and the files as root)
 WHY    Without a deletion policy the archived logs fill the recovery area or the archive
        destination, and redo transport stops (ORA-19809 / ORA-00257).
        A policy copied from the primary with "BACKED UP n TIMES"
        never deletes anything here.
 RUN    rman target /
        CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;
-       With a recovery area, Oracle then deletes applied logs by itself when it needs space.
-       With another archive destination (a folder or a disk group),
-       add a daily job as $OU,
-       for example a systemd timer that runs:
-       rman target /  ->  delete noprompt archivelog all completed before 'sysdate-1';
+       Then the nightly clean-up that ARCH_CLEANUP sets ($SELF --settings):
+       timer    systemd timer $(STANDBY_SID=$SID arch_timer) runs $(STANDBY_SID=$SID arch_script)
+       crontab  a line in the crontab of $OU, marked "$(STANDBY_SID=$SID arch_cron_tag)"
+       oracle   nothing: the recovery area deletes applied logs when it needs space
+       none     nothing
+       The script runs, as $OU:
+       rman target /
+       delete noprompt archivelog all completed before 'sysdate-${ARCH_CLEANUP_DAYS:-1}';
+       Logs that are not applied are kept (the policy). Never "force".
        The primary is not changed here. Its own policy belongs to its backups.
-       To check it there:
-       show archivelog deletion policy;
        Never set "BACKED UP n TIMES" on a primary that RMAN does not back up.
 EXPECT select value from v\$rman_configuration where name='ARCHIVELOG DELETION POLICY';
        shows TO APPLIED ON STANDBY
+       timer:   systemctl list-timers $(STANDBY_SID=$SID arch_timer)
+       crontab: crontab -u $OU -l
 EOF
   ;;
   10.1) cat <<EOF
@@ -1074,6 +1090,19 @@ IF     Different: normal for a short time while a Release Update is applied stan
        A RAC primary: only the node the script connects to is read.
 EOF
   ;;
+  10.8) cat <<EOF
+TITLE  Archived logs: space and nightly clean-up
+WHERE  This server ($S), as $OU
+WHY    A recovery area that is full of applied (reclaimable) logs is fine: Oracle deletes them
+       when it needs space. One that fills with logs that are not reclaimable stops redo
+       transport. The nightly clean-up of step 9.8 must also really run.
+RUN    sqlplus / as sysdba
+       select file_type, percent_space_used, percent_space_reclaimable from v\$recovery_area_usage;
+       timer:   systemctl status $(STANDBY_SID=$SID arch_service) ; journalctl -u $(STANDBY_SID=$SID arch_service)
+       crontab: tail $(STANDBY_SID=$SID arch_cron_log)
+EXPECT Not reclaimable below 80 %. The last clean-up without RMAN- or ORA- errors.
+EOF
+  ;;
   10.7) cat <<EOF
 TITLE  Roll forward the standby from the primary
 WHERE  This server ($S), as $OU; only with  --roll-forward
@@ -1087,12 +1116,15 @@ EXPECT RMAN restarts the standby instance, takes the control file of the primary
        datafiles added since, and applies the changes. Then redo apply runs again.
        The script checks first: the standby is mounted, no RMAN session or long job runs, the
        broker is off on the standby, RMAN logs in to both databases, the listener has a static
-       entry for $SID, an encrypted standby has an auto-login wallet, and RMAN can find the
-       standby's datafiles again (same names, db_file_name_convert, or Oracle-managed files).
+       entry for $SID, every wallet of an encrypted standby (each container) is auto-login and
+       open, and RMAN can find the standby's datafiles again: same names, a db_file_name_convert
+       that gives the standby's name of every datafile, or Oracle-managed files.
        Afterwards the script drops the standby redo log entries that came with the primary's
        control file and adds the standby's own (9.3), catalogs the recovery area, cross-checks
        the archived logs, and sets the deletion policy again (9.8). The temp files then have
        the primary's names: check them before you open or switch over to this standby.
+       A roll forward that ended while no run was watching is finished by the next run of
+       --roll-forward (asked with ROLLFORWARD again); RMAN is not run again for it.
 IF     12.1 / 12.2: not automated; see Oracle note 1987763.1. Flashback database on the
        standby: its logs are not usable after it; turn it off and on again.
        Test it once on a test standby before you need it on production.

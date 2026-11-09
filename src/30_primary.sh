@@ -56,6 +56,11 @@ prim_probe() {
     fsid)        cmd="findmnt -n -o SOURCE,UUID --target $1" ;;
     mounts)      cmd="sh -c 'findmnt -rn -o SOURCE,UUID | while read -r s u; do case \"\$s\" in /dev/*) echo \"M|\$s|\$u\"; lsblk -nsP -o TYPE,WWN,SERIAL \"\${s%%\\[*}\";; esac; done; echo __DG_MOUNTS_END__'" ;;
     now)         cmd='date +%s' ;;
+    cpus)        cmd='nproc' ;;
+    # how this host name resolves on the primary, in /etc/hosts and DNS only (not the systemd "myhostname" module),
+    # and the IPv4 addresses of the primary
+    hostres)     cmd="sh -c 'echo F \$(getent -s files ahostsv4 $1 2>/dev/null | head -n 1); echo D \$(timeout 10 getent -s dns ahostsv4 $1 2>/dev/null | head -n 1); echo A \$(getent ahosts $1 2>/dev/null | head -n 1)'" ;;
+    ipv4s)       cmd='hostname -I' ;;
     gridver)     cmd="grep -o 'NAME=\"oracle.crs\" VER=\"[0-9.]*\"' $1/inventory/ContentsXML/comps.xml" ;;
     md5)         cmd="md5sum $1" ;;
     lsdir)       cmd="ls -1A $1" ;;
@@ -178,6 +183,52 @@ prim_sql() {
   local q=$1
   readonly_guard "$q" || { _log SAFETY "Blocked: $q"; fatal "Safety stop: this statement is not read-only, so it was NOT sent to the primary: $q"; }
   _prim_sqlplus "connect / as sysdba" "$q" "PRIMARY (read-only): ${q:0:150}"
+}
+
+# ---- commands for the primary, run by the script (only with PRIMARY_RUN=yes, and only after you answer y) ----
+# The default stays: the script never changes the primary, it prints the commands for you. With PRIMARY_RUN=yes a
+# primary step may offer "[y] Run it on the primary for me", but only when EVERY line it would run is one of these
+# statements (a white list): parameters of Data Guard, force logging, standby logs, a log switch. Nothing that
+# stops, restarts, deletes, changes a password or writes a file on the primary is ever run there.
+prim_change_ok() {
+  local l; l=$(tr -s ' ' <<< "${1,,}"); l=${l# }; l=${l% }
+  [[ "$l" == *"--"* || "$l" == *$'\n'* ]] && return 1
+  [[ "$l" =~ ^alter\ system\ set\ (log_archive_config|log_archive_dest_[0-9]{1,2}|log_archive_dest_state_[0-9]{1,2}|standby_file_management|fal_server|fal_client|log_archive_max_processes|db_recovery_file_dest_size|db_recovery_file_dest)\ ?=\ ?[^\;]+\ scope=(both|spfile|memory)(\ sid=\'\*\')?\;$ ]] && return 0
+  [[ "$l" =~ ^alter\ database\ force\ logging\;$ ]] && return 0
+  [[ "$l" =~ ^alter\ database\ add\ standby\ logfile\ [^\;]+\;$ ]] && return 0
+  [[ "$l" =~ ^alter\ system\ (switch\ logfile|archive\ log\ current)\;$ ]] && return 0
+  return 1
+}
+prim_plan_statements() {
+  # the statements of a primary plan: every line that is not empty and not a remark
+  local l
+  while IFS= read -r l; do
+    l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+    [[ -z "$l" || "$l" == "--"* || "$l" == "#"* ]] && continue
+    printf '%s\n' "$l"
+  done <<< "$1"
+}
+prim_run_allowed() {
+  # $1 plan, $2 how: 0 when the script may offer to run the whole plan on the primary
+  [[ "${PRIMARY_RUN:-no}" == yes ]] || return 1
+  [[ "$2" == *"sqlplus / as sysdba"* ]] || return 1
+  local st n=0
+  while IFS= read -r st; do [[ -n "$st" ]] || continue; prim_change_ok "$st" || return 1; n=$((n + 1)); done < <(prim_plan_statements "$1")
+  [[ $n -gt 0 ]]
+}
+prim_run_plan() {
+  # $1 plan: each statement runs on the primary (sqlplus / as sysdba, as the ssh user), checked against the list
+  # once more right before it is sent. The first error stops it.
+  local st
+  while IFS= read -r st; do
+    [[ -n "$st" ]] || continue
+    prim_change_ok "$st" || { _log SAFETY "Blocked (not on the list): $st"; bad "Not run on the primary (not on the list of allowed statements): $st"; return 1; }
+    say "${C_D}Running on the primary as $PRIMARY_SSH_USER:${C_N} $st"
+    _prim_sqlplus "connect / as sysdba" "$st" "PRIMARY change (PRIMARY_RUN=yes, you answered y): ${st:0:150}" \
+      || { bad "It failed on the primary: $(ora_errors "$SQL_OUT")"; return 1; }
+    _log CHANGE "[PRIMARY] ${CUR_STEP:-}: $st (run by the script over ssh, as $PRIMARY_SSH_USER)"
+  done < <(prim_plan_statements "$1")
+  return 0
 }
 
 prim_sql_as_sys() {

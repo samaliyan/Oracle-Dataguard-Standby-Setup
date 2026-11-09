@@ -201,7 +201,9 @@ def remote(cmd, stdin_data):
         if m.group(1) != lh or m.group(3) != P.get("listener_name", "LISTENER"):
             print("TNS-12541: TNS:no listener"); return 1
         print(f"Listening Endpoints Summary...\n  (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST={P['host']})(PORT={P.get('port', 1521)})))")
-        print(f'Services Summary...\nService "{"other_svc" if P.get("lsnr_no_service") else P["service"]}" has 1 instance(s).\n  Instance "{P["sid"]}", status READY, has 1 handler(s) for this service...')
+        svcs = P.get("lsnr_services") or ["other_svc" if P.get("lsnr_no_service") else P["service"]]
+        print("Services Summary...")
+        for sv in svcs: print(f'Service "{sv}" has 1 instance(s).\n  Instance "{P["sid"]}", status READY, has 1 handler(s) for this service...')
         if P.get("static"): print(f'  Instance "{P["sid"]}", status UNKNOWN, has 1 handler(s) for this service...')
         print("The command completed successfully"); return 0
     m = re.fullmatch(r"env ORACLE_HOME=(\S+) TNS_ADMIN=(\S+) (\S+)/bin/tnsping (\S+) 1", cmd)
@@ -219,6 +221,16 @@ def remote(cmd, stdin_data):
         print('<HOME_LIST>'); print(f'<HOME NAME="OraDB19Home1" LOC="{P["db_home"]}" TYPE="O" IDX="2"/>')
         if grid: print(f'<HOME NAME="OraGI19Home1" LOC="{P["grid_home"]}" TYPE="O" IDX="1" CRS="true"/>')
         print('</HOME_LIST>'); return 0
+    if cmd == "nproc": print(P.get("cpus", 16)); return 0
+    if cmd == "dd if=/dev/zero bs=1M count=64 status=none":
+        import time; time.sleep(P.get("net_secs", 0.5)); sys.stdout.buffer.write(b"\0" * 1024 * 1024); return 0
+    m = re.fullmatch(r"sh -c 'echo F \$\(getent -s files ahostsv4 (\S+) 2>/dev/null \| head -n 1\); .*", cmd)
+    if m:
+        n = m.group(1); hr = P.get("hostres", {})
+        own = n.split(".")[0] == P["host"].split(".")[0]
+        f = hr.get(n, (P.get("ip_real", "10.0.0.1") if own else (P["stby_ip"] if P.get("hosts_stby") else "")))
+        print(f"F {f + '  STREAM ' + n if f else ''}"); print("D "); print(f"A {f + '  STREAM ' + n if f else hr.get('A_' + n, '')}"); return 0
+    if cmd == "hostname -I": print(P.get("ip_real", "10.0.0.1") + " fe80::1"); return 0
     m = re.fullmatch(r"getent (?:hosts|ahostsv4) (\S+)", cmd)
     if m:
         if P.get("hosts_stby"): print(f"{P['stby_ip']}  {m.group(1)}"); return 0
@@ -299,7 +311,8 @@ def ssh():
     mark = "echo __DG_PROBE_OUTPUT__; "
     if cmd.startswith(mark):
         print("__DG_PROBE_OUTPUT__"); cmd = cmd[len(mark):]
-    elif "sqlplus" not in cmd:
+    elif "sqlplus" not in cmd and cmd != "dd if=/dev/zero bs=1M count=64 status=none":
+        # (the network speed measure reads raw bytes, so it has no marker)
         log(BAD, "[probe without marker] " + cmd)
     return remote(cmd, data)
 

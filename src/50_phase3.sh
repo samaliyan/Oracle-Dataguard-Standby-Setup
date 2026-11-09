@@ -182,7 +182,9 @@ media_room() {
   [[ -z "$short" ]] && return 0
   NOW="Not enough space to unpack the installer files:"$'\n'"${short%$'\n'}"
   KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
-  PLAN="-- Make room on that file system (or make it bigger), then answer r."
+  local m; PLAN="-- See how full it is, and the largest folders on it:"
+  for m in "${!need_mnt[@]}"; do [[ $(free_mb_of "$m") -ge ${need_mnt[$m]} ]] && continue; PLAN+=$'\n'"df -h $m"$'\n'"du -xh $m 2>/dev/null | sort -h | tail -n 15"; done
+  PLAN+=$'\n'"-- Move or delete what is not needed there (never files of a running database), or make the file system bigger."$'\n'"-- You should then see more free space with df -h. Then answer r."
   return 1
 }
 F_GRID=""; F_DB=""
@@ -218,7 +220,7 @@ c_3_1() {
   [[ "$F_DB" == MISSING:* ]] && { miss2+=" ${F_DB#MISSING:}"; F_DB=""; }
   if [[ -n "$miss2" ]]; then
     NOW="The second installer file is missing:$miss2"$'\n'"It must be in the same folder as the first file."
-    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 next to the first file (owner root, mode 644). Then answer r."
+    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 into the folder of the first file, for example:"$'\n'"scp <user>@<server>:<folder>/$(basename "${miss2# }") $(dirname "${miss2# }")/"$'\n'"chmod 644 ${miss2# }"$'\n'"ls -l $(dirname "${miss2# }")"$'\n'"-- Then answer r."
     return 1
   fi
   if [[ ( $need_g -eq 1 && -z "$F_GRID" ) || ( $need_d -eq 1 && -z "$F_DB" ) ]]; then
@@ -227,7 +229,11 @@ c_3_1() {
     [[ -n "$MEDIA_REFUSED" ]] && NOW+=$'\n'"Not used, because of their owner or mode:"$'\n'"${MEDIA_REFUSED%$'\n'}"
     KIND_NOW=manual; MANUAL_HOW="the user named on each line"; MANUAL_WHERE="Run on the PRIMARY ($PRIMARY_HOST) and on this server ($(hostname -s))"
     local wg=""; [[ $need_g -eq 1 ]] && wg=" and grid"
-    PLAN="-- Copy the files to /stage on this server (owner root, mode 644). Then answer r."
+    PLAN="-- On this server, as root:"$'\n'"mkdir -p /stage"
+    PLAN+=$'\n'"-- Copy the files into /stage (with WinSCP, or from the server that has them), for example:"
+    [[ $need_d -eq 1 && -z "$F_DB" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name db "$(want_rel)" | awk '{print $1}') /stage/"
+    [[ $need_g -eq 1 && -z "$F_GRID" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name grid "$(want_rel grid)" | awk '{print $1}') /stage/"
+    PLAN+=$'\n'"chmod 644 /stage/*.zip"$'\n'"ls -l /stage"$'\n'"-- ls must show the zip file(s), owner root. Then answer r."
     if [[ $DB_MAJOR -ge 18 ]]; then
       PLAN+=$'\n'"-- Use one of these:"
       PLAN+=$'\n'"-- A) A gold image of the primary home, with the same patches. On the primary:"
@@ -381,11 +387,17 @@ run_installer() {
   local title=$1 runner=$2 ign=$3; shift 3
   INS08101_RETRIED=0
   local who=oracle; [[ "$runner" == "as_grid" ]] && who=grid
+  # an old success record (an earlier install, removed by hand since) must not count for this run of the installer
+  case "$title" in
+    "Grid installer"*) rm -f -- "$STATE_DIR/grid_install.done" ;;
+    "Database installer"*) rm -f -- "$STATE_DIR/db_install.done" ;;
+    "Grid configuration tools"*) rm -f -- "$STATE_DIR/grid_config.done" ;;
+  esac
   local out; out="$LOG_DIR/$(tr -c 'A-Za-z0-9\n' '_' <<< "$title" | tr -s '_' | tr -d '\n')_$RUN_ID.log"
   say "Starting the $title. It runs silently and takes several minutes."
   local rc=0 keep=$JOB_KEEP
   run_long "$title" "$out" "" "$who" "$@" < /dev/null || rc=$?
-  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && warn "$title finished with warnings. Output: $out"; installer_done_record "$title"; return 0; fi
+  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && WARN_DEDUP=0 warn "$title finished with warnings. Output: $out"; installer_done_record "$title"; return 0; fi
   bad "$title failed (exit code $rc)"
   grep -E 'INS-[0-9]+|PRVF-|PRVG-|PRCZ-|\[FATAL\]|\[WARNING\]|SEVERE' <<< "$RUN_OUT" | head -n 15 | hint
   grep -oE '(/[A-Za-z0-9_./-]+/(logs|cfgtoollogs)/[A-Za-z0-9_./-]+\.log)' <<< "$RUN_OUT" | sort -u | head -n 3 | sed 's/^/Installer log: /' | hint
@@ -491,9 +503,39 @@ root_prog_ok() {
     (( (8#$m & 8#002) == 0 )) || { ok=0; break; }
     (( (8#$m & 8#020) == 0 )) || [[ "$g" == "$INSTALL_GROUP" || "$g" == root ]] || ok=0
   done
+  # every folder above it too (else another user could rename a folder on the way and put another program there
+  # between this check and the run): the path as given, and the real path behind any link on it
+  if [[ $ok -eq 1 ]]; then
+    local real; real=$(readlink -f -- "$d" 2>/dev/null) || real=""
+    [[ -n "$real" ]] && root_prog_path_ok "$(dirname -- "$d")" && root_prog_path_ok "$(dirname -- "$real")" || ok=0
+  fi
   [[ $ok -eq 1 ]] && return 0
-  bad "Not run as root: $f (or its folder) is a link, belongs to another user, or others can change it. Check:  ls -ld $d $f"
+  bad "Not run as root: $f (or a folder above it) is a link, belongs to another user, or others can change it. Check:  ls -ld $d $f"$'\n'"and every folder above $d."
   return 1
+}
+root_prog_path_ok() {
+  # $1 a folder: it and each folder above it up to / belong to root, oracle or grid, and no other user can rename
+  # what is in them (no write for others, except a sticky folder whose next entry is theirs; group write only for
+  # the install group or root). A link on the way may stand (its owner counts; the caller checks the real path)
+  local p=$1 next="" u g m nu
+  while :; do
+    if [[ -L "$p" ]]; then
+      u=$(stat -c '%U' -- "$p" 2>/dev/null)
+      [[ "$u" == root || "$u" == "$ORACLE_USER" || "$u" == "$GRID_USER" ]] || return 1
+    else
+      IFS=' ' read -r u g m <<< "$(stat -c '%U %G %a' -- "$p" 2>/dev/null)"
+      [[ ( "$u" == root || "$u" == "$ORACLE_USER" || "$u" == "$GRID_USER" ) && "$m" =~ ^[0-7]+$ ]] || return 1
+      if (( (8#$m & 8#002) != 0 )); then
+        # world-writable: only a sticky folder (/tmp), and only when the entry below it is not someone else's
+        (( (8#$m & 8#1000) != 0 )) && [[ -n "$next" ]] || return 1
+        nu=$(stat -c '%U' -- "$next" 2>/dev/null)
+        [[ "$nu" == root || "$nu" == "$ORACLE_USER" || "$nu" == "$GRID_USER" ]] || return 1
+      fi
+      (( (8#$m & 8#020) == 0 )) || [[ "$g" == "$INSTALL_GROUP" || "$g" == root ]] || (( (8#$m & 8#1000) != 0 )) || return 1
+    fi
+    [[ "$p" == / ]] && return 0
+    next=$p; p=$(dirname -- "$p")
+  done
 }
 run_root_script() {
   # root scripts get no input: their questions (local bin folder, TFA) take the default answer
@@ -582,12 +624,17 @@ unzip_failed_check() {
   fi
   SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
   KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
-  PLAN="-- Empty the folder named above, and nothing else. First check that nothing is
--- installed there: it must not be listed in $INVENTORY_DIR/ContentsXML/inventory.xml.
--- Empty it (hidden files too):  find <folder> -mindepth 1 -delete
--- Then remove its line from the list of failed unzips:
-${rmcmd%$'\n'}
--- Then answer r. The files are unpacked again."
+  # the exact commands: the check that no installed home uses the folder, then emptying it (one per line)
+  local chk="" emp=""
+  while IFS='|' read -r t o dest; do
+    [[ -n "$t" && -n "$dest" ]] || continue
+    chk+="grep -c '\"$dest\"' $INVENTORY_DIR/ContentsXML/inventory.xml"$'\n'
+    emp+="find $dest -mindepth 1 -delete"$'\n'
+  done < "$(unzip_marker)"
+  PLAN="-- First check that nothing is installed there (each command must print 0):"$'\n'"${chk:-# the folder is not recorded: it is the home or stage folder of that file}"
+  PLAN+=$'\n'"-- Then empty it (hidden files too), and nothing else:"$'\n'"${emp:-find <that folder> -mindepth 1 -delete}"
+  PLAN+=$'\n'"-- Then remove its line from the list of failed unzips:"$'\n'"${rmcmd%$'\n'}"
+  PLAN+=$'\n'"-- Then answer r. The files are unpacked again."
   return 1
 }
 sw_folder_ok() {
@@ -693,6 +740,8 @@ sw_half_fix() {
   sw_empty_folder "$home" || return 1
   [[ -d "$stg" ]] && { sw_empty_folder "$stg" || return 1; }
   rm -f -- "$rec"
+  # a Grid home installed again: the record of its earlier root scripts no longer applies
+  [[ "$kind" == grid ]] && rm -f -- "$(GRID_ROOT_DONE_FILE)"
   return 10
 }
 stage_dir() { printf '%s/dg_stage_%s' "$(dirname "$INVENTORY_DIR")" "$1"; }   # for staged (12.x) media
@@ -740,7 +789,10 @@ grid_state() {
     if [[ -f /etc/oracle/olr.loc ]] && in_inventory "$GRID_HOME"; then GSTATE=HAS_DOWN; return; fi
   fi
   if in_inventory "$GRID_HOME"; then
-    if [[ -f "$STATE_DIR/grid_install.done" || -f /etc/oracle/olr.loc || -f "$(GRID_ROOT_DONE_FILE)" ]] && [[ -x "$GRID_HOME/bin/crsctl" ]]; then GSTATE=NEED_ROOT
+    # installed, root.sh not run yet: bin/crsctl is made by root.sh, so the installer's own files count too
+    # (only with the success record of the installer: root.sh and crsctl.bin are already in an unpacked image)
+    if { [[ -f "$STATE_DIR/grid_install.done" ]] && [[ -x "$GRID_HOME/bin/crsctl" || -s "$GRID_HOME/bin/crsctl.bin" || -x "$GRID_HOME/root.sh" ]]; } \
+       || { [[ -f /etc/oracle/olr.loc || -f "$(GRID_ROOT_DONE_FILE)" ]] && [[ -x "$GRID_HOME/bin/crsctl" ]]; }; then GSTATE=NEED_ROOT
     else GSTATE=HALF_INSTALLED; fi
     return
   fi
@@ -913,6 +965,8 @@ d_3_2() {
   else
     run_installer "Grid installer (12.1)" as_grid -ignorePrereq "$inst" -silent -waitforcompletion -responseFile "$rsp" || irc=1
   fi
+  # the installer's own last lines tell to run root.sh and the configuration tools: those are the next steps here
+  [[ $irc -eq 0 && $UI -eq 0 ]] && say "The root scripts and the configuration the installer mentions are done by steps 3.3 and 3.4."
   remove_rsp "$rsp"
   return $irc
 }
@@ -976,7 +1030,7 @@ c_3_4() {
       PLAN+=$'\n'"It creates ASM, +$DATA_DG and the listener."
       [[ -n "$ASM_PW" ]] || PLAN+=$'\n'"Ask you for the ASM password for SYS and ASMSNMP: the one from step 3.2"$'\n'"(it was not used yet), or a new one" ;;
     HAS_DOWN) NOW="High Availability Services is stopped"; PLAN="Start it as root:  $GRID_HOME/bin/crsctl start has" ;;
-    ASM_DOWN) NOW="ASM is not ONLINE"; PLAN="Start it as $GRID_USER:  crsctl start res ora.asm" ;;
+    ASM_DOWN) NOW="ASM is not ONLINE"; PLAN="Start ASM with srvctl."; cp_add grid "srvctl start asm" ;;
     UNKNOWN) NOW="Cannot read the Grid state: $(head -n 2 <<< "$GSTATE_OUT")"; return 2 ;;
     *) NOW="The Grid root scripts have not run yet (step 3.3)"; return 2 ;;
   esac
@@ -1014,11 +1068,11 @@ d_3_4() {
       done
       # the stack is up but ASM was not started with it (not set to start by itself): started here
       if [[ "$GSTATE" == "ASM_DOWN" ]]; then
-        run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+        run_logged "srvctl start asm" as_grid timeout 300 "$GRID_HOME/bin/srvctl" start asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
         t0=$(date +%s); until grid_state; [[ "$GSTATE" == "DONE" ]] || (( $(date +%s) - t0 >= 120 )); do nap 5; done
       fi
       [[ "$GSTATE" == "DONE" ]] || { bad "Oracle Restart started, but ASM did not come online in time (state $GSTATE)."; return 1; } ;;
-    ASM_DOWN) run_logged "start ora.asm" as_grid timeout 300 "$GRID_HOME/bin/crsctl" start res ora.asm || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; } ;;
+    ASM_DOWN) cp_run || return 1 ;;
   esac
 }
 
@@ -1258,6 +1312,7 @@ d_3_6() {
   else
     run_installer "Database installer (12.x)" as_oracle -ignorePrereq "$inst" -silent -waitforcompletion -responseFile "$rsp" || irc=1
   fi
+  [[ $irc -eq 0 && $UI -eq 0 ]] && say "The root script the installer mentions is run by step 3.7."
   remove_rsp "$rsp"
   return $irc
 }
@@ -1312,43 +1367,175 @@ rw_home_ok() {
 
 # ---- 3.9 resources (Grid) ----
 RES_TODO=""
+# ---- 3.9 Oracle Restart resources ----
+# Only the resources the standby needs: ora.asm, the listener and the disk groups in use. ora.diskmon and ora.ons
+# are OFFLINE in Oracle Restart by design: never reported, never started. ora.* resources are started with srvctl
+# (crsctl start res refuses them: CRS-4995).
+#   OFFLINE       -> srvctl start ...
+#   INTERMEDIATE  -> never "started": the cause is found first (host name, port taken by another listener, a HOST in
+#                    listener.ora that is not this server), fixed, then the listener is stopped and started again
+L39_CAUSE=""; L39_HOSTS_LINE=""; L39_PID=""; L39_LHOME=""; L39_LUSER=""; L39_LNAME=""; L39_LORA=""; L39_BADHOST=""
+res_state() {
+  # $1 resource -> RES_STATE: ONLINE | OFFLINE | INTERMEDIATE | MISSING | UNKNOWN ; RES_DETAIL: the text after the state
+  run_logged "crsctl stat res $1" as_grid timeout 60 "$GRID_HOME/bin/crsctl" stat res "$1" -v || true
+  RES_DETAIL=""
+  if grep -q 'CRS-2613' <<< "$RUN_OUT" || ! grep -q "NAME=$1" <<< "$RUN_OUT"; then RES_STATE=MISSING; return 0; fi
+  local st; st=$(sed -n 's/^STATE=\([A-Z_]*\).*/\1/p' <<< "$RUN_OUT" | head -n 1)
+  RES_DETAIL=$(sed -n 's/^STATE_DETAILS=//p' <<< "$RUN_OUT" | head -n 1)
+  case "$st" in ONLINE|OFFLINE|INTERMEDIATE) RES_STATE=$st ;; "") RES_STATE=UNKNOWN ;; *) RES_STATE=OFFLINE ;; esac
+}
+srvctl_start_cmd() {
+  # the srvctl command that starts resource $1
+  case "$1" in
+    ora.asm) printf 'srvctl start asm' ;;
+    ora.*.lsnr) local l=${1#ora.}; printf 'srvctl start listener -listener %s' "${l%.lsnr}" ;;
+    ora.*.dg) local g=${1#ora.}; printf 'srvctl start diskgroup -diskgroup %s' "${g%.dg}" ;;
+  esac
+}
+lsnr_port_owner() {
+  # the program that listens on the port of the listener, when it is not a listener of the Grid home:
+  # sets L39_PID, L39_LHOME (the home of a tnslsnr), L39_LUSER, L39_LNAME; 1 = none
+  L39_PID=""; L39_LHOME=""; L39_LUSER=""; L39_LNAME=""
+  local line pid args exe
+  line=$(ss -ltnp "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -n 1)
+  pid=${line#pid=}
+  num "$pid" || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  exe=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /\/bin\/tnslsnr$/) {print $i; exit}}' <<< "$args")
+  [[ -n "$exe" && "$exe" == "$GRID_HOME/bin/tnslsnr" ]] && return 1
+  L39_PID=$pid; L39_LUSER=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [[ -n "$exe" ]]; then
+    L39_LHOME=${exe%/bin/tnslsnr}
+    L39_LNAME=$(awk -v e="$exe" '{for (i = 1; i < NF; i++) if ($i == e) {print $(i + 1); exit}}' <<< "$args")
+    v_path "$L39_LHOME" && v_name "$L39_LNAME" && v_name "$L39_LUSER" || { L39_LHOME=""; L39_LNAME=""; }
+  fi
+  return 0
+}
+lsnr_ora_badhost() {
+  # a HOST in the Grid listener.ora that is neither this server's name nor one of its addresses
+  local f="$GRID_HOME/network/admin/listener.ora" h ips
+  L39_LORA=$f; L39_BADHOST=""
+  [[ -r "$f" ]] || return 1
+  ips=" $(local_ipv4s) "
+  for h in $(grep -oiE 'HOST *= *[A-Za-z0-9_.:-]+' "$f" | sed 's/.*= *//' | sort -u); do
+    [[ "${h,,}" == "${STANDBY_HOST,,}" || "${h,,}" == "$(host_fq | tr '[:upper:]' '[:lower:]')" || "$ips" == *" $h "* || "$h" == localhost || "$h" == 0.0.0.0 ]] && continue
+    [[ "$h" =~ ^[0-9.]+$ ]] || { local hv; hv=$(v4_fd "$h"); [[ -n "$hv" && "$ips" == *" $hv "* ]] && continue; }
+    L39_BADHOST=$h; return 0
+  done
+  return 1
+}
+lsnr_intermediate_cause() {
+  # the cause of an INTERMEDIATE listener, in this order: host name, port taken by another program, a HOST in
+  # listener.ora that is not this server. L39_CAUSE: hosts | port_lsnr | port_other | lsnr_host | unknown
+  local p; p=$(standby_name_problems)
+  local fq; fq=$(host_fq)
+  if [[ -n "$p" ]]; then L39_CAUSE=hosts; L39_HOSTS_LINE="$STANDBY_IP    ${fq:+$fq }$STANDBY_HOST"; L39_WHY=${p//$'\n'/; }; return 0; fi
+  if lsnr_port_owner; then
+    if [[ -n "$L39_LHOME" ]]; then L39_CAUSE=port_lsnr; else L39_CAUSE=port_other; fi
+    return 0
+  fi
+  if lsnr_ora_badhost; then L39_CAUSE=lsnr_host; return 0; fi
+  L39_CAUSE=unknown
+}
 c_3_9() {
+  L39_CAUSE=""
   use_grid || { NOW="Not needed without Grid. The listener is set up in phase 5."; return 0; }
   grid_sw_ok || { NOW="Grid is not installed yet (step 3.2)"; return 2; }
-  local r off=() miss=() on=() dg
+  local r dg off=() miss=() on=() mid=() det=""
   local -a res=(ora.asm "ora.$SB_LSNR.lsnr")
   for dg in $(asm_dgs); do res+=("ora.${dg^^}.dg"); done
   for r in "${res[@]}"; do
-    run_logged "crsctl stat res $r" as_grid timeout 60 "$GRID_HOME/bin/crsctl" stat res "$r" || true
-    if grep -q 'CRS-2613' <<< "$RUN_OUT" || ! grep -q "NAME=$r" <<< "$RUN_OUT"; then miss+=("$r")
-    elif grep -q 'STATE=ONLINE' <<< "$RUN_OUT"; then on+=("$r")
-    else off+=("$r"); fi
+    res_state "$r"
+    case "$RES_STATE" in
+      ONLINE) on+=("$r") ;; MISSING) miss+=("$r") ;; INTERMEDIATE) mid+=("$r"); det=$RES_DETAIL ;;
+      UNKNOWN) NOW="Cannot read the state of $r: $(head -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2 ;;
+      *) off+=("$r") ;;
+    esac
   done
-  if [[ ${#off[@]} -eq 0 && ${#miss[@]} -eq 0 ]]; then NOW="All ONLINE: ${on[*]}"; return 0; fi
-  RES_TODO=""
+  if [[ ${#off[@]} -eq 0 && ${#miss[@]} -eq 0 && ${#mid[@]} -eq 0 ]]; then NOW="All ONLINE: ${on[*]}"; return 0; fi
   for r in "${miss[@]+"${miss[@]}"}"; do
     if [[ "$r" == "ora.$SB_LSNR.lsnr" ]]; then
-      RES_TODO+="srvctl add listener -listener $SB_LSNR -endpoints TCP:$PORT"$'\n'"srvctl start listener -listener $SB_LSNR"$'\n'
+      cp_add grid "srvctl add listener -listener $SB_LSNR -endpoints TCP:$PORT"
+      cp_add grid "srvctl start listener -listener $SB_LSNR"
     else
       NOW="Resource $r does not exist (step 3.5)"; return 2
     fi
   done
-  for r in "${off[@]+"${off[@]}"}"; do RES_TODO+="crsctl start res $r"$'\n'; done
-  RES_TODO=${RES_TODO%$'\n'}
-  NOW="Not ONLINE yet: ${off[*]+"${off[*]}"} ${miss[*]+"${miss[*]}"}"
-  PLAN="Run as $GRID_USER:
-$RES_TODO"
+  for r in "${off[@]+"${off[@]}"}"; do cp_add grid "$(srvctl_start_cmd "$r")"; done
+  NOW=""
+  [[ ${#off[@]} -gt 0 || ${#miss[@]} -gt 0 ]] && NOW="Not ONLINE yet: ${off[*]+"${off[*]}"} ${miss[*]+"${miss[*]}"}"
+  if [[ ${#mid[@]} -gt 0 ]]; then
+    NOW+="${NOW:+$'\n'}${mid[*]} is INTERMEDIATE${det:+ ($det)}: running, but not all its endpoints are registered."
+    lsnr_intermediate_cause
+    case "$L39_CAUSE" in
+      hosts)
+        NOW+=$'\n'"Cause: $L39_WHY."
+        if [[ -L /etc/hosts ]]; then
+          NOW+=$'\n'"/etc/hosts is a symbolic link, so the script does not change it."
+          KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
+          PLAN="-- Add this line to the file /etc/hosts points to (or to DNS):"$'\n'"$L39_HOSTS_LINE"$'\n'"-- Then, as $GRID_USER:"$'\n'"srvctl stop listener -listener $SB_LSNR"$'\n'"srvctl start listener -listener $SB_LSNR"
+          return 1
+        fi
+        if grep -qiE "^[^#]*[[:space:]]${STANDBY_HOST}([[:space:].]|\$)" /etc/hosts; then
+          NOW+=$'\n'"/etc/hosts has a line for $STANDBY_HOST already, but it is wrong (the first line for a name counts)."
+          KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+          PLAN="-- Step 2.6 corrects that line (a backup is kept):"$'\n'"$SELF --only 2.6"$'\n'"-- The line must be:  $L39_HOSTS_LINE"$'\n'"-- Then answer r here."
+          return 1
+        fi
+        # (a file whose last line has no newline gets one first; --undo takes the added text out again)
+        L39_LEAD=0; [[ -s /etc/hosts && -n "$(tail -c 1 /etc/hosts)" ]] && L39_LEAD=1
+        cp_add root "cp -p /etc/hosts /etc/hosts.bak_$RUN_ID"
+        if [[ $L39_LEAD -eq 1 ]]; then cp_add root "printf '\\n%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"
+        else cp_add root "printf '%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"; fi ;;
+      port_lsnr)
+        NOW+=$'\n'"Cause: port $PORT is taken by the listener $L39_LNAME of $L39_LHOME (process $L39_PID, user $L39_LUSER), not by the Grid listener."
+        cp_add root "runuser -u $L39_LUSER -- env ORACLE_HOME=$L39_LHOME $L39_LHOME/bin/lsnrctl stop $L39_LNAME"
+        YES_HOLD=1 ;;          # another program is stopped: always asked, also with yes to all
+      port_other)
+        NOW+=$'\n'"Cause: port $PORT is taken by another program (process $L39_PID: $(ps -o args= -p "$L39_PID" 2>/dev/null | cut -c1-60))."
+        KIND_NOW=manual; MANUAL_HOW="root"
+        PLAN="-- That program is not an Oracle listener, so the script does not stop it. To see it:"$'\n'"ss -ltnp 'sport = :$PORT'"$'\n'"ps -o pid,user,args -p $L39_PID"$'\n'"-- Stop it, or move it to another port. Then answer r."
+        return 1 ;;
+      lsnr_host)
+        NOW+=$'\n'"Cause: $L39_LORA has HOST=$L39_BADHOST, which is not this server."
+        cp_add grid "cp -p $L39_LORA $L39_LORA.bak_$RUN_ID"
+        cp_add grid "sed -i -E 's/(HOST *= *)${L39_BADHOST//./\\.}( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
+      unknown)
+        NOW+=$'\n'"The host name, the port and listener.ora look right; the cause is not known."
+        KIND_NOW=check
+        PLAN="Compare, as $GRID_USER on this server:
+lsnrctl status $SB_LSNR
+getent ahosts $STANDBY_HOST
+cat $GRID_HOME/network/admin/listener.ora
+-- The listener log:
+less $GRID_BASE/diag/tnslsnr/$STANDBY_HOST/$(tr '[:upper:]' '[:lower:]' <<< "$SB_LSNR")/alert/log.xml
+-- After a fix, as $GRID_USER:
+srvctl stop listener -listener $SB_LSNR
+srvctl start listener -listener $SB_LSNR"
+        return 1 ;;
+    esac
+    cp_add grid "srvctl stop listener -listener $SB_LSNR"
+    cp_add grid "srvctl start listener -listener $SB_LSNR"
+  fi
+  PLAN="Run the commands below. Then the resources are checked again."
+  [[ "$L39_CAUSE" == hosts ]] && PLAN="Add the host name of this server to /etc/hosts (a backup is kept), then restart the listener."
+  [[ "$L39_CAUSE" == port_lsnr ]] && PLAN="Stop the other listener that holds port $PORT, then restart the Grid listener."
+  [[ "$L39_CAUSE" == lsnr_host ]] && PLAN="Put this server's name into listener.ora (a backup is kept), then restart the listener."
   return 1
 }
 d_3_9() {
-  local c
-  while IFS= read -r c; do
-    [[ -z "$c" ]] && continue
-    local -a w=(); read -ra w <<< "$c"
-    run_logged "$c" as_grid timeout 300 "$GRID_HOME/bin/${w[0]}" "${w[@]:1}" || { bad "$c failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-    say "Ran: $c"
-    [[ "$c" == "srvctl add listener"* ]] && journal LSNRRES "$SB_LSNR" "srvctl add listener"
-  done <<< "$RES_TODO"
+  local hsz=""; [[ "${L39_CAUSE:-}" == hosts ]] && hsz=$(stat -c '%s' /etc/hosts 2>/dev/null)
+  cp_run || return 1
+  if [[ "${L39_CAUSE:-}" == hosts ]]; then
+    local txt="$L39_HOSTS_LINE"$'\n'; [[ ${L39_LEAD:-0} -eq 1 ]] && txt=$'\n'"$txt"
+    journal_file_appended /etc/hosts "${hsz:-0}" "$txt" "" "${L39_LEAD:-0}"
+    say "Added to /etc/hosts:  $L39_HOSTS_LINE"
+  fi
+  if cp_find grid "srvctl add listener" >/dev/null; then journal LSNRRES "$SB_LSNR" "srvctl add listener"; fi
+  # a listener that was INTERMEDIATE gets a moment to register its endpoints before the check
+  [[ -n "${L39_CAUSE:-}" ]] && nap 5
+  L39_CAUSE=""
+  return 0
 }
 
 # ---- 3.10 listener port equal to primary (Grid listener) ----
@@ -1424,7 +1611,15 @@ ru_matches_primary() {
   done
   return 0
 }
-local_patches() { ls -1 "$1/inventory/oneoffs" 2>/dev/null | grep -E '^[0-9]{6,9}$' | sort -u; }
+# patch ids are the numeric folder names in inventory/oneoffs (5 to 10 digits: every id Oracle has used)
+local_patches() {
+  # $1 home here -> patch ids; rc 1 when the folder exists but cannot be listed (no folder = no patch applied)
+  local d="$1/inventory/oneoffs" out
+  [[ -e "$d" ]] || return 0
+  out=$(ls -1 -- "$d" 2>/dev/null) || return 1
+  grep -E '^[0-9]{5,10}$' <<< "$out" | sort -u
+  return 0
+}
 primary_patches() {
   # $1 home on primary -> patch ids; rc 1 if the inventory of that home cannot be read
   prim_probe owner "$1/inventory" || return 1
@@ -1435,7 +1630,7 @@ primary_patches() {
     return 1
   fi
   prim_probe lsdir "$1/inventory/oneoffs" || return 1           # it exists, so it must be readable
-  grep -E '^[0-9]{6,9}$' <<< "$RUN_OUT" | sort -u
+  grep -E '^[0-9]{5,10}$' <<< "$RUN_OUT" | sort -u
   return 0
 }
 local_release() {
@@ -1464,7 +1659,7 @@ c_3_11() {
   for h in "$DB_HOME" ${GRID_HOME:+"$GRID_HOME"}; do
     use_grid || [[ "$h" != "$GRID_HOME" ]] || continue
     pp=$(primary_patches "$h") || { NOW="Cannot read $h/inventory on the primary. The ssh user must be able to read it."; return 2; }
-    lp=$(local_patches "$h")
+    lp=$(local_patches "$h") || { NOW="Cannot list $h/inventory/oneoffs on this server"; return 2; }
     missing=$(comm -23 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | paste -sd' ' -)
     extra=$(comm -13 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | paste -sd' ' -)
     if [[ -n "$missing$extra" ]]; then

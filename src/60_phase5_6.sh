@@ -517,8 +517,7 @@ c_6_1() {
         NOW+=$'\n'"$t on the primary is not used (owner $towner, type $ttype, mode $tmode)."
         NOW+=$'\n'"It must be a regular file of $GRID_USER or $ORACLE_USER, mode 640 or stricter (it holds the password hashes)."
         KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
-        PLAN="rm -f $t
-asmcmd pwcopy '$pfile' $t
+        PLAN="rm -f $t && test ! -e $t && (umask 077; asmcmd pwcopy '$pfile' $t)
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
         PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
@@ -532,11 +531,10 @@ chmod 640 $t"
       NOW+=$'\n'"An old copy $t is on the primary (owner $towner, $((tage / 3600)) hours older than this run)."
       NOW+=$'\n'"It is not used: the sys password may have changed since then."
       KIND_NOW=primary; PRIMARY_HOW_STEP=$(prim_grid_how)
-      PLAN="rm -f $t
-asmcmd pwcopy '$pfile' $t
+      PLAN="rm -f $t && test ! -e $t && (umask 077; asmcmd pwcopy '$pfile' $t)
 chgrp $INSTALL_GROUP $t
 chmod 640 $t"
-        PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
+      PLAN_UNDO="rm -f $t   (step 6.2 reminds you after the copy)"
       return 1
     fi
     [[ -n "$tage" ]] && NOW="The copy $t is ready on the primary$([[ $tage -ge 60 ]] && printf ' (%s minutes old)' "$((tage / 60))")."$'\n'"$NOW"

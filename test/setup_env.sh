@@ -30,7 +30,8 @@ pkill -f 'dgt_port_listener' 2>/dev/null || true
 { printf '%s    %s\n' "$SIP" "$SH"; grep -vw "$SH" /etc/hosts.dgt_orig; } > /etc/hosts
 rm -rf "$T" /etc/oraInst.loc /etc/oracle /etc/security/limits.d/oracle-grid.conf /etc/hosts.bak_* /dev/oraasm \
        /etc/udev/rules.d/99-oracle-asmdevices.rules* /etc/systemd/system/oracle-standby-*.service \
-       /usr/local/sbin/dg_standby_*.sh /etc/systemd/system/oracle-ohasd.service.d /etc/oratab.bak_*
+       /usr/local/sbin/dg_standby_*.sh /etc/systemd/system/oracle-ohasd.service.d /etc/oratab.bak_* \
+       /usr/local/sbin/dg_arch_cleanup_*.sh* /etc/systemd/system/dg-arch-cleanup-* /root/dg
 [[ -f /etc/oratab.dgt_orig ]] || { [[ -f /etc/oratab ]] && cp -p /etc/oratab /etc/oratab.dgt_orig || : > /etc/oratab.dgt_orig; }
 cp -p /etc/oratab.dgt_orig /etc/oratab 2>/dev/null || true
 for u in oracle grid; do id $u >/dev/null 2>&1 && userdel -r $u >/dev/null 2>&1 || true; done
@@ -40,8 +41,9 @@ mkdir -p "$T/state" "$T/log" "$T/rootbin" "$T/remotebin" "$T/stage" "$T/devs"
 chmod 777 "$T/state"
 for f in calls.log primary_sql.log primary_cmds.log primary_UNEXPECTED.log; do : > "$T/state/$f"; chmod 666 "$T/state/$f"; done
 cp "$TD/mock_oracle.py" "$TD/mock_root.py" "$TD/mock_ssh.py" "$TD/mock_installer.py" "$T/"; chmod 755 "$T"/mock_*.py
-for p in rpm dnf yum oracleasm parted partprobe udevadm lsblk blkid wipefs pvs systemctl chronyc uname cmp findmnt firewall-cmd nft iptables; do ln -sf "$T/mock_root.py" "$T/rootbin/$p"; done
+for p in rpm dnf yum oracleasm parted partprobe udevadm lsblk blkid wipefs pvs systemctl chronyc uname cmp findmnt firewall-cmd nft iptables crontab; do ln -sf "$T/mock_root.py" "$T/rootbin/$p"; done
 cp "$TD/mock_ip.sh" "$T/rootbin/ip"; chmod 755 "$T/rootbin/ip"
+cp "$TD/mock_ss.py" "$T/rootbin/ss"; chmod 755 "$T/rootbin/ss"
 for p in ssh scp ssh-keyscan ssh-keygen; do ln -sf "$T/mock_ssh.py" "$T/rootbin/$p"; done
 cp "$TD/mock_shm.py" "$T/"; chmod 755 "$T/mock_shm.py"; for p in df mount; do ln -sf "$T/mock_shm.py" "$T/rootbin/$p"; done
 printf '/dev/mapper/ol-root  /  xfs  defaults  0 0\ntmpfs  /dev/shm  tmpfs  defaults,nodev  0 0\n' > "$T/fstab"
@@ -68,7 +70,9 @@ db_payload() {   # $1 dir
 grid_payload() { # $1 dir
   local d=$1 p
   mkdir -p "$d/bin" "$d/OPatch" "$d/network/admin" "$d/cfgtoollogs"
-  for p in crsctl lsnrctl sqlplus srvctl asmcmd setasmgidwrap; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
+  # like a real image: bin/crsctl is made by root.sh (from crsctl.bin here)
+  for p in lsnrctl sqlplus srvctl asmcmd setasmgidwrap; do cp "$TD/mock_oracle.py" "$d/bin/$p"; done
+  cp "$TD/mock_oracle.py" "$d/bin/crsctl.bin"
   cp "$TD/mock_oracle.py" "$d/OPatch/opatch"; printf 'mock\n' > "$d/bin/oracle"
   mkdir -p "$d/inventory/oneoffs/35643107"
   cp "$TD/zipsrc/root.sh" "$d/root.sh"; touch "$d/network/admin/README"
@@ -169,7 +173,7 @@ else
   mkdir -p "$DBH" "$INV/ContentsXML"; db_payload "$DBH"
   printf '<INVENTORY><HOME_LIST>\n<HOME NAME="d" LOC="%s"/>\n' "$DBH" > "$INV/ContentsXML/inventory.xml"
   if [[ $GRID == true ]]; then
-    mkdir -p "$GH" "$GB"; grid_payload "$GH"; printf '<HOME NAME="g" LOC="%s"/>\n' "$GH" >> "$INV/ContentsXML/inventory.xml"
+    mkdir -p "$GH" "$GB"; grid_payload "$GH"; cp -p "$GH/bin/crsctl.bin" "$GH/bin/crsctl"; printf '<HOME NAME="g" LOC="%s"/>\n' "$GH" >> "$INV/ContentsXML/inventory.xml"
     mkdir -p /etc/oracle; echo "olrconfig_loc=x" > /etc/oracle/olr.loc
     cat > "$GH/network/admin/listener.ora" <<EOF
 LISTENER =

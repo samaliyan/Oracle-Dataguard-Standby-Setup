@@ -110,6 +110,35 @@ pick_from_list() {
   done
 }
 
+SVC_PICK=""; SVC_WHY=""; SVC_FOUND_HOW=""
+svc_pick() {
+  # $1 lsnrctl status output, $2 the exact name, $3 other names of this database (one per line).
+  # SVC_PICK = the service of the listener that is this database, SVC_WHY = how it was matched ("" = exact):
+  #   1. exactly <unique name>[.<db_domain>]
+  #   2. <unique name>.<some domain>   3. <db_name> or <db_name>.<some domain>
+  #   4. one of its service_names, or a service of its root container
+  local list u=${PRIMARY_UNIQUE,,} d=${DB_NAME,,} x c
+  list=$(grep -oE 'Service "[^"]+"' <<< "$1" | cut -d'"' -f2)
+  SVC_PICK=""; SVC_WHY=""
+  SVC_PICK=$(grep -ix -- "$2" <<< "$list" | head -n 1); [[ -n "$SVC_PICK" ]] && return 0
+  while IFS= read -r x; do
+    [[ -n "$x" ]] || continue
+    if [[ "${x,,}" == "$u".* ]]; then SVC_PICK=$x; SVC_WHY="the unique name with a domain"; return 0; fi
+  done <<< "$list"
+  while IFS= read -r x; do
+    [[ -n "$x" ]] || continue
+    if [[ "${x,,}" == "$d" || "${x,,}" == "$d".* ]]; then SVC_PICK=$x; SVC_WHY="the database name"; return 0; fi
+  done <<< "$list"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    # (compared as text: a service name may hold $ or #, which a pattern would read as signs)
+    while IFS= read -r x; do
+      [[ -n "$x" ]] || continue
+      if [[ "${x,,}" == "${c,,}" || "${x,,}" == "${c,,}".* ]]; then SVC_PICK=$x; SVC_WHY="a service of this database (service_names / v\$active_services)"; return 0; fi
+    done <<< "$list"
+  done <<< "$3"
+  return 0
+}
 discover_primary() {
   local l
   DISC_NOTES=()
@@ -117,6 +146,9 @@ discover_primary() {
   # ---- host
   prim_probe host || { bad "Cannot run commands on the primary."; return 1; }
   PRIMARY_HOST=$(sed -n '1p' <<< "$RUN_OUT" | tr -d '[:space:]')
+  # its full name, when it is <short name>.<domain> (checked in /etc/hosts of the primary, step 2.7)
+  PRIMARY_FQ=$(sed -n '2p' <<< "$RUN_OUT" | tr -d '[:space:]')
+  [[ "$PRIMARY_FQ" == "$PRIMARY_HOST".* ]] && v_name "$PRIMARY_FQ" || PRIMARY_FQ=""
   v_name "$PRIMARY_HOST" || { bad "The primary returned an unexpected host name: $PRIMARY_HOST"; return 1; }
   local ls; ls=$(hostname -s 2>/dev/null || hostname)
   if [[ "${PRIMARY_HOST,,}" == "${ls,,}" ]]; then
@@ -366,6 +398,11 @@ Recovery area: $FRA_LOC}"
   # ---- listener: the running tnslsnr that offers this database's service.
   #      Only a tnslsnr that runs as an Oracle owner from a program of that owner is asked.
   local want="${PRIMARY_UNIQUE}${PRIMARY_DOMAIN:+.$PRIMARY_DOMAIN}" lu lh ln lp found=0 p svc lta
+  # the names this database may be offered under, besides the exact one (read-only): its service_names and the
+  # services of the root container (never a PDB service: RMAN and the sys logins need the CDB itself)
+  local cands="" svc_why=""
+  if prim_sql "select lower(value) from v\$parameter where name='service_names';"; then cands+=$(tr ',' '\n' <<< "$(first_line)" | tr -d ' ')$'\n'; fi
+  if prim_sql "select lower(name) from v\$active_services where con_id in (0,1) and name not like 'SYS\$%' and upper(name) not like '%XDB';"; then cands+=$SQL_OUT$'\n'; fi
   local sv_port=$PORT sv_ln=$LISTENER_NAME sv_svc=$PRIMARY_SERVICE sv_lh=$PRIMARY_LISTENER_HOME
   LISTENER_NAME=LISTENER; PORT=1521; PRIMARY_LISTENER_HOME=${GRID_HOME:-$DB_HOME}; PRIMARY_SERVICE=$want; LSNR_ASSUMED=0
   while read -r lp lu lh ln; do
@@ -381,15 +418,17 @@ Recovery area: $FRA_LOC}"
     svc=""
     for t in "${tries[@]}"; do
       if [[ "$t" == "-" ]]; then prim_probe lsnr "$lh" "$ln" || continue; else prim_probe lsnr "$lh" "$ln" "$t" || continue; fi
-      svc=$(grep -oE 'Service "[^"]+"' <<< "$RUN_OUT" | cut -d'"' -f2 | grep -ix -- "$want" | head -n 1)
+      svc_pick "$RUN_OUT" "$want" "$cands"; svc=$SVC_PICK; svc_why=$SVC_WHY
       [[ -n "$svc" ]] && { PRIMARY_LISTENER_TNS_ADMIN=${t#-}; break; }
     done
     [[ -n "$svc" ]] || continue
     p=$(norm "$RUN_OUT" | grep -oE '\(PROTOCOL=TCP\)\(HOST=[^)]*\)\(PORT=[0-9]+\)' | head -n 1 | grep -oE '[0-9]+\)$' | tr -d ')')
     LISTENER_NAME=$ln; PRIMARY_LISTENER_HOME=$lh; PRIMARY_SERVICE=$svc; num "$p" && PORT=$p; found=1; break
   done < <(awk '{ for (i = 3; i <= NF; i++) if ($i ~ /\/bin\/tnslsnr$/) { h=$i; sub(/\/bin\/tnslsnr$/, "", h); print $1, $2, h, $(i+1); break } }' <<< "$PS_OUT")
+  SVC_FOUND_HOW=""
   if [[ $found -eq 1 ]]; then ok "Listener $LISTENER_NAME on port $PORT, service $PRIMARY_SERVICE
 Listener home: $PRIMARY_LISTENER_HOME"
+    [[ -n "$svc_why" ]] && { SVC_FOUND_HOW="$svc_why"; say "The listener does not offer $want. It offers $PRIMARY_SERVICE ($svc_why): that one is used."; }
   else
     LSNR_ASSUMED=1
     # values the admin corrected in the settings of an earlier run are kept

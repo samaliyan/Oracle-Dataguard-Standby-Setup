@@ -94,9 +94,33 @@ c_1_3() {
 d_1_3() { discover_primary; }
 
 SETTINGS_DIFF=""
+summary_wanted() {
+  # the summary screen: every setup run (not the daily check of phase 10, not --roll-forward)
+  [[ ${HEALTH:-0} -eq 1 || ${ROLL_FORWARD:-0} -eq 1 || "${ONLY_PHASE:-}" == 10 ]] && return 1
+  [[ $SUMMARY_DONE -eq 0 ]]
+}
+SUMMARY_DONE=0
 c_1_4() {
   [[ $DISCOVERED -eq 1 ]] || { NOW="The primary configuration is not read yet (step 1.3)"; return 2; }
   derive_standby_settings
+  if summary_wanted; then
+    SETTINGS_DIFF=$(accepted_diff 2>/dev/null) || SETTINGS_DIFF=""
+    # what the settings file had that is converted or not used: said before the summary
+    if [[ $SETTINGS_UPGRADED -eq 1 ]]; then
+      warn "The settings file came from an older version of the script and was converted.${DROPPED_KEYS:+
+No longer used:$DROPPED_KEYS. Disks are now chosen in step 2.13.}$([[ ${PLACEMENT_KEPT:-0} -eq 1 ]] && printf '\nThe standby here was copied by an older version: its files keep the paths of the primary (DATA_DEST=same, FRA_DEST=same).')"
+    elif [[ -n "$DROPPED_KEYS" ]]; then
+      warn "Unknown keys in $SETTINGS_FILE were ignored:$DROPPED_KEYS"
+    fi
+    if [[ "$MODE" == check ]]; then
+      # the same screen, as a report
+      SUMMARY_DONE=1; summary_show; summary_save
+    else
+      NOW="Summary of this run: what was found, where the standby goes, the plan, and the values of this run."
+      KIND_NOW=ask; QUIET_PLAN=1
+      return 1
+    fi
+  fi
   if [[ $SETTINGS_ACCEPTED -eq 1 ]]; then NOW="Settings accepted ($SETTINGS_FILE)"; return 0; fi
   local d rc=0
   d=$(accepted_diff) || rc=1
@@ -112,7 +136,7 @@ c_1_4() {
   if [[ $SETTINGS_UPGRADED -eq 1 ]]; then
     warn "The settings file came from an older version of the script and was converted.
 Check the values above.${DROPPED_KEYS:+
-No longer used:$DROPPED_KEYS. Disks are now chosen in step 2.13.}"
+No longer used:$DROPPED_KEYS. Disks are now chosen in step 2.13.}$([[ ${PLACEMENT_KEPT:-0} -eq 1 ]] && printf '\nThe standby here was copied by an older version: its files keep the paths of the primary (DATA_DEST=same, FRA_DEST=same).')"
   elif [[ -n "$DROPPED_KEYS" ]]; then
     warn "Unknown keys in $SETTINGS_FILE were ignored:$DROPPED_KEYS"
   fi
@@ -129,8 +153,37 @@ pick_editor() {
 }
 d_1_4() {
   local ed
+  if summary_wanted && [[ "$MODE" != check ]]; then
+    local changed_any=0 was_ok=0
+    [[ $SETTINGS_ACCEPTED -eq 1 || ( -z "${SETTINGS_DIFF:-}" && $SETTINGS_UPGRADED -eq 0 && -f "$ACCEPTED_FILE" ) ]] && was_ok=1
+    while true; do
+      summary_values
+      if [[ $UI -eq 1 ]]; then ui_summary_ask; else summary_show; ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit"; fi
+      local a=${ANSWER//[[:space:]]/}; a=${a,,}
+      case "$a" in
+        "") if ! validate_settings >/dev/null 2>&1; then
+              validate_settings
+              SUM_NOTE="Not started: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
+              continue
+            fi
+            save_settings; save_accepted; SETTINGS_ACCEPTED=1; SETTINGS_UPGRADED=0; SUMMARY_DONE=1
+            summary_save
+            _log INFO "summary accepted, the run starts"
+            DONE_MSG="Settings saved to $SETTINGS_FILE. Summary: $LOG_DIR/summary_$RUN_ID.txt"
+            [[ $was_ok -eq 1 && $changed_any -eq 0 ]] && { DONE_AS_OK=1; DONE_MSG="Same settings as before. Summary: $LOG_DIR/summary_$RUN_ID.txt"; }
+            return 0 ;;
+        d)  local f; f=$(mktemp) && CLEANUP_FILES+=("$f") && summary_details_text > "$f"
+            if [[ $UI -eq 1 ]]; then ui_page "$f" "Details"; else cat -- "$f"; fi; rm -f -- "$f" ;;
+        h)  show_help 1.4 || true ;;
+        q)  user_stop "Stopped by you" ;;
+        e)  SUMMARY_DONE=1; L14_EDIT=1; break ;;          # the file in an editor: the way below
+        *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))"; changed_any=1
+            else sum_note "Type a number from 1 to ${#SV_ID[@]}, d, e or q, or press Enter to start."; fi ;;
+      esac
+    done
+  fi
   while true; do
-    ask_choice "[a] Accept   [e] Edit   [h] Help   [q] Quit" "aeq"
+    if [[ ${L14_EDIT:-0} -eq 1 ]]; then L14_EDIT=0; ANSWER=e; else ask_choice "[a] Accept   [e] Edit   [h] Help   [q] Quit" "aeq"; fi
     case "$ANSWER" in
       a)
         validate_settings || { bad "Fix the settings first: choose e."; continue; }

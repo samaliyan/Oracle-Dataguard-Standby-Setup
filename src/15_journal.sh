@@ -166,6 +166,9 @@ undo_text() {
     MRP)        printf 'auto: alter database recover managed standby database cancel' ;;
     UNIT)       if [[ "$obj" == *.timer ]]; then printf 'auto: systemctl disable --now %s   (the nightly clean-up stops)' "$obj"
                 else printf 'auto: systemctl disable %s   (a running standby keeps running)' "$obj"; fi ;;
+    CRONLINE)   printf 'auto: the line ending with "%s" is taken out of the crontab of %s' "$(detail_field "$det" tag | tr '~' ' ')" "$obj" ;;
+    CRONOFF)    printf 'by hand, only if wanted: ARCH_CLEANUP=crontab in %s --settings, then %s --only 9.8   (the old line is in the log of that run)' "$SELF" "$SELF" ;;
+    UNITOFF)    printf 'by hand, only if wanted: ARCH_CLEANUP=timer in %s --settings, then %s --only 9.8' "$SELF" "$SELF" ;;
     OPATCH)     printf 'by hand, only if wanted: rm -rf %s ; mv %s %s   (puts back the OPatch of the media)' "$obj" "$(detail_field "$det" old)" "$obj" ;;
     SHM)        b=$(detail_field "$det" old)
                 if [[ -n "$b" && "$b" != "-" ]]; then printf 'by hand, usually not wanted: mount -o remount,size=%s /dev/shm   (the fstab line has its own backup)' "$b"
@@ -217,7 +220,7 @@ change_word() {
   case "$1" in
     NEW) printf 'new file' ;; APPEND) printf 'file' ;; EDIT) printf 'file' ;; RENAME) printf 'renamed' ;; DIR) printf 'folder' ;;
     GROUP) printf 'group' ;; USER|USERMOD) printf 'user' ;; PKG) printf 'package' ;; FWPORT) printf 'firewall' ;;
-    SERVICE|UNIT) printf 'service' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
+    SERVICE|UNIT|UNITOFF) printf 'service' ;; CRONLINE|CRONOFF) printf 'crontab' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
     LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
     SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
@@ -249,6 +252,8 @@ journal_run_summary() {
 #---- undo ------------------------------------------------------------------
 _undo_file_ok() {
   # $1 file, $2 recorded md5 of the whole file: 0 when the file is unchanged since the script wrote it (or the user accepts)
+  # only a plain file is read (a link or a FIFO put in place would lead root elsewhere or hang the undo)
+  [[ -f "$1" && ! -L "$1" ]] || { bad "$1 is no longer a plain file. Fix it by hand."; return 1; }
   local cur; cur=$(file_md5 "$1")
   [[ -n "$2" && "$cur" == "$2" ]] && return 0
   warn "$1 was changed after this script wrote it."
@@ -279,6 +284,7 @@ _undo_obj_ok() {
       if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
     FWPORT) [[ "$obj" =~ ^[A-Za-z0-9_-]+:[0-9]+/tcp$ ]] || { bad "Not undone: invalid firewall entry $obj"; return 1; } ;;
     UNIT)   [[ "$obj" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || { bad "Not undone: invalid unit name $obj"; return 1; } ;;
+    CRONLINE) v_name "$obj" && [[ "$(detail_field "$det" tag)" =~ ^#~dg_standby_setup~[a-z0-9_]+$ ]] || { bad "Not undone: unusual crontab entry ($obj, $det)"; return 1; } ;;
     LSNRRES|LSNRPORT|LSNRSTART) v_name "$obj" || { bad "Not undone: invalid listener name $obj"; return 1; } ;;
     SRVCTL) v_name "$obj" || { bad "Not undone: invalid database name $obj"; return 1; } ;;
     INSTANCE|MRP|SRL)
@@ -321,7 +327,7 @@ Then run this undo again."
 _state_or_2() {
   # local_state that is not readable means "cannot check": never treated as done
   local_state
-  case "$LSTATE" in NOSW|ERROR|"") bad "Cannot check the instance: settings or software not found ($LSTATE)."; return 2 ;; esac
+  case "$LSTATE" in NOSW|ERROR|"") bad "Cannot check the instance: settings or software not found ($LSTATE)."; return 2 ;; HUNG) bad "$(hung_text) Step 9.2 offers to stop it (shutdown abort)."; return 2 ;; esac
   return 0
 }
 undo_one() {
@@ -335,7 +341,15 @@ undo_one() {
       # in a folder of another user (oracle, grid): removed as that user, so a folder swapped for a link meanwhile
       # cannot lead root elsewhere
       local po; po=$(stat -c '%U' -- "$(dirname -- "$obj")" 2>/dev/null)
-      if [[ -n "$po" && "$po" != root ]]; then runuser -u "$po" -- rm -f -- "$obj" || return 1
+      if [[ -n "$po" && "$po" != root ]]; then
+        if ! runuser -u "$po" -- rm -f -- "$obj" 2>/dev/null; then
+          # (a folder its owner made read-only): root removes the entry only while nobody but root can swap the
+          # folder itself for a link; else it is left for the admin
+          local od; od=$(dirname -- "$obj")
+          root_holds "$(dirname -- "$od")" "$od" || { bad "Not removed: $obj could not be removed as $po, and its folder is not held by root. Remove it by hand."; return 2; }
+          _log INFO "undo: $obj removed as root ($od is not writable by $po)"
+          rm -f -- "$obj" || return 1
+        fi
       else rm -f -- "$obj" || return 1; fi
       say "Removed $obj"; _hint_after_restore "$obj"; return 0 ;;
     APPEND)
@@ -361,7 +375,10 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       fi
       u=$(stat -c '%U' -- "$obj")
       [[ "$u" != "root" ]] || dir_root_only "$obj" || { bad "Not changed: $(dirname -- "$obj") must be a folder that only root can write to."; return 2; }
-      backup_file "$obj" "$u" || return 1
+      # who acts: in a folder only root can change (/etc/oratab, owned by oracle or grid), root, whoever owns the
+      # file (nobody else can swap the entry; the owner cannot make files there); elsewhere the owner itself
+      local act=$u; [[ "$u" != root ]] && dir_root_only "$obj" && act=root
+      backup_file "$obj" "$act" || return 1
       # exactly the added bytes go; text before and after them stays (the newline added in front of the block stays
       # when more text follows it, so two lines are not glued together). The file is rewritten as its owner.
       [[ -L "$obj" ]] && { bad "Not changed: $obj is now a symbolic link."; return 2; }
@@ -369,17 +386,22 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       [[ "$lead" == "1" && $cur_len -gt $((off + len)) ]] && keep_nl=1
       tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
       # a file of another user is also read as that user (a link put in its place cannot show root-only text)
-      if [[ "$u" == "root" ]]; then
+      if [[ "$act" == "root" ]]; then
         { head -c "$off" -- "$obj"; [[ $keep_nl -eq 1 ]] && printf '\n'; tail -c +$((off + len + 1)) -- "$obj"; } > "$tmp" || { rm -f -- "$tmp"; return 1; }
       else
-        runuser -u "$u" -- sh -c 'head -c "$1" -- "$2" && { [ "$3" != 1 ] || printf "\n"; } && tail -c +"$4" -- "$2"' sh "$off" "$obj" "$keep_nl" "$((off + len + 1))" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+        runuser -u "$act" -- sh -c 'head -c "$1" -- "$2" && { [ "$3" != 1 ] || printf "\n"; } && tail -c +"$4" -- "$2"' sh "$off" "$obj" "$keep_nl" "$((off + len + 1))" > "$tmp" || { rm -f -- "$tmp"; return 1; }
       fi
-      if [[ "$u" == "root" ]]; then cat "$tmp" > "$obj" || { rm -f -- "$tmp"; return 1; }
+      if [[ "$act" == "root" ]]; then cat "$tmp" > "$obj" || { rm -f -- "$tmp"; return 1; }
       # root reads the private temp copy; the owner writes its own file (the copy is never made readable for others)
-      else runuser -u "$u" -- sh -c 'cat > "$1"' sh "$obj" < "$tmp" || { rm -f -- "$tmp"; return 1; }; fi
+      # (a read-only file of its own, 444, is made writable for the moment by the owner itself; root never
+      # writes into a path that user controls)
+      else runuser -u "$act" -- sh -c 'm=$(stat -c %a -- "$1") || exit 1; w=0; [ -w "$1" ] || { chmod u+w -- "$1" || exit 1; w=1; }
+          cat > "$1"; r=$?; [ $w -eq 0 ] || chmod "$m" -- "$1"; exit $r' sh "$obj" < "$tmp" \
+          || { rm -f -- "$tmp"; bad "Writing $obj failed: it may be damaged. Its copy from before is $obj.bak_$RUN_ID"; return 1; }
+      fi
       rm -f -- "$tmp"
       if [[ $off -eq 0 && ! -s "$obj" ]]; then
-        if [[ "$u" == "root" ]]; then rm -f -- "$obj"; else runuser -u "$u" -- rm -f -- "$obj"; fi
+        if [[ "$act" == "root" ]]; then rm -f -- "$obj"; else runuser -u "$act" -- rm -f -- "$obj"; fi
         say "Removed $obj. It held only the added block."
       else say "Removed the block that was added to $obj."; fi
       _hint_after_restore "$obj"; return 0 ;;
@@ -387,10 +409,26 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       b=$(detail_field "$det" bak); m=$(detail_field "$det" md5)
       [[ -n "$b" && "$b" != "-" ]] || { say "There is no exact backup for this change. Compare $obj with its .bak_ copies and fix it by hand."; return 2; }
       [[ -f "$b" ]] || { bad "The backup $b is gone. Fix $obj by hand."; return 2; }
+      [[ -L "$b" ]] && { bad "The backup $b is now a symbolic link. It is not used. Fix $obj by hand."; return 2; }
       _undo_file_ok "$obj" "$m" || return 2
       local po; po=$(stat -c '%U' -- "$(dirname -- "$obj")" 2>/dev/null)
-      if [[ -n "$po" && "$po" != root ]]; then runuser -u "$po" -- cp -p --remove-destination -- "$b" "$obj" || return 1
-      else cp -p --remove-destination -- "$b" "$obj" || return 1; fi
+      local bo; bo=$(stat -c '%U' -- "$b" 2>/dev/null)
+      if [[ -n "$po" && "$po" != root && "$bo" != "$po" ]]; then
+        # a file of another user than the folder's owner (root's file in oracle's folder): the folder's owner could
+        # swap the backup for a link that root would read; left for the admin
+        bad "Not put back: $obj belongs to $bo, but its folder belongs to $po. Copy $b back by hand (check it is no link)."; return 2
+      elif [[ -n "$po" && "$po" != root ]]; then
+        # a file of the folder's owner: put back as that user (a link put in place cannot lead root elsewhere;
+        # root never reads a backup in a folder that user controls)
+        runuser -u "$po" -- test -r "$b" || { bad "Not put back: $po cannot read the backup $b. Copy it back by hand."; return 2; }
+        runuser -u "$po" -- cp -p --remove-destination -- "$b" "$obj" || return 1
+      else
+        # a file in a folder of root: copied by root, so owner and mode stay as they were (cp makes a new file
+        # after removing the old entry; it does not write through a link)
+        # a folder of root: only while no one else can change its entries (the backup cannot be swapped)
+        dir_root_only "$obj" || { bad "Not put back: $(dirname -- "$obj") can be changed by users other than root. Copy $b back by hand."; return 2; }
+        cp -p --remove-destination -- "$b" "$obj" || return 1
+      fi
       say "Put back $obj from $b"; _hint_after_restore "$obj"; return 0 ;;
     RENAME)
       local to; to=$(detail_field "$det" to)
@@ -420,9 +458,15 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       run_cmds <<< "systemctl disable $obj" || return 1
       systemctl reset-failed "$obj" 2>/dev/null || true
       say "$obj is disabled: it no longer starts at boot. The running standby was not stopped."; return 0 ;;
+    CRONLINE)
+      local tag; tag=$(detail_field "$det" tag | tr '~' ' ')
+      if ! crontab -u "$obj" -l 2>/dev/null | grep -q -- " $tag\$"; then say "The crontab of $obj has no such line. It is already gone."; return 0; fi
+      local cur; cur=$(crontab -u "$obj" -l 2>/dev/null) || { bad "The crontab of $obj cannot be read. Nothing is changed."; return 1; }
+      run_cmds <<< "crontab -u $obj -l | grep -v -- ' $tag\$' | crontab -u $obj -" || return 1
+      say "The clean-up line is out of the crontab of $obj."; return 0 ;;
     LSNRRES)
       run_logged "srvctl config listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" config listener -listener "$obj" >/dev/null 2>&1 || {
-        grep -qE 'PRCN-2044|PRCR-1001|PRCD-1120|could not be found|does not exist' <<< "$RUN_OUT" || { bad "srvctl gave no clear answer for listener $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
+        srv_notfound "$obj" PRCN-2044 || { bad "srvctl gave no clear answer for listener $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
         say "Listener $obj is not registered. It is already gone."; return 0; }
       run_logged "srvctl stop listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" stop listener -listener "$obj" || true
       run_logged "srvctl remove listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" remove listener -listener "$obj" || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
@@ -459,7 +503,7 @@ Trying shutdown abort."; sql_local "shutdown abort" || return 1; }
       say "Instance $obj is down."; return 0 ;;
     SRVCTL)
       run_logged "srvctl config" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$obj" >/dev/null 2>&1 || {
-        grep -qE 'PRCD-1120|PRCR-1001|could not be found|does not exist' <<< "$RUN_OUT" || { bad "srvctl gave no clear answer for $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
+        srv_notfound "$obj" || { bad "srvctl gave no clear answer for $obj: $(tail -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2; }
         say "$obj is not registered. It is already gone."; return 0; }
       run_logged "srvctl status" as_oracle timeout 600 "$DB_HOME/bin/srvctl" status database -db "$obj" || true
       grep -q 'is running' <<< "$RUN_OUT" && { run_logged "srvctl stop" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" stop database -db "$obj" -stopoption immediate || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }; }

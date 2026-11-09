@@ -8,51 +8,69 @@ usage() {
 dg_standby_setup.sh, version $SCRIPT_VERSION: builds an Oracle Data Guard physical standby (12.1 to 23ai)
 
 Run it as root on the new standby server (Oracle Linux 7, 8 or 9).
-It never changes the primary. What the primary needs is shown for you to run.
+It never changes the primary on its own. What the primary needs is shown for you to run
+(with PRIMARY_RUN=yes in the settings, it may run listed Data Guard statements there, step by step,
+after you answer y: never a restart, a stop or a deletion).
 Storage in ASM or in folders, Grid with its own user or not: all are supported.
 
-Usage
-  dg_standby_setup.sh                      Start or continue: a menu shows what can be run
-  dg_standby_setup.sh --primary 10.0.0.5   IP address or host name of the primary
-  dg_standby_setup.sh --user oracle        OS user for ssh on the primary (default oracle)
-  dg_standby_setup.sh --check              Check and report only; changes nothing in Oracle,
-                                           the OS or the primary, and keeps the saved progress
-                                           (still asks for the ssh and sys passwords)
-  dg_standby_setup.sh --from 6.1           Continue from a step (phase 1 always runs)
-  dg_standby_setup.sh --only 10            Run one phase only (10 = daily health check;
-                                           phase 1 runs first, so the primary must be reachable)
-  dg_standby_setup.sh --only grid          Run a part only:  os (phase 2), grid (3.1-3.5),
-                                           db (3.6-3.11), primary (phase 4), or steps such as
-                                           2.1-2.4, 3.6 or 2-3. It stops after the last one.
-  dg_standby_setup.sh --health             Health check for cron or monitoring: no questions, no changes,
-                                           one line per check. Exit 0 OK, 1 WARNING, 2 CRITICAL,
-                                           3 UNKNOWN. Needs an ssh key to the primary (--help-step health)
-  dg_standby_setup.sh --roll-forward       Bring a standby that cannot catch up up to date from the primary
-                                           (RMAN, 18c and later), instead of a new copy (--help-step 10.7)
-  dg_standby_setup.sh --settings           Review or edit the settings, then stop
-  dg_standby_setup.sh --yes                Answer "y" for the actions on this server. Still asked: anything
-                                           that erases (disks, leftovers, a half-unpacked software folder),
-                                           the copy, the host key, passwords, the listener restart (3.10),
-                                           the standby restart steps (9.1 9.2 9.3 9.7) and log deletion (9.8)
-  dg_standby_setup.sh --status             Show the result of every phase and step
-                                           (connects to nothing)
-  dg_standby_setup.sh --show-changes       Changes made by the setup, and how to undo them
-  dg_standby_setup.sh --show-changes 6.1   The same, for one step
-  dg_standby_setup.sh --undo 6.1           Undo the changes of one step (asks before each one)
-  dg_standby_setup.sh --help-step 6.1      How to do a step by hand ("all" for every step)
+Run with no option to see all of this as a menu (the same items, the same code).
+
+Setup
+  (no option)          Full setup, or continue where the last run stopped
+                         dg_standby_setup.sh
+  --check              Check and report only; changes nothing (also prints the summary screen)
+                         dg_standby_setup.sh --check
+  --only <part>        A part only: os, grid, db, primary, a phase, or steps; it stops after them
+                         dg_standby_setup.sh --only 2.1-2.4
+  --from <step>        Continue from a step (phase 1 always runs first)
+                         dg_standby_setup.sh --from 7.2
+  --yes                Answer y for the actions on this server (risky ones are still asked;
+                       a at any step question does the same from there)
+                         dg_standby_setup.sh --yes
+  --primary <ip>       The primary (IP address or host name)
+                         dg_standby_setup.sh --primary 10.0.0.5
+  --user <name>        OS user for ssh on the primary (default oracle)
+                         dg_standby_setup.sh --user oracle
+  --plain              Plain scrolling output instead of the screen layout
+                         dg_standby_setup.sh --plain
+After setup
+  --only 10            Health check, with the screen and questions
+                         dg_standby_setup.sh --only 10
+  --health             Health check for cron or monitoring: no questions, no changes; exit 0 OK,
+                       1 WARNING, 2 CRITICAL, 3 UNKNOWN (needs an ssh key: --help-step health)
+                         dg_standby_setup.sh --health
+  --roll-forward       Bring a standby that cannot catch up up to date from the primary (18c+)
+                         dg_standby_setup.sh --roll-forward
+Information
+  --status             The result of every phase and step (connects to nothing)
+                         dg_standby_setup.sh --status
+  --show-changes [N.M] Changes made by the setup, and how to undo them
+                         dg_standby_setup.sh --show-changes 6.1
+  --undo N.M           Undo the changes of one step (asks before each one)
+                         dg_standby_setup.sh --undo 6.1
+  --help-step N.M      How to do a step by hand ("all" for every step)
+                         dg_standby_setup.sh --help-step 9.2
+  --settings           The summary screen and the values of the setup, then stop
+                         dg_standby_setup.sh --settings
 
 How it works
-  Each step shows what it found and what it will do, then asks:
-    [y] Yes, do it   [s] Skip   [h] Help   [q] Quit
+  After phase 1 a summary screen shows what was found, where the standby goes, the plan, the
+  problems found now and the values of this run (a number changes one; Enter starts).
+  Each step shows what it found and the exact commands it will run ("Will run"), then asks:
+    [y] Yes, do it   [a] Yes to all   [s] Skip   [h] Help   [q] Quit
   Commands for the primary are only shown. You run them there, answer r,
   and the script checks the result.
+  The screen: the top shows every phase with its steps done, the rest shows the current step.
+  At any question, l lists every step (a step number shows its details), d shows the details
+  of the current step and h its help. In a terminal smaller than 80 x 24 the output scrolls.
   Installers, root scripts and the RMAN copy run in their own session. A closed terminal
   does not stop them. Run the script again and it waits for them.
 
 Few questions, not unattended
   Run --check first, put the installer zips in place (step 3.1 shows where), then run with --yes.
   The steps on this server then run without the [y] question. Still needed from a person:
-    - the commands on the primary (shown, never run by the script), and r when they are done
+    - the commands on the primary (shown; with PRIMARY_RUN=yes the listed ones may be run over ssh
+      when you answer y), and r when they are done
     - the ssh and sys passwords (typed, never saved), and the host key of the primary
     - erasing disks, moving leftovers aside, the RMAN copy (the word DUPLICATE) and the restart steps
   The setup is not meant to run without a person. Only --health is (for example from cron).
@@ -79,6 +97,8 @@ Exit codes
   1  Stopped, or some steps are not OK or skipped (normal for --check on a new server)
   2  Wrong option or unknown step
   With --health:  0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check, or a wrong option)
+
+Run with no option to see all of this as a menu.
 EOF
 }
 
@@ -122,6 +142,7 @@ parse_args() {
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
       --yes) YES_MODE=1 ;;
+      --plain) PLAIN_OPT=1 ;;
       --show-changes) SHOW_CHANGES=all
         if [[ $# -ge 2 && "$2" != -* ]]; then
           valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit $PX; }
@@ -133,11 +154,11 @@ parse_args() {
         FROM_STEP=$2; FROM_SEEN=1
         [[ "$FROM_STEP" == *.0 ]] && FROM_STEP=${FROM_STEP%.0}     # N.0 is the same as N (the start of phase N)
         if [[ "$FROM_STEP" == *.* ]]; then valid_step "$FROM_STEP" || { printf 'There is no step %s. To list the steps:  --help-step all\n' "$FROM_STEP"; exit $PX; }
-          on_demand "$FROM_STEP" && { printf 'Step %s runs only with --roll-forward.\n' "$FROM_STEP"; exit $PX; }
+          on_demand "$FROM_STEP" && { printf 'Step %s runs only with --roll-forward (without --from or --only).\n' "$FROM_STEP"; exit $PX; }
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
       --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit $PX; }
-              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward.\n'; exit $PX; }
+              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward (without --from or --only).\n'; exit $PX; }
               shift ;;
       --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit $PX; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -254,11 +275,11 @@ menu_next() {
   done
   printf 'all done'
 }
-menu_line() { printf '   %s) %-38s %s%s%s\n' "$1" "$2" "$C_D" "$3" "$C_N"; }
+menu_line() { printf '  %3s) %-44s %s%s%s\n' "$1" "$2" "$C_D" "$3" "$C_N"; }
 menu_records() {
-  # menu item 8: status, the changes made, undo
+  # menu item 12: the changes made, undo (and the status, as before)
   local st
-  ask_choice "[s] Status of every step   [c] Changes made, with undo commands   [u] Undo a step   [b] Back   [q] Quit" "scubq"
+  ask_choice "[c] Changes made, with undo commands   [u] Undo a step   [s] Status of every step   [b] Back   [q] Quit" "scubq"
   case "$ANSWER" in
     q) menu_quit ;;
     s) print_progress_board ;;
@@ -283,33 +304,44 @@ menu_records() {
 }
 menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
 start_menu() {
-  # shown when the script is run without options: choose what to run (the options do the same from the command line)
-  local c yesq
+  # shown when the script is run without options: one grouped menu. Next to each item, in grey, the switch that does
+  # the same from the command line (for scripts and cron). Every item reaches the same code as its switch.
+  local c yesq st
   # Ctrl+C here only leaves the menu: nothing has started, the record of the last run stays as it is
   trap 'printf "\n"; menu_quit' INT
   while true; do
     load_progress
-    printf '\n  %sWhat do you want to do?%s\n\n' "$C_W" "$C_N"
-    menu_line 1 "Full setup, all phases" "($(menu_next))"
-    menu_line 2 "OS preparation only" "phase 2"
-    menu_line 3 "Grid Infrastructure and ASM only" "3.1 - 3.5"
-    menu_line 4 "Database software only" "3.6 - 3.11"
-    menu_line 5 "Primary changes for the DBA" "phase 4"
-    menu_line 6 "Choose steps" "e.g. 2.1-2.4"
-    menu_line 7 "Health check (daily)" "phase 10"
-    menu_line 8 "Status, changes and undo" ""
-    printf '   q) Quit\n\n'
+    printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
+    printf '\n  %sSetup%s\n' "$C_B" "$C_N"
+    menu_line 1 "Full setup ($(menu_next))" "(no option)"
+    menu_line 2 "Check only, change nothing" "--check"
+    menu_line 3 "OS preparation only (phase 2)" "--only os"
+    menu_line 4 "Grid Infrastructure and ASM only" "--only grid"
+    menu_line 5 "Database software only" "--only db"
+    menu_line 6 "Primary changes for the DBA (phase 4)" "--only primary"
+    menu_line 7 "Choose steps" "--only 2.1-2.4"
+    menu_line 8 "Start from a step" "--from 7.2"
+    printf '\n  %sAfter setup%s\n' "$C_B" "$C_N"
+    menu_line 9 "Health check" "--only 10   (cron: --health)"
+    menu_line 10 "Roll forward the standby from the primary" "--roll-forward"
+    printf '\n  %sInformation%s\n' "$C_B" "$C_N"
+    menu_line 11 "Status of every step" "--status"
+    menu_line 12 "Changes made, and undo" "--show-changes, --undo N.M"
+    menu_line 13 "The manual way of a step" "--help-step N.M"
+    menu_line 14 "Settings" "--settings"
+    printf '\n   q) Quit\n\n'
     CUR_STEP=""
     ask "Choice [1]"
     c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=1
     yesq=1
     case "$c" in
       1) break ;;
-      2) parse_only os; break ;;
-      3) parse_only grid; break ;;
-      4) parse_only db; break ;;
-      5) parse_only primary; yesq=0; break ;;        # phase 4 only shows commands for the primary
-      6) while true; do
+      2) MODE=check; yesq=0; break ;;
+      3) parse_only os; break ;;
+      4) parse_only grid; break ;;
+      5) parse_only db; break ;;
+      6) parse_only primary; yesq=0; break ;;        # phase 4 only shows commands for the primary
+      7) while true; do
            ask "Steps to run, for example 2.1-2.4, 3.6 or 2-3 (Enter = back)"
            ANSWER=${ANSWER//[[:space:]]/}
            [[ -z "$ANSWER" || "${ANSWER,,}" == b ]] && continue 2
@@ -321,19 +353,43 @@ start_menu() {
          local p1 p2 pp; p1=${ONLY_PHASE:-${FROM_STEP%%.*}}; p2=${ONLY_PHASE:-${TO_STEP%%.*}}; yesq=0
          for ((pp = p1; pp <= p2; pp++)); do [[ $pp -eq 4 || $pp -eq 10 ]] || yesq=1; done
          break ;;
-      7) parse_only 10; yesq=0; break ;;
-      8) menu_records ;;
+      8) while true; do
+           ask "Start from which step, for example 7.2 or 9 (Enter = back)"
+           st=${ANSWER//[[:space:]]/}
+           [[ -z "$st" || "${st,,}" == b ]] && continue 2
+           [[ "${st,,}" == q ]] && menu_quit
+           if [[ "$st" =~ ^([1-9]|10)$ ]]; then FROM_STEP="$st.0"; FROM_SEEN=1; break; fi
+           if valid_step "$st" && ! on_demand "$st"; then FROM_STEP=$st; FROM_SEEN=1; break; fi
+           if valid_step "$st"; then say "Step $st runs only with --roll-forward (menu item 10)."; continue; fi
+           say "There is no step $st. To list the steps:  $SELF --help-step all"
+         done
+         break ;;
+      9) parse_only 10; yesq=0; break ;;
+      10) ROLL_FORWARD=1; parse_only 10; yesq=0; break ;;
+      11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100 ;;
+      12) menu_records ;;
+      13) while true; do
+            ask "Which step, for example 9.2 (Enter = back)"
+            st=${ANSWER//[[:space:]]/}
+            [[ -z "$st" || "${st,,}" == b ]] && continue 2
+            [[ "${st,,}" == q ]] && menu_quit
+            { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; break; }
+            say "There is no step $st. To list the steps:  $SELF --help-step all"
+          done ;;
+      14) REVIEW_SETTINGS=1; ONLY_PHASE=1; yesq=0; break ;;
       q) menu_quit ;;
-      *) say "Please type a number from 1 to 8, or q." ;;
+      *) say "Please type a number from 1 to 14, or q." ;;
     esac
   done
-  _log INFO "menu choice $c${ONLY_TEXT:+ ($ONLY_TEXT)}"
+  _log INFO "menu choice $c${ONLY_TEXT:+ ($ONLY_TEXT)}${FROM_STEP:+ (from $FROM_STEP)}"
   if [[ -n "$TO_STEP" ]]; then say "This run: $(range_text). It stops after it. Phase 1 (the primary) runs first."
-  elif [[ -n "$ONLY_PHASE" ]]; then say "This run: phase $ONLY_PHASE only. Phase 1 (the primary) runs first."; fi
+  elif [[ -n "$ONLY_PHASE" && $REVIEW_SETTINGS -eq 0 ]]; then say "This run: phase $ONLY_PHASE only. Phase 1 (the primary) runs first."
+  elif [[ -n "$FROM_STEP" ]]; then say "This run: from $(range_word "${FROM_STEP%.0}"). Phase 1 (the primary) runs first."; fi
   if [[ $yesq -eq 1 && $YES_MODE -eq 0 ]]; then
     say "${C_D}With --yes, the actions on this server are done without asking. Still asked: disk erasure,"
     say "clean-up, the copy, the host key, passwords, the listener restart (3.10), the restart steps"
     say "(9.1-9.3, 9.7) and the deletion setting of archived logs (9.8).${C_N}"
+    say "${C_D}You can also answer a at any step question: yes to all from there.${C_N}"
     ask "Answer y automatically for this server (--yes)?  [y] Yes   [N] No   [q] Quit"
     case "${ANSWER,,}" in
       y|yes) YES_MODE=1; _log INFO "--yes chosen in the menu"; ok "Mode: setup, --yes: actions on this server without asking" ;;
@@ -371,7 +427,11 @@ main() {
     printf '  %s\n' "$(rule 70)"
     printf '  This server   %s\n' "$(hostname -s 2>/dev/null)"
     [[ -n "$PRIMARY_UNIQUE" ]] && printf '  Primary       %s on %s\n  Standby       %s\n' "$PRIMARY_UNIQUE" "${PRIMARY_HOST:-$PRIMARY_IP}" "${STANDBY_UNIQUE:-?}"
-    if [[ $STATUS_ONLY -eq 1 ]]; then print_progress_board; [[ -s "$JOURNAL_FILE" ]] && printf '  Changes made on this server: %s --show-changes\n' "$SELF"; fi
+    if [[ $STATUS_ONLY -eq 1 ]]; then
+      print_progress_board
+      printf '\n  %sEvery step%s\n' "$C_W" "$C_N"; ui_list_text 100
+      [[ -s "$JOURNAL_FILE" ]] && printf '\n  Changes made on this server: %s --show-changes\n' "$SELF"
+    fi
     [[ -n "$SHOW_CHANGES" ]] && show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"
     exit 0
   fi
@@ -419,6 +479,8 @@ main() {
   printf '  %sAt each question: h shows help, q quits.%s\n' "$C_D" "$C_N"
   print_progress_board
   [[ $MENU_OK -eq 1 && "$MODE" == "run" ]] && start_menu
+  # the screen layout (a map of the phases on top, the current step below) from here on
+  ui_start
   # a long job of an earlier run (installer, root script, RMAN) is waited for before anything else;
   # phase 4 alone works only with the primary and does not need to wait
   if [[ "$ONLY_PHASE" == "4" ]] && job_alive; then
@@ -457,6 +519,7 @@ main() {
     [[ $p -eq 1 && $PHASE4_FIRST -eq 1 ]] && phase_4
   done
   CUR_STEP=""
+  ui_end
   summary
   local id bad_n=0
   for id in "${STEP_ORDER[@]}"; do case "${STEP_RESULT[$id]}" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) ;; *) bad_n=$((bad_n + 1)) ;; esac; done

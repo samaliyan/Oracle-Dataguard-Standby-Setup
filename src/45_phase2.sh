@@ -9,7 +9,7 @@ run_cmds() {
   while IFS= read -r c || [[ -n "$c" ]]; do
     [[ -z "$c" ]] && continue
     if ! run_logged "$c" bash -c "$c"; then bad "Failed: $c"; printf '%s\n' "$RUN_OUT" | tail -n 5 | hint; return 1; fi
-    [[ "$PLAN" == *"$c"* ]] || say "Ran: $c"      # a command the Plan already shows is not repeated
+    # (the command was shown before it ran: "Running as root: ...")
   done
   return 0
 }
@@ -315,8 +315,14 @@ make_dir() {
     if [[ ! -e "$p" && ! -L "$p" ]]; then
       if [[ $held -eq 1 ]]; then install -d -o "$owner" -g "$INSTALL_GROUP" -m 775 "$p" || return 1
       else
-        runuser -u "$owner" -- mkdir -m 775 -- "$p" 2>/dev/null && runuser -u "$owner" -- chgrp -h "$INSTALL_GROUP" -- "$p" 2>/dev/null \
+        runuser -u "$owner" -- mkdir -m 775 -- "$p" 2>/dev/null \
           || { bad "$p cannot be made by $owner (the folder above can be changed by users other than root, so root does not make it). Make it, as $owner:  mkdir -p $path"; return 1; }
+        # the group: a folder with the wrong group is taken back at once (it is empty and new), so a later run
+        # does not find it "there" and go on with it
+        if ! runuser -u "$owner" -- chgrp -h "$INSTALL_GROUP" -- "$p" 2>/dev/null; then
+          runuser -u "$owner" -- rmdir -- "$p" 2>/dev/null
+          bad "$owner cannot give $p the group $INSTALL_GROUP ($owner is not a member of it). Step 2.2 adds the users to the groups."; return 1
+        fi
       fi
       say "Created $p"; journal DIR "$p" "owner $owner"
     fi
@@ -381,6 +387,76 @@ d_2_5() { local d own; while IFS=: read -r d own; do make_dir "$d" "$own" || ret
 #   that line and gets its own correct line (lines of other names are never changed).
 H_TODO=""; H_FIX=""
 v4_of() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'; }
+# The listener and the database need the host name to give an IPv4 address of the server from /etc/hosts or
+# DNS. The systemd "myhostname" module answers too (often with an IPv6 link-local address such as fe80::...):
+# that answer does not count (the Grid listener then stays INTERMEDIATE, "Not All Endpoints Registered").
+v4_fd() {
+  # IPv4 address of $1 from /etc/hosts, else from DNS (empty: neither knows it)
+  local a; a=$(getent -s files ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}')
+  [[ -n "$a" ]] || a=$(timeout 10 getent -s dns ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}')
+  printf '%s' "$a"
+}
+name_res_local() {
+  # $1 name -> "files|dns|first answer of getent ahosts" on this server
+  printf '%s|%s|%s' "$(getent -s files ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}')" \
+    "$(timeout 10 getent -s dns ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}')" "$(getent ahosts "$1" 2>/dev/null | awk '{print $1; exit}')"
+}
+name_res_parse() {
+  # the output of the primary probe hostres -> "files|dns|first"
+  local f d a
+  f=$(sed -n 's/^F //p' <<< "$1" | awk '{print $1}'); d=$(sed -n 's/^D //p' <<< "$1" | awk '{print $1}'); a=$(sed -n 's/^A //p' <<< "$1" | awk '{print $1}')
+  printf '%s|%s|%s' "$f" "$d" "$a"
+}
+local_ipv4s() {
+  { ip -o addr show 2>/dev/null | awk '$3 == "inet" {split($4, x, "/"); print x[1]}'; hostname -I 2>/dev/null | tr ' ' '\n'; } \
+    | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u | paste -sd' ' -
+}
+name_problem() {
+  # $1 name, $2 "files|dns|first", $3 the IPv4 addresses of the server the name belongs to.
+  # Prints the problem in one line, or nothing when the name gives one of those addresses.
+  local n=$1 f d a ip; IFS='|' read -r f d a <<< "$2"
+  ip=${f:-$d}
+  if [[ -z "$ip" ]]; then
+    if [[ "$a" == *:* ]]; then printf '%s gives only the IPv6 address %s, no IPv4 address in /etc/hosts or DNS' "$n" "$a"
+    elif [[ -n "$a" ]]; then printf '%s is not in /etc/hosts or DNS (only %s from another source)' "$n" "$a"
+    else printf '%s does not resolve' "$n"; fi
+  elif [[ "$ip" == 127.* ]]; then printf '%s resolves to %s (loopback)' "$n" "$ip"
+  elif [[ -n "$3" && " $3 " != *" $ip "* ]]; then printf '%s resolves to %s, which is not an address of that server' "$n" "$ip"
+  fi
+  return 0
+}
+standby_name_problems() {
+  # the host name of this server (short, and the full name when there is one): one problem per line
+  local h fq ips; ips=$(local_ipv4s); fq=$(host_fq)
+  for h in "$STANDBY_HOST" ${fq:+"$fq"}; do
+    local p; p=$(name_problem "$h" "$(name_res_local "$h")" "$ips")
+    [[ -n "$p" ]] && printf '%s\n' "$p"
+  done
+  return 0
+}
+primary_name_problems() {
+  # the host name of the primary, as the primary itself resolves it (read-only probes); one problem per line.
+  # 2 = it could not be asked
+  ssh_alive || return 2
+  prim_probe ipv4s || return 2
+  local ips h; ips=$(tr ' ' '\n' <<< "$RUN_OUT" | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u | paste -sd' ' -)
+  PRIMARY_V4S=$ips
+  for h in "$PRIMARY_HOST" ${PRIMARY_FQ:+"$PRIMARY_FQ"}; do
+    prim_probe hostres "$h" || return 2
+    local p; p=$(name_problem "$h" "$(name_res_parse "$RUN_OUT")" "$ips")
+    [[ -n "$p" ]] && printf '%s\n' "$p"
+  done
+  return 0
+}
+primary_hosts_line() {
+  # the /etc/hosts line the primary needs for its own name: its address (the one used for ssh when it is one of
+  # its addresses), full name, short name
+  local ip=""
+  [[ " ${PRIMARY_V4S:-} " == *" $(ipv4_of "$PRIMARY_IP") "* ]] && ip=$(ipv4_of "$PRIMARY_IP")
+  [[ -n "$ip" ]] || ip=$(awk '{print $1}' <<< "${PRIMARY_V4S:-}")
+  [[ -n "$ip" ]] || ip=$(ipv4_of "$PRIMARY_IP")
+  printf '%s    %s%s' "$ip" "${PRIMARY_FQ:+$PRIMARY_FQ }" "$PRIMARY_HOST"
+}
 host_fq() {   # the full name of this server when it is <short name>.<domain>
   local fq; fq=$(hostname 2>/dev/null)
   [[ "$fq" == *.* && "${fq%%.*}" == "$STANDBY_HOST" ]] && printf '%s' "$fq"
@@ -390,10 +466,13 @@ c_2_6() {
   H_TODO=""; H_FIX=""
   for h in "$PRIMARY_HOST|$PRIMARY_IP" "$STANDBY_HOST|$STANDBY_IP"; do
     IFS='|' read -r h want <<< "$h"
-    ip=$(v4_of "$h")
+    # (only /etc/hosts and DNS count: an answer of the "myhostname" module is no entry)
+    ip=$(v4_fd "$h")
+    local why6=""; [[ -z "$ip" && "$h" == "$STANDBY_HOST" ]] && why6=$(name_problem "$h" "$(name_res_local "$h")" "")
     local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
     if [[ -z "$ip" ]]; then
       [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known"; return 2; }
+      [[ "$why6" == *IPv6* || "$why6" == *"another source"* ]] && why+="$why6."$'\n'"The listener needs an IPv4 address for it (else Not All Endpoints Registered)."$'\n'
       todo+="$want    ${fq:+$fq }$h"$'\n'
     elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" ]]; then
       if [[ "$ip" == 127.* ]]; then why+="$h resolves to $ip (loopback). The primary could not reach this server's listener."$'\n'
@@ -401,7 +480,7 @@ c_2_6() {
       fix+="$h|$want"$'\n'; todo+="$want    ${fq:+$fq }$h"$'\n'
     fi
   done
-  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_of "$PRIMARY_HOST"), $STANDBY_HOST = $(v4_of "$STANDBY_HOST")"; return 0; fi
+  if [[ -z "$todo" ]]; then NOW="Names resolve: $PRIMARY_HOST = $(v4_fd "$PRIMARY_HOST"), $STANDBY_HOST = $(v4_fd "$STANDBY_HOST")"; return 0; fi
   H_TODO=${todo%$'\n'}; H_FIX=${fix%$'\n'}
   if [[ -L /etc/hosts ]]; then
     NOW="${why:-The host names do not resolve on this server}"$'\n'"/etc/hosts is a symbolic link, so the script does not change it."
@@ -460,8 +539,21 @@ d_2_6() {
 }
 
 # ---- 2.7 primary resolves standby ----
+PRIMARY_FQ=""; PRIMARY_V4S=""
 c_2_7() {
   need_ssh || return 2
+  # first the primary's own name on the primary (its listener needs it, as here)
+  local pp prc=0; pp=$(primary_name_problems) || prc=$?
+  if [[ $prc -eq 0 && -n "$pp" ]]; then
+    NOW="On the primary: ${pp//$'\n'/; }"
+    PRIMARY_HOW_STEP="root  ->  shell"
+    PLAN="cp -p /etc/hosts /etc/hosts.bak_$RUN_ID
+echo '$(primary_hosts_line)' >> /etc/hosts
+getent ahostsv4 $PRIMARY_HOST
+-- The last command must show $(primary_hosts_line | awk '{print $1}'). Then answer r."
+    PLAN_UNDO="cp -p /etc/hosts.bak_$RUN_ID /etc/hosts   (on the primary)"
+    return 1
+  fi
   if prim_probe hosts "$STANDBY_HOST" && [[ -n "$(awk '{print $1; exit}' <<< "$RUN_OUT")" ]]; then
     local pip; pip=$(awk '{print $1; exit}' <<< "$RUN_OUT")
     if [[ "$pip" == "$STANDBY_IP" ]]; then NOW="The primary resolves $STANDBY_HOST to $pip"; return 0; fi
@@ -522,9 +614,28 @@ local_fw_rules() {
   command -v nft >/dev/null 2>&1 && rules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
   command -v iptables >/dev/null 2>&1 && rules+=$'\n'$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
   # (not "ct state invalid ... drop": it only drops broken packets)
-  r=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
+  local drops pnamed paccept pdrop
+  drops=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
       | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)' \
-      | sed 's/^[[:space:]]*//' | head -n 3)
+      | sed 's/^[[:space:]]*//')
+  [[ -n "$drops" ]] || return 0
+  # the rules that name port $PORT: an explicit accept of it (and no drop of it) is the normal default-deny set-up
+  # (counters and comments carry numbers too: taken out before the port is looked for)
+  local clean; clean=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$rules")
+  pnamed=$(grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" <<< "$clean")
+  # (only an accept that is not limited to some sources or interfaces, and in iptables not after a catch-all drop)
+  paccept=$(grep -E '(^|[[:space:]])accept([[:space:]]|;|$)|-j ACCEPT' <<< "$pnamed" | grep -vE 'saddr|(^|[[:space:]])-s[[:space:]]|iifname|iif[[:space:]]|(^|[[:space:]])-i[[:space:]]|--src-range|ipset|match-set|@')
+  # it counts only when no catch-all drop or reject comes before it, and only one input chain drops by policy
+  # (each base chain must accept the packet: with two, an accept in one says nothing about the other)
+  if [[ -n "$paccept" ]]; then
+    local first; first=$(head -n 1 <<< "$paccept")
+    awk -v a="$first" '$0 == a {exit} /^-A INPUT -j (DROP|REJECT)/ || /^(drop|reject)( with .*)?;?$/ {f = 1; exit} END {exit !f}' <<< "$clean" && paccept=""
+    [[ $(grep -cE 'policy drop|^-P INPUT DROP' <<< "$clean") -le 1 ]] || paccept=""
+  fi
+  pdrop=$(grep -E '(^|[[:space:]])(drop|reject)([[:space:]]|;|$)|-j (DROP|REJECT)' <<< "$pnamed")
+  [[ -n "$paccept" && -z "$pdrop" ]] && return 0
+  # shown: every rule that drops port $PORT itself, then the first general ones
+  r=$( { [[ -n "$pdrop" ]] && printf '%s\n' "$pdrop"; grep -vxF -f <(printf '%s\n' "${pdrop:-#none#}") <<< "$drops" | head -n 3; } | grep -v '^$')
   [[ -n "$r" ]] || return 0
   myif=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
   NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject traffic, for example:"$'\n'"$(sed 's/^/  /' <<< "$r")"

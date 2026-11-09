@@ -202,6 +202,17 @@ def uname():
     r = os.environ.get("DGT_UNAME", "5.4.17-2136.330.7.1.el8uek.x86_64")
     print(r if "-r" in a else "Linux"); return 0
 def noop(): return 0
+def crontab():
+    # crontab -u USER -l / crontab -u USER - : one file per user under the test state
+    u = a[a.index("-u") + 1] if "-u" in a else "root"
+    f = "/tmp/dgt/state/crontab_" + u
+    if "-l" in a:
+        if not os.path.exists(f): print(f"no crontab for {u}", file=sys.stderr); return 1
+        sys.stdout.write(open(f).read()); return 0
+    if a and a[-1] == "-":
+        data = sys.stdin.read()
+        open(f, "w").write(data); os.chmod(f, 0o666); return 0
+    return 1
 def findmnt():
     v = st.get("fsid", "/dev/vdb aaaa1111-2222-3333-4444-555566667777")
     print(v.split()[0] if "SOURCE" in a else v); return 0
@@ -213,4 +224,4 @@ def cmp():
 
 sys.exit({"rpm": rpm, "dnf": dnf, "oracleasm": oracleasm, "parted": parted, "lsblk": lsblk, "blkid": blkid,
           "nft": lambda: (print(st.get("nft_ruleset", "")), 0)[1], "iptables": lambda: (print(st.get("iptables_input", "-P INPUT ACCEPT")), 0)[1],
-          "systemctl": systemctl, "chronyc": chronyc, "wipefs": wipefs, "partprobe": noop, "udevadm": udevadm, "pvs": noop, "yum": dnf, "uname": uname, "cmp": cmp, "findmnt": findmnt, "firewall-cmd": firewall_cmd}[prog]())
+          "systemctl": systemctl, "chronyc": chronyc, "wipefs": wipefs, "partprobe": noop, "udevadm": udevadm, "pvs": noop, "yum": dnf, "uname": uname, "cmp": cmp, "findmnt": findmnt, "firewall-cmd": firewall_cmd, "crontab": crontab}[prog]())

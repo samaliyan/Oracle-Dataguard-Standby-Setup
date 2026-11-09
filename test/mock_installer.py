@@ -96,6 +96,11 @@ def grid_install(home, rsp, staged):
         copy_payload(os.path.join(here, "stage", "payload"), home)
     st = load(ST); st["pending_dg"] = d["oracle.install.asm.diskGroup.name"].upper(); save(ST, st)
     add_inventory(d["INVENTORY_LOCATION"], home, "OraGI19Home1")
+    import time; time.sleep(float(load(ST).get("installer_sleep", 0)))
+    if load(ST).get("grid_warn"):
+        print("[WARNING] [INS-13014] Target environment does not meet some optional requirements.")
+        print("As a root user, execute the following script(s):\n\t1. %s/root.sh" % home)
+        print("Successfully Setup Software with warning(s)."); sys.exit(6)
     print("Successfully Setup Software."); sys.exit(0)
 
 def grid_config(home, rsp):

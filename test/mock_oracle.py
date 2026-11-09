@@ -46,6 +46,26 @@ def primary_sql(q, pri):
     with open(PRI_LOG, "a") as f: f.write(q + "\n")
     try: os.chmod(PRI_LOG, 0o666)
     except Exception: pass
+    if l.strip().startswith("alter ") and os.environ.get("DGT_REMOTE") == "1":
+        # a change sent by the script itself (PRIMARY_RUN=yes): applied like the DBA would (as the driver does)
+        p = pri["params"]
+        if "alter database force logging" in l: pri["force_logging"] = "YES"
+        if "add standby logfile" in l: pri["srl"] = pri["orl"] + 1; pri["srl_bytes"] = pri["orl_bytes"]
+        m = re.search(r"log_archive_config='(dg_config=\([^)]*\))'", q, re.I)
+        if m: p["log_archive_config"] = m.group(1)
+        for m in re.finditer(r"log_archive_dest_(\d+)='([^']*)'", q): p[f"log_archive_dest_{m.group(1)}"] = m.group(2)
+        for m in re.finditer(r"log_archive_dest_state_(\d+)=enable", l): p[f"log_archive_dest_state_{m.group(1)}"] = "ENABLE"; pri.pop("dest2_error", None)
+        if "standby_file_management=auto" in l: p["standby_file_management"] = "AUTO"
+        m = re.search(r"fal_server=('[^;]*') scope", q, re.I)
+        if m: p["fal_server"] = m.group(1).replace("'", "")
+        save(PRI, pri)
+        return "System altered." if "alter system" in l else "Database altered."
+    if "select log_mode||'|'||force_logging||'|'||flashback_on from v$database" in l:
+        return f"{pri.get('log_mode', 'ARCHIVELOG')}|{pri.get('force_logging', 'YES')}|{pri.get('flashback', 'NO')}"
+    if "select lower(value) from v$parameter where name='service_names'" in l:
+        return str(pri["params"].get("service_names", pri.get("service", ""))).lower()
+    if "from v$active_services where con_id in (0,1)" in l:
+        return "\n".join(pri.get("active_services", [pri.get("service", "")]))
     major = int(str(pri["version"]).split(".")[0])
     if "d.name||'|'||d.db_unique_name||'|'||d.database_role||'|'||d.cdb||'|'||i.version" in l:
         base = pri["version"] if major < 18 else f"{major}.0.0.0.0"
@@ -55,6 +75,8 @@ def primary_sql(q, pri):
         return pri["version"]
     if "group by loc" in l:
         return "\n".join(pri["locs"])
+    if "redo_day_max" in l:
+        return str(pri.get("redo_day_mb", 2000))
     if "from v$archived_log where first_time > sysdate-7" in l:
         return str(pri.get("arch_mb_day", 0))
     if l.strip() == "select name from v$asm_diskgroup_stat order by name;":
@@ -178,6 +200,16 @@ def local_sql(q, st, sid):
     inst = st["instances"].get(sid, {"state": "idle"})
     s = inst["state"]
     l = q.lower().strip()
+    if inst.get("hung"):
+        if l.startswith("shutdown immediate") and inst.get("hung") == "sleep":
+            import time; time.sleep(30)
+        return "ERROR:\nORA-01012: not logged on"
+    # after a shutdown immediate that did not finish (set "shut_hangs"): the instance hangs from then on
+    if l.startswith("shutdown immediate") and inst.get("shut_hangs"):
+        inst["hung"] = inst.pop("shut_hangs"); st["instances"][sid] = inst
+        if inst["hung"] == "sleep":
+            save(STB, st); import time; time.sleep(30)
+        return "ERROR:\nORA-01012: not logged on"
     if l.startswith("startup nomount"):
         if s != "idle": return "ORA-01081: cannot start already-running ORACLE - shut it down first"
         inst["state"] = "started"; st["instances"][sid] = inst
@@ -188,6 +220,7 @@ def local_sql(q, st, sid):
         inst["state"] = "mounted"; st["instances"][sid] = inst
         return "ORACLE instance started.\nDatabase mounted."
     if l.startswith("shutdown abort"):
+        fake_pmon_stop(sid)
         if s == "idle": return "ORACLE instance shut down."
         inst["state"] = "idle"; inst["mrp"] = 0; st["instances"][sid] = inst
         return "ORACLE instance shut down."
@@ -201,6 +234,14 @@ def local_sql(q, st, sid):
         return f"{sid} " + {"started": "STARTED", "mounted": "MOUNTED"}[s]
     if "select status from v$instance" in l:
         return {"started": "STARTED", "mounted": "MOUNTED"}[s]
+    if "select upper(value) from v$parameter where name='db_unique_name'" in l:
+        return inst.get("unique", sid).upper()
+    if "from v$recovery_area_usage" in l:
+        return inst.get("fra_usage", "35|30")
+    if "select nvl(max(value),'-') from v$parameter where name='db_recovery_file_dest'" in l:
+        return inst.get("fra_param", "+FRA")
+    if "where name like 'log_archive_dest_%' and upper(value) like '%location=%'" in l:
+        return inst.get("arch_param", "location=use_db_recovery_file_dest valid_for=(all_logfiles,all_roles) db_unique_name=PRODDB_STBY")
     if "select database_role from v$database" in l:
         return "ORA-01507: database not mounted" if s == "started" else inst.get("role", "PHYSICAL STANDBY")
     if "i.instance_name||'|'||i.status" in l:
@@ -299,6 +340,13 @@ def local_sql(q, st, sid):
         if "sfiles" in inst: return "\n".join(f"F:{r}" for r in inst["sfiles"])
         return "\n".join(f"F:{i}|+DATA/PRODDB_STBY/DATAFILE/f{i}.{255+i}.1" for i in range(1, 4))
     if "wallet_type||'|'||status from v$encryption_wallet" in l: return inst.get("wallet", "AUTOLOGIN|OPEN")
+    if "'w:'||con_id||'|'||wallet_type||'|'||status" in l:
+        if "wallet_rows" in inst: return "\n".join("W:" + r for r in inst["wallet_rows"])
+        return "W:0|" + inst.get("wallet", "AUTOLOGIN|OPEN") + "|NONE"
+    if l == "select version from v$instance;":
+        if inst.get("version_fail"): return "ORA-00942: table or view does not exist"
+        v = cfg.get("local_version", "19.21.0.0.0"); mj = int(v.split(".")[0])
+        return v if mj < 18 else f"{mj}.0.0.0.0"
     if "select flashback_on from v$database" in l: return inst.get("flashback", "NO")
     if "database_role||'|'||controlfile_type from v$database" in l: return inst.get("role_cf", "PHYSICAL STANDBY|STANDBY")
     if "select count(*) from v$datafile_header where error is not null;" in l:
@@ -315,6 +363,11 @@ def local_sql(q, st, sid):
     if "max(sequence#)" in l: return str(load(PRI)["seq"])
     return "MOCK-UNKNOWN-LOCAL ORA-00900: invalid SQL statement"
 
+def fake_pmon_stop(sid):
+    """the process ora_pmon_<SID> that a test started for a hung instance"""
+    import subprocess
+    subprocess.run(["pkill", "-f", "^ora_pmon_" + sid + "( |$)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def sqlplus():
     if "-V" in args:
         v = cfg.get("local_version", "19.21.0.0.0"); major = v.split(".")[0]
@@ -324,6 +377,23 @@ def sqlplus():
     lines = data.split("\n")
     while lines and lines[0].strip().lower().startswith("set "):   # e.g. "set define off" before connect
         lines = lines[1:]
+    # "sqlplus -S / as sysdba" (the login in the arguments) and "sqlplus -S -prelim / as sysdba"
+    a2 = [x for x in args if x not in ("-S", "-s", "-prelim")]
+    if a2[-3:] == ["/", "as", "sysdba"]:
+        lines = ["connect / as sysdba"] + lines
+    if "-prelim" in args:
+        # a preliminary connection: only shutdown abort works (it attaches without a session)
+        q = "\n".join(x for x in lines[1:] if x.strip() and x.strip().lower() != "exit")
+        with open(STB + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            st = load(STB); sid = os.environ.get("ORACLE_SID", "")
+            inst = st["instances"].get(sid, {"state": "idle"})
+            st.setdefault("prelim_cmds", []).append(q)
+            if q.lower().startswith("shutdown abort"):
+                inst["state"] = "idle"; inst["mrp"] = 0; inst.pop("hung", None); st["instances"][sid] = inst
+                save(STB, st); fake_pmon_stop(sid); print("ORACLE instance shut down."); return 0
+            save(STB, st)
+        print("ORA-01012: not logged on"); return 0
     conn = lines[0].strip()
     marks = [x.strip()[7:] for x in lines[1:] if x.strip().lower().startswith("prompt ")]
     stmts = [x for x in lines[1:] if x.strip() and not x.lower().startswith(("set ", "whenever", "exit", "prompt "))]
@@ -359,6 +429,8 @@ def sqlplus():
         elif "select sector_size from v$asm_diskgroup" in ql:
             m = re.search(r"name=upper\('([^']*)'\)", ql)
             out.append(str(st.get("sector_sizes", {}).get((m.group(1) if m else "").upper(), st.get("sector_size", 512))))
+        elif "select free_mb||'|'||total_mb from v$asm_diskgroup" in ql:
+            out.append(st.get("dg_free_total", "300000|400000"))
         elif "select usable_file_mb from v$asm_diskgroup" in ql:
             out.append(str(cfg.get("fra_usable", cfg["data_free"])))
         elif "select total_mb from v$asm_diskgroup" in ql:
@@ -465,7 +537,16 @@ def srvctl():
         return 0
     if a[:2] == ["modify", "listener"]:
         st["lsnr_port"] = int(a[a.index("-endpoints") + 1].split(":")[1]); save(STB, st); return 0
-    if a[:2] in (["stop", "listener"], ["start", "listener"], ["add", "listener"]): return 0
+    if a[:2] == ["start", "asm"]:
+        st.pop("asm_down", None); save(STB, st); return 0
+    if a[:2] == ["start", "diskgroup"]:
+        dg = a[a.index("-diskgroup") + 1]; st["dg_off"] = [x for x in st.get("dg_off", []) if x != dg]; save(STB, st); return 0
+    if a[:2] == ["start", "listener"]:
+        st.pop("lsnr_off", None)
+        if not lsnr_cause(st): st.pop("lsnr_stale", None)
+        st["lsnr_starts"] = st.get("lsnr_starts", 0) + 1
+        save(STB, st); return 0
+    if a[:2] in (["stop", "listener"], ["add", "listener"]): return 0
     if a[:2] == ["remove", "database"]:
         st["srvctl"] = None; save(STB, st); return 0
     print("mock srvctl: unknown"); return 1
@@ -515,6 +596,27 @@ def rman():
         return 1
     if "duplicate target database for standby from active database" not in data:
         print("RMAN-00558: error"); return 1
+    if st.get("rman_fra_full"):
+        # the error stack of the real run: the recovery area filled while the archived logs were restored
+        st["rman_fra_full"] -= 1
+        m = re.search(r"db_recovery_file_dest_size='(\d+)G'", data); st["fra_size_tried"] = int(m.group(1)) if m else 0
+        inst = st["instances"].get(cfg["sid"], {"state": "idle"}); inst["state"] = "mounted"; inst["datafiles"] = 10; inst["df_errors"] = 7
+        st["instances"][cfg["sid"]] = inst; st["asm_leftovers"] = True; st["fra_full_errs"] = 1; st["asm_leftover_mb"] = 52000
+        open(os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora"), "w").write("mock spfile\n")
+        save(STB, st)
+        print("Starting Duplicate Db at 24-OCT-26\nchannel a1: restoring archived log\n"
+              "RMAN-00571: ===========================================================\n"
+              "RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============\n"
+              "RMAN-00571: ===========================================================\n"
+              "RMAN-03002: failure of Duplicate Db command at 11/08/2026 18:02:11\n"
+              "RMAN-05501: aborting duplication of target database\n"
+              "RMAN-03015: error occurred in stored script Memory Script\n"
+              "ORA-19809: limit exceeded for recovery files\n"
+              "ORA-19804: cannot reclaim 32505856 bytes disk space from 41142976512 bytes limit\n"
+              "ORA-19849: error while reading backup piece from service proddb\n"
+              "ORA-19660: some files in the backup set could not be verified\n"
+              "ORA-19662: archived log thread 1 sequence 1234 could not be verified")
+        return 1
     if cfg.get("rman_sleep"):
         import time
         print("Starting Duplicate Db at 24-OCT-26", flush=True); time.sleep(int(cfg["rman_sleep"]))
@@ -523,6 +625,7 @@ def rman():
         print("RMAN-03002: failure of Duplicate Db command\nRMAN-05501: auxiliary not started"); return 1
     print("Starting Duplicate Db at 24-OCT-26\nchannel a1: restored backup piece 1\nFinished Duplicate Db at 24-OCT-26")
     inst["state"] = "mounted"; inst["srl"] = st.get("srl_after_dup", 0); inst["datafiles"] = load(PRI).get("datafiles", 10)
+    if st.pop("fra_full_errs", None): inst["df_errors"] = 0
     st["instances"][cfg["sid"]] = inst
     spf = os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora")
     open(spf, "w").write("mock spfile\n")
@@ -542,6 +645,14 @@ def lsnrctl():
         lf = os.path.join(cfg["db_home"], "network", "admin", "listener.ora")
         if not os.path.exists(lf) or "DESCRIPTION" not in open(lf).read().upper(): print("TNS-12557: protocol adapter not loadable"); return 1
         st["lsnr_up"] = 1; save(STB, st); print("The command completed successfully"); return 0
+    if args[:1] == ["stop"]:
+        pid = st.get("fake_lsnr_pid")
+        if dbhome and pid:
+            try: os.kill(int(pid), 15)
+            except Exception: pass
+            import time; time.sleep(0.3)
+            print("The command completed successfully"); return 0
+        print("TNS-12541: TNS:no listener"); return 1
     if args[:1] == ["reload"]:
         if not up: print("TNS-12541: TNS:no listener"); return 1
         print("The command completed successfully"); return 0
@@ -584,6 +695,21 @@ def tnsping():
             print(f"Used TNSNAMES adapter to resolve the alias\nAttempting to contact {desc}\nOK (10 msec)"); return 0
     print("TNS-03505: Failed to resolve name"); return 1
 
+def lsnr_cause(st):
+    """what keeps the Grid listener INTERMEDIATE (only in tests that ask for it)"""
+    if not st.get("lsnr_check"): return ""
+    import socket
+    h = socket.gethostname().split(".")[0]
+    ok = False
+    for ln in open("/etc/hosts").read().splitlines():
+        f = ln.split("#")[0].split()
+        if len(f) >= 2 and h in f[1:] and re.fullmatch(r"[0-9.]+", f[0]) and not f[0].startswith("127."): ok = True; break
+        if len(f) >= 2 and h in f[1:]: break
+    if not ok: return "hosts"
+    pid = st.get("fake_lsnr_pid")
+    if pid and os.path.exists(f"/proc/{pid}"): return "port"
+    return ""
+
 def crsctl():
     st = load(STB)
     if args[:2] == ["check", "has"]:
@@ -592,7 +718,9 @@ def crsctl():
     if args[:2] == ["start", "has"]:
         st["has"] = 1; save(STB, st); print("CRS-4123: Oracle High Availability Services has been started."); return 0
     if args[:2] == ["start", "res"]:
-        st.pop("asm_down", None); save(STB, st); print(f"CRS-2676: Start of '{args[2]}' succeeded"); return 0
+        if args[2].startswith("ora."):
+            print(f"CRS-4995:  The command 'Start   resource' is invalid in crsctl. Use srvctl for this command."); return 1
+        print(f"CRS-2676: Start of '{args[2]}' succeeded"); return 0
     if args[:2] == ["stat", "res"]:
         name = args[2]
         if not st.get("has") or st.get("crs_weird"): print("CRS-4535: Cannot communicate with Cluster Ready Services"); return 1
@@ -601,7 +729,17 @@ def crsctl():
         else: exists = {"ora.asm": st.get("asm"), "ora.LISTENER.lsnr": st.get("asm")}.get(name)
         if not exists: print(f"CRS-2613: Could not find resource '{name}'."); return 1
         state = "OFFLINE" if (name == "ora.asm" and st.get("asm_down")) else "ONLINE"
-        print(f"NAME={name}\nTYPE=mock\nTARGET=ONLINE\nSTATE={state}"); return 0
+        detail = ""
+        if m and m.group(1) in st.get("dg_off", []): state = "OFFLINE"
+        if name == "ora.LISTENER.lsnr":
+            if st.get("lsnr_off"): state = "OFFLINE"
+            elif lsnr_cause(st):
+                st["lsnr_stale"] = 1; save(STB, st); state = "INTERMEDIATE"
+            elif st.get("lsnr_stale"): state = "INTERMEDIATE"
+            if state == "INTERMEDIATE": detail = "Not All Endpoints Registered"
+        print(f"NAME={name}\nTYPE=mock\nTARGET=ONLINE\nSTATE={state} on stby01")
+        if "-v" in args: print(f"STATE_DETAILS={detail}")
+        return 0
     return 1
 
 def orapwd():

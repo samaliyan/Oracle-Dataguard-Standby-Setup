@@ -5,9 +5,12 @@
 One Bash script that builds an **Oracle Data Guard physical standby**, step by step, on a new server.
 It runs on the standby server and copies the database with RMAN active duplicate.
 
-**The primary is never changed by the script.** On the primary it only runs a fixed set of read-only
-checks and `SELECT` statements. Anything that has to change on the primary is printed for the DBA,
-together with its undo command. The script then checks the result, again read-only.
+**The primary is never changed by the script on its own.** On the primary it only runs a fixed set of
+read-only checks and `SELECT` statements. Anything that has to change on the primary is printed for the DBA,
+together with its undo command. The script then checks the result, again read-only. Only if you set
+`PRIMARY_RUN=yes` may a primary step offer to run its statements over ssh, after you answer `y`, and only
+statements of a fixed list (Data Guard parameters, force logging, standby logs): never a restart, a stop, a
+deletion, a password change or a file.
 
 ## Supported
 
@@ -94,6 +97,7 @@ None of them changes the primary.
 | `--yes` | Do the actions on this server without the [y] question (the risky ones are still asked) |
 | `--settings` | Review or edit the saved values, then stop |
 | `--status` | Result of every phase and step so far; connects to nothing |
+| `--plain` | Plain scrolling output instead of the screen layout |
 | `--show-changes [step]` | Every change made on this server, with its undo |
 | `--undo <step>` | Undo the changes of one step |
 | `--help-step <step>` | The manual way of a step (`all` for every step, `health` for --health) |
@@ -102,11 +106,33 @@ None of them changes the primary.
 | `-h`, `--help` | Short help |
 
 ### `./dg_standby_setup.sh` (no option)
-Opens a menu: the full setup, or one part (OS preparation, Grid, database software, the primary changes,
-chosen steps, the daily check). On a later run it continues where it stopped; done steps are only
-checked again. Each step shows what it found and what it will do, then asks
-`[y] Yes, do it  [s] Skip  [h] Help  [q] Quit`. Commands for the primary are shown; you run them there
-and answer `r`, and the script checks the result.
+Opens a menu in three groups (Setup, After setup, Information), with the matching option of each item in
+grey: the full setup, check only, one part, start from a step, the health check, roll forward, status,
+changes and undo, the manual way of a step, settings. On a later run it continues where it stopped; done
+steps are only checked again.
+
+After phase 1 has read both servers, one **summary screen** shows what was found on the primary and here,
+where each kind of file of the standby goes, the plan, the problems found now (each with what happens or
+what you do), and the values of this run, numbered: `[Enter] Start  [number] Change  [d] Details
+[e] Edit the file  [q] Quit`. A number asks only that value and saves it as the new default.
+
+Each step shows what it found and the exact commands it will run (**Will run**, with the OS user and the
+environment), then asks `[y] Yes, do it  [a] Yes to all  [s] Skip  [h] Help  [q] Quit`. While it runs,
+each command is shown as `Running as grid: ...`; the log has the full command lines. Commands for you are
+real commands with the real values; long ones are put into a short script file under `/root/dg` that you
+run with one short line (useful in a console where you cannot paste).
+
+### The screen
+In a terminal of at least 80 x 24 the top of the screen is a fixed map: every phase with its steps done
+out of all, the current one marked, and the totals (done, need attention, to go). Below it only the
+current step is shown, with the steps of the same phase done before it as one line each (warnings under
+them). A new attempt of a step starts on a clean area. Installers, root scripts and the RMAN copy show
+one live line (what runs, for how long); their output stays in its file.
+
+At any question: `l` lists every step with its result and time (type a step number for its details),
+`d` shows the details of the current step (what was checked, done and shown, from the log), `h` its help.
+These open on a separate screen; closing it returns to the step as it was. While a long job runs, `l` and
+`d` (its output so far) work too. A smaller terminal, `--plain`, and `--health` use plain scrolling output.
 
 ### `--check`
 Runs every check and reports what is missing, without changing anything in Oracle, the OS or the primary,
@@ -134,13 +160,16 @@ passwords, the listener restart (3.10), the standby restart steps (9.1, 9.2, 9.3
 setting of archived logs (9.8). Typical use: `--check` first, put the installer zips in place, then `--yes`.
 
 ### `--settings`
-Shows the saved standby values (names, folders, disk groups, channels, `HEALTH_LAG_MAX`,
-`DUP_SECTION_SIZE` and so on) and lets you edit them in `$EDITOR`, then stops. Changed values are checked
-and must be accepted again on the next run.
+Shows the summary screen and the values of the setup (a number changes one, `e` opens the settings file in
+`$EDITOR`), then stops.
 
 ### `--status`
-Prints the result of every phase and step from the saved progress (ok, done, waiting, failed, skipped).
-Connects to nothing, so it also works when the primary is down.
+Prints the result of every phase, then every step with its result, when it ran and, for a step that is not
+done, why (ok, done, waiting, failed, skipped). Connects to nothing, so it also works when the primary is down.
+
+### `--plain`
+Plain scrolling output, as in earlier versions: every message stays on the screen in order. Used by itself
+when the terminal is smaller than 80 x 24 or is not a terminal.
 
 ### `--show-changes [step]`
 Lists every change the script made on this server (files written, settings, users, disks, services,
@@ -170,16 +199,27 @@ For a standby that cannot catch up (archived logs it needs were deleted on the p
 NOLOGGING work: runs `RECOVER STANDBY DATABASE FROM SERVICE` (18c and later) instead of a new copy.
 Asks for the sys password and the word `ROLLFORWARD`; never runs with `--yes` or `--check`.
 Checks first, and stops on any doubt: standby mounted, no RMAN session or long job running, broker off,
-static listener entry, auto-login wallet for an encrypted standby, both RMAN logins, and that RMAN can
-find the standby's datafiles again. Afterwards it sets the standby redo logs and RMAN settings again and
-starts redo apply. If the terminal closes meanwhile, the next `--roll-forward` checks and finishes it
-without running RMAN again. On 12.1/12.2 it shows the manual way.
+static listener entry, every TDE wallet of an encrypted standby (each container) auto-login and open, both
+RMAN logins, and that RMAN can find the standby's datafiles again (same names, a `db_file_name_convert` that
+gives every standby name, or Oracle-managed files). Afterwards it sets the standby redo logs and RMAN
+settings again and starts redo apply. If the terminal closes meanwhile, the next `--roll-forward` checks it
+and, after `ROLLFORWARD` is typed again, finishes it without running RMAN again. On 12.1/12.2 it shows the
+manual way.
 
 ### Settings that change behaviour
 - `HEALTH_LAG_MAX`: lag in seconds that `--health` accepts (empty = 300, at least 30).
 - `DUP_SECTION_SIZE`: section size of the RMAN copy, for example `32G`. Empty = automatic (32G when a
   datafile is 64 GB or more and there is more than one channel; needs COMPATIBLE 12.0+), `0` = never.
-- `AUX_CHANNELS`: channels of the RMAN copy.
+- `AUX_CHANNELS`, `PRIMARY_CHANNELS`: RMAN channels on this server and on the primary (1-64; asked before
+  the copy, with the CPUs of both servers and a suggestion).
+- `DATA_DEST`: where the database files of the standby go: `+DG` (a disk group, Oracle-managed names), `same`
+  (the paths of the primary), or a folder. Empty = automatic: the data disk group when this server has ASM.
+- `FRA_DEST`, `FRA_SIZE`: the recovery area of the standby and its size (empty = estimated from the redo of
+  the primary: the archived logs of the copy time and one day, plus 30 %; at least 10 GB).
+- `ARCH_CLEANUP`: how applied archived logs are deleted here: `timer` (systemd, default), `crontab` (a line
+  in the crontab of oracle), `oracle` (only the recovery area itself), `none`. `ARCH_CLEANUP_TIME` (HH:MM,
+  04:30), `ARCH_CLEANUP_DAYS` (0-30, 1).
+- `PRIMARY_RUN`: `yes` lets primary steps offer to run their listed statements over ssh (default `no`).
 
 ### Exit codes
 `0` every step OK; `1` stopped, or some steps are not OK or skipped (normal for `--check` on a new
@@ -207,15 +247,18 @@ them on the primary from its backup, or (18c and later) `./dg_standby_setup.sh -
 `RECOVER STANDBY DATABASE FROM SERVICE`: the standby fetches only what it misses, as incremental backups.
 Before it starts, the script checks that the standby is mounted, that RMAN can find the standby's files again
 afterwards, that no other RMAN session or long job runs, that the broker is off, that the listener has a
-static entry for the standby, that an encrypted standby has an auto-login wallet, and that both RMAN logins
-work. Afterwards it sets the standby's own standby redo logs and RMAN settings again and starts redo apply.
+static entry for the standby, that every wallet of an encrypted standby opens by itself, and that both RMAN
+logins work. Afterwards it sets the standby's own standby redo logs and RMAN settings again and starts redo apply.
 Try it once on a test standby before you need it.
 
 ## Safety design
 
-- **Primary is read-only.** Only whitelisted probes and `SELECT` statements go to the primary.
+- **Primary is read-only.** Only whitelisted probes and `SELECT` statements go to the primary (with
+  `PRIMARY_RUN=yes` also the listed Data Guard statements, each step after you answer `y`).
 - **No data is erased without proof.** A disk is used only after it is shown to be empty and not shared with
-  the primary. A check that times out counts as "no".
+  the primary. A check that times out counts as "no". The clean-up of a failed copy first proves that this
+  is the standby (host name, address, the running instance's `db_unique_name` and role) and asks for the
+  word CLEAN; only the standby's own files go, never the pfile or the password file.
 - **Every change can be undone.** Every change on the standby is recorded in a journal
   (`/var/lib/dg_standby_setup/changes.log`) and can be undone one step at a time.
 - **Known primary only.** ssh accepts only a host key the admin has checked; a changed key stops the connection.

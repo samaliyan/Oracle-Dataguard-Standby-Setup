@@ -79,20 +79,40 @@ def fix_local(text):
         os.system(f"chgrp asmadmin {env['db_home']}/bin/oracle")
 
 def cur_step(full):
-    m = re.findall(r"\n  Step (\d+\.\d+)  ", full)
+    # the title of the step: "  Step N.N  " (on the screen layout it may follow a cursor move, not a newline)
+    m = re.findall(r"  Step (\d+\.\d+)  ", full)
     return m[-1] if m else ""
 
 def main():
     cmd = sys.argv[1:]
+    ui = E("DG_TEST_UI") == "1"
     pid, fd = pty.fork()
     if pid == 0:
+        if ui:
+            import fcntl, termios, struct
+            rows, cols = [int(x) for x in E("DG_TEST_SIZE", "30x100").split("x")]
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            os.environ["TERM"] = "xterm-256color"; os.environ["DG_PLAIN"] = "0"
         os.execvp(cmd[0], cmd)
+    vt = None; snaps = lst("DG_TEST_SNAP"); pcount = {}; snapdir = E("DG_TEST_SNAPDIR", "/tmp/dgt/snaps"); snapn = [0]
+    keys = [x.split(":", 1) for x in lst("DG_TEST_KEYS")]; jobkeys = [x.split(":", 1) for x in lst("DG_TEST_JOBKEYS")]
+    if ui:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import vt as vtmod
+        rows, cols = [int(x) for x in E("DG_TEST_SIZE", "30x100").split("x")]
+        vt = vtmod.VT(rows, cols); os.makedirs(snapdir, exist_ok=True)
+    def snap(label):
+        snapn[0] += 1
+        base = os.path.join(snapdir, "%02d_%s" % (snapn[0], label.replace("/", "_").replace(" ", "_")))
+        open(base + ".txt", "w").write(vt.text() + "\n")
+        open(base + ".html", "w").write(vt.html())
+    ANSI_ALL = re.compile(r"\x1b\[[?0-9;]*[A-Za-z]|\x1b[78]")
     buf = ""; full = ""; ctx = ""; pw_asked = [0]
     deadline = time.time() + int(E("DG_TEST_TIMEOUT", "300"))
-    answered = 0; helped = set(); ctrlc = set(); retries = {}
+    answered = 0; helped = set(); ctrlc = set(); retries = {}; expanded = set()
     disk_picks = [x.replace("+", " ") for x in lst("DG_TEST_DISK_PICKS")]
     settings_answers = lst("DG_TEST_SETTINGS")
     menu_answers = E("DG_TEST_MENU", "").split(",") if E("DG_TEST_MENU") else []
+    summary_answers = E("DG_TEST_SUMMARY", "").split(",") if E("DG_TEST_SUMMARY") else []
     menu_steps = lst("DG_TEST_MENU_STEPS")
     def send(s):
         nonlocal answered, buf, ctx
@@ -100,18 +120,47 @@ def main():
         else: os.write(fd, (s + "\n").encode())
         answered += 1; buf = ""; ctx = ""
     hup_sent = False
+    chan_asked = [0]
     while True:
         r, _, _ = select.select([fd], [], [], 0.5)
         if fd in r:
             try: data = os.read(fd, 65536).decode(errors="replace")
             except OSError: break
             if not data: break
+            if ui:
+                vt.feed(data); data = ANSI_ALL.sub("", data)
             data = ANSI.sub("", data)
             sys.stdout.write(data); sys.stdout.flush()
             buf += data; full += data; ctx += data
             if E("DG_TEST_HUP_ON_JOB") and not hup_sent and re.search(E("DG_TEST_HUP_ON_JOB") + r" is running \(process \d+\)", full):
                 import signal
                 time.sleep(1); os.killpg(pid, signal.SIGHUP); hup_sent = True
+        if ui:
+            # the separate screen (list, details, help): a snapshot when asked for, then q closes it
+            if vt.in_alt and "q: close" in vt.text():
+                # the page is complete when nothing more arrives for 0.4 s
+                while True:
+                    r4, _, _ = select.select([fd], [], [], 0.4)
+                    if fd not in r4: break
+                    try: d4 = os.read(fd, 65536).decode(errors="replace")
+                    except OSError: break
+                    if not d4: break
+                    vt.feed(d4); d4 = ANSI.sub("", ANSI_ALL.sub("", d4)); full += d4; ctx += d4
+                if keys and keys[0][1] in ("l", "d", "h"): snap("alt_" + keys[0][0] + "_" + keys[0][1])
+                if keys and keys[0][1] in ("l", "d", "h"): keys.pop(0)
+                elif jobkeys and jobkeys[0][1] == "d": jobkeys.pop(0); snap("alt_job_output")
+                time.sleep(0.2); os.write(fd, b"q"); buf = ""
+                # one q only: wait until the separate screen is closed (or 5 s)
+                t_end = time.time() + 5
+                while vt.in_alt and time.time() < t_end:
+                    r3, _, _ = select.select([fd], [], [], 0.2)
+                    if fd in r3:
+                        try: d3 = os.read(fd, 65536).decode(errors="replace")
+                        except OSError: break
+                        vt.feed(d3); d3 = ANSI.sub("", ANSI_ALL.sub("", d3)); full += d3; ctx += d3
+                continue
+            if jobkeys and re.search(re.escape(jobkeys[0][0]) + r"   running, ", full[-400:]):
+                os.write(fd, jobkeys[0][1].encode()); jobkeys[0] = (jobkeys[0][0] + " (sent)", jobkeys[0][1]); time.sleep(0.5); continue
         # a question: a line "    ? text >" (or the UTF-8 mark), or a password prompt of ssh
         last = buf.rsplit("\n", 1)[-1]
         q = re.match(r"^\s*\? (.*?)\s*[>\u203a]\s$", last)
@@ -123,6 +172,22 @@ def main():
         step = cur_step(full)
         if answered > int(E("DG_TEST_MAXPROMPTS", "400")):
             print("\nDRIVER TOO MANY PROMPTS"); os.kill(pid, 9); break
+        if q and ui:
+            pcount[step] = pcount.get(step, 0) + 1
+            tag = None
+            if step in snaps and pcount[step] == 1: tag = step
+            elif "%s#%d" % (step, pcount[step]) in snaps: tag = "%s#%d" % (step, pcount[step])
+            if tag:
+                snaps.remove(tag)
+                # the screen is complete when nothing more arrives for 0.4 s
+                while True:
+                    r2, _, _ = select.select([fd], [], [], 0.4)
+                    if fd not in r2: break
+                    d2 = os.read(fd, 65536).decode(errors="replace"); vt.feed(d2)
+                    d2 = ANSI.sub("", ANSI_ALL.sub("", d2)); full += d2; ctx += d2
+                snap("step_" + tag.replace("#", "_try"))
+            if keys and keys[0][0] == step:
+                send(keys[0][1]); continue
         if q:
             if step in lst("DG_TEST_CTRLC_AT") and step not in ctrlc:
                 ctrlc.add(step); send("<CTRL-C>"); continue
@@ -132,7 +197,7 @@ def main():
         if bt == "Choice [1]": send(menu_answers.pop(0) if menu_answers else ""); continue
         if bt.startswith("Steps to run, for example"): send(menu_steps.pop(0) if menu_steps else ""); continue
         if bt.startswith("Answer y automatically for this server"): send(E("DG_TEST_MENU_YES", "n")); continue
-        if bt.startswith("[s] Status of every step   [c] Changes made"): send(E("DG_TEST_MENU_REC", "b")); continue
+        if bt.startswith("[c] Changes made, with undo commands   [u] Undo a step"): send(E("DG_TEST_MENU_REC", "b")); continue
         if bt.startswith("Step to undo, for example"): send(E("DG_TEST_MENU_UNDO", "")); continue
         if bt.startswith("IP address or host name of the primary"): send(E("DG_TEST_IP", "127.0.0.2")); continue
         if bt.startswith("OS user for ssh on the primary"): send(E("DG_TEST_SSHUSER", "")); continue
@@ -161,24 +226,51 @@ def main():
             if w == "DUPLICATE": w = E("DG_TEST_DUP", w)
             elif w == "SEPARATE": w = E("DG_TEST_SEPARATE", "n")
             elif w == "DELETE": w = E("DG_TEST_DELETE", w)
-            elif w == "CLEAN": w = E("DG_TEST_CLEAN", w)
+            elif w == "CLEAN": w = E("DG_TEST_CLEAN", "n" if E("DG_TEST_DELETE") == "n" else w)
             elif w == "IGNORE": w = E("DG_TEST_IGNORE", w)
             elif w == "ROLLFORWARD": w = E("DG_TEST_RF", w)
             elif w.startswith("/dev/"): w = E("DG_TEST_DISKWORD", w)
             send(w); continue
         if "[w] Watch until it ends" in bt: send("w"); continue
-        if bt.startswith("[d] Delete them"):
+        if bt.startswith("[k] Keep these   [c] Change"):
+            chan_asked[0] += 1
+            send(E("DG_TEST_CHAN", "k") if chan_asked[0] == 1 else "k"); continue
+        if bt.startswith("Channels on the primary (1-64)"): send(E("DG_TEST_PCH", "")); continue
+        if bt.startswith("Channels on this server ("): send(E("DG_TEST_ACH", "")); continue
+        if bt.startswith("[y] Clean up for me") or bt.startswith("[m] Show the commands   [s] Skip"):
             if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
-            send("s" if step in lst("DG_TEST_NOFIX") else E("DG_TEST_L72", "d")); continue
+            v = E("DG_TEST_L72", "y")
+            if v == "y" and "[y]" not in bt: v = "s"
+            send("s" if step in lst("DG_TEST_NOFIX") else v); continue
+        if bt.startswith("[Enter] Start   [number] Change"):
+            if summary_answers: send(summary_answers.pop(0)); continue
+            # the older settings answers (a = accept, e = edit) reach the summary as Enter / e
+            if settings_answers:
+                v = settings_answers.pop(0); send("e" if v == "e" else ""); continue
+            send(""); continue
+        if bt.startswith("[t] systemd timer   [c] crontab of"):
+            send(E("DG_TEST_ARCH", "t")); continue
+        if bt.startswith("[y] Stop it with shutdown abort"):
+            if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
+            send(E("DG_TEST_ABORT", "y")); continue
         if bt.startswith("[m] I installed it myself"): send("s" if step in lst("DG_TEST_NOFIX") else E("DG_TEST_HALF", "c")); continue
         if "[p] Type the sys password" in bt and step in lst("DG_TEST_PSYS"): send("p"); continue
         if bt.endswith("[a] Accept   [e] Edit   [h] Help   [q] Quit"):
             send(settings_answers.pop(0) if settings_answers else "a"); continue
-        if "[y] Yes, do it   [s] Skip" in bt and bt.endswith("Quit"):
+        if bt.startswith("[y] Yes, do it") and "[s] Skip" in bt and bt.endswith("Quit"):
             if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
-            send("s" if step in lst("DG_TEST_SKIP") else "y"); continue
+            if step in lst("DG_TEST_SKIP"): send("s"); continue
+            send("a" if (step in lst("DG_TEST_YESALL") and "[a] Yes to all" in bt) else "y"); continue
+        if bt.startswith("[y] Run it on the primary for me"):
+            if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
+            v = E("DG_TEST_ANSWER_PRIM", "y")
+            if v == "r": fix_primary(ctx)
+            send(v); continue
         if "[r] Done, check it" in bt and bt.endswith("Quit"):
             if step in lst("DG_TEST_QUIT_AT"): send("q"); continue
+            # the step text was cut to fit the screen: like a user, d first (the whole text), then the answer
+            if ui and "more lines: d shows all" in ctx and (step, retries.get(step, 0)) not in expanded:
+                expanded.add((step, retries.get(step, 0))); send("d"); continue
             retries[step] = retries.get(step, 0) + 1
             if step in lst("DG_TEST_NOFIX") or retries[step] > 2: send("s"); continue
             if "Run on the PRIMARY" in ctx: fix_primary(ctx)
@@ -191,11 +283,14 @@ def main():
         if bt.endswith("[h] Help   [q] Quit") and "[r]" not in bt and "[y]" not in bt and "[s]" not in bt: send("q"); continue
         if bt.startswith("The fingerprints match the primary"): send(E("DG_TEST_HOSTKEY", "y")); continue
         if bt.endswith("[y] Yes   [N] No"): send(E("DG_TEST_YN", "y")); continue
+        # any other question while DG_TEST_SUMMARY still has answers (the values a summary change asks for)
+        if q and summary_answers: send(summary_answers.pop(0)); continue
         if time.time() > deadline:
             print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break
     _, status = os.waitpid(pid, 0)
     code = os.waitstatus_to_exitcode(status)
     with open(E("DG_TEST_OUT", "/tmp/dgt/last_output.txt"), "w") as f: f.write(full)
+    if ui: snap("end")
     print(f"\n[driver] exit={code} prompts_answered={answered}")
     sys.exit(code)
 

@@ -19,7 +19,9 @@ health_exit() {
   if [[ "${BASHPID:-$$}" != "$$" ]]; then [[ -n "${2:-}" && -n "$HEALTH_LOG" ]] && printf 'UNKNOWN: %s\n' "$2" >> "$HEALTH_LOG"; exit 3; fi
   if [[ -n "${1:-}" ]]; then
     [[ $HEALTH_REPORTED -eq 0 && ${#HEALTH_ORDER[@]} -gt 0 ]] && health_report
-    health_out "  UNKNOWN         $2"
+    # the reason the run stopped: no state label of its own (the Result line below gives the overall state,
+    # which a CRITICAL check found before may make worse than UNKNOWN)
+    health_out "  Stopped:  $2"
     worst=UNKNOWN
   fi
   for id in "${HEALTH_ORDER[@]+"${HEALTH_ORDER[@]}"}"; do
@@ -95,7 +97,7 @@ health_main() {
   MODE=check; PROBE_TIMEOUT=120
   # the logs of --health: 14 days, and never more than the newest 500 (a run every few minutes)
   find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -mtime +14 -delete 2>/dev/null
-  find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +500 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --
+  find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +501 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --
   HEALTH_LOG="$LOG_DIR/health_$RUN_ID.log"
   ( umask 027; : > "$HEALTH_LOG" ) 2>/dev/null || { HEALTH_LOG=""; health_exit UNKNOWN "Cannot write the log in $LOG_DIR. Is the file system full or read-only?"; }
   LOG_FILE=$HEALTH_LOG
@@ -116,7 +118,7 @@ health_main() {
   # a long job (the copy, a roll forward, an installer) is maintenance: the standby is not expected to be in sync
   if job_alive >> "$HEALTH_LOG" 2>&1; then health_exit UNKNOWN "Maintenance is running: $JOB_TITLE (session $JOB_PID). The check was not done."; fi
   # a roll forward that ended while no run watched: redo apply stays stopped until it is finished
-  if [[ -f "$STATE_DIR/rollforward_pending" ]]; then
+  if [[ -f "$(rf_pending_file)" ]]; then
     HEALTH_STATE[10.7]=CRITICAL; HEALTH_TEXT[10.7]="A roll forward has ended but is not finished (redo apply is stopped). Run in a terminal:  $SELF --roll-forward"
     HEALTH_ORDER+=(10.7)
   fi
@@ -126,6 +128,7 @@ health_main() {
   local_state >> "$HEALTH_LOG" 2>&1
   case "$LSTATE" in
     MOUNTED|OPEN) HEALTH_STATE[0.0]=OK; HEALTH_TEXT[0.0]="Standby instance: $LSTATE" ;;
+    HUNG) HEALTH_STATE[0.0]=CRITICAL; HEALTH_TEXT[0.0]="Standby instance: $(hung_text)" ;;
     ERROR) HEALTH_STATE[0.0]=UNKNOWN; HEALTH_TEXT[0.0]="Standby instance: its state cannot be read ($(ora_errors "$SQL_OUT"))" ;;
     *) HEALTH_STATE[0.0]=CRITICAL; HEALTH_TEXT[0.0]="Standby instance: $([[ "$LSTATE" == IDLE ]] && printf 'not running' || printf 'state %s, not mounted' "$LSTATE")" ;;
   esac
@@ -140,7 +143,8 @@ health_main() {
 
   health_ssh || _log WARN "health: $HEALTH_SSH_ERR"
   local -a checks=("10.1|Transport and apply lag|c_10_1" "10.2|No archive gap|c_10_2_once" "10.3|Last log: primary and standby|c_10_3_once"
-                   "10.4|Redo apply is running|c_10_4" "10.5|No unrecoverable (NOLOGGING) changes|c_10_5" "10.6|Patch level: primary and standby|c_10_6")
+                   "10.4|Redo apply is running|c_10_4" "10.5|No unrecoverable (NOLOGGING) changes|c_10_5" "10.6|Patch level: primary and standby|c_10_6"
+                   "10.8|Archived logs: space and nightly clean-up|c_10_8")
   local c id title fn
   local -a again=()
   for c in "${checks[@]}"; do IFS='|' read -r id title fn <<< "$c"; health_run_check "$id" "$title" "$fn"; done

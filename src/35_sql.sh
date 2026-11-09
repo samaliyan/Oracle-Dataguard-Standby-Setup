@@ -4,6 +4,12 @@
 _sql_exec() {
   # $1 connect line, $2 sql text, $3 log title, $4 runner (as_oracle|as_grid), $5 home, $6 timeout (s)
   local connect=$1 sql=$2 title=$3 runner=$4 home=$5 tmo=${6:-$SQL_TIMEOUT} out rc=0 tmp
+  # during an action, a statement that changes something is shown before it runs (selects are only logged)
+  if [[ ${IN_DO:-0} -eq 1 && ! "${sql,,}" =~ ^[[:space:]]*select[[:space:]] ]]; then
+    local who=$ORACLE_USER; [[ "$runner" == as_grid ]] && who=$GRID_USER
+    local first; first=$(head -n 1 <<< "$sql"); local nl; nl=$(grep -c '' <<< "$sql")
+    say "${C_D}Running as $who:${C_N} $(mask_pw <<< "sqlplus ${connect#connect }  ->  $first")$([[ $nl -gt 1 ]] && printf '  (and %s more lines)' $((nl - 1)))"
+  fi
   # output through a file: background processes of a started instance must not keep a pipe open
   tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) || { SQL_OUT="SP2-0000: cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
@@ -30,16 +36,44 @@ sql_primary_tns() {
   _sql_exec "connect sys/\"$SYS_PW\"@$PRIMARY_TNS as sysdba" "$1" "PRIMARY via $PRIMARY_TNS (read-only): ${1:0:150}" as_oracle "$DB_HOME"
 }
 
+pmon_running() { pgrep -u "$ORACLE_USER" -f "^ora_pmon_${STANDBY_SID}( |\$)" >/dev/null 2>&1; }   # the processes of the standby instance run
+STATE_TMO=$((FAST_WAITS == 1 ? 5 : 120))     # a login that hangs longer than this is a hung instance, not a slow one
 local_state() {
-  # LSTATE = IDLE | STARTED | MOUNTED | OPEN | ERROR | NOSW
+  # LSTATE = IDLE | STARTED | MOUNTED | OPEN | HUNG | ERROR | NOSW
+  # HUNG: the instance's processes run (ora_pmon_<SID>), but a login fails with ORA-01012 (not logged on) or does
+  # not answer. Seen after a duplicate, when "shutdown immediate" of the instance RMAN started did not finish.
   if ! db_sw_ok; then LSTATE=NOSW; return; fi
-  if sql_local "select status from v\$instance;"; then
+  if sql_local "select status from v\$instance;" "$STATE_TMO"; then
     LSTATE=$(first_line)
   elif grep -qE 'ORA-01034|idle instance' <<< "$SQL_OUT"; then
     LSTATE="IDLE"
+  elif grep -qE 'ORA-01012|did not answer within' <<< "$SQL_OUT" && pmon_running; then
+    LSTATE="HUNG"
   else
     LSTATE="ERROR"
   fi
+}
+hung_text() { printf 'Instance %s hangs: its processes run (ora_pmon_%s), but a login gives %s.' "$STANDBY_SID" "$STANDBY_SID" "$(grep -q 'did not answer' <<< "$SQL_OUT" && printf 'no answer' || printf 'ORA-01012 (not logged on)')"; }
+SHUT_TMO=$((FAST_WAITS == 1 ? 5 : 300))      # shutdown immediate longer than this: it hangs (then shutdown abort is offered)
+inst_abort() {
+  # shutdown abort of the standby instance $STANDBY_SID (never another SID: ORACLE_SID is set by as_oracle).
+  # A normal login first; when that gives ORA-01012 or does not answer, "sqlplus -prelim" (it attaches without a
+  # session). Then the processes must be gone (ora_pmon_<SID>) within a minute.
+  local t0
+  say "${C_D}Running as $ORACLE_USER: sqlplus / as sysdba  ->  shutdown abort${C_N}"
+  if ! sql_local "shutdown abort" 120 && ! grep -qE 'ORA-01034|idle instance' <<< "$SQL_OUT"; then
+    say "${C_D}Running as $ORACLE_USER: sqlplus -prelim / as sysdba  ->  shutdown abort  (a normal login does not work)${C_N}"
+    local tmp; tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) && CLEANUP_FILES+=("$tmp")
+    printf 'shutdown abort\nexit\n' | as_oracle timeout 120 "$DB_HOME/bin/sqlplus" -S -prelim / as sysdba > "${tmp:-/dev/null}" 2>&1 || true
+    { printf 'sqlplus -S -prelim / as sysdba <<< shutdown abort\n'; cat -- "$tmp" 2>/dev/null; } | log_block "STANDBY sqlplus -prelim: shutdown abort"
+    rm -f -- "$tmp"
+  fi
+  t0=$SECONDS
+  while pmon_running && (( SECONDS - t0 < (FAST_WAITS == 1 ? 3 : 60) )); do nap 2; done
+  if pmon_running; then bad "Instance $STANDBY_SID still runs after shutdown abort (ora_pmon_$STANDBY_SID). Check:  ps -ef | grep ora_pmon_$STANDBY_SID"; return 1; fi
+  journal INSTANCE "$STANDBY_SID" "shutdown abort (the instance hung or did not stop)"
+  say "Instance $STANDBY_SID is stopped (shutdown abort)."
+  return 0
 }
 
 dg_proc_count() {

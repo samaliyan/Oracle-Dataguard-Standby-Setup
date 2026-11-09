@@ -31,7 +31,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.20"
+readonly SCRIPT_VERSION="5.23"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -143,13 +143,14 @@ log_block() {
 }
 
 # Screen layout of a step:   "  Step 1.5  Title"  then 4 spaces + symbol + text; more lines of a message at 6 spaces
-say()  { printf '      %s\n' "$*"; _log INFO "$*"; }
+say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else printf '      %s\n' "$*"; fi; _log INFO "$*"; }
 _mark() { # $1 color $2 symbol $3 log tag, rest = text (first line after the symbol, other lines under it)
-  local col=$1 sym=$2 tag=$3 l first=1; shift 3
+  local col=$1 sym=$2 tag=$3 l first=1 o=""; shift 3
   while IFS= read -r l || [[ -n "$l" ]]; do
-    if [[ $first -eq 1 ]]; then printf '    %s%s%s %s\n' "$col" "$sym" "$C_N" "$l"; first=0
-    else [[ -n "$l" ]] && printf '      %s\n' "$l"; fi
+    if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s%s %s' "$col" "$sym" "$C_N" "$l")$'\n'; first=0
+    else [[ -n "$l" ]] && o+="      $l"$'\n'; fi
   done <<< "$*"
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
   _log "$tag" "$*"
 }
 ok()   { _mark "$C_G" "$S_OK" OK "$*"; }
@@ -157,12 +158,13 @@ WARN_LIST=()
 warn() {
   _log WARN "$*"
   local w="[${CUR_STEP:-start}] $*" x
-  for x in "${WARN_LIST[@]+"${WARN_LIST[@]}"}"; do [[ "$x" == "$w" ]] && return 0; done   # same warning again (a re-check): shown and listed once
-  local l first=1
+  [[ "${WARN_DEDUP:-1}" == 0 ]] || for x in "${WARN_LIST[@]+"${WARN_LIST[@]}"}"; do [[ "$x" == "$w" ]] && return 0; done   # same warning again (a re-check): shown and listed once
+  local l first=1 o=""
   while IFS= read -r l || [[ -n "$l" ]]; do
-    if [[ $first -eq 1 ]]; then printf '    %s%s %s%s\n' "$C_Y" "$S_WARN" "$l" "$C_N"; first=0
-    else [[ -n "$l" ]] && printf '      %s%s%s\n' "$C_Y" "$l" "$C_N"; fi
+    if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s %s%s' "$C_Y" "$S_WARN" "$l" "$C_N")$'\n'; first=0
+    else [[ -n "$l" ]] && o+=$(printf '      %s%s%s' "$C_Y" "$l" "$C_N")$'\n'; fi
   done <<< "$*"
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
   WARN_COUNT=$((WARN_COUNT + 1)); WARN_LIST+=("$w")
 }
 bad()  { _mark "$C_R" "$S_BAD" FAIL "$*"; }
@@ -173,7 +175,7 @@ hint() {
   # explanations and advice: plain text under the message they belong to (often tool output: masked on screen too)
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '      %s\n' "$line"
+    if [[ $UI -eq 1 ]]; then ui_out 6 "      $line"; else printf '      %s\n' "$line"; fi
     _log HINT "$line"
   done < <(mask_pw)
 }
@@ -185,7 +187,9 @@ block() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     if [[ $first -eq 1 ]]; then
-      printf '    %s%-8s%s %s\n' "$C_D" "$label" "$C_N" "$line"; first=0
+      if [[ $UI -eq 1 ]]; then ui_out 13 "$(printf '    %s%-8s%s %s' "$C_D" "$label" "$C_N" "$line")"; else printf '    %s%-8s%s %s\n' "$C_D" "$label" "$C_N" "$line"; fi
+      first=0
+    elif [[ $UI -eq 1 ]]; then ui_out 13 "             $line"
     else
       printf '             %s\n' "$line"
     fi
@@ -231,6 +235,7 @@ fatal() {
   if [[ ${HEALTH:-0} -eq 1 ]] && declare -F health_exit >/dev/null; then _log FATAL "$*"; health_exit UNKNOWN "$*"; fi
   tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
+  ui_end
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
   _log FATAL "$*"
   if [[ $FATAL_SEEN -eq 0 ]]; then
@@ -284,6 +289,8 @@ TTY_RESTORE=""     # the terminal settings before a hidden question (put back on
 tty_restore() { [[ -n "$TTY_RESTORE" ]] && { stty "$TTY_RESTORE" < "${PROMPT_IN:-/dev/tty}" 2>/dev/null; TTY_RESTORE=""; }; return 0; }
 cleanup() {
   tty_restore
+  # the screen layout leaves the terminal as it was (whole screen scrolls, cursor shown)
+  [[ $UI -eq 1 || $UI_ALT -eq 1 ]] && { [[ $UI_ALT -eq 1 ]] && printf '\e[?1049l'; printf '\e[r\e[?25h\e[%d;1H\n' "${UI_ROWS:-24}"; UI=0; UI_ALT=0; }
   local f
   for f in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
     [[ -n "$f" ]] || continue
@@ -314,18 +321,27 @@ ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
   [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
+    if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; fi
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
       printf '\n'
       # Ctrl+D in a terminal is a stop; no terminal at all is a wrong way to run it
-      { [[ -t 0 ]] || { : < /dev/tty; } 2>/dev/null; } && fatal "Stopped: no answer (Ctrl+D) for: $1"
+      # (the answers come from PROMPT_IN: that is the input to judge, not stdin)
+      if [[ "$PROMPT_IN" == /dev/tty ]]; then { : < /dev/tty; } 2>/dev/null && fatal "Stopped: no answer (Ctrl+D) for: $1"
+      elif [[ -t 0 && ( "$PROMPT_IN" == /dev/stdin || "$PROMPT_IN" == /dev/fd/0 ) ]]; then fatal "Stopped: no answer (Ctrl+D) for: $1"; fi
       fatal "No answer could be read for: $1
 This script asks questions. Run it in an interactive terminal, for example:  ssh -t root@$(hostname -s 2>/dev/null)"
     fi
     _log ASK "$1  -> $ANSWER"
     case "${ANSWER,,}" in
-      h|"?"|help) if [[ -n "$CUR_STEP" ]]; then show_help "$CUR_STEP" || true
+      h|"?"|help) if [[ -n "$CUR_STEP" && $UI -eq 1 ]]; then ui_show "Help  $S_DOT  step $CUR_STEP" show_help "$CUR_STEP"
+                  elif [[ -n "$CUR_STEP" ]]; then show_help "$CUR_STEP" || true
                   else say "No help for this question. All options:  $SELF --help"; fi ;;
+      # the step text was cut to fit the screen ("N more lines: d shows all"): d shows it here too
+      d) if [[ $UI -eq 1 && ${UI_CUT:-0} -eq 1 && -n "$CUR_STEP" ]]; then
+           # the whole text of the step, uncut (the details from the log: l, then the step number)
+           if [[ -s "$UI_BUF_FILE.cut" ]]; then ui_page "$UI_BUF_FILE.cut" "Step $CUR_STEP  (the whole text)"; else ui_details "$CUR_STEP"; fi
+         else return 0; fi ;;
       *) return 0 ;;
     esac
   done
@@ -367,6 +383,7 @@ ask_secret() {
   [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   # echo is off BEFORE the question is shown: a password typed (or pasted) at once is never shown on the screen
   TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo < "$PROMPT_IN" 2>/dev/null
+  [[ $UI -eq 1 ]] && { ui_live_clear; ui_flush; printf '\n'; }
   printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
   local rc=0; IFS= read -rs SECRET < "$PROMPT_IN" || rc=$?
   tty_restore
@@ -396,6 +413,7 @@ distid_for() {
   elif [[ ${OS_MAJOR:-0} -ge 8 && -z "${RU_DIR:-}" ]]; then printf 'CV_ASSUME_DISTID=OEL7.8'; fi
   return 0
 }
+ORATMP_WARNED=0
 oracle_tmp() {
   # The Oracle installers run programs from their temporary folder. When /tmp is mounted noexec (hardened
   # servers) they fail, so a folder next to the inventory is used instead (root-owned, sticky, like /tmp).
@@ -412,6 +430,17 @@ oracle_tmp() {
 build_envs() {
   local oh gh dx=() gx=() v t
   t=$(oracle_tmp); [[ -n "$t" ]] && { dx+=("TMP=$t" "TMPDIR=$t"); gx+=("TMP=$t" "TMPDIR=$t"); }
+  # /tmp is noexec and no folder for the installers could be used (its parent is made by step 2.5): said once
+  if [[ -z "$t" && "$MODE" == "run" && $ORATMP_WARNED -eq 0 && ${HEALTH:-0} -eq 0 ]] \
+     && findmnt -n -o OPTIONS --target /tmp 2>/dev/null | tr ',' '\n' | grep -qx noexec; then
+    local tp; tp="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")"
+    ORATMP_WARNED=1
+    if [[ ! -d "$tp" ]]; then
+      warn "/tmp does not allow programs to run (noexec), and $tp does not exist yet (step 2.5 makes it)."$'\n'"Until then the Oracle installers would fail. Run phase 2 first."
+    else
+      warn "/tmp does not allow programs to run (noexec), and no folder for the installers could be made or used in $tp"$'\n'"($tp/dg_tmp must be a folder of root, mode 1777; the inventory path must be a plain path). The Oracle installers"$'\n'"may fail. Check:  ls -ld $tp $tp/dg_tmp"
+    fi
+  fi
   oh=$(home_of "$ORACLE_USER"); gh=$(home_of "$GRID_USER")
   v=$(distid_for "${DB_MAJOR:-0}"); [[ -n "$v" ]] && dx+=("$v")
   v=$(distid_for "$(rel_major "${GRID_REL:-${DB_MAJOR:-0}}")"); [[ -n "$v" ]] && gx+=("$v")
@@ -465,17 +494,41 @@ dup_log_ok() {
   [[ "${2:-}" == "0" ]] && grep -q 'Finished Duplicate Db' "$1" \
     && ! grep -qE '^RMAN-0(0569|3002|3009|3015)|ERROR MESSAGE STACK FOLLOWS' "$1"
 }
+IN_DO=0          # 1 while a step's action runs: every command that changes something is shown before it runs
+cmd_display() {
+  # the user and the command line of a run_logged call, as a person would type it: "grid|srvctl start asm"
+  local u=root w out="" q="'"
+  local -a a=("$@")
+  case "${a[0]:-}" in
+    as_oracle) u=$ORACLE_USER; a=("${a[@]:1}") ;;
+    as_grid)   u=$GRID_USER; a=("${a[@]:1}") ;;
+    runuser)   [[ "${a[1]:-}" == -u ]] && { u=${a[2]}; a=("${a[@]:3}"); [[ "${a[0]:-}" == -- ]] && a=("${a[@]:1}"); } ;;
+  esac
+  [[ "${a[0]:-}" == timeout && "${a[1]:-}" =~ ^[0-9]+$ ]] && a=("${a[@]:2}")
+  [[ "${a[0]:-}" == bash && "${a[1]:-}" == -c ]] && a=("${a[2]}")
+  for w in "${a[@]}"; do
+    if [[ ${#a[@]} -eq 1 || "$w" =~ ^[A-Za-z0-9_./,:+=@%-]+$ ]]; then out+="$w "; else out+="$q${w//$q/$q\\$q$q}$q "; fi
+  done
+  printf '%s|%s' "$u" "${out% }"
+}
+cmd_reads_only() {
+  # commands that only read (not worth a line on the screen while an action runs; they are in the log)
+  [[ "$1" =~ (^|/)(srvctl[[:space:]]+(status|config)|crsctl[[:space:]]+(stat|check|query)|lsnrctl[[:space:]]+(status|services)|asmcmd[[:space:]]+(ls|lsdg|find|lsdsk)|systemctl[[:space:]]+(is-[a-z]+|status|cat|show)|rpm[[:space:]]+-q|getent|id|stat|df|cat|ls|test|grep|findmnt|blkid|lsblk)([[:space:]]|$) ]]
+}
 run_logged() {
   # $1 = title; rest = command. Output -> RUN_OUT and log. Returns command rc. stdin is not passed on.
   # The output goes through a file: a daemon the command starts (lsnrctl start -> tnslsnr) may keep
   # its stdout open, and reading a pipe would then wait for ever.
+  # The exact command line goes to the log; during an action it is also shown ("Running as grid: ...").
   local title=$1; shift
-  local rc=0 tmp
+  local rc=0 tmp disp du dc
+  disp=$(cmd_display "$@"); du=${disp%%|*}; dc=${disp#*|}
+  [[ $IN_DO -eq 1 ]] && ! cmd_reads_only "$dc" && say "${C_D}Running as $du:${C_N} $(mask_pw <<< "$dc")"
   tmp=$(mktemp /tmp/dg_out.XXXXXXXX) || { RUN_OUT="cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
   "$@" > "$tmp" 2>&1 < /dev/null 9>&- || rc=$?
   RUN_OUT=$(cat "$tmp"); rm -f -- "$tmp"
-  printf '%s\n(exit code %s)\n' "$RUN_OUT" "$rc" | log_block "$title"
+  { printf 'command (as %s): %s\n' "$du" "$dc"; printf '%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | mask_pw | log_block "$title"
   return "$rc"
 }
 
@@ -552,8 +605,12 @@ job_finish_late() {
         dup_success_record copied; say "The RMAN copy had finished. Its result is recorded; the standby is compared with the primary next."; jok=1
       else
         jok=0; install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
-        say "The RMAN copy did NOT finish: $(grep -m1 -E '^(RMAN|ORA)-[0-9]+' "$JOB_OUT" 2>/dev/null || printf 'see its output')"
-        say "Step 7.2 of a normal run shows how to clean up this server."
+        # the same reading as a watched copy: the first real error, and a cause step 7.2 can fix (ORA-19809)
+        local fe=""; declare -F rman_first_error >/dev/null && fe=$(rman_first_error "$JOB_OUT")
+        declare -F dup_cause_record >/dev/null && dup_cause_record "$JOB_OUT"
+        say "The RMAN copy did NOT finish: ${fe:-see its output $JOB_OUT}"
+        [[ "$(dup_cause 2>/dev/null)" == FRA_FULL ]] && say "The recovery area on this server was full. Step 7.2 offers to clean up and copy again with a bigger one."
+        say "Step 7.2 of a normal run offers to clean up this server."
       fi ;;
     "RMAN roll forward")
       # not judged here: the next run with --roll-forward checks the standby, finishes the clean-up and starts
@@ -597,7 +654,14 @@ DETACHED_JOB=""
 job_detach_question() {
   # Ctrl+C while a long job runs: the job goes on in any case; the script either keeps watching or stops
   say "The job goes on in any case. A later run of the script waits for it."
-  ask_choice "[w] Keep watching   [d] Leave it running and stop the script" "wd"
+  if [[ $UI -eq 1 ]]; then
+    say "To stop the job itself:  pkill -s $2"
+    [[ "$1" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
+  fi
+  if [[ $UI -eq 1 ]]; then
+    # (d is "details" at every other question of the screen layout)
+    ask_choice "[w] Keep watching   [x] Leave it running and stop the script" "wx"; [[ "$ANSWER" == "x" ]] && ANSWER=d
+  else ask_choice "[w] Keep watching   [d] Leave it running and stop the script" "wd"; fi
   [[ "$ANSWER" == "d" ]] || return 0
   [[ -n "$TAIL_PID" ]] && { pkill -P "$TAIL_PID" 2>/dev/null; kill "$TAIL_PID" 2>/dev/null; wait "$TAIL_PID" 2>/dev/null; TAIL_PID=""; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
@@ -615,6 +679,7 @@ run_long() {
   # Returns the exit code of the command. The full output is in $2 (and in the log).
   local title=$1 out=$2 filt=$3 who=$4; shift 4
   local -a pre=()
+  ui_flush
   case "$who" in
     oracle) pre=(runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}") ;;
     grid)   pre=(runuser -u "$GRID_USER" -- env -i "${GRID_ENV[@]}") ;;
@@ -641,7 +706,11 @@ If this run stops, the next run will not know that $title is still running."
   JOB_PID=$jpid; JOB_TITLE=$title; JOB_OUT=$out; JOB_STEP=${CUR_STEP:-}
   _log JOB "start pid=$jpid $title -> $out"
   say "$title is running (process $jpid). Output: $out"
-  if [[ $LONG_ADVICE_SHOWN -eq 0 ]]; then
+  if [[ $LONG_ADVICE_SHOWN -eq 0 && $UI -eq 1 ]]; then
+    # the screen layout: one line (how to stop the job itself is shown after Ctrl+C)
+    LONG_ADVICE_SHOWN=1
+    say "${C_D}It runs in its own session: closing the terminal does not stop it. Ctrl+C shows the options.${C_N}"
+  elif [[ $LONG_ADVICE_SHOWN -eq 0 ]]; then
     LONG_ADVICE_SHOWN=1
     say "It runs in its own session. A closed terminal does not stop it, and the next run waits for it."
     say "Ctrl+C asks if you want to keep watching. The job itself goes on in any case."
@@ -649,15 +718,31 @@ If this run stops, the next run will not know that $title is still running."
     [[ "${title:-}" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
   fi
   RL_INT=0; trap 'RL_INT=1' INT
+  local t0=$SECONDS hb=0 ui_on=$UI
+  TAIL_PID=""
+  if [[ $ui_on -eq 1 ]]; then
+    # the screen layout: one live line (time, keys l and d) instead of the output; the output stays in its file
+    while [[ $UI -eq 1 ]] && kill -0 "$jpid" 2>/dev/null; do
+      ui_job_tick "$title" "$out" "$t0"
+      if [[ $RL_INT -eq 1 ]]; then
+        RL_INT=0; ui_live_clear
+        job_detach_question "$title" "$jpid" "$out"
+      fi
+      (( SECONDS - t0 >= 600 * (hb + 1) )) && { hb=$((hb + 1)); _log JOB "$title still running after $(( (SECONDS - t0) / 60 )) minutes"; }
+    done
+    ui_live_clear
+    # the terminal became too small: the plain output takes over for the rest of the job
+    [[ $UI -eq 1 ]] || ui_on=0
+  fi
   # the output is shown by a background pipeline; waiting for it can be interrupted by HUP/TERM at once
-  if [[ -n "$filt" ]]; then
+  if [[ $ui_on -eq 1 ]]; then :
+  elif [[ -n "$filt" ]]; then
     { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | mask_pw | sed -u 's/^/        /'; } 9>&- &
   else
     { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
   fi
-  TAIL_PID=$!
-  local t0=$SECONDS hb=0
-  while kill -0 "$TAIL_PID" 2>/dev/null; do
+  [[ $ui_on -eq 1 ]] || TAIL_PID=$!
+  while [[ -n "$TAIL_PID" ]] && kill -0 "$TAIL_PID" 2>/dev/null; do
     nap 5
     if [[ $RL_INT -eq 1 ]]; then
       RL_INT=0; printf '\n'
@@ -704,21 +789,31 @@ If this run stops, the next run will not know that $title is still running."
   RUN_OUT=$(cat "$out")
   printf '%s\n(exit code %s)\n' "$RUN_OUT" "$rc" | log_block "$title (full output: $out)"
   _log JOB "end pid=$jpid rc=$rc $title"
+  ui_job_done "$title" "$rc" "$t0" "$out"
+  ui_drain
   return "$rc"
 }
 
 #------------------------------------------------------------------------------
 # Files: backups and writes that never follow a symbolic link, done as the owner
 #------------------------------------------------------------------------------
+declare -A BACKUPS_MADE=()
 backup_file() {
   # $1 file, $2 user (empty = root). Keeps <file>.bak_<run id> once per run.
   local f=$1 u=${2:-} b="$1.bak_$RUN_ID"
   [[ -f "$f" && ! -L "$f" ]] || return 0
-  [[ -e "$b" || -L "$b" ]] && return 0
-  if [[ -n "$u" && "$u" != "root" ]]; then runuser -u "$u" -- cp -p -- "$f" "$b" || return 1
-  else cp -p --remove-destination -- "$f" "$b" || return 1; fi
-  # a backup is never readable by everyone, even when the old file was (a password file or wallet with a bad mode)
-  chmod o-rwx -- "$b" 2>/dev/null
+  # made once per run. In a folder of another user, a name that exists but was not made by this run is not
+  # taken as the backup (that user could have put it there before)
+  if [[ -e "$b" || -L "$b" ]]; then
+    [[ -n "${BACKUPS_MADE[$b]:-}" || -z "$u" || "$u" == root ]] && return 0
+    bad "$b exists already, but this run did not make it. Nothing is changed in $f."; return 1
+  fi
+  if [[ -n "$u" && "$u" != "root" ]]; then
+    # made and protected by the user itself: root never runs chmod on a path in that user's folder
+    # (a backup is never readable by everyone, even when the old file was: a password file or wallet with a bad mode)
+    runuser -u "$u" -- sh -c 'cp -p -- "$1" "$2" && chmod o-rwx -- "$2"' sh "$f" "$b" || return 1
+  else cp -p --remove-destination -- "$f" "$b" && chmod o-rwx -- "$b" || return 1; fi
+  BACKUPS_MADE[$b]=1
   say "Backup: $b"
 }
 dir_root_only() {
@@ -748,16 +843,17 @@ write_as() {
   # $1 user, $2 file, $3 mode; stdin = the whole new content (written as that user)
   local u=$1 f=$2 m=$3 existed=0
   [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
+  [[ -d "$f" ]] && { bad "Not changed: $f is a folder, not a file."; return 1; }
   [[ -e "$f" ]] && existed=1
 
   if [[ "$u" == "root" ]]; then
     local t; t=$(mktemp "$(dirname "$f")/.dgtmp.XXXXXX") || return 1
-    cat > "$t" && chmod "$m" "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; return 1; }
+    cat > "$t" && chmod "$m" "$t" && mv -fT -- "$t" "$f" || { rm -f -- "$t"; return 1; }
   else
     # as the owner, also through a temp file in the same folder and a rename: a crash never leaves half a file
     # (the group of the old file is kept)
     runuser -u "$u" -- sh -c 't=$(mktemp "$(dirname "$1")/.dgtmp.XXXXXX") || exit 1
-      if cat > "$t" && chmod "$2" "$t" && { [ ! -e "$1" ] || chgrp --reference="$1" "$t" 2>/dev/null || true; } && mv -f -- "$t" "$1"; then exit 0; fi
+      if cat > "$t" && chmod "$2" "$t" && { [ ! -e "$1" ] || chgrp --reference="$1" "$t" 2>/dev/null || true; } && mv -fT -- "$t" "$1"; then exit 0; fi
       rm -f -- "$t"; exit 1' sh "$f" "$m" || return 1
   fi
   declare -F journal_file_written >/dev/null && journal_file_written "$f" "$existed"
@@ -769,8 +865,9 @@ install_as() {
   # but written by $1 itself (temp file and rename in the target folder): root never chmods or chowns a path
   # there, so a link swapped in meanwhile cannot lead root to another file
   [[ -L "$5" ]] && { bad "Not changed: $5 is a symbolic link."; return 1; }
+  [[ -d "$5" ]] && { bad "Not changed: $5 is a folder, not a file."; return 1; }
   runuser -u "$1" -- sh -c 'umask 077; t=$(mktemp "$(dirname "$1")/.dgtmp.XXXXXX") || exit 1
-    if cat > "$t" && chgrp "$2" "$t" && chmod "$3" "$t" && mv -f -- "$t" "$1"; then exit 0; fi
+    if cat > "$t" && chgrp "$2" "$t" && chmod "$3" "$t" && mv -fT -- "$t" "$1"; then exit 0; fi
     rm -f -- "$t"; exit 1' sh "$5" "$2" "$3" < "$4"
 }
 safe_link_target() {
@@ -802,6 +899,19 @@ first_line() {
 # empty, or only the lost+found folder that a new file system has at its top (a fresh mount point counts as empty)
 dir_empty() { [[ -z "$(ls -A -- "$1" 2>/dev/null | grep -vx 'lost+found')" ]]; }
 norm() { printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'; }
+srv_notfound() {
+  # $1 the name asked for, $2 an extra code that means "not found" (optional). True only when the srvctl output
+  # in RUN_OUT says that this resource is not registered: its own codes, or "could not be found" / "does not
+  # exist" on a line that names it (any other failure, such as CRS down or a missing file, is no such answer)
+  local n=${1,,}
+  [[ "$n" =~ ^[a-z0-9_.$#-]+$ ]] || return 1
+  n=${n//./\\.}; n=${n//\$/\\$}
+  [[ -n "${2:-}" ]] && grep -qE "$2" <<< "$RUN_OUT" && return 0
+  # the name as the resource it is (database x, listener x, ora.x.db), never a path that only contains it, on the
+  # line of the code or the message (a PRCR-1001 about another resource is no answer about this one)
+  grep -iE 'PRCD-1120|PRCR-1001|could not be found|does not exist' <<< "$RUN_OUT" | tr '[:upper:]' '[:lower:]' \
+    | grep -qE "(database|listener|resource) $n( |\.|$)|ora\.$n\.(db|lsnr)( |$)"
+}
 ora_errors() {
   # the first error with its text (so the admin sees what it means), then the other codes
   local first rest
