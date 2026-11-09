@@ -56,6 +56,9 @@ cp "$TD/mock_ss.py" "$T/rootbin/ss"; chmod 755 "$T/rootbin/ss"
 for p in ssh scp ssh-keyscan ssh-keygen; do ln -sf "$T/mock_ssh.py" "$T/rootbin/$p"; done
 cp "$TD/mock_shm.py" "$T/"; chmod 755 "$T/mock_shm.py"; for p in df mount; do ln -sf "$T/mock_shm.py" "$T/rootbin/$p"; done
 printf '/dev/mapper/ol-root  /  xfs  defaults  0 0\ntmpfs  /dev/shm  tmpfs  defaults,nodev  0 0\n' > "$T/fstab"
+# the RAM of the mock standby is 8 GB whatever the test machine has (the memory checks of step 2.16
+# compare the SGA and PGA of the mock primary with it); HugePages none
+printf 'MemTotal:        8388608 kB\nMemFree:         6291456 kB\nMemAvailable:    7340032 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugepagesize:       2048 kB\n' > "$T/meminfo"
 ln -sf "$T/mock_oracle.py" "$T/remotebin/sqlplus"
 cat > "$T/os-release" <<EOF
 NAME="Oracle Linux Server"

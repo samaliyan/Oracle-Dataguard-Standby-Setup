@@ -18,7 +18,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -94,15 +94,16 @@ combo() { # $1 tag, then env assignments for setup; runs empty server to the end
 # A new section needs "if part KEY; then ... fi" around it and its KEY in PARTS, or every run fails.
 PARTS=(
   [1]="A B C D E F G H I J K"
-  [2]="L M N O P Q"
-  [3]="R Z4 Z5 Z19"
-  [4]="S T U"
-  [5]="V W X Z1 Z6 Z18"
-  [6]="Y Z3 Z7 Z10 Z17"
-  [7]="Z8 Z9 Z11 Z16 Z21"
-  [8]="Z12 Z13"
-  [9]="Z14 Z15 Z20"
-  [10]="5.22 5.23"
+  [2]="L M N O Q Z4 Z11"
+  [3]="P Z5 Z17 Z19"
+  [4]="R Z16 Z21"
+  [5]="S Z1 Z15"
+  [6]="T U V Z3"
+  [7]="W X Z6"
+  [8]="Y Z7 Z10 Z18"
+  [9]="Z8 Z9 Z14"
+  [10]="Z12 Z13"
+  [11]="Z20 5.22 5.23"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do

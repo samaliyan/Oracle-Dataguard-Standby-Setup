@@ -1,9 +1,9 @@
 # Checks on every push and pull request:
 #   shellcheck  errors in the built script, build.sh and the test scripts
 #   build       build.sh joins src/ into dg_standby_setup.sh: it must parse (bash -n) and be the committed file
-#   test        test/run_scenarios.sh, in parts (one part per job, run in parallel; the parts are in PARTS
-#               at the top of run_scenarios.sh). The tests make users and groups and write /etc, so they
-#               run as root (sudo) on a throw-away runner.
+#   test        test/run_scenarios.sh, in parts: one job per part, in parallel. The parts are PARTS at the top
+#               of run_scenarios.sh (the build job reads them). The tests make users and groups and write
+#               /etc, so they run as root (sudo) on a throw-away runner.
 #   ol7         a short part on Oracle Linux 7 itself (bash 4.2, Python 3.6), in a container
 name: CI
 
@@ -34,6 +34,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      parts: ${{ steps.parts.outputs.parts }}
     steps:
       - uses: actions/checkout@v4
       - name: Build from src/
@@ -51,6 +53,11 @@ jobs:
           fi
       - name: Version
         run: sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/version \1/p' dg_standby_setup.sh
+      - name: The parts of the test suite (one test job each)
+        id: parts
+        run: |
+          bash test/run_scenarios.sh --list-parts
+          echo "parts=$(bash test/run_scenarios.sh --list-parts | awk '{print $1}' | jq -cRn '[inputs | tonumber]')" >> "$GITHUB_OUTPUT"
 
   test:
     needs: build
@@ -59,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        part: ${{ fromJSON(needs.build.outputs.parts) }}
     name: test (part ${{ matrix.part }})
     steps:
       - uses: actions/checkout@v4
