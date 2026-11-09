@@ -1243,7 +1243,7 @@ check "9.7: boot script with a database that is not a physical standby -> no app
 check "9.7: boot script with an OPEN standby -> apply is not started (Active Data Guard), error in the journal" "[[ \$(DGT_ST='OPEN' ut_boot) == 'rc=0 <3>DG-BOOT-ERROR: the standby is open (OPEN), not mounted: redo apply is not started (Active Data Guard needs its own license)' ]]"
 fresh empty; run $T/z34a.txt >/dev/null; jset $S "d['srvctl']['startopt']='open'"
 rc=$(DG_TEST_SKIP=9.1 DG_TEST_QUIT_AT=9.2 run $T/z34.txt --from 9.1)
-check "9.1: registration with start option open -> only the start option is changed (the standby is not stopped)" "grep -q 'these values are wrong: start-option' $T/z34.txt && grep -q 'srvctl modify database' $T/z34.txt && grep -qE '^ +-startoption MOUNT[[:space:]]*\$' $T/z34.txt && ! grep -q 'srvctl stop database' $T/z34.txt"
+check "9.1: registration with start option open -> only the start option is changed (the standby is not stopped)" "grep -q 'these values are wrong: start-option' $T/z34.txt && grep -q 'srvctl modify database' $T/z34.txt && grep -qE 'srvctl modify database -db [A-Z_]+ .*-startoption MOUNT' $T/z34.txt && ! grep -q 'srvctl stop database' $T/z34.txt"
 rc=$(DG_TEST_QUIT_AT=9.2 run $T/z34b.txt --from 9.1)
 check "... and with [y] the start option becomes mount" "python3 -c \"import json;assert json.load(open('$S'))['srvctl'].get('startopt')=='mount'\" && grep -q 'Done. Registered in Oracle Restart' $T/z34b.txt"
 ut_timer() { bash <<'EOF'
@@ -1299,7 +1299,7 @@ EOF
 check "5.1: only the SID_LIST of this listener counts" "[[ \$(ut_sidlist) == '(SID_LIST=(SID_DESC=(SID_NAME=B)))' ]]"
 fresh empty; run $T/z40a.txt >/dev/null; jset $S "d['srvctl']['pwfile']='/tmp/old_orapw'"
 rc=$(DG_TEST_SKIP=9.1 DG_TEST_QUIT_AT=9.2 run $T/z40.txt --from 9.1)
-check "9.1: a registration with another password file is found and changed in place (no stop)" "grep -q 'these values are wrong: password-file' $T/z40.txt && grep -q 'srvctl modify database' $T/z40.txt && grep -qE '^ +-pwfile ' $T/z40.txt && ! grep -q 'srvctl remove database' $T/z40.txt"
+check "9.1: a registration with another password file is found and changed in place (no stop)" "grep -q 'these values are wrong: password-file' $T/z40.txt && grep -q 'srvctl modify database' $T/z40.txt && grep -qE 'srvctl modify database -db [A-Z_]+ .*-pwfile ' $T/z40.txt && ! grep -q 'srvctl remove database' $T/z40.txt"
 
 # 5.9: files of an earlier, failed Grid installer run in the inventory folder (no /etc/oraInst.loc): INS-32035 before
 fresh empty; rc=$(DG_TEST_QUIT_AT=3.2 run $T/z41a.txt)
@@ -1676,7 +1676,7 @@ rc=$(run $T/z110.txt --only 9.1)
 check "9.1: a registered disk group ASM here does not see -> named, never taken out by the script" "grep -q 'disk group(s) that ASM here does not see: GONE' $T/z110.txt && python3 -c \"import json;assert json.load(open('$S'))['srvctl']['dg']=='DATA,FRA,GONE'\""
 jset $S "d['srvctl']['dg']='DATA,FRA'; d['srvctl']['spfile']='/wrong/spfileX.ora'; d['srvctl']['policy']='MANUAL'; d['srvctl']['stopopt']='abort'"
 rc=$(run $T/z111.txt --only 9.1 --check)
-check "9.1: the srvctl add shown for a new registration has the kept values (policy, stop option)" "grep -q 'srvctl add database' $T/z111.txt && grep -qE '^ +-policy MANUAL' $T/z111.txt && grep -qE '^ +-stopoption abort' $T/z111.txt"
+check "9.1: the srvctl add shown for a new registration has the kept values (policy, stop option)" "grep -q 'srvctl add database' $T/z111.txt && grep -qE 'srvctl add database .*-policy MANUAL' $T/z111.txt && grep -qE 'srvctl add database .*-stopoption abort' $T/z111.txt"
 jset $S "d['srvctl']['spfile']=d['srvctl']['spfile'] if d['srvctl']['spfile']!='/wrong/spfileX.ora' else '$T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora'; d['instances']['PRODDB_STBY']['hdr_fail']=1"
 rc=$(run $T/z112.txt --only 10.4 --check)
 check "a built standby whose datafile headers cannot be read -> cannot tell, not OK" "grep -q 'datafile headers of the standby cannot be read' $T/z112.txt && [[ \$(res 10.4 $T/z112.txt) != OK ]]"
@@ -1778,7 +1778,7 @@ check "9.1: OK still names a registered disk group ASM here does not see" "grep 
 ut_518() { bash <<EOF
 source <(sed -n '/^srv_add()/,/^}/p' $T/dg_standby_setup.sh)
 srv_new_args() { :; }; bad() { echo "BAD \$*"; }; warn() { :; }; say() { :; }; ran=0
-run_logged() { ran=1; return 0; }
+srv_shown_add() { SRV_ADD_IDX=0; }; cp_exec() { ran=1; return 0; }
 SRV_DG_UNREAD="DATA,FRA" SRV_DG_LOST="" STANDBY_UNIQUE=x; SRV_KEPT=()
 srv_add "saved config" >/dev/null; a=\$?; a="\$a\$ran"
 ran=0; SRV_DG_UNREAD=""; srv_add "saved config" >/dev/null 2>&1; b="\$ran"
@@ -2096,7 +2096,7 @@ check "--health: a hung instance is CRITICAL with the reason" "[[ $rc == 2 ]] &&
 pkill -f '^ora_pmon_PRODDB_STBY( |$)' 2>/dev/null
 built523; jset $S "d['srvctl']={}" 2>/dev/null
 rc=$(DG_TEST_QUIT_AT=9.2 run $T/h5.txt --from 9.1)
-check "9.1: the srvctl add command one option per line" "grep -qF 'srvctl add database \\' $T/h5.txt && grep -qF -- '  -db PRODDB_STBY \\' $T/h5.txt && grep -qE '^ +-diskgroup [A-Z,]+[[:space:]]*\$' $T/h5.txt"
+check "9.1: the srvctl add command is shown whole under Will run before [y], and runs as shown" "grep -qE '^ +srvctl add database -db PRODDB_STBY .*-diskgroup [A-Z,]+' $T/h5.txt && grep -qE 'Running as oracle: srvctl add database -db PRODDB_STBY .*-diskgroup' $T/h5.txt"
 
 # ---- item 10: a standby copied outside the script is accepted ----
 built523; rm -f $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/.dg_duplicate_done_PRODDB_STBY $T/varlib/dup_attempt
