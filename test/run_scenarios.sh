@@ -98,12 +98,12 @@ PARTS=(
   [3]="P Z5 Z17 Z19"
   [4]="R Z16 Z21"
   [5]="S Z1 Z15"
-  [6]="T U V Z3"
-  [7]="W X Z6"
+  [6]="T U V Z3 5.22"
+  [7]="W X Z6 Z20"
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14"
   [10]="Z12 Z13"
-  [11]="Z20 5.22 5.23"
+  [11]="5.23"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
