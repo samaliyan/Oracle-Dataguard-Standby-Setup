@@ -2172,7 +2172,8 @@ check "summary: a number changes only that value, it is saved as the new default
 fresh
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/u2.txt --check)
 check "--check prints the summary as a report (no question)" "grep -q 'Values of this run' $T/u2.txt && ! grep -q '\\[Enter\\] Start' $T/u2.txt"
-check "--health never shows the summary" "! grep -q 'Values of this run' $T/a6.txt"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/u2s.txt); rc=$(run $T/u2h.txt --health)   # with settings saved, so --health really runs
+check "--health never shows the summary" "grep -q 'Data Guard health check' $T/u2h.txt && ! grep -q 'Stopped:' $T/u2h.txt && ! grep -q 'Values of this run' $T/u2h.txt"
 fresh
 rc=$(DG_TEST_MENU=2 DG_TEST_QUIT_AT=2.3 run $T/u3.txt)
 check "menu: grouped (Setup / After setup / Information) with the switch of each item; 2 = check only" "grep -q 'After setup' $T/u3.txt && grep -qE 'Check only, change nothing +--check' $T/u3.txt && grep -qE 'Roll forward the standby from the primary +--roll-forward' $T/u3.txt && grep -qE '1  Mode +check only' $T/u3.txt && grep -q 'check mode does not save them' $T/u3.txt"
