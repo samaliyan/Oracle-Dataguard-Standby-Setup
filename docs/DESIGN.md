@@ -1,7 +1,8 @@
 # dg_standby_setup.sh 5.20 - design
 
 Runs as root on the future STANDBY. Builds a physical standby of one primary database.
-Never changes the primary: primary work is printed, then re-checked read-only.
+Never changes the primary on its own: primary work is printed, then re-checked read-only.
+Only with PRIMARY_RUN=yes may a primary step run listed Data Guard statements over ssh, after you answer y.
 
 ## Supported
 - Oracle Database 12.1, 12.2, 18, 19, 21, 23ai (single instance primary; RAC primary -> stop).

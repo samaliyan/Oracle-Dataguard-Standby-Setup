@@ -1,7 +1,7 @@
 #------------------------------------------------------------------------------
 # The summary screen (step 1.4): what was found on the primary and on this server, where the standby goes, the plan,
 # the problems found now, and the values of this run, numbered. Shown on every setup run after phase 1 read both
-# servers:  [Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit
+# servers:  [Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit
 # A number asks only that value (the same checks as --settings), saves it as the new default and draws the screen
 # again. --check prints the same screen as a report (no question); --health never shows it.
 # Kept as LOG_DIR/summary_<run>.txt.
@@ -10,9 +10,11 @@ SUM_FACTS_READ=0; SUM_LOGMODE=""; SUM_FORCELOG=""; SUM_FLASHBACK=""; SUM_SRL="";
 summary_facts() {
   # read-only, once per run: what phase 4 will check on the primary, for the summary
   [[ $SUM_FACTS_READ -eq 1 ]] && return 0
-  SUM_FACTS_READ=1
+  # marked as read only after the first query worked: a failed read is tried again at the next summary
   ssh_alive || return 0
-  if prim_sql "select log_mode||'|'||force_logging||'|'||flashback_on from v\$database;"; then IFS='|' read -r SUM_LOGMODE SUM_FORCELOG SUM_FLASHBACK <<< "$(first_line)"; fi
+  prim_sql "select log_mode||'|'||force_logging||'|'||flashback_on from v\$database;" || return 0
+  SUM_FACTS_READ=1
+  IFS='|' read -r SUM_LOGMODE SUM_FORCELOG SUM_FLASHBACK <<< "$(first_line)"
   prim_sql "select count(*) from v\$standby_log;" && num "$(first_line)" && SUM_SRL=$(first_line)
   if [[ "$PRIMARY_CDB" == YES ]] && prim_sql "select count(*) from v\$pdbs where name<>'PDB\$SEED';"; then num "$(first_line)" && SUM_PDBS=$(first_line); fi
   prim_sql "select upper(value) from v\$parameter where name='dg_broker_start';" && SUM_BROKER=$(first_line)
@@ -37,21 +39,21 @@ summary_problems() {
   # one problem per line: "what  ->  what happens / what you do"
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && printf 'Host name here: %s  ->  step 2.6 adds it to /etc/hosts (a backup is kept)\n' "$p"; done < <(standby_name_problems 2>/dev/null)
-  local pp prc=0; pp=$(primary_name_problems 2>/dev/null) || prc=$?
+  local pp prc=0; primary_name_problems > /dev/null 2>&1 || prc=$?; pp=$PNP_OUT
   [[ $prc -eq 0 ]] && while IFS= read -r p; do [[ -n "$p" ]] && printf 'Host name on the primary: %s  ->  step 2.7 shows the line for its /etc/hosts\n' "$p"; done <<< "$pp"
   [[ "${SUM_LOGMODE^^}" == NOARCHIVELOG ]] && printf 'The primary is in NOARCHIVELOG mode  ->  phase 4 shows the commands (it needs a restart of the primary)\n'
   [[ "${SUM_FORCELOG^^}" == NO ]] && printf 'Force logging is off on the primary  ->  phase 4 shows the command (no restart)\n'
   [[ "${STEP_RESULT[1.6]:-OK}" != OK ]] && printf 'Version or OS: %s  ->  see step 1.6\n' "${STEP_NOW[1.6]:-check step 1.6}"
   if ! grid_sw_ok 2>/dev/null && use_grid && [[ -z "$GRID_MEDIA" ]]; then printf 'No Grid installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
   if ! db_sw_ok 2>/dev/null && [[ -z "$DB_MEDIA" ]]; then printf 'No database installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
-  primary_mixed && [[ "$(place_mode)" == asm ]] && ! sum_built && printf 'The primary keeps files in folders and in ASM  ->  here all of them go to %s (value 5 changes it)\n' "$(data_dest)"
-  [[ "$(place_mode)" != asm ]] && use_grid && grid_sw_ok 2>/dev/null && [[ -n "$(fs_dirs)" ]] && ! sum_built && printf 'This server has ASM, but files go to the file system (%s)  ->  value 5 changes it\n' "$(fs_dirs | paste -sd' ' -)"
-  [[ $LSNR_ASSUMED -eq 1 ]] && printf 'No listener on the primary offers the service %s  ->  check value "Primary" (port and service were assumed)\n' "$PRIMARY_SERVICE"
+  primary_mixed && [[ "$(place_mode)" == asm ]] && ! sum_built && printf 'The primary keeps files in folders and in ASM  ->  here all of them go to %s (value 4 changes it)\n' "$(data_dest)"
+  [[ "$(place_mode)" != asm ]] && use_grid && grid_sw_ok 2>/dev/null && [[ -n "$(fs_dirs)" ]] && ! sum_built && printf 'This server has ASM, but files go to the file system (%s)  ->  values 4 and 5 change it\n' "$(fs_dirs | paste -sd' ' -)"
+  [[ $LSNR_ASSUMED -eq 1 ]] && printf 'No listener on the primary offers the service %s  ->  check PORT, LISTENER_NAME and PRIMARY_SERVICE with [e] (they were assumed)\n' "$PRIMARY_SERVICE"
   # the space for the copy: only where it can be measured now (a disk group needs Grid running here)
   if ! sum_built && { [[ -z "$(asm_dgs)" ]] || grid_sw_ok 2>/dev/null; }; then
     PRE_INFO=""; PRE_FIX=""
     if ! space_check >/dev/null 2>&1; then
-      while IFS= read -r p; do [[ "$p" == *Missing:* ]] && printf 'Space: %s  ->  make room or change values 5 and 6\n' "${p#  }"; done <<< "$PRE_FIX"
+      while IFS= read -r p; do [[ "$p" == *Missing:* ]] && printf 'Space: %s  ->  make room or change values 4 and 5\n' "${p#  }"; done <<< "$PRE_FIX"
     fi
   fi
   return 0
@@ -169,7 +171,7 @@ summary_show() {
 SUM_NOTE=""
 sum_note() { say "$1"; SUM_NOTE=$1; }     # a message for the summary page (shown above its question there)
 sv_change() {
-  # value number $1: asked, checked, saved as the new default
+  # value number $1: asked, checked, saved as the new default. 1 = not accepted (nothing changed)
   local id=${SV_ID[$(( $1 - 1 ))]} v a b k snap=""
   for k in $STANDBY_KEYS; do snap+="$k=${!k}"$'\n'; done
   case "$id" in
@@ -181,17 +183,18 @@ sv_change() {
            if [[ -z "$v" ]]; then :
            elif [[ "$v" =~ ^([1-9]|10)$ ]]; then FROM_STEP="$v.0"; FROM_SEEN=1        # a phase: from there, as menu item 8
            elif valid_step "$v" && ! on_demand "$v"; then FROM_STEP=$v; FROM_SEEN=1
+           elif names_on_demand "$v"; then sum_note "Step 10.7 runs only with --roll-forward. All steps are kept."
            elif ! parse_only "$v"; then sum_note "Not a step, range or part: $v. All steps are kept."; fi ;;
     data)  local dgl=""; use_grid && dgl=$(asm_dgs | sed 's/^/+/' | paste -sd' ' -)
            ask_default "Database files go to: a disk group (${dgl:-none here}), same (the paths of the primary), a folder, or Enter for automatic" "${DATA_DEST:-}"
            v=${ANSWER//[[:space:]]/}
-           valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 0; }
-           [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 0; }
+           valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 1; }
+           [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 1; }
            DATA_DEST=$v ;;
     fra)   ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 0; }
+           v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 1; }
            ask_default "Its size, for example 60G (Enter = estimate: $(human_mb "$(fra_estimate_mb)"))" "${FRA_SIZE:-}"
-           a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 0; }
+           a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 1; }
            FRA_DEST=$v; FRA_SIZE=${a^^} ;;
     chan)  local sp sa; read -r sp sa <<< "$(chan_suggest)"
            ask_default "Channels on the primary (1-64)" "$(prim_channels)"; a=$ANSWER
@@ -200,10 +203,10 @@ sv_change() {
              PRIMARY_CHANNELS=$((10#$a)); AUX_CHANNELS=$((10#$b))
            else sum_note "Use numbers from 1 to 64, and not fewer on this server than on the primary (suggested: $sp and $sa)."; return 0; fi ;;
     sect)  ask_default "Section size, for example 32G (0 = none, Enter = automatic)" "${DUP_SECTION_SIZE:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value secsize "${v^^}" || { sum_note "Use for example 32G, 0, or nothing."; return 0; }; DUP_SECTION_SIZE=${v^^} ;;
+           v=${ANSWER//[[:space:]]/}; valid_value secsize "${v^^}" || { sum_note "Use for example 32G, 0, or nothing."; return 1; }; DUP_SECTION_SIZE=${v^^} ;;
     prun)  if [[ "$PRIMARY_RUN" == yes ]]; then PRIMARY_RUN=no; else PRIMARY_RUN=yes; say "The script then offers, step by step, to run the primary commands it shows over ssh (as $PRIMARY_SSH_USER). Never a restart, a stop or a deletion."; fi ;;
     names) ask_default "db_unique_name of the standby (letters, digits, _; at most 30)" "$STANDBY_UNIQUE"
-           v=${ANSWER//[[:space:]]/}; valid_value dbname "$v" || { sum_note "Not a valid name: $v"; return 0; }
+           v=${ANSWER//[[:space:]]/}; valid_value dbname "$v" || { sum_note "Not a valid name: $v"; return 1; }
            if [[ "$v" != "$STANDBY_UNIQUE" ]]; then
              [[ "$STANDBY_SID" == "$STANDBY_UNIQUE" || "$STANDBY_SID" == "${STANDBY_UNIQUE:0:12}" ]] && STANDBY_SID=""
              [[ "$STANDBY_SERVICE" == "${STANDBY_UNIQUE}"* ]] && STANDBY_SERVICE=""
@@ -212,27 +215,27 @@ sv_change() {
            fi ;;
     media) ask_default "Grid installer zip(s), comma separated (Enter = keep)" "$GRID_MEDIA"; a=${ANSWER//[[:space:]]/}
            ask_default "Database installer zip(s), comma separated (Enter = keep)" "$DB_MEDIA"; b=${ANSWER//[[:space:]]/}
-           valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 0; }
+           valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 1; }
            GRID_MEDIA=$a; DB_MEDIA=$b ;;
     asm)   ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 0; }; ASM_METHOD=$v ;;
+           v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 1; }; ASM_METHOD=$v ;;
     arch)  ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
-           v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 0; }
-           [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 0; }
-           ARCH_CLEANUP=$v
+           v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 1; }
+           [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 1; }
            if [[ "$v" == timer || "$v" == crontab ]]; then
-             ask_default "Time (HH:MM)" "$(arch_time)"; a=${ANSWER//[[:space:]]/}; valid_value hhmm "$a" && [[ -n "$a" ]] || { sum_note "Use HH:MM, for example 04:30."; return 0; }
-             ask_default "Keep applied logs this many days (0-30)" "$(arch_days)"; b=${ANSWER//[[:space:]]/}; valid_value days "$b" && [[ -n "$b" ]] || { sum_note "Use a number from 0 to 30."; return 0; }
+             ask_default "Time (HH:MM)" "$(arch_time)"; a=${ANSWER//[[:space:]]/}; valid_value hhmm "$a" && [[ -n "$a" ]] || { sum_note "Use HH:MM, for example 04:30."; return 1; }
+             ask_default "Keep applied logs this many days (0-30)" "$(arch_days)"; b=${ANSWER//[[:space:]]/}; valid_value days "$b" && [[ -n "$b" ]] || { sum_note "Use a number from 0 to 30."; return 1; }
              ARCH_CLEANUP_TIME=$a; ARCH_CLEANUP_DAYS=$b
-           fi ;;
+           fi
+           ARCH_CLEANUP=$v ;;
     lag)   ask_default "Seconds of lag that the health check accepts" "${HEALTH_LAG_MAX:-300}"
-           v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 0; }; HEALTH_LAG_MAX=$v ;;
+           v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 1; }; HEALTH_LAG_MAX=$v ;;
   esac
   if [[ "$id" != mode && "$id" != yes && "$id" != range ]]; then
     if ! validate_settings >/dev/null 2>&1; then
       sum_note "Not saved: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
       while IFS= read -r k; do [[ -n "$k" ]] && printf -v "${k%%=*}" '%s' "${k#*=}"; done <<< "$snap"     # the values from before
-      return 0
+      return 1
     fi
     save_settings; save_accepted
     _log SETTINGS "changed in the summary: ${SV_LABEL[$(( $1 - 1 ))]}"

@@ -220,7 +220,14 @@ c_3_1() {
   [[ "$F_DB" == MISSING:* ]] && { miss2+=" ${F_DB#MISSING:}"; F_DB=""; }
   if [[ -n "$miss2" ]]; then
     NOW="The second installer file is missing:$miss2"$'\n'"It must be in the same folder as the first file."
-    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 into the folder of the first file, for example:"$'\n'"scp <user>@<server>:<folder>/$(basename "${miss2# }") $(dirname "${miss2# }")/"$'\n'"chmod 644 ${miss2# }"$'\n'"ls -l $(dirname "${miss2# }")"$'\n'"-- Then answer r."
+    # one line of each kind per missing file (12.1 with Grid: both 2of2 files can be missing)
+    local m2 cpl="" chl="" lsl=""
+    for m2 in $miss2; do
+      cpl+=$'\n'"scp <user>@<server>:<folder>/$(basename "$m2") $(dirname "$m2")/"
+      chl+=$'\n'"chmod 644 $m2"
+      [[ "$lsl " == *" $(dirname "$m2") "* ]] || lsl+=" $(dirname "$m2")"
+    done
+    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 into the folder of the first file, for example:$cpl$chl"$'\n'"ls -l$lsl"$'\n'"-- Then answer r."
     return 1
   fi
   if [[ ( $need_g -eq 1 && -z "$F_GRID" ) || ( $need_d -eq 1 && -z "$F_DB" ) ]]; then
@@ -231,8 +238,16 @@ c_3_1() {
     local wg=""; [[ $need_g -eq 1 ]] && wg=" and grid"
     PLAN="-- On this server, as root:"$'\n'"mkdir -p /stage"
     PLAN+=$'\n'"-- Copy the files into /stage (with WinSCP, or from the server that has them), for example:"
-    [[ $need_d -eq 1 && -z "$F_DB" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name db "$(want_rel)" | awk '{print $1}') /stage/"
-    [[ $need_g -eq 1 && -z "$F_GRID" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name grid "$(want_rel grid)" | awk '{print $1}') /stage/"
+    # every file of the media: 12.1 has two zips each (1of2 and 2of2)
+    local mk mn mfound
+    for mk in db grid; do
+      [[ $mk == db && $need_d -eq 1 && -z "$F_DB" ]] || [[ $mk == grid && $need_g -eq 1 && -z "$F_GRID" ]] || continue
+      mfound=0
+      for mn in $(base_media_name $mk "$(want_rel "$mk")"); do
+        [[ "$mn" == *.zip ]] && { PLAN+=$'\n'"scp <user>@<server>:<folder>/$mn /stage/"; mfound=1; }
+      done
+      [[ $mfound -eq 1 ]] || PLAN+=$'\n'"scp <user>@<server>:<folder>/<the $mk zip file> /stage/"
+    done
     PLAN+=$'\n'"chmod 644 /stage/*.zip"$'\n'"ls -l /stage"$'\n'"-- ls must show the zip file(s), owner root. Then answer r."
     if [[ $DB_MAJOR -ge 18 ]]; then
       PLAN+=$'\n'"-- Use one of these:"
@@ -575,7 +590,7 @@ The owner must be root, $ORACLE_USER or $GRID_USER, and only the owner may chang
   say "Replacing $1/OPatch with the one in $OPATCH_ZIP. The Release Update needs it."
   if [[ -e "$1/OPatch" && -e "$1/OPatch.bak_$RUN_ID" ]]; then
     # a retry in this run: the original is kept already; the half copy goes
-    run_logged "remove the OPatch of the failed try" "$2" rm -rf -- "$1/OPatch" || { bad "Cannot remove $1/OPatch."; return 1; }
+    run_logged "remove the OPatch of the failed try" "$2" rm -rf --one-file-system -- "$1/OPatch" || { bad "Cannot remove $1/OPatch."; return 1; }
   elif [[ -e "$1/OPatch" ]]; then
     run_logged "keep old OPatch" "$2" mv -T -- "$1/OPatch" "$1/OPatch.bak_$RUN_ID" || { bad "Cannot move $1/OPatch aside."; return 1; }
     journal OPATCH "$1/OPatch" "old=$1/OPatch.bak_$RUN_ID"
@@ -629,10 +644,10 @@ unzip_failed_check() {
   while IFS='|' read -r t o dest; do
     [[ -n "$t" && -n "$dest" ]] || continue
     chk+="grep -c '\"$dest\"' $INVENTORY_DIR/ContentsXML/inventory.xml"$'\n'
-    emp+="find $dest -mindepth 1 -delete"$'\n'
+    emp+="find $dest -xdev -mindepth 1 -delete"$'\n'
   done < "$(unzip_marker)"
   PLAN="-- First check that nothing is installed there (each command must print 0):"$'\n'"${chk:-# the folder is not recorded: it is the home or stage folder of that file}"
-  PLAN+=$'\n'"-- Then empty it (hidden files too), and nothing else:"$'\n'"${emp:-find <that folder> -mindepth 1 -delete}"
+  PLAN+=$'\n'"-- Then empty it (hidden files too), and nothing else:"$'\n'"${emp:-find <that folder> -xdev -mindepth 1 -delete}"
   PLAN+=$'\n'"-- Then remove its line from the list of failed unzips:"$'\n'"${rmcmd%$'\n'}"
   PLAN+=$'\n'"-- Then answer r. The files are unpacked again."
   return 1
@@ -1376,13 +1391,15 @@ RES_TODO=""
 #                    listener.ora that is not this server), fixed, then the listener is stopped and started again
 L39_CAUSE=""; L39_HOSTS_LINE=""; L39_PID=""; L39_LHOME=""; L39_LUSER=""; L39_LNAME=""; L39_LORA=""; L39_BADHOST=""
 res_state() {
-  # $1 resource -> RES_STATE: ONLINE | OFFLINE | INTERMEDIATE | MISSING | UNKNOWN ; RES_DETAIL: the text after the state
+  # $1 resource -> RES_STATE: ONLINE | OFFLINE | INTERMEDIATE | MISSING | CRS_UNKNOWN (crsctl says STATE=UNKNOWN) |
+  # UNKNOWN (no state could be read) ; RES_DETAIL: the text after the state
   run_logged "crsctl stat res $1" as_grid timeout 60 "$GRID_HOME/bin/crsctl" stat res "$1" -v || true
   RES_DETAIL=""
   if grep -q 'CRS-2613' <<< "$RUN_OUT" || ! grep -q "NAME=$1" <<< "$RUN_OUT"; then RES_STATE=MISSING; return 0; fi
   local st; st=$(sed -n 's/^STATE=\([A-Z_]*\).*/\1/p' <<< "$RUN_OUT" | head -n 1)
   RES_DETAIL=$(sed -n 's/^STATE_DETAILS=//p' <<< "$RUN_OUT" | head -n 1)
-  case "$st" in ONLINE|OFFLINE|INTERMEDIATE) RES_STATE=$st ;; "") RES_STATE=UNKNOWN ;; *) RES_STATE=OFFLINE ;; esac
+  # STATE=UNKNOWN is not OFFLINE: a plain start does not help (Oracle: stop it with -f first)
+  case "$st" in ONLINE|OFFLINE|INTERMEDIATE) RES_STATE=$st ;; UNKNOWN) RES_STATE=CRS_UNKNOWN ;; "") RES_STATE=UNKNOWN ;; *) RES_STATE=OFFLINE ;; esac
 }
 srvctl_start_cmd() {
   # the srvctl command that starts resource $1
@@ -1449,6 +1466,9 @@ c_3_9() {
     case "$RES_STATE" in
       ONLINE) on+=("$r") ;; MISSING) miss+=("$r") ;; INTERMEDIATE) mid+=("$r"); det=$RES_DETAIL ;;
       UNKNOWN) NOW="Cannot read the state of $r: $(head -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2 ;;
+      CRS_UNKNOWN) NOW="Oracle Restart has $r in the state UNKNOWN${RES_DETAIL:+ ($RES_DETAIL)}: it cannot tell whether it runs."
+                   NOW+=$'\n'"As $GRID_USER: stop it with -f, then start it:  $(srvctl_start_cmd "$r" | sed 's/ start / stop /') -f ; $(srvctl_start_cmd "$r")"
+                   NOW+=$'\n'"Then run this step again."; return 2 ;;
       *) off+=("$r") ;;
     esac
   done
@@ -1499,7 +1519,9 @@ c_3_9() {
       lsnr_host)
         NOW+=$'\n'"Cause: $L39_LORA has HOST=$L39_BADHOST, which is not this server."
         cp_add grid "cp -p $L39_LORA $L39_LORA.bak_$RUN_ID"
-        cp_add grid "sed -i -E 's/(HOST *= *)${L39_BADHOST//./\\.}( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
+        # the old name as a literal in the pattern (escaped with sed: ${X//./\\.} differs between bash 4.2 and 5)
+        local besc; besc=$(printf '%s' "$L39_BADHOST" | sed 's#[][\.*^$/+?(){}|]#\\&#g')
+        cp_add grid "sed -i -E 's/(HOST *= *)$besc( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
       unknown)
         NOW+=$'\n'"The host name, the port and listener.ora look right; the cause is not known."
         KIND_NOW=check
@@ -1635,7 +1657,8 @@ primary_patches() {
 }
 local_release() {
   # base release of the installed database software, from sqlplus -V ("Release 19.0.0.0.0", "Version 19.21.0.0.0")
-  run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V || return 1
+  # (its "Running as" line during an action must not end up in the captured answer: it is only a read)
+  run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V > /dev/null || return 1
   grep -oE '(Release|Version) [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
 }
 c_3_11() {

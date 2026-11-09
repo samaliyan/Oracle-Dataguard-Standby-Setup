@@ -15,14 +15,19 @@ v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) && "$1" !
 
 ssh_alive() {
   [[ -n "$SSH_CTL" && -e "$SSH_CTL" ]] || return 1
-  ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -O check "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
+  # a deadline: a hung (for example stopped) master must not block every check
+  local rc=0
+  timeout 10 ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -O check "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 124 ]] && _log INFO "the ssh control master does not answer (10 s)"
+  return $rc
 }
 
 prim_ssh() {
   # $1 = remote command built by prim_probe / prim_sql only. stdin is passed through.
   # A stuck remote command (a hung NFS path, a wedged listener) ends after PROBE_TIMEOUT seconds (exit 124).
   # ControlMaster=no: a ControlMaster setting in root's ~/.ssh/config must not turn this call into a new master
-  timeout --foreground "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
+  # -k 30: an ssh that ignores the TERM is killed 30 s later
+  timeout --foreground -k 30 "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
 }
 PROBE_TIMEOUT=300
 
@@ -87,7 +92,9 @@ prim_probe() {
   # A marker line separates our output from anything a login script on primary prints;
   # stderr goes to the log only, never into the parsed output.
   local out err rc=0
-  err=$(mktemp); CLEANUP_FILES+=("$err")
+  # no temporary file (/tmp full or read-only): say that, not an ssh problem
+  err=$(mktemp) || { RUN_OUT=""; PROBE_TIMED_OUT=0; PROBE_REACHED=0; PROBE_ERR="cannot create a temporary file in ${TMPDIR:-/tmp} (full or read-only?)"; _log WARN "primary check $p not run: $PROBE_ERR"; return 1; }
+  CLEANUP_FILES+=("$err")
   # a stuck remote command (a hung NFS path, a wedged listener) must not stop the script for ever
   out=$(prim_ssh "echo $PROBE_MARK; $cmd" < /dev/null 2>"$err") || rc=$?
   PROBE_TIMED_OUT=0; PROBE_ERR=""; PROBE_REACHED=0
@@ -96,12 +103,15 @@ Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
   { printf '%s\n' "$out"; printf -- '--- stderr ---\n'; cat "$err"; printf '(exit code %s)\n' "$rc"; } | log_block "PRIMARY probe $p: $cmd"
   PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
   rm -f "$err"
-  # PROBE_REACHED: the command ran on the primary (the marker came back); else ssh itself failed
-  if [[ "$out" == *"$PROBE_MARK"* ]]; then RUN_OUT=${out#*"$PROBE_MARK"}; RUN_OUT=${RUN_OUT#$'\n'}; PROBE_REACHED=1
+  # PROBE_REACHED: the command ran on the primary (the marker came back on a line of its own); else ssh itself failed
+  local nl=$'\n'"$out"$'\n'
+  if [[ "$nl" == *$'\n'"$PROBE_MARK"$'\n'* ]]; then RUN_OUT=${nl#*$'\n'"$PROBE_MARK"$'\n'}; RUN_OUT=${RUN_OUT%$'\n'}; PROBE_REACHED=1
   else RUN_OUT=""; PROBE_REACHED=0; [[ $rc -eq 0 ]] && rc=1; fi
   return $rc
 }
-readonly PROBE_MARK="__DG_PROBE_OUTPUT__"
+# new for every run: a login script on the primary cannot print it by chance (or on purpose)
+PROBE_MARK="__DG_PROBE_$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc '0-9a-f')${RANDOM}${RANDOM}__"
+readonly PROBE_MARK
 PROBE_TIMED_OUT=0; PROBE_ERR=""
 
 prim_scp() {
@@ -346,7 +356,12 @@ EOF
     bad "Host key not accepted. Nothing was sent to $PRIMARY_IP. If the values differ, another machine may answer for this address."
     return 1
   fi
-  ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"
+  if ! { ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"; }; then
+    rm -f -- "$tmp"
+    bad "The host key could not be saved in $KH_FILE (is the file system full or read-only?). Nothing was sent to $PRIMARY_IP."
+    _log SSH "host key of $look accepted, but saving it in $KH_FILE failed"
+    return 1
+  fi
   rm -f -- "$tmp"
   _log SSH "host key of $look accepted by the admin: $(printf '%s' "$fps" | tr '\n' ' ')"
   return 0

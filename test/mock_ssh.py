@@ -309,9 +309,10 @@ def ssh():
         print("Permission denied (publickey,password).", file=sys.stderr); return 255
     data = sys.stdin.read() if "sqlplus" in cmd else ""
     if pri.get("login_noise"): print(pri["login_noise"]); print("stty: 'standard input': Inappropriate ioctl for device", file=sys.stderr)
-    mark = "echo __DG_PROBE_OUTPUT__; "
-    if cmd.startswith(mark):
-        print("__DG_PROBE_OUTPUT__"); cmd = cmd[len(mark):]
+    # the probe marker is random per run (__DG_PROBE_<hex>__), echoed first on a line of its own
+    m = re.match(r"echo (__DG_PROBE_[0-9a-f]+__); ", cmd)
+    if m:
+        print(m.group(1)); cmd = cmd[m.end():]
     elif "sqlplus" not in cmd and cmd != "dd if=/dev/zero bs=1M count=64 status=none":
         # (the network speed measure reads raw bytes, so it has no marker)
         log(BAD, "[probe without marker] " + cmd)

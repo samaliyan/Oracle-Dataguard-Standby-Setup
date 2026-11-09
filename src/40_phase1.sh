@@ -158,7 +158,7 @@ d_1_4() {
     [[ $SETTINGS_ACCEPTED -eq 1 || ( -z "${SETTINGS_DIFF:-}" && $SETTINGS_UPGRADED -eq 0 && -f "$ACCEPTED_FILE" ) ]] && was_ok=1
     while true; do
       summary_values
-      if [[ $UI -eq 1 ]]; then ui_summary_ask; else summary_show; ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit"; fi
+      if [[ $UI -eq 1 ]]; then ui_summary_ask; else summary_show; ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"; fi
       local a=${ANSWER//[[:space:]]/}; a=${a,,}
       case "$a" in
         "") if ! validate_settings >/dev/null 2>&1; then
@@ -177,7 +177,7 @@ d_1_4() {
         h)  show_help 1.4 || true ;;
         q)  user_stop "Stopped by you" ;;
         e)  SUMMARY_DONE=1; L14_EDIT=1; break ;;          # the file in an editor: the way below
-        *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))"; changed_any=1
+        *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))" && changed_any=1
             else sum_note "Type a number from 1 to ${#SV_ID[@]}, d, e or q, or press Enter to start."; fi ;;
       esac
     done

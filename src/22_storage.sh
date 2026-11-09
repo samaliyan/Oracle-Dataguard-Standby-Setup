@@ -79,6 +79,8 @@ net_speed_read() {
   # 64 MB of zeros from the primary to this server over the ssh connection (the primary reads and writes no
   # file: dd from /dev/zero to its output). A rough lower bound for the copy (RMAN uses SQL*Net, not ssh).
   [[ -n "$NET_MBS" ]] && return 0
+  # not in --check: it only reports, and 64 MB is load on the primary nobody asked for
+  [[ "${MODE:-}" == check ]] && return 1
   ssh_alive || return 1
   local t0 t1 rc=0 ms
   t0=$(date +%s%N)
@@ -101,7 +103,7 @@ copy_minutes() {
   elif [[ "${1:-hi}" == lo ]]; then rate=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
   printf '%s' $(( ${PRIMARY_DB_MB:-0} / rate / 60 + 1 ))
 }
-copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured'; }
+copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured%s' "$([[ "${MODE:-}" == check ]] && printf ' in check mode')"; }
 fra_estimate_mb() {
   # the archived logs of the time the copy takes (the copy restores them into the recovery area to recover
   # the new standby), one day more for the standby itself, plus 30 %; at least 10 GB, in whole GB.
@@ -205,6 +207,9 @@ ask_channels() {
       k) return 0 ;;
       s) return 1 ;;
       c) ask_default "Channels on the primary (1-64)" "$sp"; p=$ANSWER
+         # checked before any arithmetic: 08, 1.5 or a word would stop bash itself
+         [[ "$p" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 )) || { say "Use a number from 1 to 64."; continue; }
+         p=$((10#$p))
          ask_default "Channels on this server ($p-64, not fewer than on the primary)" "$(( sa > p ? sa : p ))"; a=$ANSWER
          if [[ "$p" =~ ^[0-9]{1,2}$ && "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 && 10#$a >= 10#$p && 10#$a <= 64 )); then
            PRIMARY_CHANNELS=$((10#$p)); AUX_CHANNELS=$((10#$a)); save_settings

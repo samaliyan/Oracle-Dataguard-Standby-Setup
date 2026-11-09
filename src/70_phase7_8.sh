@@ -81,7 +81,8 @@ leftover_files() {
   local dg out="" f n
   for dg in $(asm_dgs); do
     grid_sw_ok || continue
-    if sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE');" && [[ "$(first_line)" != "0" ]]; then
+    # the folder at the top of the disk group only (parent_index = its root), the same test as clean_collect
+    if sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" && [[ "$(first_line)" != "0" ]]; then
       out+="  +$dg/${STANDBY_UNIQUE^^}"$'\n'
     fi
   done
@@ -104,12 +105,14 @@ spfile_from_failed_copy() {
   sql_local "select nvl(value,'-') from v\$parameter where name='spfile';" || return 1
   [[ "$(first_line)" != "-" ]]
 }
-FS_FILENAMES=""
+FS_FILENAMES=""; FS_READ_FAIL=0
 sql_or_cached_filenames() {
   # the datafile / tempfile / redo / control file names of the primary (read-only), cached in this run
+  # FS_READ_FAIL=1: the names could not be read (not the same as "the primary has no file in a folder")
+  FS_READ_FAIL=0
   [[ -n "$FS_FILENAMES" ]] && return 0
-  need_ssh || return 1
-  prim_sql "select name from v\$datafile union all select name from v\$tempfile union all select member from v\$logfile union all select name from v\$controlfile;" || return 1
+  need_ssh || { FS_READ_FAIL=1; return 1; }
+  prim_sql "select name from v\$datafile union all select name from v\$tempfile union all select member from v\$logfile union all select name from v\$controlfile;" || { FS_READ_FAIL=1; return 1; }
   FS_FILENAMES=$(grep '^/' <<< "$SQL_OUT")
   [[ -n "$FS_FILENAMES" ]]
 }
@@ -373,7 +376,7 @@ c_7_2() {
       if spfile_from_failed_copy; then
         NOW="Instance $STANDBY_SID is in NOMOUNT, but it runs from the spfile of an unfinished copy:"$'\n'"$(spfile_path)"
         cleanup_offer spfile && return 1
-        NOW+=$'\n'"The script cannot clean this up (STANDBY_UNIQUE must differ from the primary's names)."; return 2
+        NOW+=$'\n'"The script cannot clean this up ($CL_WHY)."; return 2
       fi
       # NOMOUNT from the pfile, but a copy that did not finish left files a new copy would not overwrite
       if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished; then
@@ -381,6 +384,8 @@ c_7_2() {
         if [[ -n "$ol" ]]; then
           NOW="Instance $STANDBY_SID is in NOMOUNT, but files of an unfinished copy are still here:"$'\n'"$ol"
           cleanup_offer keep && return 1
+          # known leftovers are never passed over in silence: the way by hand, as in the other branches
+          cleanup_cannot; return 2
         fi
       fi
       NOW="Instance $STANDBY_SID is in NOMOUNT"; return 0 ;;
@@ -397,7 +402,7 @@ c_7_2() {
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
       NOW="A standby control file exists, but the database is incomplete, probably from a failed copy:"$'\n'"$SC_INFO"
       cleanup_offer mounted && return 1
-      NOW+=$'\n'"The script cannot clean this up (STANDBY_UNIQUE must differ from the primary's names)."; return 2 ;;
+      NOW+=$'\n'"The script cannot clean this up ($CL_WHY)."; return 2 ;;
     IDLE)
       if [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]]; then
         STANDBY_BUILT=1
@@ -419,6 +424,7 @@ c_7_2() {
       if [[ -n "$lo" && ! -f "$STATE_DIR/existing_files_ok" ]]; then
         NOW="Instance $STANDBY_SID is not started, and files already exist where the standby database will be written:"$'\n'"$lo"
         cleanup_offer keep && return 1
+        cleanup_cannot; return 2
       fi
       NOW="Instance $STANDBY_SID is not started"
       PLAN="Write this pfile:
@@ -441,11 +447,12 @@ Start the instance as $ORACLE_USER:
 # primary's paths ("same") the files of the copy at those paths, only when step 2.15 proved that the folders are
 # storage of this server. Renamed: the spfile of the failed copy. Never touched: init<SID>.ora, orapw<SID>, and
 # anything of the primary's own name.
-L72_CLEAN=""; L72_AUTO=0; CL_TEXT=""
+L72_CLEAN=""; L72_AUTO=0; CL_TEXT=""; CL_UNREAD=""; CL_WHY=""
 clean_collect() {
   # fills the command list (cp_add) and CL_TEXT (what goes, with sizes); 1 = nothing to clean
-  local dg f n=0 sz total=0 d
-  CL_TEXT=""
+  # CL_UNREAD: places that could not be read (never taken as "nothing there"; no clean-up for me then)
+  local dg f n=0 sz total=0 d seen=" "
+  CL_TEXT=""; CL_UNREAD=""
   local_state
   if [[ "$LSTATE" != "IDLE" && "$LSTATE" != "NOSW" ]]; then
     cp_add oracle "sqlplus -S / as sysdba" "shutdown abort"
@@ -456,23 +463,32 @@ clean_collect() {
     CL_TEXT+="  rename $(spfile_path) to $(basename "$(spfile_path)").failed_$RUN_ID"$'\n'
   fi
   for dg in $(asm_dgs); do
-    grid_sw_ok || continue
-    sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" || continue
+    grid_sw_ok || { CL_UNREAD+="  +$dg/${STANDBY_UNIQUE^^}  (Grid is not installed here, ASM cannot be read)"$'\n'; continue; }
+    if ! sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" || ! num "$(first_line)"; then
+      CL_UNREAD+="  +$dg/${STANDBY_UNIQUE^^}  (cannot read ASM: $(ora_errors "$SQL_OUT"))"$'\n'; continue
+    fi
     [[ "$(first_line)" != "0" ]] || continue
-    sz=""; sql_asm "select round(sum(f.bytes)/1048576) from v\$asm_file f, v\$asm_alias a, v\$asm_diskgroup g where f.group_number=a.group_number and f.file_number=a.file_number and a.group_number=g.group_number and g.name=upper('$dg') and a.system_created='Y' and a.reference_index=0;" && sz=$(first_line)
+    # the size of the files under the standby's folder only (the folder tree, each file once)
+    sz=""; sql_asm "select round(nvl(sum(f.bytes),0)/1048576) from v\$asm_file f, (select distinct group_number, file_number from v\$asm_alias where alias_directory='N' start with upper(name)=upper('$STANDBY_UNIQUE') and parent_index=group_number*16777216 and group_number in (select group_number from v\$asm_diskgroup where name=upper('$dg')) connect by prior reference_index=parent_index and prior group_number=group_number) a where f.group_number=a.group_number and f.file_number=a.file_number;" && sz=$(first_line)
     cp_add grid "asmcmd rm -rf +$dg/${STANDBY_UNIQUE^^}"
     CL_TEXT+="  +$dg/${STANDBY_UNIQUE^^}  (ASM folder of the standby$(num "$sz" && printf ', about %s' "$(human_mb "$sz")"))"$'\n'
   done
   # OMF folders of the standby in folders here (named after the standby: never the primary's)
   for d in $( [[ "$(place_mode)" == dir ]] && data_dest; f=$(fra_dest); [[ "$f" == /* ]] && printf '%s\n' "$f"; [[ "$(place_mode)" == same ]] && omf_dir_here ); do
+    # each folder once (the recovery area may be the data folder)
+    d=${d%/}; [[ -n "$d" && "$seen" != *" $d "* ]] || continue; seen+="$d "
     [[ -d "$d/${STANDBY_UNIQUE^^}" ]] || continue
     sz=$(du -sm -- "$d/${STANDBY_UNIQUE^^}" 2>/dev/null | cut -f1)
-    cp_add oracle "rm -rf $d/${STANDBY_UNIQUE^^}"
+    # never into another file system mounted below it
+    cp_add oracle "rm -rf --one-file-system $d/${STANDBY_UNIQUE^^}"
     CL_TEXT+="  $d/${STANDBY_UNIQUE^^}/  (OMF folder of the standby, $(human_mb "${sz:-0}"))"$'\n'
   done
   # the primary's paths: the files of the copy have the same names as the primary's own files; only on storage
   # that step 2.15 proved to be this server's
-  if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && sql_or_cached_filenames; then
+  if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && ! sql_or_cached_filenames; then
+    # names not read: the files (and an OMF folder) at the primary's paths are not known, never "none"
+    [[ $FS_READ_FAIL -eq 1 ]] && CL_UNREAD+="  files of the copy at the primary's paths in $(fs_dirs | paste -sd' ' -)  (the primary's file names cannot be read)"$'\n'
+  elif [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]]; then
     if [[ "${STORAGE_SRC:-2}" -eq 0 ]]; then
       while IFS= read -r f; do
         [[ "$f" =~ ^/[A-Za-z0-9_./-]+$ && -f "$f" ]] || continue
@@ -489,11 +505,21 @@ clean_collect() {
   [[ -n "$CL_TEXT" ]]
 }
 cleanup_offer() {
-  # $1 spfile | keep | mounted: sets the plan for d_7_2 (KIND_NOW=ask). 1 = nothing the script may offer
-  CL_FS_UNPROVEN=0
+  # $1 spfile | keep | mounted: sets the plan for d_7_2 (KIND_NOW=ask). 1 = nothing the script may offer (CL_WHY)
+  CL_FS_UNPROVEN=0; CL_UNREAD=""
+  CL_WHY="STANDBY_UNIQUE must differ from the primary's names"
   [[ -n "$STANDBY_UNIQUE" && "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" && "${STANDBY_UNIQUE^^}" != "${DB_NAME^^}" ]] || return 1
   cp_reset
-  clean_collect || { cp_reset; return 1; }
+  if ! clean_collect; then
+    cp_reset
+    CL_WHY="it found nothing here that it may remove"
+    [[ $CL_FS_UNPROVEN -eq 1 ]] && CL_WHY="step 2.15 has not proven that $(fs_dirs | paste -sd' ' -) is storage of this server only"
+    if [[ -n "$CL_UNREAD" ]]; then
+      if [[ $CL_FS_UNPROVEN -eq 1 ]]; then CL_WHY+="; not checked:"; else CL_WHY="these could not be read:"; fi
+      CL_WHY+=$'\n'"${CL_UNREAD%$'\n'}"
+    fi
+    return 1
+  fi
   L72_CLEAN=$1
   # [y] only for the leftovers of a copy THIS script started and that did not finish (else the files may be a
   # complete standby, or an older database with the same name: then [m] writes the commands, you decide)
@@ -502,10 +528,13 @@ cleanup_offer() {
   # files at the primary's paths that you once allowed to stay (existing_files_ok) may be of another database:
   # then the script does not remove them itself
   [[ "$(place_mode)" == same && -n "$(fs_dirs)" && -f "$STATE_DIR/existing_files_ok" ]] && L72_AUTO=0
+  # a place that could not be read may hold more of the copy: only the commands to read and run yourself
+  [[ -n "$CL_UNREAD" ]] && L72_AUTO=0
   PLAN="Clean up what the unfinished copy left on this server:"$'\n'"${CL_TEXT%$'\n'}"
   PLAN+=$'\n'"Kept: $(basename "$(pfile_path)"), orapw$STANDBY_SID. Then the instance starts again from the pfile (NOMOUNT)."
   [[ -n "$(asm_dgs)" ]] && PLAN+=$'\n'"Never touched: $(asm_dgs | sed "s#^#+#; s#\$#/${PRIMARY_UNIQUE^^}#" | paste -sd' ' -) (the primary's names)"
   [[ $CL_FS_UNPROVEN -eq 1 ]] && PLAN+=$'\n'"Not removed: files at the primary's paths in $(fs_dirs | paste -sd' ' -). Step 2.15 has not proven that this is storage of this server only."
+  [[ -n "$CL_UNREAD" ]] && PLAN+=$'\n'"Not checked (could not be read; check them by hand, they are not in the commands):"$'\n'"${CL_UNREAD%$'\n'}"
   if [[ "$(dup_cause)" == FRA_FULL ]]; then
     PLAN+=$'\n'"The copy failed because the recovery area was full ($(human_mb "$(fra_full_mb)"))."
     PLAN+=$'\n'"The next copy gets $(human_mb "$(fra_size_mb)") in $(fra_dest) (step 8.1 checks the space first), and step 8.2 copies again."
@@ -513,10 +542,20 @@ cleanup_offer() {
   KIND_NOW=ask
   return 0
 }
+cleanup_cannot() {
+  # leftovers are known, but cleanup_offer has nothing to offer (CL_WHY): said, with the way by hand
+  NOW+=$'\n'"The script cannot clean this up: $CL_WHY."
+  NOW+=$'\n'"By hand, after checking that they belong to the unfinished copy:"
+  [[ -n "$(asm_dgs)" ]] && NOW+=$'\n'"  an ASM folder, as $GRID_USER:  asmcmd rm -rf <folder>"
+  NOW+=$'\n'"  a folder, as $ORACLE_USER:  rm -rf --one-file-system <folder>      a file:  rm -f <file>"
+  NOW+=$'\n'"Or keep them (RMAN overwrites files with the same names):  touch $STATE_DIR/existing_files_ok"
+  NOW+=$'\n'"Then run step 7.2 again:  $SELF --from 7.2"
+}
 cleanup_proof() {
   # once, right before anything is removed: this is the standby server and its instance
-  local ls; ls=$(hostname -s 2>/dev/null)
-  [[ "${ls,,}" == "${STANDBY_HOST,,}" ]] || { bad "This server is $ls, not $STANDBY_HOST. Nothing was removed."; return 1; }
+  # host names compared without the domain and without case (STANDBY_HOST may be the full name); an empty one fails
+  local ls lsh sh; ls=$(hostname -s 2>/dev/null); lsh=${ls%%.*}; sh=${STANDBY_HOST%%.*}
+  [[ -n "$lsh" && "${lsh,,}" == "${sh,,}" ]] || { bad "This server is $ls, not $STANDBY_HOST. Nothing was removed."; return 1; }
   is_local_ip "$STANDBY_IP" || ! command -v ip >/dev/null 2>&1 || { bad "$STANDBY_IP is not an address of this server. Nothing was removed."; return 1; }
   [[ "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" ]] || { bad "Safety stop: STANDBY_UNIQUE equals the primary's unique name. Nothing was removed."; return 1; }
   local_state
@@ -530,18 +569,50 @@ cleanup_proof() {
   say "Checked: this is $ls ($STANDBY_IP), the standby ${STANDBY_UNIQUE^^}."
   return 0
 }
+cleanup_id_text() {
+  # the [m] file's own check of the instance it stops (as cleanup_proof does for [y]): a running instance must have
+  # db_unique_name STANDBY_UNIQUE, and a mounted or open one the role PHYSICAL STANDBY (never a primary). No
+  # instance running (ORA-01034) passes; any other answer refuses.
+  local t=""
+  IFS= read -r -d '' t <<'EOF' || true
+dgid=$(runuser -u @OU@ -- env -i HOME=/ LANG=C ORACLE_HOME=@OH@ ORACLE_SID=@SID@ PATH=@OH@/bin:/usr/bin:/bin timeout 120 sqlplus -S -L / as sysdba 2>&1 <<'SQLEOF'
+set heading off feedback off pagesize 0 linesize 300 trimout on
+select 'DGID|'||i.status||'|'||upper(p.value) from v$instance i, v$parameter p where p.name='db_unique_name';
+select 'DGROLE|'||database_role from v$database;
+exit
+SQLEOF
+)
+case "$dgid" in
+  *"DGID|"*)
+    dgs=$(sed -n 's/^DGID|\([^|]*\)|.*/\1/p' <<< "$dgid" | head -n 1); dgu=$(sed -n 's/^DGID|[^|]*|//p' <<< "$dgid" | head -n 1)
+    [ "$dgu" = "@SU@" ] || { echo "The running instance @SID@ has db_unique_name $dgu, not @SU@. Nothing was done."; exit 1; }
+    [ "$dgs" = STARTED ] || grep -qx 'DGROLE|PHYSICAL STANDBY' <<< "$dgid" || { echo "The database mounted here is not a physical standby. Nothing was done."; exit 1; } ;;
+  *ORA-01034*|*ORA-27101*) ;;
+  *) echo "Cannot read the instance @SID@. Nothing was done."; exit 1 ;;
+esac
+EOF
+  t=${t%$'\n'}; t=${t//@OU@/$ORACLE_USER}; t=${t//@OH@/$DB_HOME}; t=${t//@SID@/$STANDBY_SID}; t=${t//@SU@/${STANDBY_UNIQUE^^}}
+  printf '%s\n' "$t"
+}
 cleanup_script() {
-  # [m]: the commands as a short script file; prints its path. Besides the host check it refuses to run once a
-  # copy has finished (the record of a finished copy exists): then these files are the working standby
+  # [m]: the commands as a short script file; prints its path. Besides the host check it refuses to run if a copy
+  # finishes after this file was written (no record then: once any record appears; a record already there: once it
+  # is newer than the file). When a finished copy was already recorded, running it is the DBA's decision ([m] only).
+  # It also checks the running instance it stops (cleanup_id_text).
   local guard
   if [[ -e "$(dup_marker)" ]]; then guard="[ %s -nt \"\$0\" ]"; else guard="[ -e %s ]"; fi
   { printf "$guard"' && { echo "A copy has finished since this file was written: these are the files of the standby now. Nothing was done."; exit 1; }\n' "$(dup_marker)"
+    cleanup_id_text
     cp_script_text; } | short_script "c72"
 }
 d_7_2_cleanup() {
   # 0 = cleaned (or kept), 3 = not now
   local opts="[y] Clean up for me   [m] Show the commands   [s] Skip   [q] Quit" allowed="ymsq" f
-  [[ $L72_AUTO -eq 1 ]] || { opts="[m] Show the commands   [s] Skip   [q] Quit"; allowed="msq"; say "${C_D}The script did not start this copy (or it finished), so it does not remove these files itself.${C_N}"; }
+  if [[ $L72_AUTO -ne 1 ]]; then
+    opts="[m] Show the commands   [s] Skip   [q] Quit"; allowed="msq"
+    if [[ -n "$CL_UNREAD" ]]; then say "${C_D}Some places could not be read (see the list), so the script does not remove these files itself.${C_N}"
+    else say "${C_D}The script did not start this copy (or it finished), so it does not remove these files itself.${C_N}"; fi
+  fi
   [[ "$L72_CLEAN" == keep && -f "$STATE_DIR/dup_attempt" ]] && { opts+="   [k] Keep them"; allowed+="k"; }
   while true; do
     ask_choice "$opts" "$allowed"
@@ -560,9 +631,23 @@ d_7_2_cleanup() {
       y) cleanup_proof || return 1
          printf '%s\n' "${CL_TEXT%$'\n'}" | block "Removed now:"
          confirm_word "Remove these files of the unfinished copy on THIS server ($(hostname -s))." "CLEAN" || { L72_CLEAN=""; return 3; }
-         journal DELETED "$STANDBY_UNIQUE" "cannot be undone: files of the unfinished copy, after you typed CLEAN: $(tr '\n' ' ' <<< "$CL_TEXT" | tr -s ' ')"
-         [[ -f "$(spfile_path)" ]] && journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID"
-         cp_run || return 1
+         # each change is journaled after it was done (a command that failed, and those after it, leave no entry)
+         local i nf=0
+         for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+           if ! cp_exec "$i"; then
+             bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}" | mask_pw)"$'\n'"$(tail -n 4 <<< "$RUN_OUT" | mask_pw)"
+             [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+             [[ $nf -gt 0 ]] && journal DELETED "$STANDBY_UNIQUE" "cannot be undone: $nf file(s) of the unfinished copy at the primary's paths, after you typed CLEAN"
+             return 1
+           fi
+           case "${CP_CMD[$i]}" in
+             "mv -f $(spfile_path) "*) journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID" ;;
+             "asmcmd rm -rf "*|"rm -rf "*) journal DELETED "${CP_CMD[$i]##* }" "cannot be undone: files of the unfinished copy, after you typed CLEAN" ;;
+             "rm -f $(dup_marker)") ;;
+             "rm -f "*) nf=$((nf + 1)) ;;
+           esac
+         done
+         [[ $nf -gt 0 ]] && journal DELETED "$STANDBY_UNIQUE" "cannot be undone: $nf file(s) of the unfinished copy at the primary's paths, after you typed CLEAN"
          _log CHANGE "clean-up of the unfinished copy done on $(hostname -s)"
          rm -f -- "$STATE_DIR/existing_files_ok"
          return 0 ;;
@@ -572,9 +657,12 @@ d_7_2_cleanup() {
 
 d_7_2() {
   if [[ ${L72_MOUNTCHECK:-0} -eq 1 ]]; then
-    L72_MOUNTCHECK=0; L72_MOUNTED_ONCE=1
+    L72_MOUNTCHECK=0
     journal INSTANCE "$STANDBY_SID" "startup mount (to compare the standby with the primary)"
-    cp_run || return 1
+    # mounted once per run (a standby that is down again later is not mounted again and again); a mount that
+    # failed and left nothing running does not use up that one try
+    if ! cp_run; then local_state; [[ "$LSTATE" == IDLE ]] || L72_MOUNTED_ONCE=1; return 1; fi
+    L72_MOUNTED_ONCE=1
     return 0
   fi
   if [[ -n "$L72_CLEAN" ]]; then
@@ -584,6 +672,8 @@ d_7_2() {
       # you ran the script file: what it should have removed must be gone now
       cp_reset; local_state
       if [[ "$LSTATE" != IDLE ]] || clean_collect; then cp_reset; bad "The files of the unfinished copy are still here (or the instance still runs). Run the file, then answer r."; return 1; fi
+      # a place that cannot be read is not proof that it is clean
+      [[ -z "$CL_UNREAD" ]] || { cp_reset; bad "Cannot check that the files are gone:"$'\n'"${CL_UNREAD%$'\n'}"$'\n'"Answer r when it can be read."; return 1; }
       cp_reset; crc=0
       # done: the file is removed (run again later, it would remove a working standby)
       rm -f -- "$SHORT_DIR/c72"
@@ -751,7 +841,7 @@ space_check() {
   # appends to PRE_INFO; sets PRE_FIX and returns 1 when a place here lacks space. Each place (a disk group, or the
   # file system of a folder) must hold what goes there TOGETHER: the database files (+10 %), the standby logs of
   # step 9.3 and the recovery area (its full size, set as db_recovery_file_dest_size).
-  local l d mb key mnt f free need short="" sz
+  local l d mb key mnt f ff free need short="" sz
   declare -A NEED_DB=() NEED_SRL=() NEED_FRA=() FREE=() THERE=() LABEL=()
   srl_plan_space
   [[ "$(place_mode)" != same && $SRL_MB -gt 0 ]] && SRL_LOC=$(data_dest)
@@ -783,10 +873,11 @@ space_check() {
   # same paths in folders: files at exactly the target paths (an earlier copy) are overwritten by RMAN, their space
   # counts as free (once per file)
   if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && sql_or_cached_filenames; then
-    while IFS= read -r f; do
-      [[ -n "$f" && -f "$f" ]] || continue
-      mnt=$(mnt_of "$(dirname "$f")"); [[ -n "${NEED_DB[$mnt]:-}" ]] || continue
-      sz=$(stat -c '%s' -- "$f" 2>/dev/null); num "$sz" || continue
+    # (its own variable: f still holds the recovery area for the advice below)
+    while IFS= read -r ff; do
+      [[ -n "$ff" && -f "$ff" ]] || continue
+      mnt=$(mnt_of "$(dirname "$ff")"); [[ -n "${NEED_DB[$mnt]:-}" ]] || continue
+      sz=$(stat -c '%s' -- "$ff" 2>/dev/null); num "$sz" || continue
       THERE[$mnt]=$(( ${THERE[$mnt]:-0} + sz / 1048576 ))
     done <<< "$FS_FILENAMES"
   fi
@@ -824,6 +915,22 @@ dup_prechecks() {
   local_state
   [[ "$LSTATE" == "STARTED" ]] || { PRE_FIX="The standby instance must be in NOMOUNT, but it is $LSTATE (step 7.2)"; return 1; }
   if spfile_from_failed_copy; then PRE_FIX="The instance runs from the spfile of an unfinished copy. Clean up first (step 7.2)"; return 1; fi
+  # the software here must be the primary's release, the same test as step 3.11 (--from 8.1 does not need 3.11 to
+  # have passed). A patch difference is only reported: patching the standby first (standby-first) is supported.
+  local rel wr bad_rel=""; rel=$(local_release || true); wr=$(want_rel)
+  [[ -n "$rel" && -n "$wr" ]] || { PRE_FIX="The release of the database software here (sqlplus -V) or of the primary could not be read (step 3.11)"; return 1; }
+  if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$wr" ]] || bad_rel="release $rel here, release $wr on the primary"
+  else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="release $rel here, release $DB_MAJOR on the primary"; fi
+  [[ -z "$bad_rel" ]] || { PRE_FIX="The database software here is another release: $bad_rel."$'\n'"The standby must have the same release as the primary (step 3.11)."; return 1; }
+  # (the Release Update is one of these patch ids too)
+  local pp lp pdiff
+  if pp=$(primary_patches "$DB_HOME") && lp=$(local_patches "$DB_HOME"); then
+    pdiff=$(comm -3 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | tr -d '\t' | paste -sd' ' -)
+    if [[ -n "$pdiff" ]]; then PRE_INFO+="Warning: the patches of $DB_HOME differ from the primary ($pdiff; step 10.6 shows them). Allowed: a standby may be patched first."$'\n'
+    else PRE_INFO+="Release $rel; the patches of $DB_HOME match the primary"$'\n'; fi
+  else
+    PRE_INFO+="Release $rel; the patches of $DB_HOME were not compared with the primary (an inventory cannot be read)"$'\n'
+  fi
   # the disk group of the logs must fit the block size of the primary's redo (else ORA-01378 after the copy, at 9.3)
   if use_grid && grid_sw_ok; then
     # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
@@ -860,7 +967,11 @@ dup_prechecks() {
     done
   fi
   # the copy takes the spfile of the primary (duplicate ... spfile): a primary started from a pfile fails there
-  prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && [[ "$(first_line)" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
+  # (a failed query or an answer that is not a value is "could not be read", never "has an spfile")
+  prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" || { PRE_FIX="The spfile setting of the primary could not be read ($(ora_errors "$SQL_OUT"))"; return 1; }
+  local spv; spv=$(first_line)
+  [[ -n "$spv" && ! "$spv" =~ ^(ORA|SP2)-[0-9] ]] || { PRE_FIX="The spfile setting of the primary could not be read (unexpected answer: $(tr -cd '[:print:]' <<< "${spv:-nothing}"))"; return 1; }
+  [[ "$spv" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
   if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished && [[ -n "$(orphan_leftovers)" ]]; then
     PRE_FIX="Files of an unfinished copy are still on this server. Clean them up first (step 7.2)"; return 1
   fi
@@ -882,7 +993,11 @@ dup_prechecks() {
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { PRE_FIX="Cannot read the log mode of the primary"; return 1; }
   local lm fl; IFS='|' read -r lm fl <<< "$(first_line)"
   [[ "$lm" == "ARCHIVELOG" ]] || { PRE_FIX="The primary is in $lm mode. It must be in ARCHIVELOG mode (step 4.1)"; return 1; }
-  [[ "$fl" == "YES" ]] || warn "FORCE LOGGING is off on the primary (step 4.1)."$'\n'"NOLOGGING operations would not reach the standby."
+  # force logging (step 4.1); the STANDBY NOLOGGING modes (18c+, set on purpose) are accepted, as in step 10.5
+  case "${fl^^}" in
+    YES|"STANDBY NOLOGGING"*) ;;
+    *) PRE_FIX="FORCE LOGGING is off on the primary (force_logging = ${fl:-unknown}, step 4.1)."$'\n'"NOLOGGING operations would not reach the standby. On the primary:  alter database force logging;"; return 1 ;;
+  esac
   p_param remote_login_passwordfile || { PRE_FIX="Cannot read remote_login_passwordfile on the primary"; return 1; }
   [[ "$PVAL" == "EXCLUSIVE" || "$PVAL" == "SHARED" ]] || { PRE_FIX="remote_login_passwordfile on the primary is $PVAL. The primary must be restarted after the change (step 4.7)"; return 1; }
   # role separation: the oracle binary must be able to open the ASM disks

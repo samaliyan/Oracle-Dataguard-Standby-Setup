@@ -114,8 +114,9 @@ c_9_1() {
     NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options|oracle home|password file|disk groups|domain)' <<< "$cfg")"
     [[ -n "$DG_DEAD_NOTE" ]] && NOW+=$'\n'"$DG_DEAD_NOTE"
     # a new registration or a disk-group change while the disk groups cannot be read: not now (the old disk
-    # groups could not be kept, and the standby would be stopped for nothing)
-    if [[ $dg_unread -eq 1 && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
+    # groups could not be kept, and the standby would be stopped for nothing). A standby in folders whose
+    # registration names no disk group has nothing to keep: ASM does not matter then
+    if [[ $dg_unread -eq 1 && ( -n "$cdg" || -n "$(srv_dgs)" ) && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
       NOW+=$'\n'"The registration is changed when the disk groups of this server can be read again (ASM running)."
       return 2
     fi
@@ -127,6 +128,8 @@ c_9_1() {
       PLAN="-- If those disk groups are gone for good, take them out of the registration first:"$'\n'"srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"$'\n'"-- If their disks only come later, wait until ASM sees them. Then answer r."
       return 1
     fi
+    # (named here too, not only in the warning: the run summary keeps NOW)
+    [[ -n "$dead" ]] && NOW+=$'\n'"It also names disk group(s) that ASM here does not see:$dead (kept, see the warning)."
     REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
     # start option, home and password file are changed in place (the running standby is not stopped);
     # a wrong spfile, role or instance needs a new registration
@@ -264,14 +267,15 @@ d_9_1() {
     run_logged "srvctl config (before the new registration)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
     ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
     # the disk groups are read again right before (ASM may have stopped since the check): no new registration
-    # that would lose the old disk groups
-    if ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
+    # that would lose the old disk groups (none in the old registration and none needed: nothing to lose)
+    local odg; odg=$(_cfgv "$old" 'Disk Groups' | tr -d ' \t\r')
+    if [[ -n "$odg" || -n "$(srv_dgs)" ]] && ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
     run_logged "srvctl stop" as_oracle timeout 600 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle timeout 600 "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     if ! srv_add "$old"; then
       say "The new registration failed. Adding the old registration again."
       local radd back=0 diffl=""; radd=$(srv_add_cmd_from "$old")
-      if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle "${SRV_OLD_ARGS[@]}"; then
+      if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle timeout 600 "${SRV_OLD_ARGS[@]}"; then
         back=1
         # the same as before? srvctl config is read again and compared, line by line, with the saved one
         if run_logged "srvctl config (after putting the old registration back)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE"; then
@@ -304,6 +308,16 @@ d_9_1() {
     fi
     journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
     journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
+    # values of the old registration the new one does not carry (services, server pools, OS groups ...): read
+    # again and named. The values this step sets itself are left out of the comparison
+    if run_logged "srvctl config (after the new registration)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE"; then
+      local lost; lost=$(comm -23 <(srv_cfg_norm < "$old" | sort -u) <(printf '%s\n' "$RUN_OUT" | srv_cfg_norm | sort -u) \
+        | grep -viE '^(Database unique name|Database name|Oracle home|Oracle user|Spfile|Password file|Domain|Start options|Stop options|Database role|Management policy|Disk Groups|Database instance|Instance|Instance name):' \
+        | grep -E '^[^:]+:[[:space:]]*[^[:space:]]' | head -n 8)
+      [[ -n "$lost" ]] && warn "The new registration does not have these values of the old one:"$'\n'"$(sed 's/^/  /' <<< "$lost")"$'\n'"The old registration is saved in:  $old"$'\n'"Set them again by hand, as $ORACLE_USER (srvctl modify database, srvctl add service)."
+    else
+      warn "The new registration could not be read to compare it with the old one (saved in $old)."
+    fi
     return 0
   fi
   srv_add || return 1
@@ -519,8 +533,9 @@ arch_script_text() {
   printf 'echo "=== dg_arch_cleanup $(date '"'"'+%%Y-%%m-%%d %%H:%%M:%%S'"'"') ==="\n'
   printf 'export ORACLE_HOME=%s ORACLE_SID=%s LANG=C\n' "$DB_HOME" "$STANDBY_SID"
   printf '# the deletion policy first: without TO APPLIED ON STANDBY a log that is not applied could be deleted\n'
+  printf '# (the same rule as step 9.8: "... BACKED UP n TIMES ..." is not enough on a standby)\n'
   printf 'pol=$(printf "show archivelog deletion policy;\\nexit\\n" | "$ORACLE_HOME/bin/rman" target / 2>&1)\n'
-  printf 'if ! printf "%%s\\n" "$pol" | grep -qi "TO APPLIED ON.*STANDBY"; then echo "RMAN-00000: the deletion policy is not TO APPLIED ON STANDBY: nothing deleted (step 9.8 sets it)"; exit 1; fi\n'
+  printf 'if ! printf "%%s\\n" "$pol" | grep -qiE "POLICY TO APPLIED ON +(ALL +)?STANDBY *;"; then echo "RMAN-00000: the deletion policy is not TO APPLIED ON STANDBY: nothing deleted (step 9.8 sets it)"; printf "%%s\\n" "$pol" | grep -iE "DELETION POLICY|RMAN-[0-9]|ORA-[0-9]" | head -n 5; exit 1; fi\n'
   printf '"$ORACLE_HOME/bin/rman" target / <<EOF\n'
   printf "delete noprompt archivelog all completed before 'sysdate-%s';\nexit\nEOF\n" "$(arch_days)"
   printf 'rc=$?\necho "=== end (exit code $rc) ==="\nexit $rc\n'
@@ -567,6 +582,8 @@ arch_cron_state() {
   [[ -n "$(arch_cron_last_errors)" ]] && { printf failed; return; }
   printf ok
 }
+# $1 the value of 'ARCHIVELOG DELETION POLICY' in v$rman_configuration: the one rule of 9.8, 10.8 and the nightly script
+arch_policy_is_ok() { [[ "$(tr -s ' ' <<< "${1^^}")" =~ ^TO\ APPLIED\ ON\ (ALL\ )?STANDBY$ ]]; }
 ARCH_POLICY_OK=0; L98_ASK=0; L98_OLDPOL="-"; L98_TIMER_OFF=0; L98_CRON_OFF=""; L98_CRON_ON=0; L98_TIMER_ON=0
 c_9_8() {
   L98_ASK=0; L98_TIMER_OFF=0; L98_CRON_OFF=""; L98_CRON_ON=0; L98_TIMER_ON=0
@@ -577,7 +594,7 @@ c_9_8() {
   local v; v=$(first_line); L98_OLDPOL=$v
   # only "applied on (all) standby" deletes on a standby; a policy copied from the primary with "backed up n times"
   # never deletes here (nothing is backed up on the standby)
-  ARCH_POLICY_OK=0; [[ "$(tr -s ' ' <<< "${v^^}")" =~ ^TO\ APPLIED\ ON\ (ALL\ )?STANDBY$ ]] && ARCH_POLICY_OK=1
+  ARCH_POLICY_OK=0; arch_policy_is_ok "$v" && ARCH_POLICY_OK=1
   local mode=${ARCH_CLEANUP:-}
   if [[ "$mode" == oracle ]] && ! arch_in_fra; then
     NOW="ARCH_CLEANUP=oracle, but the archived logs go to $(arch_where), not to the recovery area. Oracle deletes nothing there."
@@ -649,7 +666,11 @@ c_9_8() {
                 [[ -f "$(arch_script)" && "$(cat "$(arch_script)")" == "$(arch_script_text)" ]] || cp_add_file "$(arch_script)" 755 "$(arch_script_text)"
                 # the log: a file of oracle in the log folder; the folder gets the install group so oracle can reach it
                 arch_log_traversable || { cp_add root "chgrp $INSTALL_GROUP $LOG_DIR"; cp_add root "chmod 750 $LOG_DIR"; }
-                [[ -f "$(arch_cron_log)" && "$(stat -c '%U' "$(arch_cron_log)" 2>/dev/null)" == "$ORACLE_USER" ]] || cp_add root "install -o $ORACLE_USER -g $INSTALL_GROUP -m 640 /dev/null $(arch_cron_log)"
+                # (a log that is there with another owner is given to oracle, not emptied: its error lines are kept)
+                if ! [[ -f "$(arch_cron_log)" && "$(stat -c '%U' "$(arch_cron_log)" 2>/dev/null)" == "$ORACLE_USER" ]]; then
+                  if [[ -f "$(arch_cron_log)" && ! -L "$(arch_cron_log)" ]]; then cp_add root "chown $ORACLE_USER:$INSTALL_GROUP $(arch_cron_log)"; cp_add root "chmod 640 $(arch_cron_log)"
+                  else cp_add root "install -o $ORACLE_USER -g $INSTALL_GROUP -m 640 /dev/null $(arch_cron_log)"; fi
+                fi
                 if [[ "$(arch_cron_ours)" != "$(arch_cron_line)" ]]; then
                   cp_add root "c=\$(crontab -u $ORACLE_USER -l 2>/dev/null) || { e=\$(crontab -u $ORACLE_USER -l 2>&1 >/dev/null); case \"\$e\" in 'no crontab for'*) c= ;; *) echo \"\$e\"; exit 1 ;; esac; }; { [ -z \"\$c\" ] || printf '%s\\n' \"\$c\" | grep -v -- ' $(arch_cron_tag)\$'; echo '$(arch_cron_line)'; } | crontab -u $ORACLE_USER -"
                   L98_CRON_ON=1
@@ -845,6 +866,13 @@ dropin_text() {
   if [[ "$(asm_method)" == "asmlib" ]]; then printf '[Unit]\nAfter=oracleasm.service\nWants=oracleasm.service\n'
   else printf '[Unit]\nAfter=systemd-udev-settle.service\nWants=systemd-udev-settle.service\n'; fi
 }
+srv_status_text() {
+  # read-only: "srvctl status database -verbose" of the standby, a few lines indented (empty when it gives nothing)
+  run_logged "srvctl status database" as_oracle timeout 60 "$DB_HOME/bin/srvctl" status database -db "$STANDBY_UNIQUE" -verbose || true
+  local o; o=$(grep -v '^[[:space:]]*$' <<< "$RUN_OUT" | head -n 4 | sed 's/^/  /')
+  [[ -n "$o" ]] && printf 'srvctl status database -db %s -verbose:\n%s' "$STANDBY_UNIQUE" "$o"
+  return 0
+}
 C97_FIX=""
 DGERR_PREV=""
 BOOT_ERR_SHOWN=0
@@ -873,24 +901,34 @@ c_9_7() {
       fi
       # Oracle Restart often mounts it within minutes (after a reboot): looked at again a few times, at most
       # 5 minutes in all whatever POLL_WAIT is
-      local n=0 pw=$POLL_WAIT; [[ $pw -gt 50 ]] && pw=50
+      local n=0 pw=$POLL_WAIT sub; [[ $pw -gt 50 ]] && pw=50
+      # a unit that has already ended (SubState exited, with RemainAfterExit) waits for nothing any more: no poll
+      sub=$(systemctl show -p SubState "$(unit_name)" 2>/dev/null | sed -n 's/^SubState=//p')
       # (STARTED on the way: Oracle Restart is mounting it, so it is looked at again too)
-      while [[ "$MODE" != check && ( "$LSTATE" == IDLE || "$LSTATE" == STARTED ) && $n -lt 6 ]]; do
+      while [[ "$MODE" != check && "$sub" != exited && ( "$LSTATE" == IDLE || "$LSTATE" == STARTED ) && $n -lt 6 ]]; do
         n=$((n + 1)); say "The standby is not mounted yet. Oracle Restart starts it. Checked again in $pw seconds ($n of 6)"
         nap "$pw"; local_state
       done
       # still in NOMOUNT after step 9.2 mounted it in this run: not a matter of waiting
       if [[ "$LSTATE" == STARTED && $n -gt 0 ]] && [[ "${STEP_RESULT[9.2]:-}" == OK || "${STEP_RESULT[9.2]:-}" == DONE ]]; then
         NOW="$(unit_name) is enabled, but the standby stays in NOMOUNT after step 9.2 mounted it in this run."
+        local sst; sst=$(srv_status_text); [[ -n "$sst" ]] && NOW+=$'\n'"$sst"
         PLAN="-- Find out why: the alert log of $STANDBY_SID, and as $ORACLE_USER:"$'\n'"srvctl status database -db $STANDBY_UNIQUE -verbose"$'\n'"-- Then answer r."
         MANUAL_WHERE="To check on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER"
         return 2
       fi
       if [[ "$LSTATE" == IDLE || ( "$LSTATE" == STARTED && $n -gt 0 ) ]]; then
         [[ "$LSTATE" == STARTED ]] && NOW+=$'\n'"It is started (NOMOUNT) but not mounted yet."
-        # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
-        NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
-        NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"
+        if [[ "$sub" == exited ]]; then
+          # the unit has ended: it does not start apply when the standby is mounted later
+          NOW+=$'\n'"The standby is not mounted now ($LSTATE), and $(unit_name) has already ended: it does not start redo apply"$'\n'"when Oracle Restart mounts the standby later. After the mount, start apply with step 9.4 (or:  systemctl restart $(unit_name))."
+        else
+          # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
+          NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
+        fi
+        local sst; sst=$(srv_status_text)
+        if [[ -n "$sst" ]]; then NOW+=$'\n'"$sst"$'\n'"If it stays so, see the alert log of $STANDBY_SID."
+        else NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"; fi
         CHECK_WAITS=1; return 0
       fi
     fi
@@ -1134,6 +1172,9 @@ c_10_2_once() {
       have=$(first_line); num "$have" || { unread=1; break; }
       [[ $have -lt $((hi - lo + 1)) ]] && { gone+="  thread $t, sequence $lo to $hi"$'\n'; gonel+="$t $lo-$hi"$'\n'; }
     done <<< "$gaps"
+  elif [[ -n "$gaps" ]]; then
+    # not looked at: said, so nobody waits for fal_server to send logs the primary may no longer have
+    NOW+=$'\n'"Whether the missing logs are still on the primary was not checked (no ssh connection to the primary)."
   fi
   [[ $unread -eq 1 ]] && NOW+=$'\n'"Whether the missing logs are still on the primary could not be read$([[ -n "$gone" ]] && printf ' for the other gaps')."
   if [[ -n "$gone" ]]; then
@@ -1306,16 +1347,16 @@ c_10_8() {
   need_built || return 2
   local_state
   [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { NOW="The standby is not mounted (step 9.2)"; return 2; }
-  local used recl real msg="" bad=0 warnl=0
+  local used recl real=0 msg="" bad=0 warnl=0 waits=0 lrc d
   # where the standby really archives (read from it, not from the settings: a standby made by hand may differ)
-  local rfra rarch v
+  local rfra dests v
   sql_local "select nvl(max(value),'-') from v\$parameter where name='db_recovery_file_dest';" || { NOW="Cannot read the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
   rfra=$(first_line); [[ "$rfra" == "-" ]] && rfra=""
   sql_local "select value from v\$parameter where name like 'log_archive_dest_%' and upper(value) like '%LOCATION=%' order by to_number(regexp_substr(name, '[0-9]+\$'));" || { NOW="Cannot read the archive destinations of the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
-  v=$(grep -oiE 'location=[^ ]+' <<< "$SQL_OUT" | head -n 1); rarch=${v#*=}
-  [[ -z "$rarch" && -n "$rfra" ]] && rarch=USE_DB_RECOVERY_FILE_DEST
-  [[ "${rarch^^}" == USE_DB_RECOVERY_FILE_DEST ]] && rarch=USE_DB_RECOVERY_FILE_DEST
-  [[ -n "$rarch" ]] || { NOW="The standby has no local archive destination (log_archive_dest_n with LOCATION) and no recovery area."; return 1; }
+  # every local destination, each once (a second one can fill up as well)
+  dests=$(grep -oiE 'location=[^ ]+' <<< "$SQL_OUT" | sed 's/^[^=]*=//' | awk 'toupper($0) == "USE_DB_RECOVERY_FILE_DEST" {$0 = "USE_DB_RECOVERY_FILE_DEST"} !s[$0]++')
+  [[ -z "$dests" && -n "$rfra" ]] && dests=USE_DB_RECOVERY_FILE_DEST
+  [[ -n "$dests" ]] || { NOW="The standby has no local archive destination (log_archive_dest_n with LOCATION) and no recovery area."; return 1; }
   # a disk group: its own free space counts too (a recovery area quota inside a full disk group still fails)
   _dg_low() {
     local g=${1#+}; g=${g%%/*}; local f t
@@ -1323,29 +1364,43 @@ c_10_8() {
     IFS='|' read -r f t <<< "$(first_line)"; num "$f" && num "$t" && [[ $t -gt 0 ]] || return 2
     DG_FREE_PCT=$(( f * 100 / t )); [[ $DG_FREE_PCT -lt 10 ]]
   }
-  if [[ "$rarch" == USE_DB_RECOVERY_FILE_DEST ]]; then
-    sql_local "select nvl(round(sum(percent_space_used)),0)||'|'||nvl(round(sum(percent_space_reclaimable)),0) from v\$recovery_area_usage;" \
-      || { NOW="Cannot read v\$recovery_area_usage ($(ora_errors "$SQL_OUT"))"; return 2; }
-    IFS='|' read -r used recl <<< "$(first_line)"
-    num "$used" && num "$recl" || { NOW="Unexpected answer from v\$recovery_area_usage: $(first_line)"; return 2; }
-    real=$(( used - recl )); [[ $real -lt 0 ]] && real=0
-    msg="Recovery area $rfra: ${used}% used, ${recl}% of it reclaimable (applied logs), ${real}% not reclaimable"
-    [[ $real -ge 90 ]] && bad=1; [[ $real -ge 80 && $real -lt 90 ]] && warnl=1
-    if [[ "$rfra" == +* ]]; then
-      local lrc=0; _dg_low "$rfra" || lrc=$?
-      [[ $lrc -eq 0 ]] && { msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free: the recovery area cannot grow to its size"; bad=1; }
+  # a folder: how full its file system is (DF_USED, percent); 1 when df cannot tell
+  _df_used() { DF_USED=$(df -P -- "$1" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'); num "$DF_USED"; }
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    msg+="${msg:+$'\n'}"
+    if [[ "$d" == USE_DB_RECOVERY_FILE_DEST ]]; then
+      sql_local "select nvl(round(sum(percent_space_used)),0)||'|'||nvl(round(sum(percent_space_reclaimable)),0) from v\$recovery_area_usage;" \
+        || { NOW="Cannot read v\$recovery_area_usage ($(ora_errors "$SQL_OUT"))"; return 2; }
+      IFS='|' read -r used recl <<< "$(first_line)"
+      num "$used" && num "$recl" || { NOW="Unexpected answer from v\$recovery_area_usage: $(first_line)"; return 2; }
+      real=$(( used - recl )); [[ $real -lt 0 ]] && real=0
+      msg+="Recovery area $rfra: ${used}% used, ${recl}% of it reclaimable (applied logs), ${real}% not reclaimable"
+      [[ $real -ge 90 ]] && bad=1; [[ $real -ge 80 && $real -lt 90 ]] && warnl=1
+      if [[ "$rfra" == +* ]]; then
+        # a disk group that cannot be read: cannot check, never OK (the same rule as an archive disk group)
+        lrc=0; _dg_low "$rfra" || lrc=$?
+        [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$rfra") (recovery area $rfra)"; return 2; }
+        if [[ $lrc -eq 0 ]]; then msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free: the recovery area cannot grow to its size"; bad=1
+        elif [[ $DG_FREE_PCT -lt 20 ]]; then msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free"; warnl=1; fi
+      elif [[ "$rfra" == /* ]]; then
+        # its size (db_recovery_file_dest_size) may be more than its file system really has free
+        _df_used "$rfra" || { NOW="Cannot read the free space of $rfra (df)"; return 2; }
+        msg+=$'\n'"Its file system: ${DF_USED}% used"
+        [[ $DF_USED -ge 90 ]] && bad=1; [[ $DF_USED -ge 80 && $DF_USED -lt 90 ]] && warnl=1
+      fi
+    elif [[ "$d" == +* ]]; then
+      lrc=0; _dg_low "$d" || lrc=$?
+      [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$d")"; return 2; }
+      msg+="Archive destination $d: ${DG_FREE_PCT}% of the disk group free"
+      # the same bands as a folder: less than 10% free is a problem, less than 20% needs attention
+      [[ $lrc -eq 0 ]] && bad=1; [[ $lrc -eq 1 && $DG_FREE_PCT -lt 20 ]] && warnl=1
+    else
+      _df_used "$d" || { NOW="Cannot read the free space of $d (df)"; return 2; }
+      msg+="Archive folder $d: ${DF_USED}% of its file system used"
+      [[ $DF_USED -ge 90 ]] && bad=1; [[ $DF_USED -ge 80 && $DF_USED -lt 90 ]] && warnl=1
     fi
-  elif [[ "$rarch" == +* ]]; then
-    local lrc=0; _dg_low "$rarch" || lrc=$?
-    [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$rarch")"; return 2; }
-    msg="Archive destination $rarch: ${DG_FREE_PCT}% of the disk group free"
-    [[ $lrc -eq 0 ]] && bad=1
-  else
-    used=$(df -P -- "$rarch" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')
-    num "$used" || { NOW="Cannot read the free space of $rarch (df)"; return 2; }
-    msg="Archive folder $rarch: ${used}% of its file system used"
-    [[ $used -ge 90 ]] && bad=1; [[ $used -ge 80 && $used -lt 90 ]] && warnl=1
-  fi
+  done <<< "$dests"
   # the clean-up that ARCH_CLEANUP chose: did its last run work?
   local mode=${ARCH_CLEANUP:-} cmsg=""
   case "$mode" in
@@ -1363,15 +1418,32 @@ c_10_8() {
              # a cron line that has not run for two days (cron stopped, a wrong time)
              local lf; lf=$(arch_cron_log)
              if [[ $bad -eq 0 && -f "$lf" && -n "$(find "$lf" -mmin +$((49 * 60)) 2>/dev/null)" ]]; then cmsg+="; but its log has not changed for more than two days (is crond running?)"; warnl=1; fi ;;
-    oracle)  cmsg="Clean-up: left to the recovery area (ARCH_CLEANUP=oracle)" ;;
+    oracle)  # (the same rule as 9.8: Oracle deletes only in the recovery area)
+             local outside; outside=$(grep -vx USE_DB_RECOVERY_FILE_DEST <<< "$dests" | paste -sd' ' -)
+             if [[ -n "$outside" ]]; then
+               cmsg="ARCH_CLEANUP=oracle, but archived logs also go to $outside, not to the recovery area. Oracle deletes nothing there."$'\n'"Choose timer or crontab ($SELF --settings), then run step 9.8."; bad=1
+             else cmsg="Clean-up: left to the recovery area (ARCH_CLEANUP=oracle)"; fi ;;
     none)    cmsg="Clean-up: none (ARCH_CLEANUP=none): watch the space" ;;
-    *)       cmsg="Clean-up: not chosen yet (step 9.8)" ;;
+    *)       cmsg="Clean-up: not chosen yet (ARCH_CLEANUP is empty): nothing deletes applied logs here. Step 9.8 asks."; waits=1 ;;
   esac
-  NOW="$msg"$'\n'"$cmsg"
+  # the RMAN deletion policy that step 9.8 set (changed later, or the primary's back after a roll forward):
+  # attention, not a failure (read-only; the space above shows its effect)
+  if [[ "$mode" == timer || "$mode" == crontab || "$mode" == oracle ]]; then
+    if sql_local "select nvl(max(value),'-') from v\$rman_configuration where name='ARCHIVELOG DELETION POLICY';"; then
+      v=$(first_line)
+      arch_policy_is_ok "$v" || { cmsg+=$'\n'"RMAN archivelog deletion policy: ${v/#-/not set}, not TO APPLIED ON STANDBY. Applied logs may not be deleted here (step 9.8 sets it)."; waits=1; }
+    else
+      cmsg+=$'\n'"Cannot read the RMAN archivelog deletion policy ($(ora_errors "$SQL_OUT"))"; waits=1
+    fi
+  fi
+  # attention that comes from the clean-up part: its lines first (the --health summary shows the first two lines)
+  if [[ $waits -eq 1 && $bad -eq 0 ]]; then NOW="$cmsg"$'\n'"$msg"; else NOW="$msg"$'\n'"$cmsg"; fi
   if [[ $bad -eq 1 ]]; then
     [[ "$msg" == *"not reclaimable"* && $real -ge 90 ]] && NOW+=$'\n'"Logs that are not applied (or not reclaimable) fill the recovery area. Check redo apply (10.4) and the deletion policy (9.8)."
     return 1
   fi
+  # not chosen, or a policy that does not fit: waiting (WARNING in --health), never OK
+  [[ $waits -eq 1 ]] && { CHECK_WAITS=1; return 0; }
   if [[ $warnl -eq 1 ]]; then
     if [[ ${HEALTH:-0} -eq 1 ]]; then CHECK_WAITS=1; else warn "${NOW%%$'\n'*}"; fi
   fi
@@ -1493,11 +1565,18 @@ c_10_7() {
     IFS='|' read -r plog prc < "$pf"
     if [[ "$prc" == "0" && -f "$plog" ]] && ! grep -qE '^RMAN-0(3002|3009)|ERROR MESSAGE STACK' "$plog"; then
       local_state
+      # an OPEN standby runs already: it must be mounted again, not started (the same as a new roll forward)
+      if [[ "$LSTATE" == OPEN ]]; then
+        NOW="The roll forward of an earlier run has ended, but the standby is OPEN. Its clean-up needs it mounted."
+        KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server, sqlplus / as sysdba"
+        PLAN="shutdown immediate"$'\n'"startup mount"; return 1
+      fi
       [[ "$LSTATE" == MOUNTED ]] || { NOW="The roll forward of an earlier run has ended, but the standby is not mounted ($LSTATE). Start it (step 9.2), then run again."; return 2; }
       RF_FINISH=1
       local fb0; sql_local "select flashback_on from v\$database;" && fb0=$(first_line) || fb0="?"; RF_FB=$fb0
       NOW="The roll forward of an earlier run has ended without error (output: $plog)."$'\n'"It was not checked yet, and redo apply is stopped."
       [[ "$fb0" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
+      [[ "$fb0" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
       PLAN="-- Check the standby, set its standby redo logs and RMAN settings again (9.3, 9.8) and start redo apply.
 -- RMAN is not run again."
       return 1
@@ -1591,6 +1670,7 @@ c_10_7() {
   local fb; sql_local "select flashback_on from v\$database;" && fb=$(first_line) || fb="?"
   NOW="The standby can be rolled forward from the primary ($how)."
   [[ "$fb" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
+  [[ "$fb" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
   RF_FB=$fb
   PLAN="-- 1) Redo apply is stopped, then RMAN, as $ORACLE_USER on this server:
 recover standby database from service $PRIMARY_TNS;
@@ -1640,13 +1720,17 @@ rf_after() {
   # 2) the archived logs and backups here, as RMAN knows them: the recovery area is catalogued again and every
   #    archived log is cross-checked (else the recovery area could not reclaim the old logs and fills up)
   local fra t lrc=0
-  sql_local "select nvl(value,'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="-"
+  # a recovery area that cannot be read is not taken as "none": the cross-check still runs, the catalog is
+  # reported as not done ("?": rf_redo_hint names it)
+  sql_local "select nvl(value,'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="?"
+  [[ -n "$fra" ]] || fra="?"
+  [[ "$fra" == "?" ]] && { warn "Cannot read db_recovery_file_dest ($(ora_errors "$SQL_OUT")): the recovery area is not catalogued."; rc=1; RF_FAILED+=" catalog"; RF_FRA="?"; }
   t=$(mktemp /tmp/dg_rman.XXXXXX) || { bad "Cannot create a temporary file in /tmp"; RF_FAILED+=" catalog policy"; RF_FRA=$fra; return 1; }; CLEANUP_FILES+=("$t")
-  { [[ "$fra" != "-" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
+  { [[ "$fra" != "-" && "$fra" != "?" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
     | as_oracle timeout 1800 "$DB_HOME/bin/rman" target / > "$t" 2>&1 || lrc=1
   RUN_OUT=$(cat "$t"); rm -f -- "$t"
   printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman catalog and crosscheck after the roll forward"
-  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; RF_FAILED+=" catalog"; RF_FRA=$fra; }
+  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; [[ "$RF_FAILED" == *catalog* ]] || RF_FAILED+=" catalog"; RF_FRA=$fra; }
   # 3) the deletion policy of the standby (step 9.8): the primary's came with its control file
   #    (only the policy: the nightly schedule is not touched by the roll forward)
   local r8=0; c_9_8 >/dev/null 2>&1 || r8=$?
@@ -1733,6 +1817,7 @@ or start redo apply by hand (step 9.4).
   RF_DONE=1
   DONE_MSG="The standby was rolled forward from the primary: its standby redo logs and RMAN settings are set again, and redo apply runs. Output: $rlog"$'\n'"The temp files now have the primary's names. Check them before you open this standby or switch over to it."
   [[ "${RF_FB:-}" == YES ]] && DONE_MSG+=$'\n'"Flashback database: turn it off and on again (its logs are not usable after the roll forward)."
+  [[ "${RF_FB:-}" == "?" ]] && DONE_MSG+=$'\n'"Flashback database: its state could not be read. If it is on, turn it off and on again (its logs are not usable after the roll forward)."
   return 0
 }
 switchover_verify_cmd() { printf 'alter database switchover to %s verify;' "$STANDBY_UNIQUE"; }

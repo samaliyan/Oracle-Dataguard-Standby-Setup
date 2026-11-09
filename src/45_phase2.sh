@@ -434,18 +434,21 @@ standby_name_problems() {
   done
   return 0
 }
+PNP_OUT=""
 primary_name_problems() {
-  # the host name of the primary, as the primary itself resolves it (read-only probes); one problem per line.
-  # 2 = it could not be asked
+  # the host name of the primary, as the primary itself resolves it (read-only probes): the problems, one per line,
+  # in PNP_OUT. 2 = it could not be asked. Called directly, never in $( ): PRIMARY_V4S must reach the caller
+  PNP_OUT=""
   ssh_alive || return 2
   prim_probe ipv4s || return 2
   local ips h; ips=$(tr ' ' '\n' <<< "$RUN_OUT" | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u | paste -sd' ' -)
   PRIMARY_V4S=$ips
   for h in "$PRIMARY_HOST" ${PRIMARY_FQ:+"$PRIMARY_FQ"}; do
-    prim_probe hostres "$h" || return 2
+    prim_probe hostres "$h" || { PNP_OUT=""; return 2; }
     local p; p=$(name_problem "$h" "$(name_res_parse "$RUN_OUT")" "$ips")
-    [[ -n "$p" ]] && printf '%s\n' "$p"
+    [[ -n "$p" ]] && PNP_OUT+="$p"$'\n'
   done
+  PNP_OUT=${PNP_OUT%$'\n'}
   return 0
 }
 primary_hosts_line() {
@@ -471,7 +474,7 @@ c_2_6() {
     local why6=""; [[ -z "$ip" && "$h" == "$STANDBY_HOST" ]] && why6=$(name_problem "$h" "$(name_res_local "$h")" "")
     local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
     if [[ -z "$ip" ]]; then
-      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known"; return 2; }
+      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known${why6:+$'\n'$why6.}"; return 2; }
       [[ "$why6" == *IPv6* || "$why6" == *"another source"* ]] && why+="$why6."$'\n'"The listener needs an IPv4 address for it (else Not All Endpoints Registered)."$'\n'
       todo+="$want    ${fq:+$fq }$h"$'\n'
     elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" ]]; then
@@ -543,12 +546,14 @@ PRIMARY_FQ=""; PRIMARY_V4S=""
 c_2_7() {
   need_ssh || return 2
   # first the primary's own name on the primary (its listener needs it, as here)
-  local pp prc=0; pp=$(primary_name_problems) || prc=$?
+  local pp prc=0; primary_name_problems > /dev/null || prc=$?; pp=$PNP_OUT
   if [[ $prc -eq 0 && -n "$pp" ]]; then
     NOW="On the primary: ${pp//$'\n'/; }"
     PRIMARY_HOW_STEP="root  ->  shell"
-    PLAN="cp -p /etc/hosts /etc/hosts.bak_$RUN_ID
-echo '$(primary_hosts_line)' >> /etc/hosts
+    # run twice, the first backup stays and the line is not added again; a last line without its newline gets one
+    PLAN="[ -e /etc/hosts.bak_$RUN_ID ] || cp -p /etc/hosts /etc/hosts.bak_$RUN_ID
+[ -z \"\$(tail -c 1 /etc/hosts)\" ] || echo >> /etc/hosts
+grep -qxF '$(primary_hosts_line)' /etc/hosts || echo '$(primary_hosts_line)' >> /etc/hosts
 getent ahostsv4 $PRIMARY_HOST
 -- The last command must show $(primary_hosts_line | awk '{print $1}'). Then answer r."
     PLAN_UNDO="cp -p /etc/hosts.bak_$RUN_ID /etc/hosts   (on the primary)"
@@ -610,32 +615,43 @@ local_fw_rules() {
   # firewalld is not active: rules of nftables or iptables on this server (read-only). They are not judged here
   # (sets, maps, jumps and scopes make a sure verdict impossible): the drop and reject rules are shown, so the
   # admin can see at once whether one of them stops port $PORT. The real test is the connect from the primary.
-  local r="" rules="" myif
-  command -v nft >/dev/null 2>&1 && rules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
-  command -v iptables >/dev/null 2>&1 && rules+=$'\n'$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  local r="" nrules="" irules="" rules myif
+  command -v nft >/dev/null 2>&1 && nrules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
+  command -v iptables >/dev/null 2>&1 && irules=$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  rules=$nrules$'\n'$irules
   # (not "ct state invalid ... drop": it only drops broken packets)
-  local drops pnamed paccept pdrop
-  drops=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
-      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)' \
-      | sed 's/^[[:space:]]*//')
+  local dre='policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)'
+  local inv='ct state invalid|--ctstate INVALID|state INVALID'
+  local pdre='(^|[[:space:]])(drop|reject)([[:space:]]|;|$)|-j (DROP|REJECT)'
+  local drops pdrop v clean pnamed paccept first an dn lets=1
+  drops=$(grep -vE "$inv" <<< "$rules" | grep -E "$dre" | sed 's/^[[:space:]]*//')
   [[ -n "$drops" ]] || return 0
-  # the rules that name port $PORT: an explicit accept of it (and no drop of it) is the normal default-deny set-up
-  # (counters and comments carry numbers too: taken out before the port is looked for)
-  local clean; clean=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$rules")
-  pnamed=$(grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" <<< "$clean")
-  # (only an accept that is not limited to some sources or interfaces, and in iptables not after a catch-all drop)
-  paccept=$(grep -E '(^|[[:space:]])accept([[:space:]]|;|$)|-j ACCEPT' <<< "$pnamed" | grep -vE 'saddr|(^|[[:space:]])-s[[:space:]]|iifname|iif[[:space:]]|(^|[[:space:]])-i[[:space:]]|--src-range|ipset|match-set|@')
-  # it counts only when no catch-all drop or reject comes before it, and only one input chain drops by policy
-  # (each base chain must accept the packet: with two, an accept in one says nothing about the other)
-  if [[ -n "$paccept" ]]; then
-    local first; first=$(head -n 1 <<< "$paccept")
-    awk -v a="$first" '$0 == a {exit} /^-A INPUT -j (DROP|REJECT)/ || /^(drop|reject)( with .*)?;?$/ {f = 1; exit} END {exit !f}' <<< "$clean" && paccept=""
-    [[ $(grep -cE 'policy drop|^-P INPUT DROP' <<< "$clean") -le 1 ]] || paccept=""
-  fi
-  pdrop=$(grep -E '(^|[[:space:]])(drop|reject)([[:space:]]|;|$)|-j (DROP|REJECT)' <<< "$pnamed")
-  [[ -n "$paccept" && -z "$pdrop" ]] && return 0
+  # an explicit accept of port $PORT is the normal default-deny set-up. Each view (nft, iptables) is judged on its
+  # own: iptables-nft shows the same rules in both, and an order says something only inside one view.
+  for v in "$nrules" "$irules"; do
+    grep -vE "$inv" <<< "$v" | grep -qE "$dre" || continue
+    # (counters and comments carry numbers too: taken out before the port is looked for)
+    clean=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$v")
+    pnamed=$(grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" <<< "$clean")
+    # (only an accept that is not limited to some sources or interfaces)
+    paccept=$(grep -E '(^|[[:space:]])accept([[:space:]]|;|$)|-j ACCEPT' <<< "$pnamed" | grep -vE 'saddr|(^|[[:space:]])-s[[:space:]]|iifname|iif[[:space:]]|(^|[[:space:]])-i[[:space:]]|--src-range|ipset|match-set|@')
+    [[ -n "$paccept" ]] || { lets=0; break; }
+    first=$(head -n 1 <<< "$paccept")
+    # no catch-all drop or reject before the accept
+    awk -v a="$first" '$0 == a {exit} /^-A INPUT -j (DROP|REJECT)/ || /^(drop|reject)( with .*)?;?$/ {f = 1; exit} END {exit !f}' <<< "$clean" && { lets=0; break; }
+    # a drop of port $PORT itself counts only before the accept (after it, the packet is already let in)
+    an=$(grep -nxF -- "$first" <<< "$clean" | head -n 1 | cut -d: -f1)
+    dn=$(grep -nxF -f <(grep -E "$pdre" <<< "$pnamed") <<< "$clean" | head -n 1 | cut -d: -f1)
+    [[ -n "$dn" && -n "$an" && $dn -lt $an ]] && { lets=0; break; }
+    # only one input chain of this view drops by policy (each base chain must accept the packet: with two, an
+    # accept in one says nothing about the other)
+    [[ $(grep -cE 'policy drop|^-P INPUT DROP' <<< "$clean") -le 1 ]] || { lets=0; break; }
+  done
+  [[ $lets -eq 1 ]] && return 0
+  pdrop=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$rules" \
+          | grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" | grep -E "$pdre")
   # shown: every rule that drops port $PORT itself, then the first general ones
-  r=$( { [[ -n "$pdrop" ]] && printf '%s\n' "$pdrop"; grep -vxF -f <(printf '%s\n' "${pdrop:-#none#}") <<< "$drops" | head -n 3; } | grep -v '^$')
+  r=$( { [[ -n "$pdrop" ]] && printf '%s\n' "$pdrop"; grep -vxF -f <(printf '%s\n' "${pdrop:-#none#}") <<< "$drops" | head -n 3; } | grep -v '^$' | awk '!seen[$0]++')
   [[ -n "$r" ]] || return 0
   myif=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
   NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject traffic, for example:"$'\n'"$(sed 's/^/  /' <<< "$r")"

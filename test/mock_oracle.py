@@ -672,6 +672,13 @@ def lsnrctl():
 def orapki():
     # orapki wallet create -wallet <dir> -auto_login|-auto_login_local ; the password comes on stdin
     with open(os.path.join(STATE_DIR, "calls.log"), "a") as f: f.write(f"orapki args={args}\n")
+    # orapki wallet display -wallet <dir>: an auto-login wallet opens without a password, except a LOCAL one
+    # made on another host (a file with the word LOCALSSO in the tests)
+    if args[:2] == ["wallet", "display"] and "-wallet" in args:
+        sso = os.path.join(args[args.index("-wallet") + 1], "cwallet.sso")
+        if not os.path.exists(sso): print("PKI-02002: Unable to open the wallet. Check password and wallet location"); return 1
+        if "LOCALSSO" in open(sso, errors="replace").read(): print("PKI-02002: Unable to open the wallet. Check password and wallet location"); return 1
+        print("Oracle PKI Tool Release 19.0.0.0.0"); print("Requested Certificates:"); return 0
     if args[:2] != ["wallet", "create"] or "-wallet" not in args: print("PKI-01001: bad arguments"); return 1
     d = args[args.index("-wallet") + 1]
     pw = sys.stdin.readline().rstrip("\n")

@@ -845,17 +845,15 @@ EXPECT Finished Duplicate Db.
        RMAN-05535, or ORA-19527 / ORA-00312 about redo log files,
        are normal during the copy.
 IF     The copy failed: clean this server before you try again, and check every name twice.
-       The script shows the exact commands when you run it with --from 7.2.
-       On this server only ($S):
-         $SSQL
-         shutdown abort
-       ASM, as $GU:
-         [ "\$(hostname -s)" = "$(hostname -s)" ] && ORACLE_HOME=$GH ORACLE_SID=+ASM $GH/bin/asmcmd rm -rf +<DG>/$SUU
-         NEVER +<DG>/$PUU: those are the primary's files.
-       Folders: delete the files the copy left (step 7.2 lists them).
-       As $OU:
-         [ "\$(hostname -s)" = "$(hostname -s)" ] && rm -f $DBH/dbs/spfile$SID.ora $DBH/dbs/.dg_duplicate_done_$SID
-       Then run the script with:  --from 7.2
+       Run the script with --from 7.2. Its clean-up menu offers:
+         [y] Clean up for me      only for a copy this script started that did not finish:
+                                  it checks the host and the instance, lists what goes, asks
+                                  for the word CLEAN, then: shutdown abort, asmcmd rm -rf
+                                  +<DG>/$SUU, the standby's OMF folders, and it renames
+                                  spfile$SID.ora to spfile$SID.ora.failed_<run>
+         [m] Show the commands    the same commands in a short script file for you to read and run
+       NEVER +<DG>/$PUU: those are the primary's files.
+       init$SID.ora and orapw$SID are kept. The run then goes on and copies again.
 EOF
   ;;
   9.1) cat <<EOF
