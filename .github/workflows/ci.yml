@@ -102,9 +102,12 @@ jobs:
     steps:
       # checkout runs on the runner: the actions need a newer glibc than Oracle Linux 7 has
       - uses: actions/checkout@v4
+      # SYS_RESOURCE: step 2.4 sets the limits of oracle and grid (nofile 65536, ...), and pam_limits
+      # must raise them when runuser opens a session; root in a container cannot without it
+      # ("runuser: cannot open session: Permission denied"), root on a real server can
       - name: Sections A and Q in oraclelinux:7
         run: |
-          docker run --rm -v "$PWD:/src" -w /src oraclelinux:7-slim bash -c '
+          docker run --rm --cap-add SYS_RESOURCE -v "$PWD:/src" -w /src oraclelinux:7-slim bash -c '
             set -e
             yum install -y -q python3 zip unzip perl procps-ng util-linux shadow-utils hostname findutils which >/dev/null
             cat /etc/oracle-release; bash --version | head -n 1; python3 --version
