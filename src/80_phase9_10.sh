@@ -1722,7 +1722,7 @@ rf_after() {
   local fra t lrc=0
   # a recovery area that cannot be read is not taken as "none": the cross-check still runs, the catalog is
   # reported as not done ("?": rf_redo_hint names it)
-  sql_local "select nvl(value,'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="?"
+  sql_local "select nvl(max(value),'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="?"
   [[ -n "$fra" ]] || fra="?"
   [[ "$fra" == "?" ]] && { warn "Cannot read db_recovery_file_dest ($(ora_errors "$SQL_OUT")): the recovery area is not catalogued."; rc=1; RF_FAILED+=" catalog"; RF_FRA="?"; }
   t=$(mktemp /tmp/dg_rman.XXXXXX) || { bad "Cannot create a temporary file in /tmp"; RF_FAILED+=" catalog policy"; RF_FRA=$fra; return 1; }; CLEANUP_FILES+=("$t")

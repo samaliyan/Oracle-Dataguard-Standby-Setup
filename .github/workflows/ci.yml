@@ -86,7 +86,7 @@ jobs:
       - name: Keep what the failed checks saw
         if: failure()
         run: sudo tar czf test-part-${{ matrix.part }}.tgz --ignore-failed-read /tmp/dgt_fail /tmp/dgt_stuck /tmp/dgt/log 2>/dev/null || true
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         if: failure()
         with:
           name: test-part-${{ matrix.part }}
