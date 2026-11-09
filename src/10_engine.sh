@@ -428,7 +428,7 @@ run_step() {
     UI_RETRY=0
     YES_HOLD=0
     NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""; CHECK_WAITS=0
-    cp_reset; DONE_AS_OK=0
+    cp_reset; job_show_reset; DONE_AS_OK=0   # (the job list of phase 3 is cleared like the command list)
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
     ui_live_clear

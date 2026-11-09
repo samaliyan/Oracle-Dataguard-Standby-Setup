@@ -43,25 +43,21 @@ dg_union() {
   # $1 $2 comma lists of disk groups -> one list, upper case, each once, in the order first seen
   printf '%s,%s' "$1" "$2" | tr ',' '\n' | tr -d ' \t\r' | tr '[:lower:]' '[:upper:]' | grep -v '^$' | awk '!s[$0]++' | paste -sd, -
 }
-cmd_lines() {
-  # a long command, one option per line (each line but the last ends with " \\", so it can be typed as it is):
-  #   srvctl add database \\
-  #     -db X \\
-  #     -oraclehome /u01/...
-  # $@ = the words; an option (-x) starts a new line together with its value
-  local out="" w line=""
-  for w in "$@"; do
-    if [[ "$w" == -* && -n "$line" ]]; then out+="$line \\"$'\n'; line="  $w"
-    else line+="${line:+ }$w"; fi
+srv_words() {
+  # the words $@ as one shell command line (for the "Will run" list: what is shown is what bash runs). A word
+  # with characters other than these is put in single quotes, so a value with a space stays one value
+  local a out="" q="'"
+  for a in "$@"; do
+    if [[ "$a" =~ ^[A-Za-z0-9_./,:+=@-]+$ ]]; then out+="$a "; else out+="$q${a//$q/$q\\$q$q}$q "; fi
   done
-  printf '%s%s' "$out" "$line"
+  printf '%s' "${out% }"
 }
 c_9_1() {
   use_grid || { NOW="Not needed: no Oracle Restart on this server. Step 9.7 sets up the start at boot."; return 0; }
   need_built || return 2
   local srv="$DB_HOME/bin/srvctl" spf; spf=$(spfile_path)
   [[ -f "$spf" ]] || { NOW="The spfile is missing: $spf"; return 2; }
-  local add; srv_new_args; add=$(cmd_lines srvctl add database "${SRV_NEW[@]}")
+  local add; srv_new_args; add=$(srv_words srvctl add database "${SRV_NEW[@]}")
   DG_DEAD_NOTE=""
   if run_logged "srvctl config database" as_oracle timeout 600 "$srv" config database -db "$STANDBY_UNIQUE"; then
     local cfg=$RUN_OUT bad_items=""
@@ -141,21 +137,24 @@ c_9_1() {
       [[ "$bad_items" == *password-file* ]] && REG_MOD_ARGS+=(-pwfile "$(pw_dest)")
       [[ "$bad_items" == *diskgroup* ]] && REG_MOD_ARGS+=(-diskgroup "$REG_NEW_DG")
       [[ "$bad_items" == *domain* ]] && REG_MOD_ARGS+=(-domain "$PRIMARY_DOMAIN")
-      PLAN="As $ORACLE_USER, on this server only:
-$(cmd_lines srvctl modify database -db "$STANDBY_UNIQUE" "${REG_MOD_ARGS[@]}")"
+      # changed in place: the running standby is not stopped
+      PLAN="Change the wrong values of the registration in place, on this server only (the standby keeps running)."
+      cp_add oracle "$(srv_words srvctl modify database -db "$STANDBY_UNIQUE" "${REG_MOD_ARGS[@]}")"
       return 1
     fi
     REG_MODE=re
     # the command shown is made from the same values as the action (policy, stop option, disk groups, domain)
-    local cf; cf=$(mktemp) || return 2; CLEANUP_FILES+=("$cf"); printf '%s\n' "$cfg" > "$cf"
-    srv_new_args "$cf"; rm -f -- "$cf"
-    add=$(cmd_lines srvctl add database "${SRV_NEW[@]}")
-    PLAN="As $ORACLE_USER, on this server only:
-srvctl stop database -db $STANDBY_UNIQUE
-srvctl remove database -db $STANDBY_UNIQUE -noprompt
-$add"
+    local cf radd; cf=$(mktemp) || return 2; CLEANUP_FILES+=("$cf"); printf '%s\n' "$cfg" > "$cf"
+    srv_new_args "$cf"; radd=$(srv_add_cmd_from "$cf"); rm -f -- "$cf"
+    add=$(srv_words srvctl add database "${SRV_NEW[@]}")
+    # (a stop that fails does not end the step: remove then says whether the registration can go)
+    cp_add oracle "srvctl stop database -db $STANDBY_UNIQUE"
+    cp_add oracle "srvctl remove database -db $STANDBY_UNIQUE -noprompt"
+    cp_add oracle "$add"
+    PLAN="Register $STANDBY_UNIQUE in Oracle Restart again, on this server only (the standby is stopped for it)."
     [[ -n "$SRV_DG_LOST" ]] && PLAN+=$'\n'"The disk groups of the old registration cannot be read ($SRV_DG_LOST): only the needed ones are set."
     PLAN+=$'\n'"The management policy, stop option, disk groups and domain of the old registration are kept."$'\n'"The old registration is saved first. If the new one cannot be added, the old one is added again;"$'\n'"settings it had beyond these (for example services) are then listed, to set again by hand."
+    [[ -n "$radd" ]] && PLAN+=$'\n'"Only if the new registration fails, this puts the old one back (as $ORACLE_USER):"$'\n'"  $radd"
     return 1
   fi
   # only "the resource could not be found" means not registered; another failure (CRS down, a timeout) is unknown
@@ -164,8 +163,8 @@ $add"
   fi
   REG_MODE=add
   NOW="$STANDBY_UNIQUE is not registered in Oracle Restart"
-  PLAN="As $ORACLE_USER:
-$add"
+  PLAN="Register $STANDBY_UNIQUE in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)."
+  cp_add oracle "$add"
   USING="-instance must be exactly $STANDBY_SID, or sqlplus shows 'Connected to an idle instance'"
   return 1
 }
@@ -236,21 +235,32 @@ srv_new_args() {
   SRV_NEW+=("${keep[@]}")
   return 0
 }
+SRV_ADD_IDX=""
+srv_shown_add() {
+  # SRV_ADD_IDX: the index of the "srvctl add database" entry of the shown list when it is exactly the command
+  # that the values now give (SRV_NEW); 1 (and said) when it is not: a registration that changed since the check
+  # is not touched (answer r: it is checked and shown again)
+  local i want; want=$(srv_words srvctl add database "${SRV_NEW[@]}"); SRV_ADD_IDX=""
+  if i=$(cp_find oracle "srvctl add database ") && [[ "${CP_CMD[$i]}" == "$want" ]]; then SRV_ADD_IDX=$i; return 0; fi
+  bad "The srvctl add command is not the one shown before (the registration or the settings changed since the check)."$'\n'"Answer r: it is checked and shown again."
+  return 1
+}
 srv_add() {
-  # $1 (optional) saved "srvctl config database" of an earlier registration: see srv_new_args
+  # $1 (optional) saved "srvctl config database" of an earlier registration: see srv_new_args. Runs the shown
+  # "srvctl add database" entry, after checking that it is still the right command
   srv_new_args "${1:-}"
   # ASM stopped answering after the check (during stop/remove): no new registration with an unchecked list. The
   # caller puts the old registration back
   if [[ -n "$SRV_DG_UNREAD" && -n "${1:-}" ]]; then bad "The disk groups of this server cannot be read now (old ones: $SRV_DG_UNREAD). The new registration is not added."; return 1; fi
   [[ -n "$SRV_DG_LOST" ]] && warn "The disk groups of the old registration cannot be read ($SRV_DG_LOST). Only the ones the standby needs are set:"$'\n'"$(srv_dgs). Add others again with:  srvctl modify database -db $STANDBY_UNIQUE -diskgroup <list>"
-  run_logged "srvctl add database" as_oracle timeout 600 "$DB_HOME/bin/srvctl" add database "${SRV_NEW[@]}" || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+  srv_shown_add || return 1
+  cp_exec "$SRV_ADD_IDX" || { bad "srvctl add failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
   [[ ${#SRV_KEPT[@]} -gt 0 ]] && say "Kept from the old registration: ${SRV_KEPT[*]}"
   return 0
 }
 d_9_1() {
   if [[ "$REG_MODE" == "modify" ]]; then
-    run_logged "srvctl modify database" as_oracle timeout 600 "$DB_HOME/bin/srvctl" modify database -db "$STANDBY_UNIQUE" "${REG_MOD_ARGS[@]}" \
-      || { bad "srvctl modify failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    cp_run || return 1
     # the old values, so --undo can say exactly how to put them back
     local od=""
     [[ " ${REG_MOD_ARGS[*]} " == *" -startoption "* ]] && od+="old=${REG_OLD_OPT:-unknown} "
@@ -270,9 +280,14 @@ d_9_1() {
     # that would lose the old disk groups (none in the old registration and none needed: nothing to lose)
     local odg; odg=$(_cfgv "$old" 'Disk Groups' | tr -d ' \t\r')
     if [[ -n "$odg" || -n "$(srv_dgs)" ]] && ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
-    run_logged "srvctl stop" as_oracle timeout 600 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
-    run_logged "srvctl remove" as_oracle timeout 600 "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
+    # the new registration made from the registration as it is now must be the one shown: else nothing is stopped
+    srv_new_args "$old"
+    [[ -z "$SRV_DG_UNREAD" ]] || { bad "The disk groups of this server cannot be read now (old ones: $SRV_DG_UNREAD). Nothing is changed."; return 1; }
+    srv_shown_add || { say "Nothing is changed."; return 1; }
+    cp_run_one oracle "srvctl stop database -db $STANDBY_UNIQUE" || true
+    cp_run_one oracle "srvctl remove database -db $STANDBY_UNIQUE -noprompt" || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     if ! srv_add "$old"; then
+      # (put back after a failure: the command is shown when it runs, and logged)
       say "The new registration failed. Adding the old registration again."
       local radd back=0 diffl=""; radd=$(srv_add_cmd_from "$old")
       if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle timeout 600 "${SRV_OLD_ARGS[@]}"; then
@@ -444,6 +459,18 @@ d_9_2() {
 
 # ---- 9.3 ----
 SRL_SQL=""
+# redo apply: one statement each way (9.3, 9.4, 9.7 and 10.7 show and run exactly these)
+APPLY_START_SQL="alter database recover managed standby database disconnect from session;"
+APPLY_STOP_SQL="alter database recover managed standby database cancel;"
+sb_cp_idx() {
+  # the index of the shown entry with role $1, command $2 and input $3 (all exactly); 1 when there is none
+  local i
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    [[ "${CP_ROLE[$i]}" == "$1" && "${CP_CMD[$i]}" == "$2" && "${CP_IN[$i]}" == "${3:-}" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+srl_add_input() { printf 'whenever sqlerror exit failure\n%s' "$SRL_SQL"; }   # the first error stops the rest
 c_9_3() {
   need_built || return 2
   local rc=0; srl_statements sql_local || rc=$?
@@ -451,8 +478,13 @@ c_9_3() {
   NOW=$SRL_INFO
   [[ $rc -eq 0 ]] && return 0
   SRL_SQL="alter system set standby_file_management=manual scope=memory;"$'\n'"$SRL_STMTS"$'\n'"alter system set standby_file_management=auto scope=memory;"
-  PLAN="On this server, in sqlplus / as sysdba (apply is stopped first if it runs):
-$SRL_SQL"
+  # apply is stopped while the logs are added, and started again afterwards (also after an error)
+  local mrp=0; mrp_running && mrp=1
+  PLAN="Add the standby redo logs on this server$([[ $mrp -eq 1 ]] && printf ' (redo apply is stopped for it, and started again afterwards, also after an error)')."
+  PLAN+=$'\n'"If adding fails, standby_file_management is set back to AUTO."
+  [[ $mrp -eq 1 ]] && cp_add oracle "sqlplus -S / as sysdba" "$APPLY_STOP_SQL"
+  cp_add oracle "sqlplus -S / as sysdba" "$(srl_add_input)"
+  [[ $mrp -eq 1 ]] && cp_add oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL"
   USING="Same size as the online logs of the primary"$'\n'"Per thread: one group more than the online groups"
   return 1
 }
@@ -463,37 +495,48 @@ d_9_3() {
   [[ $rc -eq 2 ]] && { bad "Cannot read the redo logs of the standby ($(ora_errors "$SQL_OUT"))"; return 1; }
   [[ $rc -eq 0 ]] && { say "The standby logs are already there."; return 0; }
   SRL_SQL="alter system set standby_file_management=manual scope=memory;"$'\n'"$SRL_STMTS"$'\n'"alter system set standby_file_management=auto scope=memory;"
+  # the statements needed now must be the ones shown (else nothing is changed: checked and shown again)
+  local iadd istop istart
+  iadd=$(sb_cp_idx oracle "sqlplus -S / as sysdba" "$(srl_add_input)") \
+    || { bad "The standby redo logs needed now are not the ones shown before (they changed since the check). Nothing is changed."$'\n'"Answer r: they are checked and shown again."; return 1; }
+  istop=$(sb_cp_idx oracle "sqlplus -S / as sysdba" "$APPLY_STOP_SQL") || istop=""
+  istart=$(sb_cp_idx oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL") || istart=""
   # without the list of groups before, the new groups could not be told apart (the undo would drop them all)
   sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby logs ($(ora_errors "$SQL_OUT"))"; return 1; }
   before=$(tr -d ' ' <<< "$SQL_OUT")
-  # apply is stopped while the logs are added, and started again afterwards (also after an error)
   local was_mrp=0
-  if mrp_running; then sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop apply"; return 1; }; was_mrp=1; fi
-  if ! sql_local "$SRL_SQL"; then
-    local eo=$SQL_OUT
+  if mrp_running; then
+    [[ -n "$istop" && -n "$istart" ]] || { bad "Redo apply was started since the check: stopping it was not shown. Nothing is changed."$'\n'"Answer r: it is checked and shown again."; return 1; }
+    cp_exec "$istop" || { bad "Cannot stop apply ($(ora_errors "$RUN_OUT"))"; return 1; }
+    was_mrp=1
+  elif [[ -n "$istop" ]]; then
+    say "Redo apply is not running now: it is not stopped, and not started afterwards."
+  fi
+  if ! cp_exec "$iadd"; then
+    local eo=$RUN_OUT
+    # (after an error: shown when it runs)
     sql_local "alter system set standby_file_management=auto scope=memory;" \
       || warn "standby_file_management could not be set back to AUTO. Set it by hand:  alter system set standby_file_management=auto scope=memory;"
     # groups that were added before the error are recorded too (they are undone with the step)
     sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
     new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
     [[ -n "$new" ]] && journal SRL "$STANDBY_SID" "$new"
-    SQL_OUT=$eo
-    bad "Cannot add the standby redo logs ($(ora_errors "$SQL_OUT"))"
-    grep -q 'ORA-01378' <<< "$SQL_OUT" && printf 'ORA-01378: the online logs of the primary use 4K blocks.\nThe disk group or file system here must have a 4K sector size.\n' | hint
-    srl_apply_back $was_mrp
+    bad "Cannot add the standby redo logs ($(ora_errors "$eo"))"
+    grep -q 'ORA-01378' <<< "$eo" && printf 'ORA-01378: the online logs of the primary use 4K blocks.\nThe disk group or file system here must have a 4K sector size.\n' | hint
+    srl_apply_back $was_mrp "$istart"
     return 1
   fi
   sql_local "select group# from v\$standby_log order by group#;" && after=$(tr -d ' ' <<< "$SQL_OUT") || after=""
   new=$(comm -13 <(sort <<< "$before") <(sort <<< "$after") | sort -n | paste -sd' ' -)
   [[ -n "$new" ]] && journal SRL "$STANDBY_SID" "$new"
-  srl_apply_back $was_mrp || return 1
+  srl_apply_back $was_mrp "$istart" || return 1
   return 0
 }
 srl_apply_back() {
-  # $1 = 1: apply ran before step 9.3 stopped it; it is started again (1 when that fails)
+  # $1 = 1: apply ran before step 9.3 stopped it; it is started again with the shown entry $2 (1 when that fails)
   [[ "$1" == 1 ]] || return 0
-  if sql_local "alter database recover managed standby database disconnect from session;"; then say "Redo apply is running again."; return 0; fi
-  bad "Redo apply was stopped to add the standby logs and could not be started again ($(ora_errors "$SQL_OUT")). Step 9.4 starts it."
+  if cp_exec "$2"; then say "Redo apply is running again."; return 0; fi
+  bad "Redo apply was stopped to add the standby logs and could not be started again ($(ora_errors "$RUN_OUT")). Step 9.4 starts it."
   return 1
 }
 
@@ -648,7 +691,7 @@ c_9_8() {
                 cp_add root "systemctl enable $(arch_timer)"; cp_add root "systemctl start $(arch_timer)"; L98_TIMER_ON=1 ;;
         failed) NOW+="${NOW:+$'\n'}The last run of $(arch_service) failed: $(journalctl -u "$(arch_service)" -n 20 --no-pager -o cat 2>/dev/null | grep -E 'RMAN-|ORA-' | tail -n 2 | tr '\n' ' ')"
                 NOW+=$'\n'"To see why:  journalctl -u $(arch_service)"
-                cp_add root "systemctl reset-failed $(arch_service)"; cp_add root "systemctl start $(arch_service)"
+                cp_add root "systemctl reset-failed $(arch_service)"; cp_add root "systemctl start $(arch_service)" "" 3600
                 systemctl is-enabled --quiet "$(arch_timer)" 2>/dev/null && systemctl is-active --quiet "$(arch_timer)" 2>/dev/null || { cp_add root "systemctl enable $(arch_timer)"; cp_add root "systemctl start $(arch_timer)"; L98_TIMER_ON=1; } ;;
         files)  NOW+="${NOW:+$'\n'}The nightly clean-up timer is not set up as wanted ($(arch_mode_text timer))."
                 cp_add_file "$(arch_script)" 755 "$(arch_script_text)"
@@ -711,13 +754,26 @@ d_9_8() {
     ask_choice "[y] Yes, do it   [s] Skip   [q] Quit" "ysq"
     case "$ANSWER" in s) return 3 ;; q) user_stop "Stopped by you" ;; esac
   fi
-  local ondo=$L98_TIMER_ON cron_on=$L98_CRON_ON toff=$L98_TIMER_OFF coff=$L98_CRON_OFF
-  cp_run || return 1
-  [[ $ARCH_POLICY_OK -eq 1 ]] || journal RMANCFG "$STANDBY_SID" "old=${L98_OLDPOL// /~}"
-  [[ $toff -eq 1 ]] && journal UNITOFF "$(arch_timer)" "taken out (ARCH_CLEANUP=${ARCH_CLEANUP})"
-  [[ -n "$coff" ]] && journal CRONOFF "$ORACLE_USER" "tag=$(arch_cron_tag | tr ' ' '~')"
-  [[ $ondo -eq 1 ]] && journal UNIT "$(arch_timer)" "daily clean-up of applied archived logs at $(arch_time)"
-  [[ $cron_on -eq 1 ]] && journal CRONLINE "$ORACLE_USER" "tag=$(arch_cron_tag | tr ' ' '~')"
+  # the shown list, in order; each change is journaled right after it is done (a command that failed, and those
+  # after it, leave no entry)
+  local i c coff=$L98_CRON_OFF
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    if ! cp_exec "$i"; then
+      bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}" | mask_pw)"$'\n'"$(tail -n 4 <<< "$RUN_OUT" | mask_pw)"
+      [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+      return 1
+    fi
+    c=${CP_CMD[$i]}
+    case "$c" in
+      "rman target /") journal RMANCFG "$STANDBY_SID" "old=${L98_OLDPOL// /~}" ;;
+      "systemctl disable --now $(arch_timer)") journal UNITOFF "$(arch_timer)" "taken out (ARCH_CLEANUP=${ARCH_CLEANUP})" ;;
+      "systemctl enable $(arch_timer)") journal UNIT "$(arch_timer)" "daily clean-up of applied archived logs at $(arch_time)" ;;
+      "c=\$(crontab -u "*)
+        # the line put in (it ends with "echo '<line>'") or the line taken out
+        if [[ "$c" == *"echo '"* ]]; then journal CRONLINE "$ORACLE_USER" "tag=$(arch_cron_tag | tr ' ' '~')"
+        elif [[ -n "$coff" ]]; then journal CRONOFF "$ORACLE_USER" "tag=$(arch_cron_tag | tr ' ' '~')"; fi ;;
+    esac
+  done
   return 0
 }
 
@@ -735,14 +791,20 @@ c_9_4() {
     return 0
   fi
   NOW="Redo apply (MRP) is not running"
-  PLAN="On this server:  alter database recover managed standby database disconnect from session;"
+  PLAN="Start redo apply (MRP) on this server."
+  cp_add oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL"
   return 1
 }
 d_9_4() {
-  if ! sql_local "alter database recover managed standby database disconnect from session;"; then
-    bad "Cannot start redo apply ($(ora_errors "$SQL_OUT"))"
-    grep -q 'ORA-01153' <<< "$SQL_OUT" && printf 'ORA-01153: another recovery session is active (an old MRP or a manual recover). Cancel it first:\n  alter database recover managed standby database cancel;\n' | hint
-    grep -q 'ORA-01154' <<< "$SQL_OUT" && printf 'ORA-01154: the database is OPEN or opening. This script only mounts a physical standby.\n' | hint
+  local i; i=$(sb_cp_idx oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL") || { bad "Internal error: the start of redo apply was not shown before, so it is not run."; return 1; }
+  apply_start_run "$i"
+}
+apply_start_run() {
+  # $1 the index of the shown entry that starts redo apply (steps 9.4, 9.7 and 10.7)
+  if ! cp_exec "$1"; then
+    bad "Cannot start redo apply ($(ora_errors "$RUN_OUT"))"
+    grep -q 'ORA-01153' <<< "$RUN_OUT" && printf 'ORA-01153: another recovery session is active (an old MRP or a manual recover). Cancel it first:\n  alter database recover managed standby database cancel;\n' | hint
+    grep -q 'ORA-01154' <<< "$RUN_OUT" && printf 'ORA-01154: the database is OPEN or opening. This script only mounts a physical standby.\n' | hint
     return 1
   fi
   # the command ran, so its undo (cancel) is recorded either way; the journal says what was seen
@@ -936,7 +998,8 @@ c_9_7() {
       MOUNTED|OPEN) ;;
       IDLE)
         NOW="$(unit_name) is enabled, but the standby is not running now ($LSTATE)."
-        C97_FIX=start; PLAN="systemctl restart $(unit_name)"$'\n'"-- It starts the listener, mounts the standby and starts redo apply."
+        C97_FIX=start; PLAN="Restart the unit: it starts the listener, mounts the standby and starts redo apply."
+        cp_add root "systemctl restart $(unit_name)" "" 2100
         return 1 ;;
       *)
         # NOMOUNT (someone works on it by hand) or a state that cannot be read: never restarted by the script
@@ -955,9 +1018,9 @@ c_9_7() {
     fi
     if ! run_logged "lsnrctl status" as_lsnr timeout 60 "$(lsnr_home)/bin/lsnrctl" status "$SB_LSNR"; then
       NOW="$(unit_name) is enabled, but the listener $SB_LSNR is not running. The primary cannot send redo."
-      C97_FIX=lsnr
-      if use_grid; then PLAN="As $GRID_USER:  srvctl start listener -listener $SB_LSNR"
-      else PLAN="As $ORACLE_USER:  lsnrctl start $SB_LSNR"; fi
+      C97_FIX=lsnr; PLAN="Start the listener $SB_LSNR$(use_grid && printf ' through Oracle Restart')."
+      if use_grid; then cp_add grid "srvctl start listener -listener $SB_LSNR"
+      else cp_add oracle "lsnrctl start $SB_LSNR" "" 120; fi
       return 1
     fi
     if ! mrp_running; then
@@ -969,7 +1032,8 @@ c_9_7() {
         MANUAL_WHERE="Run on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER  ->  sqlplus / as sysdba"
         return 2
       fi
-      C97_FIX=mrp; PLAN="On this server, in sqlplus / as sysdba:"$'\n'"alter database recover managed standby database disconnect from session;"
+      C97_FIX=mrp; PLAN="Start redo apply (MRP) on this server."
+      cp_add oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL"
       return 1
     fi
     adg_note "$LSTATE"
@@ -987,6 +1051,14 @@ c_9_7() {
   if use_grid; then PLAN+=$'\n'"It waits until Oracle Restart has mounted the standby, then starts redo apply if it is not running."
   else PLAN+=$'\n'"A running standby stays as it is (redo apply is started if it is not running);"$'\n'"a standby that is down is started: listener, startup mount, redo apply."; fi
   USING="The standby is only mounted."$'\n'"Opening it read-only while apply runs needs the Active Data Guard license."
+  # the files that are missing or not as wanted (a backup of an earlier one is kept; --undo puts it back), then
+  # the unit is enabled and started
+  [[ -f "$sc" && "$(cat "$sc")" == "$(script_text)" ]] || cp_add_file "$sc" 755 "$(script_text)"
+  [[ -f "$u" && "$(cat "$u")" == "$(unit_text)" ]] || cp_add_file "$u" 644 "$(unit_text)"
+  if need_udev_dropin; then [[ -f "$(udev_dropin)" && "$(cat "$(udev_dropin)")" == "$(dropin_text)" ]] || cp_add_file "$(udev_dropin)" 644 "$(dropin_text)"; fi
+  cp_add root "systemctl daemon-reload"
+  cp_add root "systemctl enable $(unit_name)"
+  cp_add root "systemctl start $(unit_name)" "" 2100
   return 1
 }
 boot_errors_now() {
@@ -1001,35 +1073,30 @@ boot_err_hint() {
   printf 'What went wrong at a boot is logged with priority "err". To see it (or to alert on it):\n  journalctl -p err -u %s\n' "$(unit_name)" | hint
 }
 d_9_7() {
-  local sc u; sc=$(start_script); u="/etc/systemd/system/$(unit_name)"
   # the unit is right, but what it starts is not running: only that is started (on this server)
   case "$C97_FIX" in
-    start) run_cmds <<< "systemctl restart $(unit_name)" || { bad "The unit did not start. Check:  systemctl status $(unit_name)"; return 1; }; boot_err_hint; return 0 ;;
+    start) cp_run || { bad "The unit did not start. Check:  systemctl status $(unit_name)"; return 1; }; boot_err_hint; return 0 ;;
     lsnr)
-      if use_grid; then run_logged "srvctl start listener" as_grid timeout 600 "$GRID_HOME/bin/srvctl" start listener -listener "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-      else run_logged "lsnrctl start" as_oracle timeout 120 "$DB_HOME/bin/lsnrctl" start "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }; fi
+      cp_run || return 1
       journal LSNRSTART "$SB_LSNR" "started from $(lsnr_home)$(use_grid && printf ' via=srvctl')"
       boot_err_hint; return 0 ;;
     mrp) d_9_4 || return 1; boot_err_hint; return 0 ;;
   esac
-  install -d -m 755 /usr/local/sbin || return 1
-  # earlier contents are kept (the undo puts them back)
-  [[ -f "$sc" && "$(cat "$sc")" != "$(script_text)" ]] && { backup_file "$sc" || return 1; }
-  [[ -f "$u" && "$(cat "$u")" != "$(unit_text)" ]] && { backup_file "$u" || return 1; }
-  [[ -f "$sc" && "$(cat "$sc")" == "$(script_text)" ]] || { script_text | write_as root "$sc" 755 || return 1; }
-  [[ -f "$u" && "$(cat "$u")" == "$(unit_text)" ]] || { unit_text | write_as root "$u" 644 || return 1; }
-  script_text | log_block "written $sc"
-  unit_text | log_block "written $u"
-  command -v restorecon >/dev/null 2>&1 && restorecon "$sc" "$u" 2>/dev/null
-  if need_udev_dropin; then
-    install -d -m 755 "$(dirname "$(udev_dropin)")" || return 1
-    [[ -f "$(udev_dropin)" && "$(cat "$(udev_dropin)")" != "$(dropin_text)" ]] && { backup_file "$(udev_dropin)" || return 1; }
-    [[ -f "$(udev_dropin)" && "$(cat "$(udev_dropin)")" == "$(dropin_text)" ]] || { dropin_text | write_as root "$(udev_dropin)" 644 || return 1; }
-  fi
-  run_cmds <<< "systemctl daemon-reload
-systemctl enable $(unit_name)" || return 1
-  journal UNIT "$(unit_name)" "enabled (start at boot)"
-  run_cmds <<< "systemctl start $(unit_name)" || { bad "The unit did not start. Check:  systemctl status $(unit_name)"; systemctl status "$(unit_name)" --no-pager -l 2>&1 | tail -n 8 | hint; return 1; }
+  # the shown list: the files, daemon-reload, enable, start (each change journaled after it is done; a written
+  # file is journaled by the write itself)
+  local i
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    if ! cp_exec "$i"; then
+      if [[ "${CP_CMD[$i]}" == "systemctl start $(unit_name)" ]]; then
+        bad "The unit did not start. Check:  systemctl status $(unit_name)"; systemctl status "$(unit_name)" --no-pager -l 2>&1 | tail -n 8 | hint
+      else
+        bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}")"$'\n'"$(tail -n 4 <<< "$RUN_OUT")"
+        [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+      fi
+      return 1
+    fi
+    [[ "${CP_CMD[$i]}" == "systemctl enable $(unit_name)" ]] && journal UNIT "$(unit_name)" "enabled (start at boot)"
+  done
   boot_err_hint
 }
 
@@ -1477,6 +1544,19 @@ c_10_6() {
 # ---- 10.7 (only with --roll-forward) ----
 RF_DONE=0; RF_FINISH=0; RF_FAILED=""; RF_FRA="-"
 rf_pending_file() { printf '%s/rollforward_pending' "$STATE_DIR"; }
+rf_log() { printf '%s/rollforward_%s.log' "$LOG_DIR" "$RUN_ID"; }
+rf_rman_input() {
+  # the input of the RMAN job; $1 the password (the real one for the job, ***** for the screen): one text for both
+  printf 'connect target sys/"%s"@%s\n' "$1" "$STANDBY_TNS"
+  printf 'recover standby database from service %s;\n' "$PRIMARY_TNS"
+  printf 'exit\n'
+}
+rf_job_text() {
+  # what the job runs, as shown before ROLLFORWARD (run_long starts exactly this, in its own session)
+  printf '%s/bin/rman <<'"'"'EOF'"'"'\n' "$DB_HOME"
+  rf_rman_input '*****' | sed 's/^/  /'
+  printf 'EOF\n(output: %s)\n' "$(rf_log)"
+}
 rf_login_test() {
   # RMAN logs in to the standby as target (the way the roll forward does) and to the primary alias (as auxiliary
   # here: FROM SERVICE uses the same credentials to reach it). The password travels on stdin only
@@ -1578,7 +1658,8 @@ c_10_7() {
       [[ "$fb0" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
       [[ "$fb0" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
       PLAN="-- Check the standby, set its standby redo logs and RMAN settings again (9.3, 9.8) and start redo apply.
--- RMAN is not run again."
+-- RMAN is not run again. The commands of each part are worked out from the standby as it is then, and
+-- shown before that part runs."
       return 1
     fi
     # it did not finish: said, and the roll forward may be started again (every check below runs first)
@@ -1672,8 +1753,10 @@ c_10_7() {
   [[ "$fb" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
   [[ "$fb" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
   RF_FB=$fb
-  PLAN="-- 1) Redo apply is stopped, then RMAN, as $ORACLE_USER on this server:
-recover standby database from service $PRIMARY_TNS;
+  # redo apply is stopped first (shown under "Will run"); RMAN runs as a job (shown in the plan)
+  mrp_running && cp_add oracle "sqlplus -S / as sysdba" "$APPLY_STOP_SQL"
+  PLAN="-- 1) $(cp_any && printf 'Redo apply is stopped (see Will run). ')RMAN runs as a job, as $ORACLE_USER on this server:
+$(rf_job_text)
 -- RMAN restarts the standby instance, takes the control file of the primary, copies the datafiles added since,
 -- and fetches the changes as incremental backups. The primary builds and sends those backups over the network:
 -- it reads its data and works for a while, but nothing on the primary is changed.
@@ -1681,24 +1764,25 @@ recover standby database from service $PRIMARY_TNS;
 --    or cleared when their files are on this server (standby_file_management is MANUAL for that moment), and the
 --    standby's own are added again (step 9.3);
 --    RMAN catalogs the recovery area and cross-checks the archived logs; the deletion policy is set again (9.8).
--- 3) Redo apply is started again."
+-- 3) Redo apply is started again (9.4).
+-- The commands of 2) and 3) depend on the control file RMAN brings: they are shown before each part runs."
   return 1
 }
 rf_after() {
   # after RECOVER STANDBY DATABASE FROM SERVICE the control file is the primary's: it lists the primary's standby
   # redo logs (with the primary's names), the primary's RMAN settings, and none of the archived logs here.
+  # Each part is worked out from the standby as it is now, its commands are shown, then run (ROLLFORWARD covers them).
   # 1) standby redo logs: the listed groups are dropped (only their entries: no file of this standby is named
   #    there) and the standby's own are added again (step 9.3)
-  local rc=0 g groups mem m allhere
+  local rc=0 g groups mem m allhere i
   # redo apply must not run meanwhile (the boot script or a hand start may have started it since)
   dg_proc_count MRP || { bad "Cannot tell whether redo apply runs: $(ora_errors "$SQL_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1; }
-  if [[ $DGP_COUNT -ge 1 ]]; then
-    sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop redo apply: $(ora_errors "$SQL_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1; }
-  fi
   sql_local "select group# from v\$standby_log order by group#;" || { bad "Cannot read the standby redo logs: $(ora_errors "$SQL_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1; }
   groups=$(grep -oE '^[[:space:]]*[0-9]+' <<< "$SQL_OUT" | tr -d ' ')
+  cp_reset
+  [[ $DGP_COUNT -ge 1 ]] && cp_add oracle "sqlplus -S / as sysdba" "$APPLY_STOP_SQL"
   if [[ -n "$groups" ]]; then
-    sql_local "alter system set standby_file_management=manual scope=memory;" || { bad "Cannot set standby_file_management: $(ora_errors "$SQL_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1; }
+    cp_add oracle "sqlplus -S / as sysdba" "alter system set standby_file_management=manual scope=memory;"
     for g in $groups; do
       # a group whose files are on this server (the same paths on both servers) is cleared, so the files are used
       # again; a group that names files of the primary only is dropped (its entry; no file here is named)
@@ -1706,31 +1790,38 @@ rf_after() {
       mem=$(sed -n 's/^[[:space:]]*M://p' <<< "$SQL_OUT"); allhere=1
       [[ -n "$mem" ]] || allhere=0
       while IFS= read -r m; do [[ -n "$m" && "$m" == /* && -f "$m" ]] || allhere=0; done <<< "$mem"
-      if [[ $allhere -eq 1 ]]; then
-        sql_local "alter database clear logfile group $g;" || { warn "Group $g could not be cleared: $(ora_errors "$SQL_OUT")"; rc=1; }
-      else
-        sql_local "alter database drop standby logfile group $g;" || { warn "Group $g could not be dropped: $(ora_errors "$SQL_OUT")"; rc=1; }
-      fi
+      if [[ $allhere -eq 1 ]]; then cp_add oracle "sqlplus -S / as sysdba" "alter database clear logfile group $g;"
+      else cp_add oracle "sqlplus -S / as sysdba" "alter database drop standby logfile group $g;"; fi
     done
-    sql_local "alter system set standby_file_management=auto scope=memory;" \
-      || { warn "Set it back by hand:  alter system set standby_file_management=auto scope=memory;"; rc=1; }
+    cp_add oracle "sqlplus -S / as sysdba" "alter system set standby_file_management=auto scope=memory;"
+  fi
+  if cp_any; then
+    say "After the roll forward: redo apply stays stopped, the standby redo log entries of the primary go:"; cp_show
+    for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+      cp_exec "$i" && continue
+      case "${CP_IN[$i]}" in
+        "$APPLY_STOP_SQL") bad "Cannot stop redo apply: $(ora_errors "$RUN_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1 ;;
+        *"=manual "*) bad "Cannot set standby_file_management: $(ora_errors "$RUN_OUT")"; RF_FAILED=" srl catalog policy"; RF_FRA="?"; return 1 ;;
+        *"=auto "*) warn "Set it back by hand:  alter system set standby_file_management=auto scope=memory;"; rc=1 ;;
+        *) g=$(grep -oE '[0-9]+;$' <<< "${CP_IN[$i]}"); warn "Group ${g%;} could not be $([[ "${CP_IN[$i]}" == *clear* ]] && printf cleared || printf dropped): $(ora_errors "$RUN_OUT")"; rc=1 ;;
+      esac
+    done
   fi
   if [[ $rc -eq 0 ]]; then d_9_3_wrap || rc=1; fi
   [[ $rc -eq 0 ]] || RF_FAILED+=" srl"
   # 2) the archived logs and backups here, as RMAN knows them: the recovery area is catalogued again and every
   #    archived log is cross-checked (else the recovery area could not reclaim the old logs and fills up)
-  local fra t lrc=0
+  local fra
   # a recovery area that cannot be read is not taken as "none": the cross-check still runs, the catalog is
   # reported as not done ("?": rf_redo_hint names it)
   sql_local "select nvl(max(value),'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="?"
   [[ -n "$fra" ]] || fra="?"
   [[ "$fra" == "?" ]] && { warn "Cannot read db_recovery_file_dest ($(ora_errors "$SQL_OUT")): the recovery area is not catalogued."; rc=1; RF_FAILED+=" catalog"; RF_FRA="?"; }
-  t=$(mktemp /tmp/dg_rman.XXXXXX) || { bad "Cannot create a temporary file in /tmp"; RF_FAILED+=" catalog policy"; RF_FRA=$fra; return 1; }; CLEANUP_FILES+=("$t")
-  { [[ "$fra" != "-" && "$fra" != "?" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
-    | as_oracle timeout 1800 "$DB_HOME/bin/rman" target / > "$t" 2>&1 || lrc=1
-  RUN_OUT=$(cat "$t"); rm -f -- "$t"
-  printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman catalog and crosscheck after the roll forward"
-  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; [[ "$RF_FAILED" == *catalog* ]] || RF_FAILED+=" catalog"; RF_FRA=$fra; }
+  local rin="crosscheck archivelog all;"$'\n'"exit"
+  [[ "$fra" != "-" && "$fra" != "?" ]] && rin="catalog recovery area noprompt;"$'\n'"$rin"
+  cp_reset; cp_add oracle "rman target /" "$rin" 1800
+  say "After the roll forward: the archived logs here, as RMAN knows them:"; cp_show
+  cp_exec 0 || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; [[ "$RF_FAILED" == *catalog* ]] || RF_FAILED+=" catalog"; RF_FRA=$fra; }
   # 3) the deletion policy of the standby (step 9.8): the primary's came with its control file
   #    (only the policy: the nightly schedule is not touched by the roll forward)
   local r8=0; c_9_8 >/dev/null 2>&1 || r8=$?
@@ -1757,11 +1848,26 @@ rf_redo_hint() {
   } | hint
 }
 # the steps' own functions, with their journal entries under their own step numbers
-d_9_3_wrap() { local CUR_STEP=9.3; d_9_3; }
+# (after the roll forward, which you confirmed with ROLLFORWARD: each list is shown, then run)
+d_9_3_wrap() {
+  local CUR_STEP=9.3 NOW="" PLAN="" USING="" r=0
+  cp_reset; c_9_3 || r=$?
+  [[ $r -eq 0 ]] && { say "The standby redo logs are there (step 9.3)."; return 0; }
+  [[ $r -eq 2 ]] && { bad "${NOW:-Step 9.3 cannot be checked}"; return 1; }
+  say "Step 9.3, the standby redo logs of the standby:"; cp_show
+  d_9_3
+}
+d_9_4_wrap() {
+  local CUR_STEP=9.4
+  cp_reset; cp_add oracle "sqlplus -S / as sysdba" "$APPLY_START_SQL"
+  say "Step 9.4, redo apply:"; cp_show
+  d_9_4
+}
 arch_policy_wrap() {
   # the RMAN deletion policy of step 9.8 alone (journaled under 9.8)
   local CUR_STEP=9.8
   cp_reset; cp_add oracle "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;" 300
+  say "Step 9.8, the RMAN deletion policy of archived logs:"; cp_show
   cp_run || return 1
   journal RMANCFG "$STANDBY_SID" "old=${L98_OLDPOL// /~}"
 }
@@ -1776,17 +1882,17 @@ d_10_7() {
     # apply must be stopped: a process list that cannot be read is no "not running"
     dg_proc_count MRP || { bad "Cannot tell whether redo apply runs: $(ora_errors "$SQL_OUT")"; return 1; }
     if [[ $DGP_COUNT -ge 1 ]]; then
-      sql_local "alter database recover managed standby database cancel;" || { bad "Cannot stop redo apply: $(ora_errors "$SQL_OUT")"; return 1; }
+      local istop; istop=$(sb_cp_idx oracle "sqlplus -S / as sysdba" "$APPLY_STOP_SQL") \
+        || { bad "Redo apply was started since the check: stopping it was not shown. Nothing was changed."$'\n'"Answer r: it is checked and shown again."; return 1; }
+      cp_exec "$istop" || { bad "Cannot stop redo apply: $(ora_errors "$RUN_OUT")"; return 1; }
       say "Redo apply stopped."
     fi
-    rlog="$LOG_DIR/rollforward_$RUN_ID.log"
+    rlog=$(rf_log)
     journal ROLLFWD "$STANDBY_UNIQUE" "RMAN roll forward from $PRIMARY_TNS (control file and datafiles of the standby refreshed)"
     # a mark for a roll forward that ends while no run watches (its result is then checked by the next one)
     install -d -m 700 "$STATE_DIR"; printf '%s|\n' "$rlog" > "$pf"
-    run_long "RMAN roll forward" "$rlog" 'Starting|Finished|ORA-|RMAN-|restor|recover|media recovery' oracle "$DB_HOME/bin/rman" < <(
-      printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"
-      printf 'recover standby database from service %s;\n' "$PRIMARY_TNS"
-      printf 'exit\n') || rc=$?
+    say "${C_D}Running as $ORACLE_USER (a job):${C_N} $DB_HOME/bin/rman  ->  $(rf_rman_input '*****' | head -n 2 | tail -n 1)"
+    run_long "RMAN roll forward" "$rlog" 'Starting|Finished|ORA-|RMAN-|restor|recover|media recovery' oracle "$DB_HOME/bin/rman" < <(rf_rman_input "$SYS_PW") || rc=$?
   fi
   if [[ $rc -ne 0 || ! -f "$rlog" ]] || grep -qE '^RMAN-0(3002|3009)|ERROR MESSAGE STACK' "$rlog"; then
     rm -f -- "$pf"
@@ -1806,7 +1912,7 @@ or start redo apply by hand (step 9.4).
   rf_after || arc=1
   rm -f -- "$pf"
   # redo apply runs again in any case: a standby without its own standby redo logs still applies archived logs
-  CUR_STEP=9.4; d_9_4 || mrc=1
+  d_9_4_wrap || mrc=1
   CUR_STEP=$cs
   if [[ $arc -eq 1 ]]; then
     bad "The standby was rolled forward$([[ $mrc -eq 0 ]] && printf ' and redo apply runs'), but the clean-up after it did not finish (see above)."
