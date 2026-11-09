@@ -2032,7 +2032,8 @@ check "a warning is shown once per step, but 'finished with warnings' of each in
 SN=/tmp/dgt_snaps; rm -rf $SN
 # a full setup with the screen layout (100 x 30): the map, the step area, the list, the details, the help
 fresh empty
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=30x100 DG_TEST_SNAPDIR=$SN/a DG_TEST_SNAP=3.2,4.1 DG_TEST_KEYS=3.2:l,3.2:d,3.2:h DG_TEST_TIMEOUT=500 run $T/z500.txt)
+# (48 rows: step 3.2 shows its job command lines and the response file; on a smaller screen the step is cut and d shows all of it)
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=48x100 DG_TEST_SNAPDIR=$SN/a DG_TEST_SNAP=3.2,4.1 DG_TEST_KEYS=3.2:l,3.2:d,3.2:h DG_TEST_TIMEOUT=500 run $T/z500.txt)
 check "screen: a full setup runs to the end in the screen layout" "[[ $rc -eq 0 ]] && grep -q 'Standby setup is complete' $SN/a/*_end.txt"
 check "screen: the map on top (every phase, done/total, totals, keys), the step below with this phase so far" "grep -qE 'Data Guard standby setup [0-9]+\.[0-9]+ ' $SN/a/*_step_3.2.txt && grep -qE '✔ +2 This server +16/16' $SN/a/*_step_3.2.txt && grep -qE '▶ +3 Software +1/11' $SN/a/*_step_3.2.txt && grep -q 'need attention' $SN/a/*_step_3.2.txt && grep -q 'l: all steps   d: details   h: help' $SN/a/*_step_3.2.txt && grep -qE '✔ 3.1 +Installer files +done' $SN/a/*_step_3.2.txt && grep -q '  Step 3.2  Grid Infrastructure' $SN/a/*_step_3.2.txt"
 check "screen: the next phase starts on a clean area (phase 3 done, 4 is current)" "grep -qE '✔ +3 Software +11/11' $SN/a/*_step_4.1.txt && grep -qE '▶ +4 Primary' $SN/a/*_step_4.1.txt && ! grep -q 'Step 3\.' $SN/a/*_step_4.1.txt"

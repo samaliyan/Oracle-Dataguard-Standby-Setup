@@ -7768,7 +7768,7 @@ rsp_set() {
   # ("#  oracle.install.asm.diskGroup.disks=/oracle/asm/disk1,...") before the real key, and a Java
   # properties reader takes the LAST line of a key, so a replaced example line would be ignored.
   local f=$1 v=$2 k; shift 2
-  [[ $RSP_SHOW -eq 1 ]] && { rsp_show_key "$v" "$@"; return; }
+  [[ ${RSP_SHOW:-0} -eq 1 ]] && { rsp_show_key "$v" "$@"; return; }
   for k in "$@"; do
     # the same plain-text test as the replacement (no regular expression: the dots in the keys stay dots)
     if DG_K=$k awk 'BEGIN{k=ENVIRON["DG_K"]} { t=$0; sub(/^[[:space:]]*/, "", t); if (index(t, k "=") == 1) f=1 } END { exit !f }' "$f"; then
@@ -8521,10 +8521,19 @@ grid_inst_argv() {
   return 0
 }
 rsp_plan_text() {
-  # $1 response file, $2 template, $3 owner, rest = key function: the lines PLAN shows about the response file
-  local rsp=$1 tpl=$2 owner=$3; shift 3
-  printf 'Response file %s: a copy of %s (owner %s, mode 600,\nremoved when the installer has ended), with these values set (passwords *****):\n' "$rsp" "$tpl" "$owner"
-  rsp_show_text "$tpl" "$owner" "$@"
+  # $1 response file, $2 template, $3 owner, rest = key function: the lines PLAN shows about the response file.
+  # The values it sets (20 or more lines) go into a file, so the job command lines stay on the screen; a key
+  # the template lacks (the step then stops) is shown here
+  local rsp=$1 tpl=$2 owner=$3 vals vf; shift 3
+  vals=$(rsp_show_text "$tpl" "$owner" "$@")
+  printf 'Response file %s: a copy of %s (owner %s, mode 600,\nremoved when the installer has ended).' "$rsp" "$tpl" "$owner"
+  vf="$LOG_DIR/response_values_${CUR_STEP:-x}_$RUN_ID.txt"
+  if ( umask 077; printf 'Values the script sets in %s (a copy of %s; passwords *****):\n%s\n' "$rsp" "$tpl" "$(grep -v '^  Not in the template' <<< "$vals")" > "$vf" ) 2>/dev/null; then
+    printf '\nThe values the script sets in it (passwords *****):  %s\n' "$vf"
+  else
+    printf ' The values the script sets in it (passwords *****):\n%s\n' "$(grep -v '^  Not in the template' <<< "$vals")"
+  fi
+  grep '^  Not in the template' <<< "$vals" || true
 }
 grid_plan_jobs() {
   # check: $1 now | fresh (the home and stage folder are emptied first), $2 the installer files. Adds the unzip
