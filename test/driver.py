@@ -121,8 +121,14 @@ def main():
         answered += 1; buf = ""; ctx = ""
     hup_sent = False
     chan_asked = [0]
+    status = None
     while True:
         r, _, _ = select.select([fd], [], [], 0.5)
+        if fd not in r and status is None:
+            # the script has ended, but a job it left running in its own session (installer, RMAN)
+            # may still hold the terminal open: no end of file until that job ends. Stop here.
+            wp, ws = os.waitpid(pid, os.WNOHANG)
+            if wp == pid: status = ws; break
         if fd in r:
             try: data = os.read(fd, 65536).decode(errors="replace")
             except OSError: break
@@ -287,7 +293,7 @@ def main():
         if q and summary_answers: send(summary_answers.pop(0)); continue
         if time.time() > deadline:
             print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break
-    _, status = os.waitpid(pid, 0)
+    if status is None: _, status = os.waitpid(pid, 0)
     # os.waitstatus_to_exitcode is new in Python 3.9; this also runs on 3.6 (Oracle Linux 7)
     code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
     with open(E("DG_TEST_OUT", "/tmp/dgt/last_output.txt"), "w") as f: f.write(full)
