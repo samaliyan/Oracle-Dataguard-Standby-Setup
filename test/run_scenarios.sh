@@ -492,7 +492,9 @@ rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
 fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/claude-hosts.$$; cat /etc/hosts >> /tmp/claude-hosts.$$; cp /tmp/claude-hosts.$$ /etc/hosts; rm -f /tmp/claude-hosts.$$
 rc=$(DG_TEST_QUIT_AT=2.7 run $T/p12.txt)
-check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^192\.0\.2\.2[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
+# the address the script puts in: the first non-loopback one of this machine (as in setup_env.sh)
+SIPRE=$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | grep -E '^[0-9.]+$' | head -n 1); SIPRE=${SIPRE//./\\.}
+check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^${SIPRE}[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
 fresh
 cat > $T/ed.sh <<'EOF'
 #!/bin/bash
@@ -971,13 +973,14 @@ check "--show-changes 4.3 shows the primary command and its undo" "grep -q 'PRIM
 fresh empty; rc=$(DG_TEST_P4FIRST=4 DG_TEST_QUIT_AT=2.1 run $T/y2.txt)
 check "[4] at the end of phase 1: phase 4 runs before phase 2" "[[ \$(grep -n 'Phase 4 of 10' $T/y2.txt | head -n 1 | cut -d: -f1) -lt \$(grep -n 'Phase 2 of 10' $T/y2.txt | head -n 1 | cut -d: -f1) ]]"
 # Y3 the terminal is closed during the Grid installer: --status and --check see the running job; the next run records the result
-fresh empty; jset $T/state/env.json "d['installer_sleep']=12"
+# (the installer runs 30 s: long enough that --status and --check still see it running on a fast machine)
+fresh empty; jset $T/state/env.json "d['installer_sleep']=30"
 rc=$(DG_TEST_HUP_ON_JOB='Grid installer' run $T/y3a.txt)
 rc=$(run $T/y3s.txt --status)
 check "--status during the installer: 'Running now' with the job" "grep -q 'Running now: Grid installer' $T/y3s.txt"
 rc=$(run $T/y3c.txt --check)
 check "--check during the installer: phase 3 and later WAITS, no clean-up plan" "grep -qE '^    3\.2 +waiting' $T/y3c.txt && grep -qE 'is still running \(session|has ended but is not recorded yet' $T/y3c.txt && ! grep -q 'deinstall' $T/y3c.txt"
-sleep 14
+sleep 32
 rc=$(DG_TEST_QUIT_AT=3.3 run $T/y3b.txt --from 3.2)
 check "installer ended unwatched -> recorded; 3.2 OK (not HALF installed); SOFTWARE in the journal" "grep -q 'had finished without error. Its result is recorded' $T/y3b.txt && grep -qE '^    3\.2 +ok' $T/y3b.txt && grep -q '|3.2|SOFTWARE|' $T/varlib/changes.log"
 # Y4 a failed duplicate: only [q] is offered, the next step is 7.2 (one Next line)
