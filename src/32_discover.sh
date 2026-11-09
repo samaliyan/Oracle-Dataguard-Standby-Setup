@@ -14,7 +14,9 @@ tde_read() {
   # answer is "no wallet", a failed query is "not known" (step 6.3 asks again and says so). Used by the discovery
   # and by 6.3, so both read the same columns (wallet_type: a LOCAL auto-login wallet opens only where it was made)
   TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0; TDE_ERR=""; WROOT_BAD=""
+  # the short query (no wallet_type) only for an old release, where the column is unknown (ORA-00904)
   if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  elif ! grep -q 'ORA-00904' <<< "$SQL_OUT"; then TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT")    # not "old release": a LOCAL wallet would look portable
   elif prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
   else TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT"); fi
   if [[ $DB_MAJOR -ge 18 ]]; then
@@ -120,7 +122,7 @@ svc_pick() {
   local list u=${PRIMARY_UNIQUE,,} d=${DB_NAME,,} x c
   list=$(grep -oE 'Service "[^"]+"' <<< "$1" | cut -d'"' -f2)
   SVC_PICK=""; SVC_WHY=""
-  SVC_PICK=$(grep -ix -- "$2" <<< "$list" | head -n 1); [[ -n "$SVC_PICK" ]] && return 0
+  SVC_PICK=$(grep -ixF -- "$2" <<< "$list" | head -n 1); [[ -n "$SVC_PICK" ]] && return 0
   while IFS= read -r x; do
     [[ -n "$x" ]] || continue
     if [[ "${x,,}" == "$u".* ]]; then SVC_PICK=$x; SVC_WHY="the unique name with a domain"; return 0; fi

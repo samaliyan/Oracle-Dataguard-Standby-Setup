@@ -114,7 +114,7 @@ steps are only checked again.
 After phase 1 has read both servers, one **summary screen** shows what was found on the primary and here,
 where each kind of file of the standby goes, the plan, the problems found now (each with what happens or
 what you do), and the values of this run, numbered: `[Enter] Start  [number] Change  [d] Details
-[e] Edit the file  [q] Quit`. A number asks only that value and saves it as the new default.
+[e] Edit the file  [h] Help  [q] Quit`. A number asks only that value and saves it as the new default.
 
 Each step shows what it found and the exact commands it will run (**Will run**, with the OS user and the
 environment), then asks `[y] Yes, do it  [a] Yes to all  [s] Skip  [h] Help  [q] Quit`. While it runs,
@@ -137,7 +137,8 @@ These open on a separate screen; closing it returns to the step as it was. While
 ### `--check`
 Runs every check and reports what is missing, without changing anything in Oracle, the OS or the primary,
 and without touching the saved progress. It still asks for the ssh and sys passwords (to read the primary).
-Start with it on a new server.
+It does not measure the network speed (that test sends 64 MB from the primary); a normal run does, before the
+copy. Start with it on a new server.
 
 ### `--primary <ip>` and `--user <name>`
 Give the primary's IP address or host name and the OS user for ssh there (default `oracle`, never `root`),
@@ -255,6 +256,11 @@ Try it once on a test standby before you need it.
 
 - **Primary is read-only.** Only whitelisted probes and `SELECT` statements go to the primary (with
   `PRIMARY_RUN=yes` also the listed Data Guard statements, each step after you answer `y`).
+  The SQL guard checks the script's own statements. A `glogin.sql` (or `login.sql`) on the primary runs at
+  every sqlplus login and belongs to the DBA there.
+- **Oracle Net encryption is not checked.** The RMAN copy and the redo go over Oracle Net as your site set it
+  up. On a network you do not trust, configure native network encryption (`SQLNET.ENCRYPTION_SERVER` /
+  `SQLNET.ENCRYPTION_CLIENT` in `sqlnet.ora` on both servers) or TCPS before the copy.
 - **No data is erased without proof.** A disk is used only after it is shown to be empty and not shared with
   the primary. A check that times out counts as "no". The clean-up of a failed copy first proves that this
   is the standby (host name, address, the running instance's `db_unique_name` and role) and asks for the
@@ -283,7 +289,7 @@ dg_standby_setup.sh   the ready-to-use script (built from src/)
 src/                  source, split by phase; build.sh joins them in a fixed order
 build.sh              rebuilds dg_standby_setup.sh from src/
 CHANGELOG.md          what changed in each version
-.github/workflows/    makes the release of each new version by itself (script, checksum, notes)
+.github/workflows/    CI on every push (ci.yml) and the release of each new version (release.yml)
 test/                 scenario tests against mock Oracle, ssh, installers and OS tools
 docs/DESIGN.md        design notes
 ```
@@ -301,6 +307,11 @@ a disk that is not empty, a failed duplicate, undo, and a check that no changing
 ./build.sh
 cd test && ./run_scenarios.sh
 ```
+
+The suite can also run in parts: `./run_scenarios.sh --list-parts` shows them, `--part 3` runs one, and
+`--sections A,Q` runs only the named sections. GitHub Actions (`.github/workflows/ci.yml`) runs shellcheck,
+the build check (`bash -n`, and the committed script must match the build of `src/`), every part as its own job, and
+sections A and Q on Oracle Linux 7 (bash 4.2) in a container.
 
 The mocks are not real Oracle. Before using the script in production, run `--check` on the real servers
 and read what it reports.

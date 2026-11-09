@@ -95,6 +95,9 @@ health_main() {
   umask 077
   exec 7>&1
   MODE=check; PROBE_TIMEOUT=120
+  # one statement may take at most 60 seconds here (not the 600 of a setup run), so a run with a hung sqlplus
+  # still ends well within the 300 seconds a monitoring agent allows; DG_SQL_TIMEOUT, when set, is kept
+  [[ -n "${DG_SQL_TIMEOUT:-}" ]] || SQL_TIMEOUT=60
   # the logs of --health: 14 days, and never more than the newest 500 (a run every few minutes)
   find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -mtime +14 -delete 2>/dev/null
   find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +501 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --
@@ -149,10 +152,15 @@ health_main() {
   local -a again=()
   for c in "${checks[@]}"; do IFS='|' read -r id title fn <<< "$c"; health_run_check "$id" "$title" "$fn"; done
   # a short gap, a log or two behind, a lag peak: often gone within a minute. Those checks are done once more
-  # after 60 seconds before anything is reported (the patch check and NOLOGGING do not change in a minute)
-  for c in "${checks[@]:0:4}"; do
+  # after 60 seconds before anything is reported (the patch check and NOLOGGING do not change in a minute).
+  # Also once more: 10.8 when it failed, and any check that could not read (a dropped connection, a busy view);
+  # but not the checks that need the primary when there is no ssh connection to it at all (that stays so)
+  for c in "${checks[@]}"; do
     IFS='|' read -r id title fn <<< "$c"
-    [[ "${HEALTH_STATE[$id]}" == CRITICAL || "${HEALTH_STATE[$id]}" == WARNING ]] && again+=("$c")
+    case "$id:${HEALTH_STATE[$id]}" in
+      10.[1-4]:CRITICAL|10.[1-4]:WARNING|10.8:CRITICAL) again+=("$c") ;;
+      *:UNKNOWN) [[ $HEALTH_SSH_OPEN -eq 1 || ! "$id" =~ ^10\.[356]$ ]] && again+=("$c") ;;
+    esac
   done
   if [[ ${#again[@]} -gt 0 ]]; then
     printf '\n(checked once more in 60 seconds:%s)\n' "$(for c in "${again[@]}"; do printf ' %s' "${c%%|*}"; done)" >> "$HEALTH_LOG"
@@ -173,5 +181,9 @@ health_report() {
     health_out "$(printf '  %-9s %-5s %s' "${HEALTH_STATE[$id]}" "$([[ "$id" == 0.0 ]] || printf '%s' "$id")" "${HEALTH_TEXT[$id]}")"
   done
   [[ -n "$HEALTH_SSH_ERR" ]] && health_out "  Note: $HEALTH_SSH_ERR. The checks that need the primary were not done. See:  $SELF --help-step health"
+  # what the boot unit (step 9.7) reported at its start in this boot: a note, not a state (it stays in the journal
+  # until the next start of the unit, also after the problem was fixed; 0.0 and 10.4 show the effect itself)
+  local berr; berr=$(boot_errors_now 2>/dev/null)
+  [[ -n "$berr" ]] && health_out "  Note: at its start in this boot, $(unit_name) reported: $(head -n 1 <<< "$berr")$([[ $(grep -c . <<< "$berr") -gt 1 ]] && printf ' (and more)'). See:  journalctl -p err -u $(unit_name) -b"
   return 0
 }

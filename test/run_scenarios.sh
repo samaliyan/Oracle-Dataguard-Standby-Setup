@@ -18,7 +18,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -74,8 +74,98 @@ cmds_whitelisted() {
 }
 safe_primary() { cmds_whitelisted && ! nonselect_on_primary; }
 no_secrets() { ! grep -rqE 'Welcome_123|Asm_Pass123|Oracle_os1' $T/log/ "$T/varlib" 2>/dev/null; }
+full_ok() { # $1 output
+  [[ $(grep -cE '^    [0-9.]+ +(skipped|failed, skipped|to do|UNKNOWN) ' "$1") -eq 0 ]] && grep -q 'Standby setup is complete' "$1" && safe_primary && no_secrets
+}
+combo() { # $1 tag, then env assignments for setup; runs empty server to the end
+  local tag=$1; shift
+  ( export "$@"; bash $TD/setup_env.sh empty >/dev/null )
+  ( export "$@"; run $T/r_$tag.txt ) >/dev/null
+}
+
+ut_lsnr_host_esc() { # step 3.9's listener.ora HOST fix, taken from the script: prints "<escaped old host>|<3 results>"
+  # (no Oracle needed; runs on bash 4.2 too: section A)
+  local d esc line cmd L39_BADHOST=old.example.com STANDBY_HOST=stby01 L39_LORA besc
+  d=$(mktemp -d); L39_LORA=$d/listener.ora
+  esc=$(grep -o "sed 's#\[\]\[[^']*'" $T/dg_standby_setup.sh | head -n 1)
+  line=$(grep -o "cp_add grid \"sed -i -E 's/(HOST.*" $T/dg_standby_setup.sh | head -n 1); line=${line#cp_add grid }; line=${line% ;;}
+  besc=$(printf '%s' "$L39_BADHOST" | eval "$esc")
+  printf '%s\n' 'L1 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = old.example.com)(PORT = 1521)))' \
+    'L2 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = oldxexample.com)(PORT = 1522)))' \
+    'L3 = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = old.example.com.x)(PORT = 1523)))' > $L39_LORA
+  eval "cmd=$line"
+  [[ -n "$esc" && -n "$line" ]] && bash -c "$cmd" >/dev/null 2>&1
+  printf '%s|%s|%s|%s\n' "$besc" "$(grep -c '(HOST = stby01)(PORT = 1521)' $L39_LORA)" "$(grep -c '(HOST = oldxexample.com)' $L39_LORA)" "$(grep -c '(HOST = old.example.com.x)' $L39_LORA)"
+  rm -rf "$d"
+}
+#==============================================================================
+# Parts: the suite can be run in parts, e.g. one part per CI job (.github/workflows/ci.yml).
+#   run_scenarios.sh                    every section, in order
+#   run_scenarios.sh --part 3           the sections of part 3 (DG_PART=3 does the same)
+#   run_scenarios.sh --sections A,Q     only these sections (DG_SECTIONS=A,Q)
+#   run_scenarios.sh --list-parts       the parts and their sections
+# Every section is in exactly one part; a part starts from a fresh mock environment, so its first
+# section must not need what an earlier section left behind (B, C and D share one, so they stay together).
+# A new section needs "if part KEY; then ... fi" around it and its KEY in PARTS, or every run fails.
+PARTS=(
+  [1]="A B C D E F G H I J K"
+  [2]="L M N O Q Z4 Z11"
+  [3]="P Z5 Z17 Z19 5.24"
+  [4]="R Z16 Z21"
+  [5]="S Z1 Z15"
+  [6]="T U V Z3 5.22"
+  [7]="W X Z6 Z20"
+  [8]="Y Z7 Z10 Z18"
+  [9]="Z8 Z9 Z14"
+  [10]="Z12 Z13"
+  [11]="5.23"
+)
+SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --part) SEL_PART=${2:-}; shift 2 || shift ;;
+    --part=*) SEL_PART=${1#*=}; shift ;;
+    --sections) SEL_SECTIONS=${2:-}; shift 2 || shift ;;
+    --sections=*) SEL_SECTIONS=${1#*=}; shift ;;
+    --list-parts) LIST_PARTS=1; shift ;;
+    *) echo "usage: $0 [--part N | --sections A,B,... | --list-parts]" >&2; exit 2 ;;
+  esac
+done
+SEL_SECTIONS=${SEL_SECTIONS//,/ }
+if [[ $LIST_PARTS == 1 ]]; then
+  for p in "${!PARTS[@]}"; do printf '%2s  %s\n' "$p" "${PARTS[$p]}"; done; exit 0
+fi
+if [[ -n "$SEL_PART" ]] && { [[ "$SEL_PART" == *[!0-9]* ]] || [[ -z "${PARTS[$SEL_PART]:-}" ]]; }; then
+  echo "no part '$SEL_PART' (parts: ${!PARTS[*]})" >&2; exit 2
+fi
+CUR=-; RAN_SECTIONS=""; PART_STARTED=""
+part() { # $1 = section key; true when the section runs in this run
+  local k=$1 p hit=""
+  for p in "${!PARTS[@]}"; do [[ " ${PARTS[$p]} " == *" $k "* ]] && hit=$p; done
+  if [[ -z "$hit" ]]; then
+    CUR=$k; fail "section $k is in no part of PARTS in run_scenarios.sh (CI would never run it)"
+    [[ -z "$SEL_PART$SEL_SECTIONS" ]] || return 1
+  elif [[ -n "$SEL_SECTIONS" ]]; then [[ " $SEL_SECTIONS " == *" $k "* ]] || return 1
+  elif [[ -n "$SEL_PART" ]]; then [[ "$hit" == "$SEL_PART" ]] || return 1
+  fi
+  # a part on its own starts from a fresh mock environment (the full run has one from the section before)
+  if [[ -n "$SEL_PART$SEL_SECTIONS" && -z "$PART_STARTED" ]]; then PART_STARTED=1; fresh; fi
+  RAN_SECTIONS+=" $k"
+  printf -- '-- section %s starts %ds into this run\n' "$k" "$SECONDS"
+}
+parts_done() { # every section that should have run did run (a key in PARTS with no section is a typo)
+  local p k want=""
+  if [[ -n "$SEL_SECTIONS" ]]; then want=$SEL_SECTIONS
+  elif [[ -n "$SEL_PART" ]]; then want=${PARTS[$SEL_PART]}
+  else for p in "${!PARTS[@]}"; do want+=" ${PARTS[$p]}"; done; fi
+  CUR=parts
+  for k in $want; do [[ " $RAN_SECTIONS " == *" $k "* ]] || fail "section $k (in PARTS or asked for) does not exist or did not run"; done
+  [[ -n "$SEL_PART$SEL_SECTIONS" ]] && echo "This run: ${SEL_PART:+part $SEL_PART, }sections:$RAN_SECTIONS"
+  true
+}
 
 #==============================================================================
+if part A; then
 CUR=A; echo "== A. readonly_guard unit tests"
 fresh
 G=$(mktemp); sed -n '/^readonly_guard()/,/^}/p' $T/dg_standby_setup.sh > "$G"; source "$G"; rm -f "$G"
@@ -104,12 +194,16 @@ out=$(bash -c "fatal(){ echo FATAL:\$*; exit 1; }; run_logged(){ echo RUN; }; so
 check "prim_probe refuses an unknown probe name" "[[ '$out' == FATAL:* ]]"
 out=$(bash -c "fatal(){ echo FATAL:\$*; exit 1; }; run_logged(){ echo RUN; }; source $G; prim_probe hosts 'a\$(id)'" 2>&1); rm -f "$G"
 check "prim_probe refuses \$( ) in an argument" "[[ '$out' == FATAL:* ]]"
+ut_lsnr_host_esc > $T/ut_a_lhost.txt
+check "unit: 3.9 listener.ora HOST fix: old.example.com escaped to old\\.example\\.com; only that HOST is replaced" "[[ \$(cat $T/ut_a_lhost.txt) == 'old\\.example\\.com|1|1|1' ]]"
 
+fi
 #==============================================================================
+if part B; then
 CUR=B; echo "== B. Empty server, full run (only IP + passwords given)"
 fresh empty
 rc=$(run $T/b.txt)
-cp $T/b.txt /tmp/claude-0/sc/keep_b.txt; check "exit code 0" "[[ $rc -eq 0 ]]"
+check "exit code 0" "[[ $rc -eq 0 ]]"
 check "summary: no SKIPPED/FAILED/TODO" "! grep -qE '^    [0-9.]+ +(skipped|failed, skipped|to do|UNKNOWN)' $T/b.txt"
 check "setup complete message" "grep -q 'Standby setup is complete' $T/b.txt"
 check "primary: only whitelisted read-only commands" "cmds_whitelisted"
@@ -148,6 +242,8 @@ check "every [y] question comes after a Plan of the same step" "awk '/^  \\[[0-9
 check "/etc/hosts backup kept" "ls /etc/hosts.bak_* >/dev/null 2>&1"
 cp $T/b.txt $T/b_full.txt
 
+fi
+if part C; then
 CUR=C; echo "== C. Second run on the finished server changes nothing"
 : > $T/state/calls.log; : > $T/state/primary_cmds.log
 rc=$(run $T/c.txt)
@@ -157,6 +253,8 @@ check "second run: the summary screen, started with Enter, no settings question;
 check "no installer, no rman, no parted, no groupadd" "! grep -qE '^(gridSetup|runInstaller|rman|parted)' $T/state/calls.log"
 check "primary still safe" "safe_primary"
 
+fi
+if part D; then
 CUR=D; echo "== D. --only 10 (daily check) and --from"
 rc=$(run $T/d1.txt --only 10)
 check "--only 10 exit 0" "[[ $rc -eq 0 ]]"
@@ -168,6 +266,8 @@ rc=$(run $T/d4.txt --from 3.99); check "--from 3.99 (no such step) rejected" "[[
 rc=$(run $T/d5.txt --from 5.1 --only 10); check "--from with --only rejected" "[[ $rc -eq 2 ]] && grep -q 'not both' $T/d5.txt"
 rc=$(run $T/d6.txt --from 9.1); check "--from 9.1 does not ask the sys password, says all OK" "! grep -q 'sys password of the primary' $T/d6.txt && grep -q 'Standby setup is complete' $T/d6.txt"
 
+fi
+if part E; then
 CUR=E; echo "== E. --check on an empty server changes nothing"
 fresh empty
 rc=$(run $T/e.txt --check)
@@ -182,6 +282,8 @@ check "check mode: legend explains TODO / WAITS / PROBLEM" "grep -q 'Only .probl
 check "check mode on a new server with a healthy primary: no PROBLEM (7.6 waits for 7.2)" "! grep -qE '^    [0-9]+\.[0-9]+ +problem' $T/e.txt && grep -qE '^    7\.6 +waiting' $T/e.txt"
 check "primary safe" "safe_primary"
 
+fi
+if part F; then
 CUR=F; echo "== F. Safety stops"
 fresh; jset $P "d['host']='$(hostname -s).example.local'"
 rc=$(run $T/f1.txt)
@@ -213,6 +315,8 @@ check "wrong primary IP -> ssh fails, stop" "[[ $rc -ne 0 ]] && grep -q 'ssh con
 check "ssh's own error message is shown to the user, with the fix" "grep -q 'Connection refused' $T/f8.txt && grep -q 'systemctl enable --now sshd' $T/f8.txt"
 check "no option that old OpenSSH (OL7) rejects" "! grep -q 'accept-new' $T/dg_standby_setup.sh"
 
+fi
+if part G; then
 CUR=G; echo "== G. Installed server: fixes + manual steps"
 fresh
 rc=$(run $T/g.txt)
@@ -225,6 +329,8 @@ check "existing proddb alias accepted, standby alias added" "[[ \$(res 5.3 $T/g.
 check "no installer run (software present)" "! grep -qE '^(gridSetup|runInstaller)' $T/state/calls.log"
 check "primary safe" "safe_primary"
 
+fi
+if part H; then
 CUR=H; echo "== H. Skip, quit, help, Ctrl-C"
 fresh empty; rc=$(DG_TEST_SKIP=2.11 run $T/h1.txt)
 check "skip 2.11 -> SKIPPED, run continues to the end" "[[ \$(res 2.11 $T/h1.txt) == SKIPPED ]] && grep -q 'Phase 10 of 10' $T/h1.txt"
@@ -248,6 +354,8 @@ for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 
 done
 pass "all help ids are real steps"
 
+fi
+if part I; then
 CUR=I; echo "== I. Disks"
 fresh empty; jset $O "d['disks']['/dev/sdb']['size_mb']=50000; d['disks']['/dev/sdc']['size_mb']=60000"
 rc=$(run $T/i1.txt)
@@ -260,6 +368,8 @@ check "only one empty disk -> not enough, nothing erased" "grep -q 'Not enough e
 fresh empty; rc=$(DG_TEST_DISK_PICKS=2,1 run $T/i4.txt)
 check "user picks sdc for DATA -> too small refused, asks again" "grep -qE '\\+DATA needs [0-9]+ MB more. Choose more' $T/i4.txt"
 
+fi
+if part J; then
 CUR=J; echo "== J. Primary side not done by the DBA"
 fresh; rc=$(DG_TEST_NOFIX=4.3,4.8,4.10 run $T/j.txt)
 check "4.3 SKIPPED, optional 4.8 / 4.10 SKIPPED_OPTIONAL, others continue" "[[ \$(res 4.3 $T/j.txt) == SKIPPED && \$(res 4.8 $T/j.txt) == SKIPPED_OPTIONAL && \$(res 4.10 $T/j.txt) == SKIPPED_OPTIONAL && \$(res 5.1 $T/j.txt) != '' ]]"
@@ -271,6 +381,8 @@ fresh; jset $P "d['dest2_error']='ORA-16191: Primary log shipping client not log
 rc=$(DG_TEST_NOFIX=9.5 run $T/j3.txt)
 check "dest_2 error explained (password file)" "grep -q 'password files differ' $T/j3.txt"
 
+fi
+if part K; then
 CUR=K; echo "== K. Password file variants"
 fresh; jset $P "d['pwfile']='$T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwPRODDB'"
 rc=$(run $T/k1.txt)
@@ -279,6 +391,8 @@ fresh; printf 'OLDFILE\n' > $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwP
 rc=$(run $T/k2.txt)
 check "invalid existing file replaced, backup kept" "ls $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwPRODDB_STBY.bak_* >/dev/null 2>&1 && grep -q ORAPW-PRIMARY $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwPRODDB_STBY"
 
+fi
+if part L; then
 CUR=L; echo "== L. Duplicate safety"
 fresh; rc=$(DG_TEST_DUP=no run $T/l1.txt)
 check "duplicate not confirmed -> not run" "grep -q 'The copy was not started' $T/l1.txt && ! python3 -c \"import json;assert json.load(open('$S')).get('duplicated')\" 2>/dev/null"
@@ -296,6 +410,8 @@ rc=$(run $T/l4.txt)
 check "primary-only parameters remapped/cleared in RMAN script (the logs go to the standby's own disk group, not +REDO1)" "grep -q \"set db_create_online_log_dest_1='+DATA'\" $T/log/duplicate_*.rman && ! grep -q REDO1 $T/log/duplicate_*.rman && grep -q \"set log_archive_dest_state_3='defer'\" $T/log/duplicate_*.rman && grep -q \"dg_config=(PRODDB,PRODDB_STBY)\" $T/log/duplicate_*.rman"
 check "rman script has no password" "! grep -q Welcome_123 $T/log/duplicate_*.rman $T/log/duplicate_*.log"
 
+fi
+if part M; then
 CUR=M; echo "== M. Registration and apply problems"
 fresh empty; run $T/m0.txt >/dev/null
 jset $S "d['srvctl']['instance']='PRODDB'; d['srvctl']['running']=1; d['instances']['PRODDB']={'state':'mounted','srl':4}; d['instances']['PRODDB_STBY']={'state':'idle','srl':4,'datafiles':10}"
@@ -303,6 +419,8 @@ rc=$(run $T/m1.txt --from 9.1)
 check "wrong -instance detected and re-registered" "grep -q 'Registered, but these values are wrong: instance' $T/m1.txt && python3 -c \"import json;assert json.load(open('$S'))['srvctl']['instance']=='PRODDB_STBY'\""
 check "after fix exit 0" "[[ $rc -eq 0 ]]"
 
+fi
+if part N; then
 CUR=N; echo "== N. Software problems"
 fresh empty; jset $S "d['grid_prereq_fail']=1"
 rc=$(run $T/n1.txt)
@@ -330,6 +448,8 @@ fresh; jset $S "d['rooh']=1"; mkdir -p $T/u01/app/oracle/dbs; touch $T/u01/app/o
 rc=$(DG_TEST_QUIT_AT=4.1 run $T/n8.txt)
 check "read-only home already used -> not converted" "grep -q 'The script does not change such a home' $T/n8.txt && ! grep -q 'roohctl' $T/state/calls.log"
 
+fi
+if part O; then
 CUR=O; echo "== O. Settings"
 fresh; rc=$(DG_TEST_QUIT_AT=2.1 run $T/o1.txt)
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/o2.txt --primary 127.0.0.2)
@@ -343,6 +463,8 @@ fresh; jset $P "d['unique']='verylongname'"
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/o5.txt)
 check "long db_unique_name -> standby name within 12 chars" "grep -qE 'Standby names +VERYLONGN_SB, SID VERYLONGN_SB' $T/o5.txt"
 
+fi
+if part P; then
 CUR=P; echo "== P. Review fixes (noise, stale files, dest in use, multi-disk, memory, ...)"
 fresh empty; jset $P "d['login_noise']='Welcome to prim01 - authorized users only'; d['glogin_noise']='Session altered.'"
 rc=$(DG_TEST_PW=Welcome_123 DG_SYS_PASSWORD=Welcome_123 run $T/p1.txt)
@@ -387,7 +509,9 @@ rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
 fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/claude-hosts.$$; cat /etc/hosts >> /tmp/claude-hosts.$$; cp /tmp/claude-hosts.$$ /etc/hosts; rm -f /tmp/claude-hosts.$$
 rc=$(DG_TEST_QUIT_AT=2.7 run $T/p12.txt)
-check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^192\.0\.2\.2[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
+# the address the script puts in: the first non-loopback one of this machine (as in setup_env.sh)
+SIPRE=$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | grep -E '^[0-9.]+$' | head -n 1); SIPRE=${SIPRE//./\\.}
+check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^${SIPRE}[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
 fresh
 cat > $T/ed.sh <<'EOF'
 #!/bin/bash
@@ -401,6 +525,8 @@ fresh; jset $P "d['domain']='example.local'"
 rc=$(run $T/p14.txt)
 check "db_domain set -> srvctl add with -domain" "grep -q -- '-domain example.local' $T/p14.txt"
 
+fi
+if part Q; then
 CUR=Q; echo "== Q. Oracle Linux 7 (bash 4.2 mode, OpenSSH 7.4) and help after failures"
 fresh empty
 sed -i 's/^if (( BASH_VERSINFO\[0\] > 4 .*then set -u; fi$/: # bash 4.2 mode for the test: nounset off/' $T/dg_standby_setup.sh
@@ -415,15 +541,9 @@ fresh; jset $P "d['tns_stby']=1; d['tns_stby_host']='wronghost'"
 rc=$(DG_TEST_NOFIX=4.9 DG_TEST_QUIT_AT=5.1 run $T/q3.txt)
 check "primary step failure prints exact commands" "grep -q 'The entry must be:' $T/q3.txt"
 
+fi
+if part R; then
 CUR=R; echo "== R. Combinations: storage x version x owner x media x OS (full runs)"
-full_ok() { # $1 output
-  [[ $(grep -cE '^    [0-9.]+ +(skipped|failed, skipped|to do|UNKNOWN) ' "$1") -eq 0 ]] && grep -q 'Standby setup is complete' "$1" && safe_primary && no_secrets
-}
-combo() { # $1 tag, then env assignments for setup; runs empty server to the end
-  local tag=$1; shift
-  ( export "$@"; bash $TD/setup_env.sh empty >/dev/null )
-  ( export "$@"; run $T/r_$tag.txt ) >/dev/null
-}
 DGT_UNAME_OL9=5.14.0-427.el9.x86_64
 
 combo fs19 DGT_STORAGE=fs DGT_VER=19.21.0.0.0
@@ -513,6 +633,8 @@ rc=$(DG_TEST_HOMEPATH=$T/u01/app/oracle/product/19.0.0/dbhome_1 DG_TEST_QUIT_AT=
 check "home not in oratab, process not readable -> found in the inventory, not asked" "! grep -q 'Full path of the database ORACLE_HOME' $T/r_home.txt && grep -q 'ORACLE_SID=PRODDB  home=$T/u01/app/oracle/product/19.0.0/dbhome_1' $T/r_home.txt && grep -q 'Its home was found another way' $T/r_home.txt"
 
 
+fi
+if part S; then
 CUR=S; echo "== S. Audit round 1: new safety and flow checks"
 # S1 storage shared with the primary (file system): the copy is refused
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['shared_dirs']=['$T/u02/oradata/PRODDB']"
@@ -588,6 +710,8 @@ rc=$(DG_TEST_QUIT_AT=2.2 run $T/s15b.txt)
 check "... second run does not ask the ssh user" "grep -q 'ssh user on the primary: oracle' $T/s15b.txt && ! grep -q 'OS user for ssh on the primary' $T/s15b.txt"
 
 
+fi
+if part T; then
 CUR=T; echo "== T. Audit round 2"
 # T1 Grid newer than the database (Grid 19c, database 12.2): Grid media and checks use the Grid release
 ( export DGT_VER=12.2.0.1.0 DGT_MEDIA=staged DGT_OS=7; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['grid_version']='19.21.0.0.0'"
@@ -604,6 +728,8 @@ rm -rf $T/sd; rc=$(DG_SHORT_DIR=$T/sd DG_TEST_L72=m DG_TEST_QUIT_AT=8.1 run $T/t
 check "file-system cleanup of a copy the script did not start: only [m], a script file with ONE host check and the rm lines" "grep -q 'the database is incomplete' $T/t3.txt && ! grep -q '\[y\] Clean up for me' $T/t3.txt && [[ \$(grep -c 'hostname -s' $T/sd/c72) -eq 1 ]] && grep -q 'rm -f $T/u02/oradata/PRODDB/system01.dbf' $T/sd/c72"
 
 
+fi
+if part U; then
 CUR=U; echo "== U. Audit round 3"
 # U1 the same file system UUID as on primary, test file not seen: copy or the SAME disk -> not proven
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'"
@@ -654,6 +780,8 @@ jset $O "d['disks']['/dev/vdb']={'mnt':'/u02','size_mb':102400,'wwn':'0x5000c500
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/u8.txt)
 check "local disk WWN is under a file system of the primary -> not accepted" "! grep -qE '^    2\.15 +ok' $T/u8.txt && grep -q 'is also under a file system of the primary' $T/u8.txt"
 
+fi
+if part V; then
 CUR=V; echo "== V. Audit round 4"
 # V1 the terminal is closed during the duplicate, the copy ends, then the server is rebooted: the result still counts
 fresh; jset $T/state/env.json "d['rman_sleep']=6"
@@ -709,6 +837,8 @@ echo "$lead|unzip v7.zip|$T/log/v7job.log||$(cat /proc/sys/kernel/random/boot_id
 rc=$(DG_TEST_QUIT_AT=1.2 run $T/v7.txt)
 check "leader gone, program left -> [c] offered, [w] waits for the session" "grep -q '\\[c\\] Continue without it' $T/v7.txt && grep -q 'has ended with exit code' $T/v7.txt && ! pgrep -f '^sleep 8$' >/dev/null"
 
+fi
+if part W; then
 CUR=W; echo "== W. Field report 1 (check mode on a real server)"
 # W1 software installed here, no instance yet: check mode shows no PROBLEM for 1.4 / 4.2 / 7.6
 fresh; jset $S "d['instances']={}"
@@ -723,6 +853,8 @@ fresh; jset $S "d['instances']={'PRODDB_STBY':{'state':'started'}}"; jset $P "d[
 rc=$(DG_TEST_NOFIX=4.9 DG_TEST_QUIT_AT=7.7 run $T/w3.txt --from 7.6)
 check "login from primary fails -> ORA-12154 and its explanation, not only SP2-0640" "grep -q 'sys@proddb_stby failed (ORA-12154' $T/w3.txt && grep -q 'The alias is missing in tnsnames.ora' $T/w3.txt"
 
+fi
+if part X; then
 CUR=X; echo "== X. Pass 1 of the final review (flow, questions, rollback, Oracle, OS)"
 # X1 a full run: no [y] question for 1.2/1.3/1.5, the progress board, the end hints, the journal
 fresh empty
@@ -846,6 +978,8 @@ rc=$(run $T/x22b.txt --check)
 check "--check on a built standby: 2.15 is OK (proven before the copy), not WAITS" "grep -qE '^    2\.15 +ok' $T/x22b.txt"
 
 
+fi
+if part Y; then
 CUR=Y; echo "== Y. Pass 2 of the final review"
 # Y1 the phase-4 box answered with r: steps are DONE_BY_YOU and the primary commands are in the journal with their undo
 fresh; rc=$(DG_TEST_BATCH=r run $T/y1.txt --only 4)
@@ -856,13 +990,15 @@ check "--show-changes 4.3 shows the primary command and its undo" "grep -q 'PRIM
 fresh empty; rc=$(DG_TEST_P4FIRST=4 DG_TEST_QUIT_AT=2.1 run $T/y2.txt)
 check "[4] at the end of phase 1: phase 4 runs before phase 2" "[[ \$(grep -n 'Phase 4 of 10' $T/y2.txt | head -n 1 | cut -d: -f1) -lt \$(grep -n 'Phase 2 of 10' $T/y2.txt | head -n 1 | cut -d: -f1) ]]"
 # Y3 the terminal is closed during the Grid installer: --status and --check see the running job; the next run records the result
-fresh empty; jset $T/state/env.json "d['installer_sleep']=12"
+# (the installer runs 90 s: it starts in the middle of y3a, and --status and --check must still see it
+# running afterwards, also on a fast machine; y3b waits until it has ended)
+fresh empty; jset $T/state/env.json "d['installer_sleep']=90"
 rc=$(DG_TEST_HUP_ON_JOB='Grid installer' run $T/y3a.txt)
 rc=$(run $T/y3s.txt --status)
 check "--status during the installer: 'Running now' with the job" "grep -q 'Running now: Grid installer' $T/y3s.txt"
 rc=$(run $T/y3c.txt --check)
 check "--check during the installer: phase 3 and later WAITS, no clean-up plan" "grep -qE '^    3\.2 +waiting' $T/y3c.txt && grep -qE 'is still running \(session|has ended but is not recorded yet' $T/y3c.txt && ! grep -q 'deinstall' $T/y3c.txt"
-sleep 14
+for _ in $(seq 150); do pgrep -u grid >/dev/null || break; sleep 1; done   # the installer runs as grid
 rc=$(DG_TEST_QUIT_AT=3.3 run $T/y3b.txt --from 3.2)
 check "installer ended unwatched -> recorded; 3.2 OK (not HALF installed); SOFTWARE in the journal" "grep -q 'had finished without error. Its result is recorded' $T/y3b.txt && grep -qE '^    3\.2 +ok' $T/y3b.txt && grep -q '|3.2|SOFTWARE|' $T/varlib/changes.log"
 # Y4 a failed duplicate: only [q] is offered, the next step is 7.2 (one Next line)
@@ -900,7 +1036,9 @@ check "LOCAL auto-login wallet: not copied, made here with orapki -auto_login_lo
 fresh; rc=$(DG_TEST_DUP= DG_TEST_QUIT_AT=9.1 run $T/y11.txt)
 check "Enter at DUPLICATE asks again (does not skip the copy)" "grep -q 'Nothing was typed. Type DUPLICATE' $T/y11.txt"
 
+fi
 #==============================================================================
+if part Z1; then
 CUR=Z; echo "== Z. External review fixes (5.1 - 5.10)"
 fresh
 G=$(mktemp); { sed -n '/^v_name()/p;/^v_path()/p' $T/dg_standby_setup.sh; sed -n '/^valid_value()/,/^}/p' $T/dg_standby_setup.sh; } > "$G"
@@ -918,6 +1056,8 @@ sed -i 's/^STANDBY_SID=.*/STANDBY_SID=/; s/^STANDBY_TNS=.*/STANDBY_TNS=/' $T/var
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/z2.txt --settings)
 check "empty STANDBY_SID / STANDBY_TNS in the settings are derived again" "! grep -q 'Invalid value' $T/z2.txt && grep -q '^STANDBY_SID=PRODDB_STBY$' $T/varlib/settings.conf"
 
+fi
+if part Z3; then  CUR=Z
 # ---- 5.3: the script fixes what is safe on this server itself ----
 # oratab line with another home -> corrected, Y/N kept
 fresh; printf 'PRODDB_STBY:/u01/other/home:Y\n' >> /etc/oratab
@@ -944,17 +1084,23 @@ fresh; jset $S "d['instances']['PRODDB_STBY']={'state':'idle'}; d['asm_leftovers
 rc=$(DG_TEST_L72=k DG_TEST_QUIT_AT=7.3 run $T/z8.txt --from 6.1)
 check "leftovers kept with k -> nothing removed, existing_files_ok recorded" "[[ -f $T/varlib/existing_files_ok ]] && ! python3 -c \"import json;assert json.load(open('$S')).get('asm_removed')\" 2>/dev/null"
 
+fi
+if part Z4; then  CUR=Z
 # ---- 5.4: the database installer waits for the inventory (field report: INS-32035 / INS-32039) ----
 fresh; rm -f /etc/oraInst.loc $T/varlib/db_install.done
 sed -i '\#dbhome_1#d' $T/u01/app/oraInventory/ContentsXML/inventory.xml
 rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/z9.txt --from 3.6)
 check "no /etc/oraInst.loc with Grid -> 3.6 waits for the Grid root scripts, installer not started" "grep -q '/etc/oraInst.loc is missing' $T/z9.txt && ! grep -q 'runInstaller user=' $T/state/calls.log"
 
+fi
+if part Z5; then  CUR=Z
 # ---- 5.5: a sys password with @ / $ is accepted (it travels in double quotes, through stdin) ----
 fresh; jset $T/state/env.json "d['pw']='Pass@word/1\$x'"
 rc=$(DG_TEST_PW='Pass@word/1$x' DG_TEST_QUIT_AT=2.1 run $T/z10.txt)
 check "sys password with @ / \$ accepted and working" "grep -q 'The sys password works on the primary' $T/z10.txt && ! grep -q 'Pass@word' $T/log/run_*.log"
 
+fi
+if part Z6; then  CUR=Z
 # ---- 5.6: memory of the standby against SGA + PGA of the primary (step 2.16, and again before the copy) ----
 fresh
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/z11.txt)
@@ -973,6 +1119,8 @@ fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/z15.txt)
 check "2.16: memory_max_target bigger than /dev/shm -> made bigger by the script (remount + fstab, other options kept)" "grep -q '/dev/shm is too small' $T/z15.txt && grep -q 'mount -o remount,size=9728m /dev/shm' $T/z15.txt && grep -qE '^    2\.16 +done' $T/z15.txt && grep -qE '^tmpfs +/dev/shm +tmpfs +defaults,nodev,size=9728m' $T/fstab && grep -q '^/dev/mapper/ol-root' $T/fstab && ls $T/fstab.bak_* >/dev/null 2>&1"
 
+fi
+if part Z7; then  CUR=Z
 # 5.7: the host key of the primary is shown and must be confirmed before the password is typed
 fresh
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/z16.txt)
@@ -1027,6 +1175,8 @@ EOF
 }
 check "p_param refuses a name that is not a plain parameter name (nothing sent)" "[[ \$(ut_pparam) == FATAL ]]"
 
+fi
+if part Z8; then  CUR=Z
 # 5.8: checks that passed when they should not
 fresh; printf 'grid  soft  nofile  4096\ngrid  hard  nofile  70000\n' > /etc/security/limits.d/oracle-grid.conf
 rc=$(DG_TEST_QUIT_AT=2.5 run $T/z26.txt)
@@ -1110,6 +1260,8 @@ check "9.8: the clean-up timer must be running, and its last run must not have f
 fresh; rc=$(DG_TEST_QUIT_AT=1.3 run $T/z35.txt --from 10.0)
 check "--from 10.0 is the same as --from 10" "! grep -q 'There is no step 10.0' $T/z35.txt"
 
+fi
+if part Z9; then  CUR=Z
 # 5.9
 fresh; jset $P "d['mem']={'sga_target':'0','sga_max_size':'0','memory_target':'0','memory_max_target':'0','pga_aggregate_target':str(256*1024**2),'use_large_pages':'TRUE','db_recovery_file_dest_size':'0'}; d['sgainfo']=7*1024**3"
 rc=$(DG_TEST_QUIT_AT=3.1 run $T/z36.txt)
@@ -1155,6 +1307,8 @@ mkdir -p $T/u01/app/oraInventory/logs; echo old > $T/u01/app/oraInventory/logs/G
 rc=$(DG_TEST_QUIT_AT=3.3 run $T/z41.txt)
 check "3.2: leftover inventory of a failed Grid run -> moved aside (nothing deleted), Grid installs, no INS-32035" "grep -q 'no Oracle home is registered in it' $T/z41.txt && ls -d $T/u01/app/oraInventory.old_* >/dev/null 2>&1 && [[ -f \$(ls -d $T/u01/app/oraInventory.old_* | head -n 1)/logs/GridSetupActions.log ]] && ! grep -qF '[INS-32035]' $T/z41.txt && grep -q 'Successfully Setup Software' $T/log/Grid_installer_*.log"
 
+fi
+if part Z10; then  CUR=Z
 # 5.10: fewer questions
 fresh
 rc=$(DG_TEST_QUIT_AT=4.1 run $T/z42.txt --yes)
@@ -1183,6 +1337,8 @@ EOF
 }
 check "5.1: of two SID_LIST blocks of one listener, the last one counts (as in Oracle)" "[[ \$(ut_sidlast) == '(SID_LIST=(SID_DESC=(SID_NAME=NEW)))' ]]"
 
+fi
+if part Z11; then  CUR=Z
 # 5.11: start menu and parts (--only os, grid, db, primary, A-B)
 fresh empty
 rc=$(DG_TEST_MENU=3 run $T/z46.txt)
@@ -1202,6 +1358,8 @@ check "menu 12 then q: shows the status again and stops without running a step (
 rc1=$(run $T/z52a.txt --only 3.6-3.1); rc2=$(run $T/z52b.txt --only 3.99); rc3=$(run $T/z52c.txt --only grid --from 3.1)
 check "--only: a reversed range, an unknown step, or --only with --from are refused (exit 2)" "[[ $rc1 -eq 2 && $rc2 -eq 2 && $rc3 -eq 2 ]]"
 
+fi
+if part Z12; then  CUR=Z
 # 5.12: a step that could not check is never OK; persistence of /dev/shm; 9.1 rollback; threads; ranges
 ut_goon() { bash <<EOF
 source <(sed -n '/^step_num()/p;/^go_on_cmd()/,/^}/p' $T/dg_standby_setup.sh)
@@ -1270,6 +1428,8 @@ fresh; jset $P "d['ssh_users']=d.get('ssh_users',['oracle'])+['dgcheck']; d['pro
 rc=$(run $T/z64.txt --only 4 --user dgcheck)
 check "4.11: another ssh user that cannot read oracle's .bash_profile -> 'cannot be checked', never OK (read-only probe)" "grep -q 'Cannot be checked: the ssh user dgcheck cannot read' $T/z64.txt && [[ \$(res 4.11 $T/z64.txt) != OK ]] && cmds_whitelisted"
 
+fi
+if part Z13; then  CUR=Z
 # 5.13: sixth external review
 ut_513() { bash <<EOF
 source <(sed -n '/^norm()/p;/^sidlist_of()/,/^}/p;/^sqlnet_wallet_replaced()/,/^}/p;/^sid_desc_block()/,/^}/p;/^sidlist_insert()/,/^}/p;/^num()/p;/^hugepages_kb()/,/^}/p;/^lim_min()/,/^}/p;/^lim_enough()/,/^}/p' $T/dg_standby_setup.sh)
@@ -1361,6 +1521,8 @@ rc=$(DG_TEST_QUIT_AT=2.1 run $T/z84.txt)
 check "an inventory this server already has (/etc/oraInst.loc) is the one used, not the primary's path" "grep -q 'inventory: this server uses $T/u01/app/otherInventory' $T/log/run_*.log"
 rm -f /etc/oraInst.loc
 
+fi
+if part Z14; then  CUR=Z
 # 5.14: seventh external review
 ut_514() { bash <<EOF
 source <(sed -n '/^norm()/p;/^num()/p;/^sidlist_of()/,/^}/p;/^sid_desc_block()/,/^}/p;/^sidlist_replace()/,/^}/p;/^tns_block()/,/^}/p;/^tns_replace()/,/^}/p;/^sqlnet_wallet_replaced()/,/^}/p;/^hugepages_kb()/,/^}/p;/^lim_min()/,/^}/p;/^lim_enough()/,/^}/p;/^dg_union()/,/^}/p;/^ru_root()/,/^}/p' $T/dg_standby_setup.sh)
@@ -1489,6 +1651,8 @@ fresh; sed -i 's|(HOST = prim01)|(HOST = wronghost)|' $T/u01/app/oracle/product/
 rc=$(DG_TEST_QUIT_AT=6.1 run $T/z107.txt)
 check "5.3: an existing alias with a wrong host -> replaced (backup kept), not a manual edit" "[[ \$(res 5.3 $T/z107.txt) == DONE ]] && grep -q '(HOST = prim01)' $T/u01/app/oracle/product/19.0.0/dbhome_1/network/admin/tnsnames.ora && ! grep -q wronghost $T/u01/app/oracle/product/19.0.0/dbhome_1/network/admin/tnsnames.ora && ls $T/u01/app/oracle/product/19.0.0/dbhome_1/network/admin/tnsnames.ora.bak_* >/dev/null"
 
+fi
+if part Z15; then  CUR=Z
 # 5.15: eighth external review
 ut_515() { bash <<EOF
 source <(sed -n '/^num()/p;/^v_path()/p;/^ru_root()/,/^}/p;/^ru_ids()/,/^}/p;/^ru_matches_primary()/,/^}/p;/^hugepages_kb()/,/^}/p;/^lim_min()/,/^}/p;/^lim_enough()/,/^}/p' $T/dg_standby_setup.sh)
@@ -1538,6 +1702,8 @@ jset $P "d['dg_names']=['DATAC1','RECOC1']"
 rc=$(run $T/z118.txt --only 4.6 --check)
 check "4.6: the Exadata-style RECOC1 is taken for the recovery area" "grep -q \"db_recovery_file_dest='+RECOC1'\" $T/z118.txt"
 
+fi
+if part Z16; then  CUR=Z
 # 5.16: ninth external review
 fresh; jset $O "d['nft_ruleset']='table inet f {\n chain input {\n  type filter hook input priority 0; policy accept;\n  jump sub\n }\n chain sub {\n  tcp dport 1521 reject\n }\n}'"
 rc=$(run $T/z120.txt --only 2.9)
@@ -1556,6 +1722,8 @@ fresh; jset $P "d['pwfile']=''; d['exists_fail']=['$T/u01/app/oracle/product/19.
 rc=$(DG_TEST_QUIT_AT=6.2 run $T/z124.txt)
 check "6.1: the primary does not answer whether its password file is there -> not called missing" "grep -q 'Cannot tell whether .*orapwPRODDB is on the primary' $T/z124.txt && ! grep -q 'The password file of the primary was not found' $T/z124.txt"
 
+fi
+if part Z17; then  CUR=Z
 # 5.17: tenth external review
 fresh; jset $P "d['tde_fail']=1; d['tde']=['FILE|$T/pwallet/|OPEN']"
 rc=$(DG_TEST_QUIT_AT=7.1 run $T/z130.txt)
@@ -1579,6 +1747,8 @@ EOF
 fresh; ut_517 > $T/ut_517.txt
 check "unit: firewall note shows drop/reject rules and a drop policy, not accept rules or 'ct state invalid drop'" "[[ \$(cat $T/ut_517.txt) == 1010 ]]"
 
+fi
+if part Z18; then  CUR=Z
 # 5.18: eleventh external review
 fresh empty; rc=$(run $T/z140a.txt)
 printf "*.audit_file_dest='/srv/dgt518/aud'\n" >> $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfilePRODDB_STBY.ora
@@ -1632,6 +1802,8 @@ EOF
 }
 fresh; ut_518b > $T/ut_518b.txt
 check "unit: below a folder another user owns, folders are made as their owner (never by root); one the owner cannot make is said, nothing made" "[[ \$(cat $T/ut_518b.txt) == 'oracle:oinstall none said oracle' ]]"
+fi
+if part Z19; then  CUR=Z
 # final audit
 fresh empty; rc=$(run $T/z150a.txt)
 jset $S "d['instances']['PRODDB_STBY']['no_ms']=1"
@@ -1640,6 +1812,8 @@ check "9.4: no v\$managed_standby (newer release) -> v\$dataguard_process is use
 jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
 rc=$(run $T/z151.txt --only 9.4 --check)
 check "9.4: no v\$managed_standby and no MRP -> not OK" "[[ \$(res 9.4 $T/z151.txt) != OK ]]"
+fi
+if part Z20; then  CUR=Z
 # 5.20: new checks 10.5 and 10.6, --health, --roll-forward, section size
 fresh empty; rc=$(run $T/z200.txt)
 check "phase 10: NOLOGGING (10.5) and patch level (10.6) OK; the switchover readiness command is shown" "[[ \$(res 10.5 $T/z200.txt) == OK && \$(res 10.6 $T/z200.txt) == OK ]] && grep -q 'alter database switchover to PRODDB_STBY verify;' $T/z200.txt"
@@ -1763,6 +1937,8 @@ fresh empty; jset $P "d['max_df_mb']=70000"
 rc=$(run $T/z221a.txt --only 1); sed -i 's/^DUP_SECTION_SIZE=.*/DUP_SECTION_SIZE=0/' $T/varlib/settings.conf
 rc=$(run $T/z221.txt)
 check "DUP_SECTION_SIZE=0: no section size even for a big datafile" "ls $T/log/duplicate_*.rman >/dev/null && ! grep -q 'section size' $T/log/duplicate_*.rman"
+fi
+if part Z21; then  CUR=Z
 # 5.21: findings of the review of 5.20
 ut_521() { bash <<EOF
 ORACLE_USER=oracle GRID_USER=grid INSTALL_GROUP=oinstall PORT=1521 PRIMARY_IP=10.0.0.1 STANDBY_IP=10.0.0.2
@@ -1843,6 +2019,8 @@ check "... and the flashback reminder is shown on that path too" "grep -q 'Flash
 rc=$(DG_TEST_PSYS=10.7 run $T/z305b.txt --roll-forward)
 check "... finished when ROLLFORWARD is typed; the flashback note is in the result" "[[ \$(res 10.7 $T/z305b.txt) == DONE ]] && grep -q 'Flashback database: turn it off and on again' $T/z305b.txt && [[ ! -e $T/varlib/rollforward_pending ]]"
 jset $S "d['instances']['PRODDB_STBY']['flashback']='NO'"
+fi
+if part 5.22; then
 CUR=5.22; echo "== 5.22  Screen layout, the Grid install check before root.sh"
 G=$(mktemp); sed -n '/^ui_fold()/,/^}/p;/^ui_spaces()/p;/^warn()/,/^}/p' $T/dg_standby_setup.sh > "$G"
 out=$( _log() { :; }; source "$G"; UI=0; UI_COLS=40; WARN_LIST=(); WARN_COUNT=0; CUR_STEP=3.2; C_Y=""; C_N=""; S_WARN='!'
@@ -1886,6 +2064,8 @@ check "3.2: a home registered by a killed installer is not 'installed', even wit
 rm -f /etc/oracle/olr.loc
 rc=$(run $T/z505.txt --status)
 check "--status: every step with its result (not only the phases)" "grep -q 'Every step' $T/z505.txt && grep -qE '✔ 1.1 +Root and tools on this server +ok' $T/z505.txt && grep -qE '✔ 2.1 +Groups .* done' $T/z505.txt && grep -qE '· 3.3 +Grid root scripts +to do' $T/z505.txt"
+fi
+if part 5.23; then
 CUR=5.23; echo "== 5.23  Real-run fixes: hung instance, listener, storage, clean-up, commands"
 # a built standby once; later tests start from a copy of it (each full setup takes about a minute)
 rm -f /tmp/dgt_built523.tar
@@ -2009,7 +2189,8 @@ check "summary: a number changes only that value, it is saved as the new default
 fresh
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/u2.txt --check)
 check "--check prints the summary as a report (no question)" "grep -q 'Values of this run' $T/u2.txt && ! grep -q '\\[Enter\\] Start' $T/u2.txt"
-check "--health never shows the summary" "! grep -q 'Values of this run' $T/a6.txt"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/u2s.txt); rc=$(run $T/u2h.txt --health)   # with settings saved, so --health really runs
+check "--health never shows the summary" "grep -q 'Data Guard health check' $T/u2h.txt && ! grep -q 'Stopped:' $T/u2h.txt && ! grep -q 'Values of this run' $T/u2h.txt"
 fresh
 rc=$(DG_TEST_MENU=2 DG_TEST_QUIT_AT=2.3 run $T/u3.txt)
 check "menu: grouped (Setup / After setup / Information) with the switch of each item; 2 = check only" "grep -q 'After setup' $T/u3.txt && grep -qE 'Check only, change nothing +--check' $T/u3.txt && grep -qE 'Roll forward the standby from the primary +--roll-forward' $T/u3.txt && grep -qE '1  Mode +check only' $T/u3.txt && grep -q 'check mode does not save them' $T/u3.txt"
@@ -2048,7 +2229,123 @@ check "3.9: listener and a disk group OFFLINE -> srvctl start listener / diskgro
 fresh; jset $S "d['asm_down']=1"
 rc=$(DG_TEST_QUIT_AT=3.5 run $T/r4.txt --only 3.4)
 check "3.4: ASM not ONLINE -> srvctl start asm (Will run shows it), never crsctl start res" "grep -A4 'Will run' $T/r4.txt | grep -q 'srvctl start asm' && ! grep -q \"'start', 'res'\" $T/state/calls.log"
+fi
+if part 5.24; then
+CUR=5.24; echo "== 5.24  Review fixes: force logging modes, 8.1 pre-checks, probes, clean-up script, 10.8, TDE, escaping"
+fresh
+# ---- 4.1: the STANDBY NOLOGGING modes keep the standby complete (as in 8.1 and 10.5); NO still needs force logging ----
+jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='STANDBY NOLOGGING FOR DATA AVAILABILITY'"
+rc=$(DG_TEST_QUIT_AT=4.1 run $T/r24a.txt --only 4.1)
+check "4.1: force_logging 'STANDBY NOLOGGING FOR DATA AVAILABILITY' -> OK, no 'alter database force logging' planned" "[[ \$(res 4.1 $T/r24a.txt) == OK ]] && grep -q 'force_logging is STANDBY NOLOGGING FOR DATA AVAILABILITY' $T/r24a.txt && ! grep -qi 'alter database force logging' $T/r24a.txt"
+jset $P "d['force_logging']='NO'"
+rc=$(DG_TEST_QUIT_AT=4.1 run $T/r24b.txt --only 4.1)
+check "4.1: force_logging NO -> 'alter database force logging;' planned, not OK" "grep -q '^ *alter database force logging;' $T/r24b.txt && [[ \$(res 4.1 $T/r24b.txt) != OK ]]"
+
+# ---- 8.1 pre-checks: the spfile of the primary, force logging, the release of the software here ----
+# (each run starts at 8.1 with the instance in NOMOUNT; these checks come before the logins of 7.4)
+pre81() { jset $S "d['instances']['PRODDB_STBY']={'state':'started'}"; jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='YES'"; }
+pre81; jset $P "d['spfile']=''"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24c.txt --from 8.1)
+check "8.1: the primary answers nothing for its spfile -> stops, 'could not be read' (never taken as an spfile)" "grep -q 'The spfile setting of the primary could not be read' $T/r24c.txt && [[ \$(res 8.1 $T/r24c.txt) != OK && \$(res 8.2 $T/r24c.txt) != DONE ]]"
+pre81; jset $P "d['spfile']='ORA-03113: end-of-file on communication channel'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24d.txt --from 8.1)
+check "8.1: the spfile query on the primary fails (ORA-03113) -> stops, 'could not be read'" "grep -q 'The spfile setting of the primary could not be read' $T/r24d.txt && grep -q 'ORA-03113' $T/r24d.txt && [[ \$(res 8.1 $T/r24d.txt) != OK ]]"
+pre81; jset $P "del d['spfile']; d['force_logging']='NO'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24e.txt --from 8.1)
+check "8.1: force logging switched off after 4.1 passed -> stops and shows 'alter database force logging;'" "grep -q 'FORCE LOGGING is off on the primary (force_logging = NO, step 4.1)' $T/r24e.txt && grep -q 'On the primary:  alter database force logging;' $T/r24e.txt && [[ \$(res 8.1 $T/r24e.txt) != OK ]]"
+pre81; jset $T/state/env.json "d['local_version']='21.3.0.0.0'"
+rc=$(DG_TEST_QUIT_AT=8.2 run $T/r24f.txt --from 8.1)
+jset $T/state/env.json "d['local_version']='19.21.0.0.0'"
+check "8.1: the database software here is another release than the primary -> stops, step 3.11 named" "grep -q 'The database software here is another release: release 21.0 here, release 19 on the primary' $T/r24f.txt && grep -q 'same release as the primary (step 3.11)' $T/r24f.txt && [[ \$(res 8.1 $T/r24f.txt) != OK ]]"
+
+# ---- 4.4: a log_archive_dest_1 that already ships to the standby alias is used, no second destination ----
+fresh; jset $P "d['log_mode']='ARCHIVELOG'; d['force_logging']='YES'; d['params']['log_archive_dest_1']='service=proddb_stby async valid_for=(online_logfiles,primary_role)'"
+rc=$(DG_TEST_QUIT_AT=4.4 run $T/r24g.txt --only 4.4)
+check "4.4: log_archive_dest_1 already names the standby alias -> that one is used, no log_archive_dest_2 planned" "grep -q 'log_archive_dest_1 already names the alias proddb_stby, so it is used' $T/r24g.txt && grep -q \"log_archive_dest_1='service=proddb_stby async\" $T/r24g.txt && ! grep -qE 'log_archive_dest(_state)?_2=' $T/r24g.txt"
+
+# ---- a channel number with a leading zero is an invalid value, never a bash error ----
+# (the settings saved by the runs above; the summary rejects the value on Enter, then q: the driver would press Enter for ever)
+sed -i 's/^PRIMARY_CHANNELS=.*/PRIMARY_CHANNELS=08/' $T/varlib/settings.conf
+rc=$(DG_TEST_SUMMARY=' ,q' run $T/r24i.txt --only 4.1)
+check "settings PRIMARY_CHANNELS=08 -> the invalid-value message, no 'value too great for base'" "grep -q 'PRIMARY_CHANNELS must be a number from 1 to 64' $T/r24i.txt && ! grep -q 'value too great for base' $T/r24i.txt && ! grep -qs 'value too great for base' $T/log/run_*.log"
+
+# ---- --check sends no 64 MB network measure to the primary ----
+fresh empty
+rc=$(run $T/r24h.txt --check)
+check "--check on an empty server: no 'dd if=/dev/zero' sent to the primary, 'not measured in check mode' said" "[[ -s $T/state/primary_cmds.log ]] && ! grep -q 'dd if=/dev/zero' $T/state/primary_cmds.log && grep -q 'not measured in check mode' $T/r24h.txt"
+
+# ---- login noise on the primary that looks like a probe marker ----
+fresh empty; jset $P "d['login_noise']='__DG_PROBE_deadbeef__'"
+rc=$(DG_TEST_QUIT_AT=2.1 run $T/r24j.txt)
+check "login noise like a marker (__DG_PROBE_deadbeef__) does not break reading the primary: 1.3 done, primary host read" "[[ \$(res 1.3 $T/r24j.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'Primary host: prim01[[:space:]]*\$' $T/r24j.txt && ! grep -q '__DG_PROBE_deadbeef__' $T/varlib/settings.conf"
+
+# ---- srv_notfound: the name is a literal (+ and . are no regex characters) ----
+ut_524_srv() { bash <<EOF
+source <(sed -n '/^srv_notfound()/,/^}/p' $T/dg_standby_setup.sh)
+RUN_OUT="PRCN-2044 : No listener exists ... 
+PRCR-1001 : Resource ora.lsnr+x.lsnr does not exist"; srv_notfound 'lsnr+x' && echo p1
+RUN_OUT="PRCN-2065 : Listener lsnr+x does not exist"; srv_notfound 'lsnr+x' && echo p2
+RUN_OUT="PRCN-2065 : Listener lsnrrx does not exist"; srv_notfound 'lsnr+x' && echo p3
+RUN_OUT="PRCD-1120 : The resource for database axb could not be found."; srv_notfound 'a.b' && echo p4
+RUN_OUT="PRCD-1120 : The resource for database a.b could not be found."; srv_notfound 'a.b' && echo p5
+EOF
+}
+ut_524_srv > $T/ut524s.txt
+check "unit: srv_notfound with '+' in the name: found for lsnr+x (ora.lsnr+x.lsnr, listener lsnr+x), not for lsnrrx" "grep -qx p1 $T/ut524s.txt && grep -qx p2 $T/ut524s.txt && ! grep -qx p3 $T/ut524s.txt"
+check "unit: srv_notfound 'a.b' does not match 'axb' (and does match a.b)" "! grep -qx p4 $T/ut524s.txt && grep -qx p5 $T/ut524s.txt"
+
+# ---- 3.9: the old HOST of listener.ora as a literal in the sed fix ----
+ut_lsnr_host_esc > $T/ut524h.txt
+check "unit: 3.9 listener.ora HOST fix: old.example.com escaped to old\\.example\\.com; only that HOST is replaced" "[[ \$(cat $T/ut524h.txt) == 'old\\.example\\.com|1|1|1' ]]"
+
+# ---- 6.3: a LOCAL auto-login wallet made on another host is on this server already ----
+fresh; jset $P "d['tde']=['FILE|$T/pwallet/|OPEN|LOCAL_AUTOLOGIN']; d['files']={'$T/pwallet/ewallet.p12':'EWALLET\\n','$T/pwallet/cwallet.sso':'LOCALSSO\\n'}"
+mkdir -p $T/pwallet; printf 'EWALLET\n' > $T/pwallet/ewallet.p12; touch -d '-1 hour' $T/pwallet/ewallet.p12; printf 'LOCALSSO foreign\n' > $T/pwallet/cwallet.sso
+chown -R oracle:oinstall $T/pwallet; chmod 700 $T/pwallet; chmod 600 $T/pwallet/*
+rc=$(DG_TEST_QUIT_AT=7.1 run $T/r24k.txt --from 6.1)
+check "6.3: a foreign LOCAL cwallet.sso here -> 'not usable here' (orapki cannot open it), moved aside as cwallet.sso.old_*, made again with -auto_login_local" "grep -q 'Not usable here' $T/r24k.txt && grep -q 'orapki cannot open it without a password' $T/r24k.txt && grep -q 'LOCALSSO foreign' $T/pwallet/cwallet.sso.old_* && grep -q 'MOCK-ORAPKI -auto_login_local' $T/pwallet/cwallet.sso && [[ \$(res 6.3 $T/r24k.txt) == DONE ]]"
+
+# ---- the nightly clean-up script (needs the oracle user: after the installed server above) refuses a deletion policy that is not TO APPLIED ON STANDBY ----
+ut_524_arch() { # $1 = the policy line the fake rman prints; prints the exit code of the script, then its output
+  local d=$T/ut524arch; rm -rf $d; mkdir -p $d/bin; chmod 755 $d $d/bin
+  printf '%s\n' "$1" > $d/pol; : > $d/del.log; chown oracle $d/del.log
+  cat > $d/bin/rman <<EOF
+#!/bin/bash
+in=\$(cat)
+if grep -q 'show archivelog deletion policy' <<< "\$in"; then
+  echo 'RMAN configuration parameters for database with db_unique_name PRODDB_STBY are:'; cat $d/pol
+else echo "DELETE RAN as \$(id -un): \$in" >> $d/del.log; echo 'deleted archived log'; fi
+EOF
+  chmod 755 $d/bin/rman
+  bash -c "source <(sed -n '/^arch_days()/p; /^arch_script_text()/,/^}/p' $T/dg_standby_setup.sh); STANDBY_UNIQUE=PRODDB_STBY STANDBY_SID=PRODDB_STBY ORACLE_USER=oracle DB_HOME=$d ARCH_CLEANUP_DAYS=1; arch_script_text" > $d/s.sh
+  chmod 755 $d/s.sh
+  local out rc=0; out=$($d/s.sh 2>&1) || rc=$?
+  printf '%s\n%s\n' "$rc" "$out"
+}
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DEVICE TYPE DISK;')
+printf '%s\n' "$o" > $T/ut524a.txt
+check "clean-up script: policy '... APPLIED ON ALL STANDBY BACKED UP 1 TIMES ...' -> refuses (exit not 0), prints the policy, deletes nothing" "[[ \$(head -n 1 $T/ut524a.txt) != 0 ]] && grep -q 'the deletion policy is not TO APPLIED ON STANDBY: nothing deleted' $T/ut524a.txt && grep -q 'BACKED UP 1 TIMES TO DEVICE TYPE DISK' $T/ut524a.txt && [[ ! -s $T/ut524arch/del.log ]]"
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;')
+printf '%s\n' "$o" > $T/ut524b.txt
+check "clean-up script: policy '... TO APPLIED ON ALL STANDBY;' -> the delete runs (as oracle), exit 0" "[[ \$(head -n 1 $T/ut524b.txt) == 0 ]] && grep -q 'DELETE RAN as oracle:' $T/ut524arch/del.log && grep -q \"delete noprompt archivelog all completed before 'sysdate-1'\" $T/ut524arch/del.log && grep -q '=== end (exit code 0) ===' $T/ut524b.txt"
+rm -rf $T/ut524arch
+
+# ---- 10.8 on a built standby: no clean-up chosen; the free space of the recovery area's disk group unreadable ----
+fresh empty; rc=$(run $T/r24l0.txt)
+check "a standby built from an empty server (base for the 10.8 tests)" "grep -q 'Standby setup is complete' $T/r24l0.txt"
+sed -i 's/^ARCH_CLEANUP=.*/ARCH_CLEANUP=/' $T/varlib/settings.conf
+rc=$(run $T/r24l.txt --only 10.8)
+check "10.8: ARCH_CLEANUP empty -> not OK (waiting: nothing deletes applied logs)" "grep -q 'Clean-up: not chosen yet (ARCH_CLEANUP is empty)' $T/r24l.txt && [[ \$(res 10.8 $T/r24l.txt) == WAITS ]]"
+rc=$(run $T/r24m.txt --health)
+check "--health: ARCH_CLEANUP empty -> 10.8 WARNING" "grep -qE 'WARNING +10\\.8' $T/r24m.txt"
+sed -i 's/^ARCH_CLEANUP=.*/ARCH_CLEANUP=timer/' $T/varlib/settings.conf
+jset $S "d['dg_free_total']='ORA-15001: diskgroup \"FRA\" does not exist or is not mounted'"
+rc=$(run $T/r24n.txt --only 10.8)
+check "10.8: recovery area in ASM, the disk group's free space query fails -> cannot check, not OK" "grep -q 'Cannot read the free space of disk group +FRA (recovery area +FRA)' $T/r24n.txt && [[ \$(res 10.8 $T/r24n.txt) != OK && \$(res 10.8 $T/r24n.txt) != WAITS ]]"
+jset $S "del d['dg_free_total']"
+fi
+parts_done
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
-for f in "${FAILED[@]}"; do echo "  - $f"; done
+for f in ${FAILED[@]+"${FAILED[@]}"}; do echo "  - $f"; done   # bash 4.2: an empty array is "unbound" under set -u
 [[ $FAILN -eq 0 ]]

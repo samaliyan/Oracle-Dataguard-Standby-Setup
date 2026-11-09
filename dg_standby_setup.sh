@@ -17,7 +17,9 @@
 #      (cat, id, stat, ls, md5sum, date, orabase, lsnrctl status, tnsping, sqlplus).
 #    * SQL sent to primary must be a single-line SELECT (readonly_guard).
 #    * Changes needed on primary are only PRINTED; you run them, the script
-#      checks them again with SELECT.
+#      checks them again with SELECT. Only with PRIMARY_RUN=yes in the settings
+#      may a primary step run its statements over ssh, from a fixed list
+#      (Data Guard parameters, force logging, standby logs), after you answer y.
 #    * The only process that works against primary is RMAN active duplicate
 #      (reads datafiles, normal log switches) after a typed confirmation.
 #==============================================================================
@@ -31,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.23"
+readonly SCRIPT_VERSION="5.24"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -347,6 +349,19 @@ This script asks questions. Run it in an interactive terminal, for example:  ssh
   done
 }
 
+ask_value() {
+  # $1 question: a free-text value (a host or a user name). A lone l or d is a screen key at every question,
+  # never the value: on the screen layout it opens the list or the details, else it asks again with a hint
+  while true; do
+    ask "$1"
+    case "${ANSWER,,}" in
+      l) if [[ $UI -eq 1 ]]; then ui_list; else say "l and d are screen keys, not values. Type the whole name."; fi ;;
+      d) if [[ $UI -eq 1 ]]; then ui_details "${CUR_STEP:-}"; else say "l and d are screen keys, not values. Type the whole name."; fi ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 ask_default() {
   # $1 question, $2 default. Result in ANSWER (default when Enter).
   ask "$1 [$2]"
@@ -413,7 +428,7 @@ distid_for() {
   elif [[ ${OS_MAJOR:-0} -ge 8 && -z "${RU_DIR:-}" ]]; then printf 'CV_ASSUME_DISTID=OEL7.8'; fi
   return 0
 }
-ORATMP_WARNED=0
+ORATMP_WARNED=""      # the causes already said (nodir, bad): each one once, a second cause is still said
 oracle_tmp() {
   # The Oracle installers run programs from their temporary folder. When /tmp is mounted noexec (hardened
   # servers) they fail, so a folder next to the inventory is used instead (root-owned, sticky, like /tmp).
@@ -430,12 +445,12 @@ oracle_tmp() {
 build_envs() {
   local oh gh dx=() gx=() v t
   t=$(oracle_tmp); [[ -n "$t" ]] && { dx+=("TMP=$t" "TMPDIR=$t"); gx+=("TMP=$t" "TMPDIR=$t"); }
-  # /tmp is noexec and no folder for the installers could be used (its parent is made by step 2.5): said once
-  if [[ -z "$t" && "$MODE" == "run" && $ORATMP_WARNED -eq 0 && ${HEALTH:-0} -eq 0 ]] \
+  # /tmp is noexec and no folder for the installers could be used (its parent is made by step 2.5): said once per cause
+  local tp tcause=bad; tp="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")"; [[ -d "$tp" ]] || tcause=nodir
+  if [[ -z "$t" && "$MODE" == "run" && " $ORATMP_WARNED " != *" $tcause "* && ${HEALTH:-0} -eq 0 ]] \
      && findmnt -n -o OPTIONS --target /tmp 2>/dev/null | tr ',' '\n' | grep -qx noexec; then
-    local tp; tp="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")"
-    ORATMP_WARNED=1
-    if [[ ! -d "$tp" ]]; then
+    ORATMP_WARNED+=" $tcause"
+    if [[ $tcause == nodir ]]; then
       warn "/tmp does not allow programs to run (noexec), and $tp does not exist yet (step 2.5 makes it)."$'\n'"Until then the Oracle installers would fail. Run phase 2 first."
     else
       warn "/tmp does not allow programs to run (noexec), and no folder for the installers could be made or used in $tp"$'\n'"($tp/dg_tmp must be a folder of root, mode 1777; the inventory path must be a plain path). The Oracle installers"$'\n'"may fail. Check:  ls -ld $tp $tp/dg_tmp"
@@ -903,9 +918,11 @@ srv_notfound() {
   # $1 the name asked for, $2 an extra code that means "not found" (optional). True only when the srvctl output
   # in RUN_OUT says that this resource is not registered: its own codes, or "could not be found" / "does not
   # exist" on a line that names it (any other failure, such as CRS down or a missing file, is no such answer)
-  local n=${1,,}
-  [[ "$n" =~ ^[a-z0-9_.$#-]+$ ]] || return 1
-  n=${n//./\\.}; n=${n//\$/\\$}
+  # (the pattern in a variable: written in [[ ]], bash would expand its $# and drop the characters)
+  local n=${1,,} re='^[a-z0-9_.$#+-]+$'
+  [[ "$n" =~ $re ]] || return 1
+  # the regex characters a name can hold (. $ +) as literals, escaped with sed (the same on bash 4.2 and 5)
+  n=$(printf '%s' "$n" | sed 's#[.$+]#\\&#g')
   [[ -n "${2:-}" ]] && grep -qE "$2" <<< "$RUN_OUT" && return 0
   # the name as the resource it is (database x, listener x, ora.x.db), never a path that only contains it, on the
   # line of the code or the message (a PRCR-1001 about another resource is no answer about this one)
@@ -1847,7 +1864,8 @@ cp_exec() {
   if [[ "${CP_ROLE[$i]}" == file ]]; then
     say "${C_D}Writing ${CP_CMD[$i]}${C_N}"
     local f=${CP_CMD[$i]}
-    install -d -m 755 -- "$(dirname "$f")" || { RUN_OUT="cannot make the folder of $f"; return 1; }
+    # only a missing folder is made: install -d would also reset the mode of one that exists
+    [[ -d "$(dirname "$f")" ]] || install -d -m 755 -- "$(dirname "$f")" || { RUN_OUT="cannot make the folder of $f"; return 1; }
     backup_file "$f" || { RUN_OUT="cannot keep a backup of $f"; return 1; }
     if printf '%s\n' "${CP_IN[$i]}" | write_as root "$f" "${CP_TO[$i]}"; then rc=0; RUN_OUT=""; else rc=1; RUN_OUT="cannot write $f"; fi
     command -v restorecon >/dev/null 2>&1 && restorecon "$f" 2>/dev/null
@@ -1865,13 +1883,14 @@ cp_exec() {
   CLEANUP_FILES+=("$tmp")
   if [[ -n "${CP_IN[$i]}" ]]; then
     # the input reaches the command through a pipe (printf is a builtin): never in an argument or a file
-    printf '%s\n' "${CP_IN[$i]}" | cp_role_run "${CP_ROLE[$i]}" timeout "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 || rc=$?
+    printf '%s\n' "${CP_IN[$i]}" | cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 || rc=$?
   else
-    cp_role_run "${CP_ROLE[$i]}" timeout "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 < /dev/null || rc=$?
+    cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 < /dev/null || rc=$?
   fi
   RUN_OUT=$(cat -- "$tmp"); rm -f -- "$tmp"
   # sqlplus ends with 0 also after an error: an ORA- or SP2- line in its output is a failure
-  [[ $rc -eq 0 && "$first" == sqlplus* ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
+  # (sqlplus by name or by a full path that ends in /sqlplus)
+  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
   { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
   return "$rc"
 }
@@ -1911,7 +1930,9 @@ short_script() {
   local name=$1 f
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   if [[ ! -d "$SHORT_DIR" ]]; then ( umask 077; mkdir -p -- "$SHORT_DIR" ) || return 1; fi
-  [[ ! -L "$SHORT_DIR" && "$(stat -c '%U' -- "$SHORT_DIR")" == root ]] || return 1
+  # root's own folder that nobody else can write (else another user could swap the file before it runs)
+  local own mode; read -r own mode <<< "$(stat -c '%U %a' -- "$SHORT_DIR" 2>/dev/null)"
+  [[ ! -L "$SHORT_DIR" && "$own" == root && "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 8#022) == 0 )) || return 1
   f="$SHORT_DIR/$name"
   rm -f -- "$f"
   ( umask 077; set -C
@@ -1920,7 +1941,7 @@ short_script() {
       printf 'set -x\n'
       cat
     } > "$f" ) || return 1
-  chmod 700 -- "$f"
+  chmod 700 -- "$f" || return 1
   printf '%s' "$f"
 }
 cp_script_text() {
@@ -2538,8 +2559,8 @@ ui_job_done() {
 
 # ---- the summary screen of step 1.4: on its own page, the question at its bottom ----
 ui_summary_ask() {
-  local -a L=(); local n h i f
-  f=$(mktemp) || { ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit"; return 0; }
+  local -a L=(); local n h i f mine=0
+  f=$(mktemp) || { ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"; return 0; }
   CLEANUP_FILES+=("$f")
   h=$((UI_ROWS - 4))
   summary_text > "$f"; mapfile -t L < <(ui_fold "      " < "$f")
@@ -2548,16 +2569,17 @@ ui_summary_ask() {
   rm -f -- "$f"
   n=${#L[@]}
   ui_live_clear
-  [[ $UI_ALT -eq 0 ]] && printf '\e[?1049h'
+  # UI_ALT=1: an interrupt (Ctrl-C) at this question then also leaves the separate screen
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
   printf '\e[r\e[H\e[2J %sSummary of this run%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s) -> standby of $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
   for ((i = 0; i < n && i < h - 1; i++)); do printf '%s\n' "${L[$i]}"; done
   [[ $n -ge $h ]] && printf ' %s%s %d more lines: d shows them%s\n' "$C_D" "$S_WAIT" $((n - h + 1)) "$C_N"
   [[ -n "${SUM_NOTE:-}" ]] && printf '\e[%d;1H\e[2K    %s%s %s%s' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${SUM_NOTE:0:$((UI_COLS - 8))}" "$C_N"
   SUM_NOTE=""
-  printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit" "$C_N" "$S_END"
+  printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit" "$C_N" "$S_END"
   ANSWER=""; IFS= read -r ANSWER < "$PROMPT_IN" || ANSWER=q
   _log ASK "[1.4] summary -> ${ANSWER:-Enter}"
-  [[ $UI_ALT -eq 0 ]] && printf '\e[?1049l'
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
   ui_header; ui_region
   return 0
 }
@@ -3251,7 +3273,8 @@ load_settings() {
   # Parses $SETTINGS_FILE. $1 = soft: problems are returned in LOAD_ERR (rc 1) instead of stopping.
   # Keys of the 3.x settings file are converted (GRID_ZIP, DB_ZIP) or dropped; unknown keys are dropped.
   local soft=${1:-} line key val spec t
-  LOAD_ERR=""; DROPPED_KEYS=""
+  # these describe the file read now: a second read (after an edit) must not keep the notes of the first
+  LOAD_ERR=""; DROPPED_KEYS=""; SETTINGS_UPGRADED=0; PLACEMENT_KEPT=0
   [[ -f "$SETTINGS_FILE" ]] || { LOAD_ERR="$SETTINGS_FILE is missing"; return 1; }
   if ! settings_file_safe "$SETTINGS_FILE"; then
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
@@ -3423,8 +3446,9 @@ validate_settings() {
   [[ ${#STANDBY_SID} -le 12 ]] || { bad "STANDBY_SID '$STANDBY_SID' is longer than 12 characters."; bad_n=1; }
   [[ "$STANDBY_SID" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { bad "STANDBY_SID must start with a letter and use only letters, digits and _."; bad_n=1; }
   [[ ${#STANDBY_UNIQUE} -le 30 ]] || { bad "STANDBY_UNIQUE is longer than 30 characters."; bad_n=1; }
-  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 64 ]] || { bad "AUX_CHANNELS must be a number from 1 to 64."; bad_n=1; }
-  [[ -z "$PRIMARY_CHANNELS" || ( "$PRIMARY_CHANNELS" -ge 1 && "$PRIMARY_CHANNELS" -le 64 ) ]] || { bad "PRIMARY_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  # the pattern first (no leading 0): a value like 08 would otherwise print a bash error
+  [[ "$AUX_CHANNELS" =~ ^[1-9][0-9]?$ ]] && (( 10#$AUX_CHANNELS >= 1 && 10#$AUX_CHANNELS <= 64 )) || { bad "AUX_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  [[ -z "$PRIMARY_CHANNELS" ]] || { [[ "$PRIMARY_CHANNELS" =~ ^[1-9][0-9]?$ ]] && (( 10#$PRIMARY_CHANNELS >= 1 && 10#$PRIMARY_CHANNELS <= 64 )); } || { bad "PRIMARY_CHANNELS must be a number from 1 to 64."; bad_n=1; }
   if [[ "$ARCH_CLEANUP" == oracle && "$(arch_dest_sb 2>/dev/null)" != USE_DB_RECOVERY_FILE_DEST ]]; then bad "ARCH_CLEANUP=oracle works only when the archived logs go to the recovery area. Here they go to $(arch_dest_sb 2>/dev/null). Use timer or crontab."; bad_n=1; fi
   if [[ "$DATA_DEST" == +* || "$FRA_DEST" == +* ]] && ! use_grid; then bad "DATA_DEST or FRA_DEST names a disk group, but this standby has no ASM (the primary uses none)."; bad_n=1; fi
   [[ -z "$RU_DIR" || -d "$RU_DIR" ]] || { bad "RU_DIR $RU_DIR is not a folder."; bad_n=1; }
@@ -3643,6 +3667,8 @@ net_speed_read() {
   # 64 MB of zeros from the primary to this server over the ssh connection (the primary reads and writes no
   # file: dd from /dev/zero to its output). A rough lower bound for the copy (RMAN uses SQL*Net, not ssh).
   [[ -n "$NET_MBS" ]] && return 0
+  # not in --check: it only reports, and 64 MB is load on the primary nobody asked for
+  [[ "${MODE:-}" == check ]] && return 1
   ssh_alive || return 1
   local t0 t1 rc=0 ms
   t0=$(date +%s%N)
@@ -3660,12 +3686,12 @@ copy_minutes() {
   local rate=100
   if num "${NET_MBS:-}"; then
     rate=$NET_MBS; [[ "${1:-hi}" == hi ]] && rate=$(( NET_MBS * 2 / 3 ))
-    local cap=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt $cap ]] && rate=$cap
+    local cap=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt $cap ]] && rate=$cap
     [[ $rate -lt 1 ]] && rate=1
-  elif [[ "${1:-hi}" == lo ]]; then rate=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
+  elif [[ "${1:-hi}" == lo ]]; then rate=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
   printf '%s' $(( ${PRIMARY_DB_MB:-0} / rate / 60 + 1 ))
 }
-copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured'; }
+copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured%s' "$([[ "${MODE:-}" == check ]] && printf ' in check mode')"; }
 fra_estimate_mb() {
   # the archived logs of the time the copy takes (the copy restores them into the recovery area to recover
   # the new standby), one day more for the standby itself, plus 30 %; at least 10 GB, in whole GB.
@@ -3719,13 +3745,20 @@ chan_suggest() {
   [[ $p -gt $a ]] && p=$a
   printf '%s %s' "$p" "$a"
 }
-prim_channels() { local p=${PRIMARY_CHANNELS:-}; [[ -n "$p" ]] || p=${AUX_CHANNELS:-4}; [[ $p -gt ${AUX_CHANNELS:-4} ]] && p=${AUX_CHANNELS:-4}; printf '%s' "$p"; }
+# a channel count as a plain number: a value that is not 1..64 (08, abc, empty) gives $2 instead. The summary
+# and the copy plan use the counts before the settings are checked; raw "08" would be a bash error there.
+chan_n() { if [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 64 )); then printf '%s' $((10#$1)); else printf '%s' "$2"; fi; }
+prim_channels() {
+  local a p; a=$(chan_n "${AUX_CHANNELS:-}" 4); p=$(chan_n "${PRIMARY_CHANNELS:-}" "$a")
+  [[ $p -gt $a ]] && p=$a
+  printf '%s' "$p"
+}
 
 # ---- the RMAN parts that place the files (one source for the copy, and later for a restore) ----
 rman_channel_lines() {
   local i out=""
   for ((i = 1; i <= $(prim_channels); i++)); do out+="  allocate channel p$i device type disk;"$'\n'; done
-  for ((i = 1; i <= AUX_CHANNELS; i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
+  for ((i = 1; i <= $(chan_n "${AUX_CHANNELS:-}" 4); i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
   printf '%s' "$out"
 }
 place_newname_lines() {
@@ -3769,6 +3802,9 @@ ask_channels() {
       k) return 0 ;;
       s) return 1 ;;
       c) ask_default "Channels on the primary (1-64)" "$sp"; p=$ANSWER
+         # checked before any arithmetic: 08, 1.5 or a word would stop bash itself
+         [[ "$p" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 )) || { say "Use a number from 1 to 64."; continue; }
+         p=$((10#$p))
          ask_default "Channels on this server ($p-64, not fewer than on the primary)" "$(( sa > p ? sa : p ))"; a=$ANSWER
          if [[ "$p" =~ ^[0-9]{1,2}$ && "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 && 10#$a >= 10#$p && 10#$a <= 64 )); then
            PRIMARY_CHANNELS=$((10#$p)); AUX_CHANNELS=$((10#$a)); save_settings
@@ -3795,14 +3831,19 @@ v_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) && "$1" !
 
 ssh_alive() {
   [[ -n "$SSH_CTL" && -e "$SSH_CTL" ]] || return 1
-  ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -O check "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
+  # a deadline: a hung (for example stopped) master must not block every check
+  local rc=0
+  timeout 10 ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -O check "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 124 ]] && _log INFO "the ssh control master does not answer (10 s)"
+  return $rc
 }
 
 prim_ssh() {
   # $1 = remote command built by prim_probe / prim_sql only. stdin is passed through.
   # A stuck remote command (a hung NFS path, a wedged listener) ends after PROBE_TIMEOUT seconds (exit 124).
   # ControlMaster=no: a ControlMaster setting in root's ~/.ssh/config must not turn this call into a new master
-  timeout --foreground "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
+  # -k 30: an ssh that ignores the TERM is killed 30 s later
+  timeout --foreground -k 30 "${PROBE_TIMEOUT:-300}" ssh -o ControlMaster=no -o ControlPath="$SSH_CTL" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "$1"
 }
 PROBE_TIMEOUT=300
 
@@ -3867,7 +3908,9 @@ prim_probe() {
   # A marker line separates our output from anything a login script on primary prints;
   # stderr goes to the log only, never into the parsed output.
   local out err rc=0
-  err=$(mktemp); CLEANUP_FILES+=("$err")
+  # no temporary file (/tmp full or read-only): say that, not an ssh problem
+  err=$(mktemp) || { RUN_OUT=""; PROBE_TIMED_OUT=0; PROBE_REACHED=0; PROBE_ERR="cannot create a temporary file in ${TMPDIR:-/tmp} (full or read-only?)"; _log WARN "primary check $p not run: $PROBE_ERR"; return 1; }
+  CLEANUP_FILES+=("$err")
   # a stuck remote command (a hung NFS path, a wedged listener) must not stop the script for ever
   out=$(prim_ssh "echo $PROBE_MARK; $cmd" < /dev/null 2>"$err") || rc=$?
   PROBE_TIMED_OUT=0; PROBE_ERR=""; PROBE_REACHED=0
@@ -3876,12 +3919,15 @@ Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
   { printf '%s\n' "$out"; printf -- '--- stderr ---\n'; cat "$err"; printf '(exit code %s)\n' "$rc"; } | log_block "PRIMARY probe $p: $cmd"
   PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
   rm -f "$err"
-  # PROBE_REACHED: the command ran on the primary (the marker came back); else ssh itself failed
-  if [[ "$out" == *"$PROBE_MARK"* ]]; then RUN_OUT=${out#*"$PROBE_MARK"}; RUN_OUT=${RUN_OUT#$'\n'}; PROBE_REACHED=1
+  # PROBE_REACHED: the command ran on the primary (the marker came back on a line of its own); else ssh itself failed
+  local nl=$'\n'"$out"$'\n'
+  if [[ "$nl" == *$'\n'"$PROBE_MARK"$'\n'* ]]; then RUN_OUT=${nl#*$'\n'"$PROBE_MARK"$'\n'}; RUN_OUT=${RUN_OUT%$'\n'}; PROBE_REACHED=1
   else RUN_OUT=""; PROBE_REACHED=0; [[ $rc -eq 0 ]] && rc=1; fi
   return $rc
 }
-readonly PROBE_MARK="__DG_PROBE_OUTPUT__"
+# new for every run: a login script on the primary cannot print it by chance (or on purpose)
+PROBE_MARK="__DG_PROBE_$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc '0-9a-f')${RANDOM}${RANDOM}__"
+readonly PROBE_MARK
 PROBE_TIMED_OUT=0; PROBE_ERR=""
 
 prim_scp() {
@@ -4126,7 +4172,12 @@ EOF
     bad "Host key not accepted. Nothing was sent to $PRIMARY_IP. If the values differ, another machine may answer for this address."
     return 1
   fi
-  ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"
+  if ! { ( umask 077; cat -- "$tmp" >> "$KH_FILE" ) && chmod 600 "$KH_FILE"; }; then
+    rm -f -- "$tmp"
+    bad "The host key could not be saved in $KH_FILE (is the file system full or read-only?). Nothing was sent to $PRIMARY_IP."
+    _log SSH "host key of $look accepted, but saving it in $KH_FILE failed"
+    return 1
+  fi
   rm -f -- "$tmp"
   _log SSH "host key of $look accepted by the admin: $(printf '%s' "$fps" | tr '\n' ' ')"
   return 0
@@ -4180,7 +4231,9 @@ tde_read() {
   # answer is "no wallet", a failed query is "not known" (step 6.3 asks again and says so). Used by the discovery
   # and by 6.3, so both read the same columns (wallet_type: a LOCAL auto-login wallet opens only where it was made)
   TDE_INFO=""; WALLET_ROOT=""; TDE_CONFIG=""; TDE_UNREAD=0; TDE_ERR=""; WROOT_BAD=""
+  # the short query (no wallet_type) only for an old release, where the column is unknown (ORA-00904)
   if prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status||'|'||nvl(wallet_type,'-') from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
+  elif ! grep -q 'ORA-00904' <<< "$SQL_OUT"; then TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT")    # not "old release": a LOCAL wallet would look portable
   elif prim_sql "select wrl_type||'|'||nvl(wrl_parameter,'-')||'|'||status from v\$encryption_wallet;"; then TDE_INFO=$SQL_OUT
   else TDE_UNREAD=1; TDE_ERR=$(ora_errors "$SQL_OUT"); fi
   if [[ $DB_MAJOR -ge 18 ]]; then
@@ -4286,7 +4339,7 @@ svc_pick() {
   local list u=${PRIMARY_UNIQUE,,} d=${DB_NAME,,} x c
   list=$(grep -oE 'Service "[^"]+"' <<< "$1" | cut -d'"' -f2)
   SVC_PICK=""; SVC_WHY=""
-  SVC_PICK=$(grep -ix -- "$2" <<< "$list" | head -n 1); [[ -n "$SVC_PICK" ]] && return 0
+  SVC_PICK=$(grep -ixF -- "$2" <<< "$list" | head -n 1); [[ -n "$SVC_PICK" ]] && return 0
   while IFS= read -r x; do
     [[ -n "$x" ]] || continue
     if [[ "${x,,}" == "$u".* ]]; then SVC_PICK=$x; SVC_WHY="the unique name with a domain"; return 0; fi
@@ -4667,7 +4720,7 @@ _sql_exec() {
   tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) || { SQL_OUT="SP2-0000: cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
   printf 'set define off echo off\n%s\n%s\nprompt %s\n%s\nexit\n' "$connect" "$SQL_HEADER" "$SQL_MARK" "$sql" \
-    | "$runner" timeout "$tmo" "$home/bin/sqlplus" -S /nolog > "$tmp" 2>&1 || rc=$?
+    | "$runner" timeout -k 30 "$tmo" "$home/bin/sqlplus" -S /nolog > "$tmp" 2>&1 || rc=$?
   out=$(cat "$tmp"); rm -f -- "$tmp"
   [[ $rc -eq 124 ]] && out+=$'\n'"SP2-0000: sqlplus did not answer within $tmo seconds (stopped)"
   { printf 'SQL> %s\n' "$sql" | sed '2,$s/^/     /'; printf '%s\n(exit code %s)\n' "$out" "$rc"; } | log_block "$title"
@@ -4906,7 +4959,7 @@ d_1_4() {
     [[ $SETTINGS_ACCEPTED -eq 1 || ( -z "${SETTINGS_DIFF:-}" && $SETTINGS_UPGRADED -eq 0 && -f "$ACCEPTED_FILE" ) ]] && was_ok=1
     while true; do
       summary_values
-      if [[ $UI -eq 1 ]]; then ui_summary_ask; else summary_show; ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit"; fi
+      if [[ $UI -eq 1 ]]; then ui_summary_ask; else summary_show; ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"; fi
       local a=${ANSWER//[[:space:]]/}; a=${a,,}
       case "$a" in
         "") if ! validate_settings >/dev/null 2>&1; then
@@ -4925,7 +4978,7 @@ d_1_4() {
         h)  show_help 1.4 || true ;;
         q)  user_stop "Stopped by you" ;;
         e)  SUMMARY_DONE=1; L14_EDIT=1; break ;;          # the file in an editor: the way below
-        *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))"; changed_any=1
+        *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))" && changed_any=1
             else sum_note "Type a number from 1 to ${#SV_ID[@]}, d, e or q, or press Enter to start."; fi ;;
       esac
     done
@@ -5106,7 +5159,7 @@ build_envs_if_possible() { users_ok && build_envs; return 0; }
 #------------------------------------------------------------------------------
 # The summary screen (step 1.4): what was found on the primary and on this server, where the standby goes, the plan,
 # the problems found now, and the values of this run, numbered. Shown on every setup run after phase 1 read both
-# servers:  [Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit
+# servers:  [Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit
 # A number asks only that value (the same checks as --settings), saves it as the new default and draws the screen
 # again. --check prints the same screen as a report (no question); --health never shows it.
 # Kept as LOG_DIR/summary_<run>.txt.
@@ -5115,9 +5168,11 @@ SUM_FACTS_READ=0; SUM_LOGMODE=""; SUM_FORCELOG=""; SUM_FLASHBACK=""; SUM_SRL="";
 summary_facts() {
   # read-only, once per run: what phase 4 will check on the primary, for the summary
   [[ $SUM_FACTS_READ -eq 1 ]] && return 0
-  SUM_FACTS_READ=1
+  # marked as read only after the first query worked: a failed read is tried again at the next summary
   ssh_alive || return 0
-  if prim_sql "select log_mode||'|'||force_logging||'|'||flashback_on from v\$database;"; then IFS='|' read -r SUM_LOGMODE SUM_FORCELOG SUM_FLASHBACK <<< "$(first_line)"; fi
+  prim_sql "select log_mode||'|'||force_logging||'|'||flashback_on from v\$database;" || return 0
+  SUM_FACTS_READ=1
+  IFS='|' read -r SUM_LOGMODE SUM_FORCELOG SUM_FLASHBACK <<< "$(first_line)"
   prim_sql "select count(*) from v\$standby_log;" && num "$(first_line)" && SUM_SRL=$(first_line)
   if [[ "$PRIMARY_CDB" == YES ]] && prim_sql "select count(*) from v\$pdbs where name<>'PDB\$SEED';"; then num "$(first_line)" && SUM_PDBS=$(first_line); fi
   prim_sql "select upper(value) from v\$parameter where name='dg_broker_start';" && SUM_BROKER=$(first_line)
@@ -5142,21 +5197,21 @@ summary_problems() {
   # one problem per line: "what  ->  what happens / what you do"
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && printf 'Host name here: %s  ->  step 2.6 adds it to /etc/hosts (a backup is kept)\n' "$p"; done < <(standby_name_problems 2>/dev/null)
-  local pp prc=0; pp=$(primary_name_problems 2>/dev/null) || prc=$?
+  local pp prc=0; primary_name_problems > /dev/null 2>&1 || prc=$?; pp=$PNP_OUT
   [[ $prc -eq 0 ]] && while IFS= read -r p; do [[ -n "$p" ]] && printf 'Host name on the primary: %s  ->  step 2.7 shows the line for its /etc/hosts\n' "$p"; done <<< "$pp"
   [[ "${SUM_LOGMODE^^}" == NOARCHIVELOG ]] && printf 'The primary is in NOARCHIVELOG mode  ->  phase 4 shows the commands (it needs a restart of the primary)\n'
   [[ "${SUM_FORCELOG^^}" == NO ]] && printf 'Force logging is off on the primary  ->  phase 4 shows the command (no restart)\n'
   [[ "${STEP_RESULT[1.6]:-OK}" != OK ]] && printf 'Version or OS: %s  ->  see step 1.6\n' "${STEP_NOW[1.6]:-check step 1.6}"
   if ! grid_sw_ok 2>/dev/null && use_grid && [[ -z "$GRID_MEDIA" ]]; then printf 'No Grid installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
   if ! db_sw_ok 2>/dev/null && [[ -z "$DB_MEDIA" ]]; then printf 'No database installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
-  primary_mixed && [[ "$(place_mode)" == asm ]] && ! sum_built && printf 'The primary keeps files in folders and in ASM  ->  here all of them go to %s (value 5 changes it)\n' "$(data_dest)"
-  [[ "$(place_mode)" != asm ]] && use_grid && grid_sw_ok 2>/dev/null && [[ -n "$(fs_dirs)" ]] && ! sum_built && printf 'This server has ASM, but files go to the file system (%s)  ->  value 5 changes it\n' "$(fs_dirs | paste -sd' ' -)"
-  [[ $LSNR_ASSUMED -eq 1 ]] && printf 'No listener on the primary offers the service %s  ->  check value "Primary" (port and service were assumed)\n' "$PRIMARY_SERVICE"
+  primary_mixed && [[ "$(place_mode)" == asm ]] && ! sum_built && printf 'The primary keeps files in folders and in ASM  ->  here all of them go to %s (value 4 changes it)\n' "$(data_dest)"
+  [[ "$(place_mode)" != asm ]] && use_grid && grid_sw_ok 2>/dev/null && [[ -n "$(fs_dirs)" ]] && ! sum_built && printf 'This server has ASM, but files go to the file system (%s)  ->  values 4 and 5 change it\n' "$(fs_dirs | paste -sd' ' -)"
+  [[ $LSNR_ASSUMED -eq 1 ]] && printf 'No listener on the primary offers the service %s  ->  check PORT, LISTENER_NAME and PRIMARY_SERVICE with [e] (they were assumed)\n' "$PRIMARY_SERVICE"
   # the space for the copy: only where it can be measured now (a disk group needs Grid running here)
   if ! sum_built && { [[ -z "$(asm_dgs)" ]] || grid_sw_ok 2>/dev/null; }; then
     PRE_INFO=""; PRE_FIX=""
     if ! space_check >/dev/null 2>&1; then
-      while IFS= read -r p; do [[ "$p" == *Missing:* ]] && printf 'Space: %s  ->  make room or change values 5 and 6\n' "${p#  }"; done <<< "$PRE_FIX"
+      while IFS= read -r p; do [[ "$p" == *Missing:* ]] && printf 'Space: %s  ->  make room or change values 4 and 5\n' "${p#  }"; done <<< "$PRE_FIX"
     fi
   fi
   return 0
@@ -5274,7 +5329,7 @@ summary_show() {
 SUM_NOTE=""
 sum_note() { say "$1"; SUM_NOTE=$1; }     # a message for the summary page (shown above its question there)
 sv_change() {
-  # value number $1: asked, checked, saved as the new default
+  # value number $1: asked, checked, saved as the new default. 1 = not accepted (nothing changed)
   local id=${SV_ID[$(( $1 - 1 ))]} v a b k snap=""
   for k in $STANDBY_KEYS; do snap+="$k=${!k}"$'\n'; done
   case "$id" in
@@ -5286,17 +5341,18 @@ sv_change() {
            if [[ -z "$v" ]]; then :
            elif [[ "$v" =~ ^([1-9]|10)$ ]]; then FROM_STEP="$v.0"; FROM_SEEN=1        # a phase: from there, as menu item 8
            elif valid_step "$v" && ! on_demand "$v"; then FROM_STEP=$v; FROM_SEEN=1
+           elif names_on_demand "$v"; then sum_note "Step 10.7 runs only with --roll-forward. All steps are kept."
            elif ! parse_only "$v"; then sum_note "Not a step, range or part: $v. All steps are kept."; fi ;;
     data)  local dgl=""; use_grid && dgl=$(asm_dgs | sed 's/^/+/' | paste -sd' ' -)
            ask_default "Database files go to: a disk group (${dgl:-none here}), same (the paths of the primary), a folder, or Enter for automatic" "${DATA_DEST:-}"
            v=${ANSWER//[[:space:]]/}
-           valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 0; }
-           [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 0; }
+           valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 1; }
+           [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 1; }
            DATA_DEST=$v ;;
     fra)   ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 0; }
+           v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 1; }
            ask_default "Its size, for example 60G (Enter = estimate: $(human_mb "$(fra_estimate_mb)"))" "${FRA_SIZE:-}"
-           a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 0; }
+           a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 1; }
            FRA_DEST=$v; FRA_SIZE=${a^^} ;;
     chan)  local sp sa; read -r sp sa <<< "$(chan_suggest)"
            ask_default "Channels on the primary (1-64)" "$(prim_channels)"; a=$ANSWER
@@ -5305,10 +5361,10 @@ sv_change() {
              PRIMARY_CHANNELS=$((10#$a)); AUX_CHANNELS=$((10#$b))
            else sum_note "Use numbers from 1 to 64, and not fewer on this server than on the primary (suggested: $sp and $sa)."; return 0; fi ;;
     sect)  ask_default "Section size, for example 32G (0 = none, Enter = automatic)" "${DUP_SECTION_SIZE:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value secsize "${v^^}" || { sum_note "Use for example 32G, 0, or nothing."; return 0; }; DUP_SECTION_SIZE=${v^^} ;;
+           v=${ANSWER//[[:space:]]/}; valid_value secsize "${v^^}" || { sum_note "Use for example 32G, 0, or nothing."; return 1; }; DUP_SECTION_SIZE=${v^^} ;;
     prun)  if [[ "$PRIMARY_RUN" == yes ]]; then PRIMARY_RUN=no; else PRIMARY_RUN=yes; say "The script then offers, step by step, to run the primary commands it shows over ssh (as $PRIMARY_SSH_USER). Never a restart, a stop or a deletion."; fi ;;
     names) ask_default "db_unique_name of the standby (letters, digits, _; at most 30)" "$STANDBY_UNIQUE"
-           v=${ANSWER//[[:space:]]/}; valid_value dbname "$v" || { sum_note "Not a valid name: $v"; return 0; }
+           v=${ANSWER//[[:space:]]/}; valid_value dbname "$v" || { sum_note "Not a valid name: $v"; return 1; }
            if [[ "$v" != "$STANDBY_UNIQUE" ]]; then
              [[ "$STANDBY_SID" == "$STANDBY_UNIQUE" || "$STANDBY_SID" == "${STANDBY_UNIQUE:0:12}" ]] && STANDBY_SID=""
              [[ "$STANDBY_SERVICE" == "${STANDBY_UNIQUE}"* ]] && STANDBY_SERVICE=""
@@ -5317,27 +5373,27 @@ sv_change() {
            fi ;;
     media) ask_default "Grid installer zip(s), comma separated (Enter = keep)" "$GRID_MEDIA"; a=${ANSWER//[[:space:]]/}
            ask_default "Database installer zip(s), comma separated (Enter = keep)" "$DB_MEDIA"; b=${ANSWER//[[:space:]]/}
-           valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 0; }
+           valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 1; }
            GRID_MEDIA=$a; DB_MEDIA=$b ;;
     asm)   ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
-           v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 0; }; ASM_METHOD=$v ;;
+           v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 1; }; ASM_METHOD=$v ;;
     arch)  ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
-           v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 0; }
-           [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 0; }
-           ARCH_CLEANUP=$v
+           v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 1; }
+           [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 1; }
            if [[ "$v" == timer || "$v" == crontab ]]; then
-             ask_default "Time (HH:MM)" "$(arch_time)"; a=${ANSWER//[[:space:]]/}; valid_value hhmm "$a" && [[ -n "$a" ]] || { sum_note "Use HH:MM, for example 04:30."; return 0; }
-             ask_default "Keep applied logs this many days (0-30)" "$(arch_days)"; b=${ANSWER//[[:space:]]/}; valid_value days "$b" && [[ -n "$b" ]] || { sum_note "Use a number from 0 to 30."; return 0; }
+             ask_default "Time (HH:MM)" "$(arch_time)"; a=${ANSWER//[[:space:]]/}; valid_value hhmm "$a" && [[ -n "$a" ]] || { sum_note "Use HH:MM, for example 04:30."; return 1; }
+             ask_default "Keep applied logs this many days (0-30)" "$(arch_days)"; b=${ANSWER//[[:space:]]/}; valid_value days "$b" && [[ -n "$b" ]] || { sum_note "Use a number from 0 to 30."; return 1; }
              ARCH_CLEANUP_TIME=$a; ARCH_CLEANUP_DAYS=$b
-           fi ;;
+           fi
+           ARCH_CLEANUP=$v ;;
     lag)   ask_default "Seconds of lag that the health check accepts" "${HEALTH_LAG_MAX:-300}"
-           v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 0; }; HEALTH_LAG_MAX=$v ;;
+           v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 1; }; HEALTH_LAG_MAX=$v ;;
   esac
   if [[ "$id" != mode && "$id" != yes && "$id" != range ]]; then
     if ! validate_settings >/dev/null 2>&1; then
       sum_note "Not saved: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
       while IFS= read -r k; do [[ -n "$k" ]] && printf -v "${k%%=*}" '%s' "${k#*=}"; done <<< "$snap"     # the values from before
-      return 0
+      return 1
     fi
     save_settings; save_accepted
     _log SETTINGS "changed in the summary: ${SV_LABEL[$(( $1 - 1 ))]}"
@@ -5784,18 +5840,21 @@ standby_name_problems() {
   done
   return 0
 }
+PNP_OUT=""
 primary_name_problems() {
-  # the host name of the primary, as the primary itself resolves it (read-only probes); one problem per line.
-  # 2 = it could not be asked
+  # the host name of the primary, as the primary itself resolves it (read-only probes): the problems, one per line,
+  # in PNP_OUT. 2 = it could not be asked. Called directly, never in $( ): PRIMARY_V4S must reach the caller
+  PNP_OUT=""
   ssh_alive || return 2
   prim_probe ipv4s || return 2
   local ips h; ips=$(tr ' ' '\n' <<< "$RUN_OUT" | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u | paste -sd' ' -)
   PRIMARY_V4S=$ips
   for h in "$PRIMARY_HOST" ${PRIMARY_FQ:+"$PRIMARY_FQ"}; do
-    prim_probe hostres "$h" || return 2
+    prim_probe hostres "$h" || { PNP_OUT=""; return 2; }
     local p; p=$(name_problem "$h" "$(name_res_parse "$RUN_OUT")" "$ips")
-    [[ -n "$p" ]] && printf '%s\n' "$p"
+    [[ -n "$p" ]] && PNP_OUT+="$p"$'\n'
   done
+  PNP_OUT=${PNP_OUT%$'\n'}
   return 0
 }
 primary_hosts_line() {
@@ -5821,7 +5880,7 @@ c_2_6() {
     local why6=""; [[ -z "$ip" && "$h" == "$STANDBY_HOST" ]] && why6=$(name_problem "$h" "$(name_res_local "$h")" "")
     local fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
     if [[ -z "$ip" ]]; then
-      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known"; return 2; }
+      [[ "$want" =~ ^[0-9.]+$ ]] || { NOW="$h does not resolve, and its IP address is not known${why6:+$'\n'$why6.}"; return 2; }
       [[ "$why6" == *IPv6* || "$why6" == *"another source"* ]] && why+="$why6."$'\n'"The listener needs an IPv4 address for it (else Not All Endpoints Registered)."$'\n'
       todo+="$want    ${fq:+$fq }$h"$'\n'
     elif [[ "$want" =~ ^[0-9.]+$ && "$ip" != "$want" ]]; then
@@ -5893,12 +5952,14 @@ PRIMARY_FQ=""; PRIMARY_V4S=""
 c_2_7() {
   need_ssh || return 2
   # first the primary's own name on the primary (its listener needs it, as here)
-  local pp prc=0; pp=$(primary_name_problems) || prc=$?
+  local pp prc=0; primary_name_problems > /dev/null || prc=$?; pp=$PNP_OUT
   if [[ $prc -eq 0 && -n "$pp" ]]; then
     NOW="On the primary: ${pp//$'\n'/; }"
     PRIMARY_HOW_STEP="root  ->  shell"
-    PLAN="cp -p /etc/hosts /etc/hosts.bak_$RUN_ID
-echo '$(primary_hosts_line)' >> /etc/hosts
+    # run twice, the first backup stays and the line is not added again; a last line without its newline gets one
+    PLAN="[ -e /etc/hosts.bak_$RUN_ID ] || cp -p /etc/hosts /etc/hosts.bak_$RUN_ID
+[ -z \"\$(tail -c 1 /etc/hosts)\" ] || echo >> /etc/hosts
+grep -qxF '$(primary_hosts_line)' /etc/hosts || echo '$(primary_hosts_line)' >> /etc/hosts
 getent ahostsv4 $PRIMARY_HOST
 -- The last command must show $(primary_hosts_line | awk '{print $1}'). Then answer r."
     PLAN_UNDO="cp -p /etc/hosts.bak_$RUN_ID /etc/hosts   (on the primary)"
@@ -5960,32 +6021,43 @@ local_fw_rules() {
   # firewalld is not active: rules of nftables or iptables on this server (read-only). They are not judged here
   # (sets, maps, jumps and scopes make a sure verdict impossible): the drop and reject rules are shown, so the
   # admin can see at once whether one of them stops port $PORT. The real test is the connect from the primary.
-  local r="" rules="" myif
-  command -v nft >/dev/null 2>&1 && rules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
-  command -v iptables >/dev/null 2>&1 && rules+=$'\n'$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  local r="" nrules="" irules="" rules myif
+  command -v nft >/dev/null 2>&1 && nrules=$(nft list ruleset 2>/dev/null | awk '/hook (output|forward)/ { o = 1 } o && /^[[:space:]]*}/ { o = 0; next } !o { print }')
+  command -v iptables >/dev/null 2>&1 && irules=$(iptables -S 2>/dev/null | grep -vE '^-(P|A) (OUTPUT|FORWARD)')
+  rules=$nrules$'\n'$irules
   # (not "ct state invalid ... drop": it only drops broken packets)
-  local drops pnamed paccept pdrop
-  drops=$(grep -vE 'ct state invalid|--ctstate INVALID|state INVALID' <<< "$rules" \
-      | grep -E 'policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)' \
-      | sed 's/^[[:space:]]*//')
+  local dre='policy drop|^-P INPUT DROP|(^|[[:space:]])(drop|reject)([[:space:]].*)?;?[[:space:]]*$|-j (DROP|REJECT)'
+  local inv='ct state invalid|--ctstate INVALID|state INVALID'
+  local pdre='(^|[[:space:]])(drop|reject)([[:space:]]|;|$)|-j (DROP|REJECT)'
+  local drops pdrop v clean pnamed paccept first an dn lets=1
+  drops=$(grep -vE "$inv" <<< "$rules" | grep -E "$dre" | sed 's/^[[:space:]]*//')
   [[ -n "$drops" ]] || return 0
-  # the rules that name port $PORT: an explicit accept of it (and no drop of it) is the normal default-deny set-up
-  # (counters and comments carry numbers too: taken out before the port is looked for)
-  local clean; clean=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$rules")
-  pnamed=$(grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" <<< "$clean")
-  # (only an accept that is not limited to some sources or interfaces, and in iptables not after a catch-all drop)
-  paccept=$(grep -E '(^|[[:space:]])accept([[:space:]]|;|$)|-j ACCEPT' <<< "$pnamed" | grep -vE 'saddr|(^|[[:space:]])-s[[:space:]]|iifname|iif[[:space:]]|(^|[[:space:]])-i[[:space:]]|--src-range|ipset|match-set|@')
-  # it counts only when no catch-all drop or reject comes before it, and only one input chain drops by policy
-  # (each base chain must accept the packet: with two, an accept in one says nothing about the other)
-  if [[ -n "$paccept" ]]; then
-    local first; first=$(head -n 1 <<< "$paccept")
-    awk -v a="$first" '$0 == a {exit} /^-A INPUT -j (DROP|REJECT)/ || /^(drop|reject)( with .*)?;?$/ {f = 1; exit} END {exit !f}' <<< "$clean" && paccept=""
-    [[ $(grep -cE 'policy drop|^-P INPUT DROP' <<< "$clean") -le 1 ]] || paccept=""
-  fi
-  pdrop=$(grep -E '(^|[[:space:]])(drop|reject)([[:space:]]|;|$)|-j (DROP|REJECT)' <<< "$pnamed")
-  [[ -n "$paccept" && -z "$pdrop" ]] && return 0
+  # an explicit accept of port $PORT is the normal default-deny set-up. Each view (nft, iptables) is judged on its
+  # own: iptables-nft shows the same rules in both, and an order says something only inside one view.
+  for v in "$nrules" "$irules"; do
+    grep -vE "$inv" <<< "$v" | grep -qE "$dre" || continue
+    # (counters and comments carry numbers too: taken out before the port is looked for)
+    clean=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$v")
+    pnamed=$(grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" <<< "$clean")
+    # (only an accept that is not limited to some sources or interfaces)
+    paccept=$(grep -E '(^|[[:space:]])accept([[:space:]]|;|$)|-j ACCEPT' <<< "$pnamed" | grep -vE 'saddr|(^|[[:space:]])-s[[:space:]]|iifname|iif[[:space:]]|(^|[[:space:]])-i[[:space:]]|--src-range|ipset|match-set|@')
+    [[ -n "$paccept" ]] || { lets=0; break; }
+    first=$(head -n 1 <<< "$paccept")
+    # no catch-all drop or reject before the accept
+    awk -v a="$first" '$0 == a {exit} /^-A INPUT -j (DROP|REJECT)/ || /^(drop|reject)( with .*)?;?$/ {f = 1; exit} END {exit !f}' <<< "$clean" && { lets=0; break; }
+    # a drop of port $PORT itself counts only before the accept (after it, the packet is already let in)
+    an=$(grep -nxF -- "$first" <<< "$clean" | head -n 1 | cut -d: -f1)
+    dn=$(grep -nxF -f <(grep -E "$pdre" <<< "$pnamed") <<< "$clean" | head -n 1 | cut -d: -f1)
+    [[ -n "$dn" && -n "$an" && $dn -lt $an ]] && { lets=0; break; }
+    # only one input chain of this view drops by policy (each base chain must accept the packet: with two, an
+    # accept in one says nothing about the other)
+    [[ $(grep -cE 'policy drop|^-P INPUT DROP' <<< "$clean") -le 1 ]] || { lets=0; break; }
+  done
+  [[ $lets -eq 1 ]] && return 0
+  pdrop=$(sed -E 's/counter packets [0-9]+ bytes [0-9]+//g; s/comment "[^"]*"//g; s/--comment ("[^"]*"|[^ ]+)//g; s/^[[:space:]]*//' <<< "$rules" \
+          | grep -E "(tcp dport|-p tcp .*--dports?)[^;]*[^0-9]$PORT([^0-9]|\$)" | grep -E "$pdre")
   # shown: every rule that drops port $PORT itself, then the first general ones
-  r=$( { [[ -n "$pdrop" ]] && printf '%s\n' "$pdrop"; grep -vxF -f <(printf '%s\n' "${pdrop:-#none#}") <<< "$drops" | head -n 3; } | grep -v '^$')
+  r=$( { [[ -n "$pdrop" ]] && printf '%s\n' "$pdrop"; grep -vxF -f <(printf '%s\n' "${pdrop:-#none#}") <<< "$drops" | head -n 3; } | grep -v '^$' | awk '!seen[$0]++')
   [[ -n "$r" ]] || return 0
   myif=$(ip -o addr show 2>/dev/null | awk -v a="$STANDBY_IP" '{split($4, x, "/"); if (x[1] == a) {print $2; exit}}')
   NOW+=$'\n'"Note: this server has firewall rules outside firewalld that drop or reject traffic, for example:"$'\n'"$(sed 's/^/  /' <<< "$r")"
@@ -7347,7 +7419,14 @@ c_3_1() {
   [[ "$F_DB" == MISSING:* ]] && { miss2+=" ${F_DB#MISSING:}"; F_DB=""; }
   if [[ -n "$miss2" ]]; then
     NOW="The second installer file is missing:$miss2"$'\n'"It must be in the same folder as the first file."
-    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 into the folder of the first file, for example:"$'\n'"scp <user>@<server>:<folder>/$(basename "${miss2# }") $(dirname "${miss2# }")/"$'\n'"chmod 644 ${miss2# }"$'\n'"ls -l $(dirname "${miss2# }")"$'\n'"-- Then answer r."
+    # one line of each kind per missing file (12.1 with Grid: both 2of2 files can be missing)
+    local m2 cpl="" chl="" lsl=""
+    for m2 in $miss2; do
+      cpl+=$'\n'"scp <user>@<server>:<folder>/$(basename "$m2") $(dirname "$m2")/"
+      chl+=$'\n'"chmod 644 $m2"
+      [[ "$lsl " == *" $(dirname "$m2") "* ]] || lsl+=" $(dirname "$m2")"
+    done
+    KIND_NOW=manual; MANUAL_HOW="root"; PLAN="-- Copy$miss2 into the folder of the first file, for example:$cpl$chl"$'\n'"ls -l$lsl"$'\n'"-- Then answer r."
     return 1
   fi
   if [[ ( $need_g -eq 1 && -z "$F_GRID" ) || ( $need_d -eq 1 && -z "$F_DB" ) ]]; then
@@ -7358,8 +7437,16 @@ c_3_1() {
     local wg=""; [[ $need_g -eq 1 ]] && wg=" and grid"
     PLAN="-- On this server, as root:"$'\n'"mkdir -p /stage"
     PLAN+=$'\n'"-- Copy the files into /stage (with WinSCP, or from the server that has them), for example:"
-    [[ $need_d -eq 1 && -z "$F_DB" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name db "$(want_rel)" | awk '{print $1}') /stage/"
-    [[ $need_g -eq 1 && -z "$F_GRID" ]] && PLAN+=$'\n'"scp <user>@<server>:<folder>/$(base_media_name grid "$(want_rel grid)" | awk '{print $1}') /stage/"
+    # every file of the media: 12.1 has two zips each (1of2 and 2of2)
+    local mk mn mfound
+    for mk in db grid; do
+      [[ $mk == db && $need_d -eq 1 && -z "$F_DB" ]] || [[ $mk == grid && $need_g -eq 1 && -z "$F_GRID" ]] || continue
+      mfound=0
+      for mn in $(base_media_name $mk "$(want_rel "$mk")"); do
+        [[ "$mn" == *.zip ]] && { PLAN+=$'\n'"scp <user>@<server>:<folder>/$mn /stage/"; mfound=1; }
+      done
+      [[ $mfound -eq 1 ]] || PLAN+=$'\n'"scp <user>@<server>:<folder>/<the $mk zip file> /stage/"
+    done
     PLAN+=$'\n'"chmod 644 /stage/*.zip"$'\n'"ls -l /stage"$'\n'"-- ls must show the zip file(s), owner root. Then answer r."
     if [[ $DB_MAJOR -ge 18 ]]; then
       PLAN+=$'\n'"-- Use one of these:"
@@ -7702,7 +7789,7 @@ The owner must be root, $ORACLE_USER or $GRID_USER, and only the owner may chang
   say "Replacing $1/OPatch with the one in $OPATCH_ZIP. The Release Update needs it."
   if [[ -e "$1/OPatch" && -e "$1/OPatch.bak_$RUN_ID" ]]; then
     # a retry in this run: the original is kept already; the half copy goes
-    run_logged "remove the OPatch of the failed try" "$2" rm -rf -- "$1/OPatch" || { bad "Cannot remove $1/OPatch."; return 1; }
+    run_logged "remove the OPatch of the failed try" "$2" rm -rf --one-file-system -- "$1/OPatch" || { bad "Cannot remove $1/OPatch."; return 1; }
   elif [[ -e "$1/OPatch" ]]; then
     run_logged "keep old OPatch" "$2" mv -T -- "$1/OPatch" "$1/OPatch.bak_$RUN_ID" || { bad "Cannot move $1/OPatch aside."; return 1; }
     journal OPATCH "$1/OPatch" "old=$1/OPatch.bak_$RUN_ID"
@@ -7756,10 +7843,10 @@ unzip_failed_check() {
   while IFS='|' read -r t o dest; do
     [[ -n "$t" && -n "$dest" ]] || continue
     chk+="grep -c '\"$dest\"' $INVENTORY_DIR/ContentsXML/inventory.xml"$'\n'
-    emp+="find $dest -mindepth 1 -delete"$'\n'
+    emp+="find $dest -xdev -mindepth 1 -delete"$'\n'
   done < "$(unzip_marker)"
   PLAN="-- First check that nothing is installed there (each command must print 0):"$'\n'"${chk:-# the folder is not recorded: it is the home or stage folder of that file}"
-  PLAN+=$'\n'"-- Then empty it (hidden files too), and nothing else:"$'\n'"${emp:-find <that folder> -mindepth 1 -delete}"
+  PLAN+=$'\n'"-- Then empty it (hidden files too), and nothing else:"$'\n'"${emp:-find <that folder> -xdev -mindepth 1 -delete}"
   PLAN+=$'\n'"-- Then remove its line from the list of failed unzips:"$'\n'"${rmcmd%$'\n'}"
   PLAN+=$'\n'"-- Then answer r. The files are unpacked again."
   return 1
@@ -8503,13 +8590,15 @@ RES_TODO=""
 #                    listener.ora that is not this server), fixed, then the listener is stopped and started again
 L39_CAUSE=""; L39_HOSTS_LINE=""; L39_PID=""; L39_LHOME=""; L39_LUSER=""; L39_LNAME=""; L39_LORA=""; L39_BADHOST=""
 res_state() {
-  # $1 resource -> RES_STATE: ONLINE | OFFLINE | INTERMEDIATE | MISSING | UNKNOWN ; RES_DETAIL: the text after the state
+  # $1 resource -> RES_STATE: ONLINE | OFFLINE | INTERMEDIATE | MISSING | CRS_UNKNOWN (crsctl says STATE=UNKNOWN) |
+  # UNKNOWN (no state could be read) ; RES_DETAIL: the text after the state
   run_logged "crsctl stat res $1" as_grid timeout 60 "$GRID_HOME/bin/crsctl" stat res "$1" -v || true
   RES_DETAIL=""
   if grep -q 'CRS-2613' <<< "$RUN_OUT" || ! grep -q "NAME=$1" <<< "$RUN_OUT"; then RES_STATE=MISSING; return 0; fi
   local st; st=$(sed -n 's/^STATE=\([A-Z_]*\).*/\1/p' <<< "$RUN_OUT" | head -n 1)
   RES_DETAIL=$(sed -n 's/^STATE_DETAILS=//p' <<< "$RUN_OUT" | head -n 1)
-  case "$st" in ONLINE|OFFLINE|INTERMEDIATE) RES_STATE=$st ;; "") RES_STATE=UNKNOWN ;; *) RES_STATE=OFFLINE ;; esac
+  # STATE=UNKNOWN is not OFFLINE: a plain start does not help (Oracle: stop it with -f first)
+  case "$st" in ONLINE|OFFLINE|INTERMEDIATE) RES_STATE=$st ;; UNKNOWN) RES_STATE=CRS_UNKNOWN ;; "") RES_STATE=UNKNOWN ;; *) RES_STATE=OFFLINE ;; esac
 }
 srvctl_start_cmd() {
   # the srvctl command that starts resource $1
@@ -8576,6 +8665,9 @@ c_3_9() {
     case "$RES_STATE" in
       ONLINE) on+=("$r") ;; MISSING) miss+=("$r") ;; INTERMEDIATE) mid+=("$r"); det=$RES_DETAIL ;;
       UNKNOWN) NOW="Cannot read the state of $r: $(head -n 2 <<< "$RUN_OUT" | tr '\n' ' ')"; return 2 ;;
+      CRS_UNKNOWN) NOW="Oracle Restart has $r in the state UNKNOWN${RES_DETAIL:+ ($RES_DETAIL)}: it cannot tell whether it runs."
+                   NOW+=$'\n'"As $GRID_USER: stop it with -f, then start it:  $(srvctl_start_cmd "$r" | sed 's/ start / stop /') -f ; $(srvctl_start_cmd "$r")"
+                   NOW+=$'\n'"Then run this step again."; return 2 ;;
       *) off+=("$r") ;;
     esac
   done
@@ -8626,7 +8718,9 @@ c_3_9() {
       lsnr_host)
         NOW+=$'\n'"Cause: $L39_LORA has HOST=$L39_BADHOST, which is not this server."
         cp_add grid "cp -p $L39_LORA $L39_LORA.bak_$RUN_ID"
-        cp_add grid "sed -i -E 's/(HOST *= *)${L39_BADHOST//./\\.}( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
+        # the old name as a literal in the pattern (escaped with sed: ${X//./\\.} differs between bash 4.2 and 5)
+        local besc; besc=$(printf '%s' "$L39_BADHOST" | sed 's#[][\.*^$/+?(){}|]#\\&#g')
+        cp_add grid "sed -i -E 's/(HOST *= *)$besc( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
       unknown)
         NOW+=$'\n'"The host name, the port and listener.ora look right; the cause is not known."
         KIND_NOW=check
@@ -8762,7 +8856,8 @@ primary_patches() {
 }
 local_release() {
   # base release of the installed database software, from sqlplus -V ("Release 19.0.0.0.0", "Version 19.21.0.0.0")
-  run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V || return 1
+  # (its "Running as" line during an action must not end up in the captured answer: it is only a read)
+  run_logged "sqlplus -V" as_oracle "$DB_HOME/bin/sqlplus" -V > /dev/null || return 1
   grep -oE '(Release|Version) [0-9]+\.[0-9]+' <<< "$RUN_OUT" | head -n 1 | awk '{print $2}'
 }
 c_3_11() {
@@ -8890,18 +8985,21 @@ create spfile from memory;
     return 1
   fi
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
-  local lm fl; IFS='|' read -r lm fl <<< "$(first_line)"
-  if [[ "$lm" == "ARCHIVELOG" && "$fl" == "YES" ]]; then NOW="ARCHIVELOG mode and FORCE LOGGING are on"; return 0; fi
+  local lm fl flok=0; IFS='|' read -r lm fl <<< "$(first_line)"
+  # STANDBY NOLOGGING (FOR DATA AVAILABILITY / LOAD PERFORMANCE) also keeps the standby complete, as in 8.1
+  # and 10.5 (docs/DESIGN.md)
+  [[ "$fl" == "YES" || "$fl" == "STANDBY NOLOGGING"* ]] && flok=1
+  if [[ "$lm" == "ARCHIVELOG" && $flok -eq 1 ]]; then NOW="ARCHIVELOG mode is on, force_logging is $fl"; return 0; fi
   NOW="log_mode is $lm, force_logging is $fl"
   PLAN=""
-  [[ "$fl" != "YES" ]] && PLAN+="alter database force logging;"$'\n'
+  [[ $flok -eq 0 ]] && PLAN+="alter database force logging;"$'\n'
   [[ "$lm" != "ARCHIVELOG" ]] && PLAN+="-- DOWNTIME: the next 4 lines restart the primary database
 shutdown immediate
 startup mount
 alter database archivelog;
 alter database open;"
   PLAN=${PLAN%$'\n'}
-  PLAN_UNDO=""; [[ "$fl" != "YES" ]] && PLAN_UNDO="alter database no force logging;"
+  PLAN_UNDO=""; [[ $flok -eq 0 ]] && PLAN_UNDO="alter database no force logging;"
   [[ "$lm" != "ARCHIVELOG" ]] && PLAN_UNDO+="${PLAN_UNDO:+ }-- keep ARCHIVELOG mode (every backup needs it)"
   return 1
 }
@@ -9010,21 +9108,23 @@ dg_config_names_ok() {
 }
 
 # ---- 4.4 ----
-DEST_N=""; DEST_FREE2=""
+DEST_N=""; DEST_FREE2=""; DEST_FOUND=""
 find_dest() {
   # Which log_archive_dest_N on primary ships (or will ship) to this standby. Read-only.
-  # 1) an N that already points to the standby alias, 2) dest_2 if it is free, 3) the first free N.
+  # 1) an N (1-31) that already points to the standby alias, 2) dest_2 if it is free, 3) the first free N (2-31).
   prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name like 'log_archive_dest_%';" || return 1
   local line n v used=" " found=""
   DEST_N=""; DEST_FREE2=""
   while IFS= read -r line; do
     [[ "$line" =~ ^log_archive_dest_([0-9]+)\|(.*)$ ]] || continue
     n=${BASH_REMATCH[1]}; v=$(tr '[:lower:]' '[:upper:]' <<< "${BASH_REMATCH[2]}" | tr -d "\"'" | sed -E 's/ *= */=/g')
-    num "$n" && [[ $n -ge 2 && $n -le 31 ]] || continue
+    num "$n" && [[ $n -ge 1 && $n -le 31 ]] || continue
+    # one that already ships to the standby alias counts from 1 (dest_1 too); a free one is chosen from 2
     [[ -z "$found" ]] && has_token "$v" "SERVICE=${STANDBY_TNS^^}" && found=$n
-    [[ "$v" == "-" ]] || used+="$n "
+    [[ $n -ge 2 && "$v" != "-" ]] && used+="$n "
   done <<< "$SQL_OUT"
   # a destination without a value (or not listed) is free; prefer 2
+  DEST_FOUND=$found
   if [[ -n "$found" ]]; then DEST_N=$found
   else for ((n = 2; n <= 31; n++)); do [[ "$used" == *" $n "* ]] || { DEST_N=$n; break; }; done; fi
   [[ -n "$DEST_N" ]] || return 1
@@ -9048,7 +9148,8 @@ c_4_4() {
     return 0
   fi
   NOW="log_archive_dest_$DEST_N = $(disp_val "$PVAL")"
-  [[ "$DEST_N" != "2" ]] && NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"
+  if [[ -n "$DEST_FOUND" ]]; then NOW+=$'\n'"log_archive_dest_$DEST_N already names the alias $STANDBY_TNS, so it is used"
+  elif [[ "$DEST_N" != "2" ]]; then NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"; fi
   PLAN=""
   # no local destination named at all (no recovery area, no log_archive_dest, no log_archive_dest_N LOCATION): the
   # primary archives to its built-in default folder. A first log_archive_dest_N may end that default, and then
@@ -9760,14 +9861,14 @@ tns_alias_present() {
   # the alias as plain text (a . in my.db is a dot, not "any character")
   local f a; f=$(tns_file); [[ -f "$f" ]] || return 1
   a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$1")
-  grep -qiE "^[[:space:]]*$a[[:space:]]*=" "$f"
+  grep -qiE "^[[:space:]]*${a}[[:space:]]*=" "$f"
 }
 tns_replace() {
   # $1 tnsnames.ora, $2 alias -> the file with the entry of that alias replaced by the right one (tns_block).
   # 1 unless: exactly one entry starts with "<alias> =" on its own line, its parentheses close, and nothing
   # else follows on the line where it ends. Comments inside it are kept above the new entry; other entries stay.
   local a n; a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$2")
-  n=$(grep -ciE "^[[:space:]]*$a[[:space:]]*=" "$1"); [[ "$n" == 1 ]] || return 1
+  n=$(grep -ciE "^[[:space:]]*${a}[[:space:]]*=" "$1"); [[ "$n" == 1 ]] || return 1
   # the alias is compared as text (an awk pattern from -v would turn "\." into "any character")
   DG_ALIAS="$2" awk -v blk="$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")" '
     function cl(s) { t = s; sub(/#.*/, "", t); return t }
@@ -9909,6 +10010,10 @@ c_6_1() {
   # 12.2+: v$passwordfile_info has file_name and format; 12.1: file_name only; else the file in dbs
   local pfile=""
   if prim_sql "select file_name from v\$passwordfile_info;"; then pfile=$(first_line)
+  # a failed query is not "no password file": only a view this release does not have (ORA-00942) is
+  elif ! grep -q 'ORA-00942' <<< "$SQL_OUT"; then
+    local qe; qe=$(ora_errors "$SQL_OUT")
+    NOW="Cannot read v\$passwordfile_info on the primary${qe:+ ($qe)}, so it is not known where its password file is."$'\n'"Answer r to check again."; return 2
   fi
   if [[ -z "$pfile" || "$pfile" == "-" ]]; then
     local pex=""; prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && pex=$(head -n 1 <<< "$RUN_OUT")
@@ -9976,6 +10081,8 @@ chmod 640 $t"
   fi
   # can the ssh user read it? (md5sum reads the file; a copy would fail the same way)
   if ! prim_probe md5 "$pfile" || ! [[ "$(awk '{print $1; exit}' <<< "$RUN_OUT")" =~ ^[0-9a-f]{32}$ ]]; then
+    # no answer in time is not "cannot read": no chmod is advised for it
+    [[ $PROBE_TIMED_OUT -eq 1 ]] && { NOW+=$'\n'"The primary did not answer in time, so it is not known whether the ssh user $PRIMARY_SSH_USER can read $pfile."$'\n'"Answer r to check again."; return 2; }
     NOW+=$'\n'"The ssh user $PRIMARY_SSH_USER cannot read $pfile on the primary."
     KIND_NOW=primary; PRIMARY_HOW_STEP="root  ->  shell"
     PLAN="-- Let the ssh user read it (it is in the group $INSTALL_GROUP, or use the oracle user for ssh):
@@ -10044,20 +10151,46 @@ tde_dirs() {
   awk -F'|' 'toupper($1)=="FILE" && $2 != "-" && toupper($3) != "NOT_AVAILABLE" {print $2}' <<< "$TDE_INFO" | sed 's#/*$##' | sort -u
 }
 sqlnet_file() { printf '%s/network/admin/sqlnet.ora' "$DB_HOME"; }
-tde_local_autologin() { awk -F'|' 'toupper($4) ~ /LOCAL/' <<< "$TDE_INFO" | grep -q .; }
+tde_local_autologin() {
+  # $1 wallet folder: 0 when the primary's wallet in THAT folder is a LOCAL auto-login one (it opens only on the host
+  # where it was made; folders may differ). Without $1: any folder (for notes about the primary as a whole)
+  awk -F'|' -v d="${1:-}" '{ p = $2; sub(/\/+$/, "", p) } (d == "" || p == d) && toupper($4) ~ /LOCAL/' <<< "$TDE_INFO" | grep -q .
+}
+TDE_SSO_WHY=""
+tde_sso_stale() {
+  # $1 folder with a cwallet.sso for a LOCAL auto-login wallet (never compared with the primary's: it is made here).
+  # 0 when it is not usable here (ORA-28365 / ORA-28374 later), the reason in TDE_SSO_WHY: older than ewallet.p12
+  # (made before the newer keystore came), or orapki cannot open it without a password (an auto-login wallet opens
+  # without one; a LOCAL one made on another host does not). 2 when orapki gave no answer. 1 otherwise, also when
+  # orapki fails for another reason (not installed, unknown option): then the age test is all there is. Read-only.
+  local d=$1 out rc=0; TDE_SSO_WHY=""
+  if [[ -f "$d/ewallet.p12" && "$d/cwallet.sso" -ot "$d/ewallet.p12" ]]; then TDE_SSO_WHY="it is older than ewallet.p12"; return 0; fi
+  [[ -x "$DB_HOME/bin/orapki" ]] || return 1
+  out=$(timeout 120 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet display -wallet "$d" < /dev/null 2>&1 9>&-) || rc=$?
+  printf '%s\n(exit code %s)\n' "$out" "$rc" | log_block "orapki wallet display -wallet $d (no password: auto-login)"
+  [[ $rc -eq 124 ]] && { TDE_SSO_WHY="orapki gave no answer in 120 seconds"; return 2; }
+  if grep -qiE 'PKI-02[0-9]+|password|unable to open' <<< "$out"; then
+    TDE_SSO_WHY="orapki cannot open it without a password ($({ grep -m1 -E 'PKI-02[0-9]+' <<< "$out" || grep -m1 -iE 'password|unable to open' <<< "$out"; } | sed 's/[[:space:]]*$//'))"; return 0
+  fi
+  return 1
+}
 orapki_plan() {
   # creates cwallet.sso next to ewallet.p12 on THIS server; orapki asks for the keystore password itself
-  printf 'ORACLE_HOME=%s %s/bin/orapki wallet create -wallet %s %s\n' "$DB_HOME" "$DB_HOME" "$1" "$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')"
+  printf 'ORACLE_HOME=%s %s/bin/orapki wallet create -wallet %s %s\n' "$DB_HOME" "$DB_HOME" "$1" "$(tde_local_autologin "$1" && printf -- '-auto_login_local' || printf -- '-auto_login')"
   printf '# orapki asks for the keystore password and writes %s/cwallet.sso here.\n# The primary is not changed. Then answer r.' "$1"
 }
 tde_autologin_missing() {
-  # 0 when the primary uses a file keystore and this server has no auto-login file for it (ORA-28365 later)
+  # 0 when the primary uses a file keystore and a keystore folder here has no usable auto-login file (ORA-28365
+  # later). Every folder counts (CDB and PDB keystores are separate folders, $WALLET_ROOT/tde among them), as in 6.3
   [[ -n "$TDE_INFO" ]] || return 1
-  local d; d=$(tde_dirs | head -n 1)
-  [[ -n "$d" && "$d" == /* ]] || return 1
-  [[ -f "$d/cwallet.sso" ]] && return 1
-  [[ -n "$WALLET_ROOT" && -f "$WALLET_ROOT/tde/cwallet.sso" ]] && return 1
-  return 0
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" && "$d" == /* ]] || continue
+    [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]] && continue
+    [[ -f "$d/cwallet.sso" ]] || return 0
+    tde_local_autologin "$d" && { tde_sso_stale "$d"; [[ $? -eq 0 ]]; } && return 0
+  done < <(tde_dirs)
+  return 1
 }
 sqlnet_wallet_replaced() {
   # $1 sqlnet.ora, $2 wallet folder -> the file with its ENCRYPTION_WALLET_LOCATION entry (one or more lines,
@@ -10104,7 +10237,8 @@ c_6_3() {
   [[ ${#dirs[@]} -gt 0 && -n "${dirs[0]}" ]] || { NOW="The primary does not use a TDE wallet"; return 0; }
   # 18c+: the password for "IDENTIFIED BY EXTERNAL STORE" is in WALLET_ROOT/tde_seps
   # (a folder that cannot be read is not left out silently: the password in it would be missing here)
-  if [[ -n "$WALLET_ROOT" ]] && need_ssh; then
+  if [[ -n "$WALLET_ROOT" ]]; then
+    need_ssh || { NOW="Cannot check $WALLET_ROOT/tde_seps on the primary: $NOW"; return 2; }
     local sx=""; prim_probe exists "$WALLET_ROOT/tde_seps" && sx=$(head -n 1 <<< "$RUN_OUT")
     [[ "$sx" == YES || "$sx" == NO ]] || { NOW="Cannot tell whether $WALLET_ROOT/tde_seps exists on the primary (no answer)."; return 2; }
     # "not there" counts only when the ssh user can look into WALLET_ROOT (else test -e says no for anything)
@@ -10133,7 +10267,7 @@ c_6_3() {
       found=1
       # a LOCAL auto-login wallet of the primary does not open here: it is made again on this server (orapki)
       # (not the tde_seps folder: it holds only the external-store password and is copied as it is)
-      if [[ "$f" == cwallet.sso ]] && tde_local_autologin && ! [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]]; then continue; fi
+      if [[ "$f" == cwallet.sso ]] && tde_local_autologin "$d" && ! [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]]; then continue; fi
       if [[ ! -f "$d/$f" ]]; then miss+=" $d/$f"; TDE_TODO+=("$d/$f"); continue; fi
       # a checksum the primary cannot give (the ssh user cannot read the file) is not "different": it is not known
       local rmd=""; prim_probe md5 "$d/$f" && rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT")
@@ -10178,19 +10312,29 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   fi
   # every keystore folder needs its own auto-login file here (CDB and PDB wallets are separate folders);
   # the tde_seps folder holds only the external-store password and is copied as it is
-  local nocw=()
+  # a LOCAL auto-login file is not compared with the primary's (it is made here): it must open on this server
+  local nocw=() stale="" nloc=0 nport=0 sr
   for d in "${dirs[@]}"; do
     [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]] && continue
-    [[ -f "$d/cwallet.sso" ]] && continue
     [[ " ${TDE_TODO[*]+"${TDE_TODO[*]}"} " == *" $d/cwallet.sso "* ]] && continue
+    if [[ -f "$d/cwallet.sso" ]]; then
+      tde_local_autologin "$d" || continue
+      sr=0; tde_sso_stale "$d" || sr=$?
+      [[ $sr -eq 2 ]] && { NOW="Cannot check whether $d/cwallet.sso opens on this server: $TDE_SSO_WHY."$'\n'"Answer r to check again."; return 2; }
+      [[ $sr -eq 1 ]] && continue
+      stale+=$'\n'"  $d/cwallet.sso: $TDE_SSO_WHY"
+    fi
     nocw+=("$d")
+    if tde_local_autologin "$d"; then nloc=1; else nport=1; fi
   done
   TDE_NO_AUTOLOGIN=0; [[ ${#nocw[@]} -gt 0 ]] && TDE_NO_AUTOLOGIN=1
   TDE_CW_TODO=("${nocw[@]+"${nocw[@]}"}")
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 && $TDE_NO_AUTOLOGIN -eq 1 ]]; then
-    NOW="The TDE wallet is copied, but there is no auto-login keystore (cwallet.sso) here in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
-    tde_local_autologin && NOW+=$'\n'"The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is made again here."
+    NOW="The TDE wallet is copied, but there is no usable auto-login keystore (cwallet.sso) here in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"Without it, the RMAN copy and redo apply stop with ORA-28365."
+    [[ $nloc -eq 1 ]] && NOW+=$'\n'"The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is made again here."
+    [[ -n "$stale" ]] && NOW+=$'\n'"Not usable here:$stale"
     PLAN="Make cwallet.sso here with orapki, as $ORACLE_USER, in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"You type the keystore (wallet) password once. It is passed to orapki and not kept anywhere."
+    [[ -n "$stale" ]] && PLAN+=$'\n'"A cwallet.sso that is not usable is kept first as cwallet.sso.old_$RUN_ID (same folder)."
     return 1
   fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
@@ -10206,8 +10350,9 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
   [[ $TDE_SQLNET -eq 1 ]] && PLAN+="Add this to sqlnet.ora (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
   [[ $TDE_SQLNET -eq 2 ]] && PLAN+="Change the ENCRYPTION_WALLET_LOCATION entry of sqlnet.ora to (a backup is kept):"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${dirs[0]})))"$'\n'
   if [[ $TDE_NO_AUTOLOGIN -eq 1 ]]; then
-    if tde_local_autologin; then PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
-    else PLAN+="The primary has no auto-login keystore (cwallet.sso)."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'; fi
+    [[ $nloc -eq 1 ]] && PLAN+="The primary uses a local auto-login wallet. It opens only on the primary host,"$'\n'"so it is not copied."$'\n'
+    [[ $nport -eq 1 ]] && PLAN+="The primary has no auto-login keystore (cwallet.sso)$([[ $nloc -eq 1 ]] && printf ' in the other folders')."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'
+    [[ -n "$stale" ]] && PLAN+="Not usable here, kept as cwallet.sso.old_$RUN_ID:$stale"$'\n'
     PLAN+="After the copy, cwallet.sso is made on this server with orapki (you type the keystore password once)."$'\n'
   fi
   PLAN=${PLAN%$'\n'}
@@ -10247,8 +10392,17 @@ d_6_3() {
   fi
   # the auto-login keystore: worked out again after the copy (the copied files may have brought one)
   need_ssh || return 1            # a lost connection is opened again on the screen, not in the quiet check
-  c_6_3 >/dev/null 2>&1 || true
-  [[ ${#TDE_CW_TODO[@]} -gt 0 ]] || return 0
+  local rc=0; TDE_CW_TODO=(); c_6_3 >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 0 ]] && return 0
+  # only a missing auto-login file is left for orapki; anything else the re-check finds is reported, not hidden
+  [[ $rc -eq 2 ]] && { bad "The TDE wallet could not be checked again after the copy: $NOW"; return 1; }
+  if [[ ${#TDE_CW_TODO[@]} -eq 0 || ${#TDE_TODO[@]} -gt 0 || $TDE_SQLNET -ne 0 ]]; then bad "The TDE wallet is still not right after the copy: $NOW"; return 1; fi
+  # a cwallet.sso that does not open here (LOCAL, made on another host or outdated) is kept aside, then made again
+  for d in "${TDE_CW_TODO[@]}"; do
+    [[ -f "$d/cwallet.sso" ]] || continue
+    runuser -u "$ORACLE_USER" -- mv -f -- "$d/cwallet.sso" "$d/cwallet.sso.old_$RUN_ID" || { bad "Cannot move $d/cwallet.sso aside"; return 1; }
+    journal RENAME "$d/cwallet.sso" "to=$d/cwallet.sso.old_$RUN_ID"; say "The auto-login file of $d that is not usable here is kept as cwallet.sso.old_$RUN_ID. It is made again."
+  done
   tde_make_autologin
 }
 TDE_CW_TODO=()
@@ -10256,10 +10410,11 @@ tde_make_autologin() {
   # cwallet.sso for every keystore folder in TDE_CW_TODO. The password goes to orapki on its input
   # (never on its command line, never in a file or the log). If orapki does not take it, the command is shown.
   # every folder is tried (one failure does not stop the others); the result is the files that exist at the end
-  local d out failed=0 opt; opt=$(tde_local_autologin && printf -- '-auto_login_local' || printf -- '-auto_login')
+  local d out failed=0 opt
   ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${TDE_CW_TODO[*]})"
   local pw=$SECRET; SECRET=""
   for d in "${TDE_CW_TODO[@]}"; do
+    opt=$(tde_local_autologin "$d" && printf -- '-auto_login_local' || printf -- '-auto_login')
     out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
     out=${out//"$pw"/*****}
     printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
@@ -10373,7 +10528,8 @@ leftover_files() {
   local dg out="" f n
   for dg in $(asm_dgs); do
     grid_sw_ok || continue
-    if sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE');" && [[ "$(first_line)" != "0" ]]; then
+    # the folder at the top of the disk group only (parent_index = its root), the same test as clean_collect
+    if sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" && [[ "$(first_line)" != "0" ]]; then
       out+="  +$dg/${STANDBY_UNIQUE^^}"$'\n'
     fi
   done
@@ -10396,12 +10552,14 @@ spfile_from_failed_copy() {
   sql_local "select nvl(value,'-') from v\$parameter where name='spfile';" || return 1
   [[ "$(first_line)" != "-" ]]
 }
-FS_FILENAMES=""
+FS_FILENAMES=""; FS_READ_FAIL=0
 sql_or_cached_filenames() {
   # the datafile / tempfile / redo / control file names of the primary (read-only), cached in this run
+  # FS_READ_FAIL=1: the names could not be read (not the same as "the primary has no file in a folder")
+  FS_READ_FAIL=0
   [[ -n "$FS_FILENAMES" ]] && return 0
-  need_ssh || return 1
-  prim_sql "select name from v\$datafile union all select name from v\$tempfile union all select member from v\$logfile union all select name from v\$controlfile;" || return 1
+  need_ssh || { FS_READ_FAIL=1; return 1; }
+  prim_sql "select name from v\$datafile union all select name from v\$tempfile union all select member from v\$logfile union all select name from v\$controlfile;" || { FS_READ_FAIL=1; return 1; }
   FS_FILENAMES=$(grep '^/' <<< "$SQL_OUT")
   [[ -n "$FS_FILENAMES" ]]
 }
@@ -10665,7 +10823,7 @@ c_7_2() {
       if spfile_from_failed_copy; then
         NOW="Instance $STANDBY_SID is in NOMOUNT, but it runs from the spfile of an unfinished copy:"$'\n'"$(spfile_path)"
         cleanup_offer spfile && return 1
-        NOW+=$'\n'"The script cannot clean this up (STANDBY_UNIQUE must differ from the primary's names)."; return 2
+        NOW+=$'\n'"The script cannot clean this up ($CL_WHY)."; return 2
       fi
       # NOMOUNT from the pfile, but a copy that did not finish left files a new copy would not overwrite
       if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished; then
@@ -10673,6 +10831,8 @@ c_7_2() {
         if [[ -n "$ol" ]]; then
           NOW="Instance $STANDBY_SID is in NOMOUNT, but files of an unfinished copy are still here:"$'\n'"$ol"
           cleanup_offer keep && return 1
+          # known leftovers are never passed over in silence: the way by hand, as in the other branches
+          cleanup_cannot; return 2
         fi
       fi
       NOW="Instance $STANDBY_SID is in NOMOUNT"; return 0 ;;
@@ -10689,7 +10849,7 @@ c_7_2() {
       if [[ $sc -eq 2 ]]; then NOW="Cannot compare the standby with the primary: $SC_INFO"; return 2; fi
       NOW="A standby control file exists, but the database is incomplete, probably from a failed copy:"$'\n'"$SC_INFO"
       cleanup_offer mounted && return 1
-      NOW+=$'\n'"The script cannot clean this up (STANDBY_UNIQUE must differ from the primary's names)."; return 2 ;;
+      NOW+=$'\n'"The script cannot clean this up ($CL_WHY)."; return 2 ;;
     IDLE)
       if [[ -f "$(dup_marker)" && -f "$(spfile_path)" ]]; then
         STANDBY_BUILT=1
@@ -10711,6 +10871,7 @@ c_7_2() {
       if [[ -n "$lo" && ! -f "$STATE_DIR/existing_files_ok" ]]; then
         NOW="Instance $STANDBY_SID is not started, and files already exist where the standby database will be written:"$'\n'"$lo"
         cleanup_offer keep && return 1
+        cleanup_cannot; return 2
       fi
       NOW="Instance $STANDBY_SID is not started"
       PLAN="Write this pfile:
@@ -10733,11 +10894,12 @@ Start the instance as $ORACLE_USER:
 # primary's paths ("same") the files of the copy at those paths, only when step 2.15 proved that the folders are
 # storage of this server. Renamed: the spfile of the failed copy. Never touched: init<SID>.ora, orapw<SID>, and
 # anything of the primary's own name.
-L72_CLEAN=""; L72_AUTO=0; CL_TEXT=""
+L72_CLEAN=""; L72_AUTO=0; CL_TEXT=""; CL_UNREAD=""; CL_WHY=""
 clean_collect() {
   # fills the command list (cp_add) and CL_TEXT (what goes, with sizes); 1 = nothing to clean
-  local dg f n=0 sz total=0 d
-  CL_TEXT=""
+  # CL_UNREAD: places that could not be read (never taken as "nothing there"; no clean-up for me then)
+  local dg f n=0 sz total=0 d seen=" "
+  CL_TEXT=""; CL_UNREAD=""
   local_state
   if [[ "$LSTATE" != "IDLE" && "$LSTATE" != "NOSW" ]]; then
     cp_add oracle "sqlplus -S / as sysdba" "shutdown abort"
@@ -10748,23 +10910,32 @@ clean_collect() {
     CL_TEXT+="  rename $(spfile_path) to $(basename "$(spfile_path)").failed_$RUN_ID"$'\n'
   fi
   for dg in $(asm_dgs); do
-    grid_sw_ok || continue
-    sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" || continue
+    grid_sw_ok || { CL_UNREAD+="  +$dg/${STANDBY_UNIQUE^^}  (Grid is not installed here, ASM cannot be read)"$'\n'; continue; }
+    if ! sql_asm "select count(*) from v\$asm_alias a, v\$asm_diskgroup g where a.group_number=g.group_number and g.name=upper('$dg') and upper(a.name)=upper('$STANDBY_UNIQUE') and a.parent_index=a.group_number*16777216;" || ! num "$(first_line)"; then
+      CL_UNREAD+="  +$dg/${STANDBY_UNIQUE^^}  (cannot read ASM: $(ora_errors "$SQL_OUT"))"$'\n'; continue
+    fi
     [[ "$(first_line)" != "0" ]] || continue
-    sz=""; sql_asm "select round(sum(f.bytes)/1048576) from v\$asm_file f, v\$asm_alias a, v\$asm_diskgroup g where f.group_number=a.group_number and f.file_number=a.file_number and a.group_number=g.group_number and g.name=upper('$dg') and a.system_created='Y' and a.reference_index=0;" && sz=$(first_line)
+    # the size of the files under the standby's folder only (the folder tree, each file once)
+    sz=""; sql_asm "select round(nvl(sum(f.bytes),0)/1048576) from v\$asm_file f, (select distinct group_number, file_number from v\$asm_alias where alias_directory='N' start with upper(name)=upper('$STANDBY_UNIQUE') and parent_index=group_number*16777216 and group_number in (select group_number from v\$asm_diskgroup where name=upper('$dg')) connect by prior reference_index=parent_index and prior group_number=group_number) a where f.group_number=a.group_number and f.file_number=a.file_number;" && sz=$(first_line)
     cp_add grid "asmcmd rm -rf +$dg/${STANDBY_UNIQUE^^}"
     CL_TEXT+="  +$dg/${STANDBY_UNIQUE^^}  (ASM folder of the standby$(num "$sz" && printf ', about %s' "$(human_mb "$sz")"))"$'\n'
   done
   # OMF folders of the standby in folders here (named after the standby: never the primary's)
   for d in $( [[ "$(place_mode)" == dir ]] && data_dest; f=$(fra_dest); [[ "$f" == /* ]] && printf '%s\n' "$f"; [[ "$(place_mode)" == same ]] && omf_dir_here ); do
+    # each folder once (the recovery area may be the data folder)
+    d=${d%/}; [[ -n "$d" && "$seen" != *" $d "* ]] || continue; seen+="$d "
     [[ -d "$d/${STANDBY_UNIQUE^^}" ]] || continue
     sz=$(du -sm -- "$d/${STANDBY_UNIQUE^^}" 2>/dev/null | cut -f1)
-    cp_add oracle "rm -rf $d/${STANDBY_UNIQUE^^}"
+    # never into another file system mounted below it
+    cp_add oracle "rm -rf --one-file-system $d/${STANDBY_UNIQUE^^}"
     CL_TEXT+="  $d/${STANDBY_UNIQUE^^}/  (OMF folder of the standby, $(human_mb "${sz:-0}"))"$'\n'
   done
   # the primary's paths: the files of the copy have the same names as the primary's own files; only on storage
   # that step 2.15 proved to be this server's
-  if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && sql_or_cached_filenames; then
+  if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && ! sql_or_cached_filenames; then
+    # names not read: the files (and an OMF folder) at the primary's paths are not known, never "none"
+    [[ $FS_READ_FAIL -eq 1 ]] && CL_UNREAD+="  files of the copy at the primary's paths in $(fs_dirs | paste -sd' ' -)  (the primary's file names cannot be read)"$'\n'
+  elif [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]]; then
     if [[ "${STORAGE_SRC:-2}" -eq 0 ]]; then
       while IFS= read -r f; do
         [[ "$f" =~ ^/[A-Za-z0-9_./-]+$ && -f "$f" ]] || continue
@@ -10781,11 +10952,21 @@ clean_collect() {
   [[ -n "$CL_TEXT" ]]
 }
 cleanup_offer() {
-  # $1 spfile | keep | mounted: sets the plan for d_7_2 (KIND_NOW=ask). 1 = nothing the script may offer
-  CL_FS_UNPROVEN=0
+  # $1 spfile | keep | mounted: sets the plan for d_7_2 (KIND_NOW=ask). 1 = nothing the script may offer (CL_WHY)
+  CL_FS_UNPROVEN=0; CL_UNREAD=""
+  CL_WHY="STANDBY_UNIQUE must differ from the primary's names"
   [[ -n "$STANDBY_UNIQUE" && "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" && "${STANDBY_UNIQUE^^}" != "${DB_NAME^^}" ]] || return 1
   cp_reset
-  clean_collect || { cp_reset; return 1; }
+  if ! clean_collect; then
+    cp_reset
+    CL_WHY="it found nothing here that it may remove"
+    [[ $CL_FS_UNPROVEN -eq 1 ]] && CL_WHY="step 2.15 has not proven that $(fs_dirs | paste -sd' ' -) is storage of this server only"
+    if [[ -n "$CL_UNREAD" ]]; then
+      if [[ $CL_FS_UNPROVEN -eq 1 ]]; then CL_WHY+="; not checked:"; else CL_WHY="these could not be read:"; fi
+      CL_WHY+=$'\n'"${CL_UNREAD%$'\n'}"
+    fi
+    return 1
+  fi
   L72_CLEAN=$1
   # [y] only for the leftovers of a copy THIS script started and that did not finish (else the files may be a
   # complete standby, or an older database with the same name: then [m] writes the commands, you decide)
@@ -10794,10 +10975,13 @@ cleanup_offer() {
   # files at the primary's paths that you once allowed to stay (existing_files_ok) may be of another database:
   # then the script does not remove them itself
   [[ "$(place_mode)" == same && -n "$(fs_dirs)" && -f "$STATE_DIR/existing_files_ok" ]] && L72_AUTO=0
+  # a place that could not be read may hold more of the copy: only the commands to read and run yourself
+  [[ -n "$CL_UNREAD" ]] && L72_AUTO=0
   PLAN="Clean up what the unfinished copy left on this server:"$'\n'"${CL_TEXT%$'\n'}"
   PLAN+=$'\n'"Kept: $(basename "$(pfile_path)"), orapw$STANDBY_SID. Then the instance starts again from the pfile (NOMOUNT)."
   [[ -n "$(asm_dgs)" ]] && PLAN+=$'\n'"Never touched: $(asm_dgs | sed "s#^#+#; s#\$#/${PRIMARY_UNIQUE^^}#" | paste -sd' ' -) (the primary's names)"
   [[ $CL_FS_UNPROVEN -eq 1 ]] && PLAN+=$'\n'"Not removed: files at the primary's paths in $(fs_dirs | paste -sd' ' -). Step 2.15 has not proven that this is storage of this server only."
+  [[ -n "$CL_UNREAD" ]] && PLAN+=$'\n'"Not checked (could not be read; check them by hand, they are not in the commands):"$'\n'"${CL_UNREAD%$'\n'}"
   if [[ "$(dup_cause)" == FRA_FULL ]]; then
     PLAN+=$'\n'"The copy failed because the recovery area was full ($(human_mb "$(fra_full_mb)"))."
     PLAN+=$'\n'"The next copy gets $(human_mb "$(fra_size_mb)") in $(fra_dest) (step 8.1 checks the space first), and step 8.2 copies again."
@@ -10805,10 +10989,20 @@ cleanup_offer() {
   KIND_NOW=ask
   return 0
 }
+cleanup_cannot() {
+  # leftovers are known, but cleanup_offer has nothing to offer (CL_WHY): said, with the way by hand
+  NOW+=$'\n'"The script cannot clean this up: $CL_WHY."
+  NOW+=$'\n'"By hand, after checking that they belong to the unfinished copy:"
+  [[ -n "$(asm_dgs)" ]] && NOW+=$'\n'"  an ASM folder, as $GRID_USER:  asmcmd rm -rf <folder>"
+  NOW+=$'\n'"  a folder, as $ORACLE_USER:  rm -rf --one-file-system <folder>      a file:  rm -f <file>"
+  NOW+=$'\n'"Or keep them (RMAN overwrites files with the same names):  touch $STATE_DIR/existing_files_ok"
+  NOW+=$'\n'"Then run step 7.2 again:  $SELF --from 7.2"
+}
 cleanup_proof() {
   # once, right before anything is removed: this is the standby server and its instance
-  local ls; ls=$(hostname -s 2>/dev/null)
-  [[ "${ls,,}" == "${STANDBY_HOST,,}" ]] || { bad "This server is $ls, not $STANDBY_HOST. Nothing was removed."; return 1; }
+  # host names compared without the domain and without case (STANDBY_HOST may be the full name); an empty one fails
+  local ls lsh sh; ls=$(hostname -s 2>/dev/null); lsh=${ls%%.*}; sh=${STANDBY_HOST%%.*}
+  [[ -n "$lsh" && "${lsh,,}" == "${sh,,}" ]] || { bad "This server is $ls, not $STANDBY_HOST. Nothing was removed."; return 1; }
   is_local_ip "$STANDBY_IP" || ! command -v ip >/dev/null 2>&1 || { bad "$STANDBY_IP is not an address of this server. Nothing was removed."; return 1; }
   [[ "${STANDBY_UNIQUE^^}" != "${PRIMARY_UNIQUE^^}" ]] || { bad "Safety stop: STANDBY_UNIQUE equals the primary's unique name. Nothing was removed."; return 1; }
   local_state
@@ -10822,18 +11016,50 @@ cleanup_proof() {
   say "Checked: this is $ls ($STANDBY_IP), the standby ${STANDBY_UNIQUE^^}."
   return 0
 }
+cleanup_id_text() {
+  # the [m] file's own check of the instance it stops (as cleanup_proof does for [y]): a running instance must have
+  # db_unique_name STANDBY_UNIQUE, and a mounted or open one the role PHYSICAL STANDBY (never a primary). No
+  # instance running (ORA-01034) passes; any other answer refuses.
+  local t=""
+  IFS= read -r -d '' t <<'EOF' || true
+dgid=$(runuser -u @OU@ -- env -i HOME=/ LANG=C ORACLE_HOME=@OH@ ORACLE_SID=@SID@ PATH=@OH@/bin:/usr/bin:/bin timeout 120 sqlplus -S -L / as sysdba 2>&1 <<'SQLEOF'
+set heading off feedback off pagesize 0 linesize 300 trimout on
+select 'DGID|'||i.status||'|'||upper(p.value) from v$instance i, v$parameter p where p.name='db_unique_name';
+select 'DGROLE|'||database_role from v$database;
+exit
+SQLEOF
+)
+case "$dgid" in
+  *"DGID|"*)
+    dgs=$(sed -n 's/^DGID|\([^|]*\)|.*/\1/p' <<< "$dgid" | head -n 1); dgu=$(sed -n 's/^DGID|[^|]*|//p' <<< "$dgid" | head -n 1)
+    [ "$dgu" = "@SU@" ] || { echo "The running instance @SID@ has db_unique_name $dgu, not @SU@. Nothing was done."; exit 1; }
+    [ "$dgs" = STARTED ] || grep -qx 'DGROLE|PHYSICAL STANDBY' <<< "$dgid" || { echo "The database mounted here is not a physical standby. Nothing was done."; exit 1; } ;;
+  *ORA-01034*|*ORA-27101*) ;;
+  *) echo "Cannot read the instance @SID@. Nothing was done."; exit 1 ;;
+esac
+EOF
+  t=${t%$'\n'}; t=${t//@OU@/$ORACLE_USER}; t=${t//@OH@/$DB_HOME}; t=${t//@SID@/$STANDBY_SID}; t=${t//@SU@/${STANDBY_UNIQUE^^}}
+  printf '%s\n' "$t"
+}
 cleanup_script() {
-  # [m]: the commands as a short script file; prints its path. Besides the host check it refuses to run once a
-  # copy has finished (the record of a finished copy exists): then these files are the working standby
+  # [m]: the commands as a short script file; prints its path. Besides the host check it refuses to run if a copy
+  # finishes after this file was written (no record then: once any record appears; a record already there: once it
+  # is newer than the file). When a finished copy was already recorded, running it is the DBA's decision ([m] only).
+  # It also checks the running instance it stops (cleanup_id_text).
   local guard
   if [[ -e "$(dup_marker)" ]]; then guard="[ %s -nt \"\$0\" ]"; else guard="[ -e %s ]"; fi
   { printf "$guard"' && { echo "A copy has finished since this file was written: these are the files of the standby now. Nothing was done."; exit 1; }\n' "$(dup_marker)"
+    cleanup_id_text
     cp_script_text; } | short_script "c72"
 }
 d_7_2_cleanup() {
   # 0 = cleaned (or kept), 3 = not now
   local opts="[y] Clean up for me   [m] Show the commands   [s] Skip   [q] Quit" allowed="ymsq" f
-  [[ $L72_AUTO -eq 1 ]] || { opts="[m] Show the commands   [s] Skip   [q] Quit"; allowed="msq"; say "${C_D}The script did not start this copy (or it finished), so it does not remove these files itself.${C_N}"; }
+  if [[ $L72_AUTO -ne 1 ]]; then
+    opts="[m] Show the commands   [s] Skip   [q] Quit"; allowed="msq"
+    if [[ -n "$CL_UNREAD" ]]; then say "${C_D}Some places could not be read (see the list), so the script does not remove these files itself.${C_N}"
+    else say "${C_D}The script did not start this copy (or it finished), so it does not remove these files itself.${C_N}"; fi
+  fi
   [[ "$L72_CLEAN" == keep && -f "$STATE_DIR/dup_attempt" ]] && { opts+="   [k] Keep them"; allowed+="k"; }
   while true; do
     ask_choice "$opts" "$allowed"
@@ -10852,9 +11078,23 @@ d_7_2_cleanup() {
       y) cleanup_proof || return 1
          printf '%s\n' "${CL_TEXT%$'\n'}" | block "Removed now:"
          confirm_word "Remove these files of the unfinished copy on THIS server ($(hostname -s))." "CLEAN" || { L72_CLEAN=""; return 3; }
-         journal DELETED "$STANDBY_UNIQUE" "cannot be undone: files of the unfinished copy, after you typed CLEAN: $(tr '\n' ' ' <<< "$CL_TEXT" | tr -s ' ')"
-         [[ -f "$(spfile_path)" ]] && journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID"
-         cp_run || return 1
+         # each change is journaled after it was done (a command that failed, and those after it, leave no entry)
+         local i nf=0
+         for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+           if ! cp_exec "$i"; then
+             bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}" | mask_pw)"$'\n'"$(tail -n 4 <<< "$RUN_OUT" | mask_pw)"
+             [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+             [[ $nf -gt 0 ]] && journal DELETED "$STANDBY_UNIQUE" "cannot be undone: $nf file(s) of the unfinished copy at the primary's paths, after you typed CLEAN"
+             return 1
+           fi
+           case "${CP_CMD[$i]}" in
+             "mv -f $(spfile_path) "*) journal RENAME "$(spfile_path)" "to=$(spfile_path).failed_$RUN_ID" ;;
+             "asmcmd rm -rf "*|"rm -rf "*) journal DELETED "${CP_CMD[$i]##* }" "cannot be undone: files of the unfinished copy, after you typed CLEAN" ;;
+             "rm -f $(dup_marker)") ;;
+             "rm -f "*) nf=$((nf + 1)) ;;
+           esac
+         done
+         [[ $nf -gt 0 ]] && journal DELETED "$STANDBY_UNIQUE" "cannot be undone: $nf file(s) of the unfinished copy at the primary's paths, after you typed CLEAN"
          _log CHANGE "clean-up of the unfinished copy done on $(hostname -s)"
          rm -f -- "$STATE_DIR/existing_files_ok"
          return 0 ;;
@@ -10864,9 +11104,12 @@ d_7_2_cleanup() {
 
 d_7_2() {
   if [[ ${L72_MOUNTCHECK:-0} -eq 1 ]]; then
-    L72_MOUNTCHECK=0; L72_MOUNTED_ONCE=1
+    L72_MOUNTCHECK=0
     journal INSTANCE "$STANDBY_SID" "startup mount (to compare the standby with the primary)"
-    cp_run || return 1
+    # mounted once per run (a standby that is down again later is not mounted again and again); a mount that
+    # failed and left nothing running does not use up that one try
+    if ! cp_run; then local_state; [[ "$LSTATE" == IDLE ]] || L72_MOUNTED_ONCE=1; return 1; fi
+    L72_MOUNTED_ONCE=1
     return 0
   fi
   if [[ -n "$L72_CLEAN" ]]; then
@@ -10876,6 +11119,8 @@ d_7_2() {
       # you ran the script file: what it should have removed must be gone now
       cp_reset; local_state
       if [[ "$LSTATE" != IDLE ]] || clean_collect; then cp_reset; bad "The files of the unfinished copy are still here (or the instance still runs). Run the file, then answer r."; return 1; fi
+      # a place that cannot be read is not proof that it is clean
+      [[ -z "$CL_UNREAD" ]] || { cp_reset; bad "Cannot check that the files are gone:"$'\n'"${CL_UNREAD%$'\n'}"$'\n'"Answer r when it can be read."; return 1; }
       cp_reset; crc=0
       # done: the file is removed (run again later, it would remove a working standby)
       rm -f -- "$SHORT_DIR/c72"
@@ -11043,7 +11288,7 @@ space_check() {
   # appends to PRE_INFO; sets PRE_FIX and returns 1 when a place here lacks space. Each place (a disk group, or the
   # file system of a folder) must hold what goes there TOGETHER: the database files (+10 %), the standby logs of
   # step 9.3 and the recovery area (its full size, set as db_recovery_file_dest_size).
-  local l d mb key mnt f free need short="" sz
+  local l d mb key mnt f ff free need short="" sz
   declare -A NEED_DB=() NEED_SRL=() NEED_FRA=() FREE=() THERE=() LABEL=()
   srl_plan_space
   [[ "$(place_mode)" != same && $SRL_MB -gt 0 ]] && SRL_LOC=$(data_dest)
@@ -11075,10 +11320,11 @@ space_check() {
   # same paths in folders: files at exactly the target paths (an earlier copy) are overwritten by RMAN, their space
   # counts as free (once per file)
   if [[ "$(place_mode)" == same && -n "$(fs_dirs)" ]] && sql_or_cached_filenames; then
-    while IFS= read -r f; do
-      [[ -n "$f" && -f "$f" ]] || continue
-      mnt=$(mnt_of "$(dirname "$f")"); [[ -n "${NEED_DB[$mnt]:-}" ]] || continue
-      sz=$(stat -c '%s' -- "$f" 2>/dev/null); num "$sz" || continue
+    # (its own variable: f still holds the recovery area for the advice below)
+    while IFS= read -r ff; do
+      [[ -n "$ff" && -f "$ff" ]] || continue
+      mnt=$(mnt_of "$(dirname "$ff")"); [[ -n "${NEED_DB[$mnt]:-}" ]] || continue
+      sz=$(stat -c '%s' -- "$ff" 2>/dev/null); num "$sz" || continue
       THERE[$mnt]=$(( ${THERE[$mnt]:-0} + sz / 1048576 ))
     done <<< "$FS_FILENAMES"
   fi
@@ -11116,6 +11362,22 @@ dup_prechecks() {
   local_state
   [[ "$LSTATE" == "STARTED" ]] || { PRE_FIX="The standby instance must be in NOMOUNT, but it is $LSTATE (step 7.2)"; return 1; }
   if spfile_from_failed_copy; then PRE_FIX="The instance runs from the spfile of an unfinished copy. Clean up first (step 7.2)"; return 1; fi
+  # the software here must be the primary's release, the same test as step 3.11 (--from 8.1 does not need 3.11 to
+  # have passed). A patch difference is only reported: patching the standby first (standby-first) is supported.
+  local rel wr bad_rel=""; rel=$(local_release || true); wr=$(want_rel)
+  [[ -n "$rel" && -n "$wr" ]] || { PRE_FIX="The release of the database software here (sqlplus -V) or of the primary could not be read (step 3.11)"; return 1; }
+  if [[ "$DB_MAJOR" == "12" ]]; then [[ "$rel" == "$wr" ]] || bad_rel="release $rel here, release $wr on the primary"
+  else [[ "${rel%%.*}" == "$DB_MAJOR" ]] || bad_rel="release $rel here, release $DB_MAJOR on the primary"; fi
+  [[ -z "$bad_rel" ]] || { PRE_FIX="The database software here is another release: $bad_rel."$'\n'"The standby must have the same release as the primary (step 3.11)."; return 1; }
+  # (the Release Update is one of these patch ids too)
+  local pp lp pdiff
+  if pp=$(primary_patches "$DB_HOME") && lp=$(local_patches "$DB_HOME"); then
+    pdiff=$(comm -3 <(printf '%s\n' "$pp" | grep -v '^$') <(printf '%s\n' "$lp" | grep -v '^$') | tr -d '\t' | paste -sd' ' -)
+    if [[ -n "$pdiff" ]]; then PRE_INFO+="Warning: the patches of $DB_HOME differ from the primary ($pdiff; step 10.6 shows them). Allowed: a standby may be patched first."$'\n'
+    else PRE_INFO+="Release $rel; the patches of $DB_HOME match the primary"$'\n'; fi
+  else
+    PRE_INFO+="Release $rel; the patches of $DB_HOME were not compared with the primary (an inventory cannot be read)"$'\n'
+  fi
   # the disk group of the logs must fit the block size of the primary's redo (else ORA-01378 after the copy, at 9.3)
   if use_grid && grid_sw_ok; then
     # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
@@ -11152,7 +11414,11 @@ dup_prechecks() {
     done
   fi
   # the copy takes the spfile of the primary (duplicate ... spfile): a primary started from a pfile fails there
-  prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && [[ "$(first_line)" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
+  # (a failed query or an answer that is not a value is "could not be read", never "has an spfile")
+  prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" || { PRE_FIX="The spfile setting of the primary could not be read ($(ora_errors "$SQL_OUT"))"; return 1; }
+  local spv; spv=$(first_line)
+  [[ -n "$spv" && ! "$spv" =~ ^(ORA|SP2)-[0-9] ]] || { PRE_FIX="The spfile setting of the primary could not be read (unexpected answer: $(tr -cd '[:print:]' <<< "${spv:-nothing}"))"; return 1; }
+  [[ "$spv" == "-" ]] && { PRE_FIX="The primary runs from a text pfile, but the copy needs its spfile (step 4.1)"; return 1; }
   if [[ -f "$STATE_DIR/dup_attempt" && ! -f "$STATE_DIR/existing_files_ok" ]] && ! copy_finished && [[ -n "$(orphan_leftovers)" ]]; then
     PRE_FIX="Files of an unfinished copy are still on this server. Clean them up first (step 7.2)"; return 1
   fi
@@ -11174,7 +11440,11 @@ dup_prechecks() {
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { PRE_FIX="Cannot read the log mode of the primary"; return 1; }
   local lm fl; IFS='|' read -r lm fl <<< "$(first_line)"
   [[ "$lm" == "ARCHIVELOG" ]] || { PRE_FIX="The primary is in $lm mode. It must be in ARCHIVELOG mode (step 4.1)"; return 1; }
-  [[ "$fl" == "YES" ]] || warn "FORCE LOGGING is off on the primary (step 4.1)."$'\n'"NOLOGGING operations would not reach the standby."
+  # force logging (step 4.1); the STANDBY NOLOGGING modes (18c+, set on purpose) are accepted, as in step 10.5
+  case "${fl^^}" in
+    YES|"STANDBY NOLOGGING"*) ;;
+    *) PRE_FIX="FORCE LOGGING is off on the primary (force_logging = ${fl:-unknown}, step 4.1)."$'\n'"NOLOGGING operations would not reach the standby. On the primary:  alter database force logging;"; return 1 ;;
+  esac
   p_param remote_login_passwordfile || { PRE_FIX="Cannot read remote_login_passwordfile on the primary"; return 1; }
   [[ "$PVAL" == "EXCLUSIVE" || "$PVAL" == "SHARED" ]] || { PRE_FIX="remote_login_passwordfile on the primary is $PVAL. The primary must be restarted after the change (step 4.7)"; return 1; }
   # role separation: the oracle binary must be able to open the ASM disks
@@ -11359,7 +11629,7 @@ dup_prechecks() {
   DUP_SECTION=""
   if [[ "${DUP_SECTION_SIZE:-}" == "0" ]]; then :
   elif [[ -n "${DUP_SECTION_SIZE:-}" ]]; then DUP_SECTION=$DUP_SECTION_SIZE
-  elif [[ ${AUX_CHANNELS:-1} -gt 1 ]]; then
+  elif [[ $(chan_n "${AUX_CHANNELS:-}" 1) -gt 1 ]]; then
     prim_sql "select round(max(bytes)/1048576) from v\$datafile;" || { PRE_FIX="Cannot read the size of the datafiles of the primary"; return 1; }
     local maxdf; maxdf=$(first_line)
     num "$maxdf" || { PRE_FIX="Unexpected answer for the largest datafile of the primary: $maxdf"; return 1; }
@@ -11771,8 +12041,9 @@ c_9_1() {
     NOW="Registered, but these values are wrong:$bad_items"$'\n'"$(grep -iE '^(spfile|database role|database instance|instance|start options|oracle home|password file|disk groups|domain)' <<< "$cfg")"
     [[ -n "$DG_DEAD_NOTE" ]] && NOW+=$'\n'"$DG_DEAD_NOTE"
     # a new registration or a disk-group change while the disk groups cannot be read: not now (the old disk
-    # groups could not be kept, and the standby would be stopped for nothing)
-    if [[ $dg_unread -eq 1 && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
+    # groups could not be kept, and the standby would be stopped for nothing). A standby in folders whose
+    # registration names no disk group has nothing to keep: ASM does not matter then
+    if [[ $dg_unread -eq 1 && ( -n "$cdg" || -n "$(srv_dgs)" ) && "$bad_items" =~ (spfile|role|instance|diskgroup) ]]; then
       NOW+=$'\n'"The registration is changed when the disk groups of this server can be read again (ASM running)."
       return 2
     fi
@@ -11784,6 +12055,8 @@ c_9_1() {
       PLAN="-- If those disk groups are gone for good, take them out of the registration first:"$'\n'"srvctl modify database -db $STANDBY_UNIQUE -diskgroup $(dg_union "$live" "$(srv_dgs)")"$'\n'"-- If their disks only come later, wait until ASM sees them. Then answer r."
       return 1
     fi
+    # (named here too, not only in the warning: the run summary keeps NOW)
+    [[ -n "$dead" ]] && NOW+=$'\n'"It also names disk group(s) that ASM here does not see:$dead (kept, see the warning)."
     REG_OLD_OPT=$(sed -n 's/^Start options:[[:space:]]*//Ip' <<< "$cfg" | head -n 1 | tr -cd 'A-Za-z ' | tr ' ' '_')
     # start option, home and password file are changed in place (the running standby is not stopped);
     # a wrong spfile, role or instance needs a new registration
@@ -11921,14 +12194,15 @@ d_9_1() {
     run_logged "srvctl config (before the new registration)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE" || { bad "Cannot read the old registration. Nothing is changed."; return 1; }
     ( umask 077; printf '%s\n' "$RUN_OUT" > "$old" ) || { bad "Cannot save the old registration to $old. Nothing is changed."; return 1; }
     # the disk groups are read again right before (ASM may have stopped since the check): no new registration
-    # that would lose the old disk groups
-    if ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
+    # that would lose the old disk groups (none in the old registration and none needed: nothing to lose)
+    local odg; odg=$(_cfgv "$old" 'Disk Groups' | tr -d ' \t\r')
+    if [[ -n "$odg" || -n "$(srv_dgs)" ]] && ! asm_dg_names; then bad "The disk groups of this server cannot be read now${ASM_MISSING:+ (missing:$ASM_MISSING)}. Nothing is changed."; return 1; fi
     run_logged "srvctl stop" as_oracle timeout 600 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" || true
     run_logged "srvctl remove" as_oracle timeout 600 "$DB_HOME/bin/srvctl" remove database -db "$STANDBY_UNIQUE" -noprompt || { bad "srvctl remove failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }
     if ! srv_add "$old"; then
       say "The new registration failed. Adding the old registration again."
       local radd back=0 diffl=""; radd=$(srv_add_cmd_from "$old")
-      if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle "${SRV_OLD_ARGS[@]}"; then
+      if srv_old_args "$old" && run_logged "srvctl add (the old registration)" as_oracle timeout 600 "${SRV_OLD_ARGS[@]}"; then
         back=1
         # the same as before? srvctl config is read again and compared, line by line, with the saved one
         if run_logged "srvctl config (after putting the old registration back)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE"; then
@@ -11961,6 +12235,16 @@ d_9_1() {
     fi
     journal SRVCTL_OLD "$STANDBY_UNIQUE" "file=$old"
     journal SRVCTL "$STANDBY_UNIQUE" "registered in Oracle Restart (role PHYSICAL_STANDBY, start option MOUNT)"
+    # values of the old registration the new one does not carry (services, server pools, OS groups ...): read
+    # again and named. The values this step sets itself are left out of the comparison
+    if run_logged "srvctl config (after the new registration)" as_oracle timeout 600 "$DB_HOME/bin/srvctl" config database -db "$STANDBY_UNIQUE"; then
+      local lost; lost=$(comm -23 <(srv_cfg_norm < "$old" | sort -u) <(printf '%s\n' "$RUN_OUT" | srv_cfg_norm | sort -u) \
+        | grep -viE '^(Database unique name|Database name|Oracle home|Oracle user|Spfile|Password file|Domain|Start options|Stop options|Database role|Management policy|Disk Groups|Database instance|Instance|Instance name):' \
+        | grep -E '^[^:]+:[[:space:]]*[^[:space:]]' | head -n 8)
+      [[ -n "$lost" ]] && warn "The new registration does not have these values of the old one:"$'\n'"$(sed 's/^/  /' <<< "$lost")"$'\n'"The old registration is saved in:  $old"$'\n'"Set them again by hand, as $ORACLE_USER (srvctl modify database, srvctl add service)."
+    else
+      warn "The new registration could not be read to compare it with the old one (saved in $old)."
+    fi
     return 0
   fi
   srv_add || return 1
@@ -12176,8 +12460,9 @@ arch_script_text() {
   printf 'echo "=== dg_arch_cleanup $(date '"'"'+%%Y-%%m-%%d %%H:%%M:%%S'"'"') ==="\n'
   printf 'export ORACLE_HOME=%s ORACLE_SID=%s LANG=C\n' "$DB_HOME" "$STANDBY_SID"
   printf '# the deletion policy first: without TO APPLIED ON STANDBY a log that is not applied could be deleted\n'
+  printf '# (the same rule as step 9.8: "... BACKED UP n TIMES ..." is not enough on a standby)\n'
   printf 'pol=$(printf "show archivelog deletion policy;\\nexit\\n" | "$ORACLE_HOME/bin/rman" target / 2>&1)\n'
-  printf 'if ! printf "%%s\\n" "$pol" | grep -qi "TO APPLIED ON.*STANDBY"; then echo "RMAN-00000: the deletion policy is not TO APPLIED ON STANDBY: nothing deleted (step 9.8 sets it)"; exit 1; fi\n'
+  printf 'if ! printf "%%s\\n" "$pol" | grep -qiE "POLICY TO APPLIED ON +(ALL +)?STANDBY *;"; then echo "RMAN-00000: the deletion policy is not TO APPLIED ON STANDBY: nothing deleted (step 9.8 sets it)"; printf "%%s\\n" "$pol" | grep -iE "DELETION POLICY|RMAN-[0-9]|ORA-[0-9]" | head -n 5; exit 1; fi\n'
   printf '"$ORACLE_HOME/bin/rman" target / <<EOF\n'
   printf "delete noprompt archivelog all completed before 'sysdate-%s';\nexit\nEOF\n" "$(arch_days)"
   printf 'rc=$?\necho "=== end (exit code $rc) ==="\nexit $rc\n'
@@ -12224,6 +12509,8 @@ arch_cron_state() {
   [[ -n "$(arch_cron_last_errors)" ]] && { printf failed; return; }
   printf ok
 }
+# $1 the value of 'ARCHIVELOG DELETION POLICY' in v$rman_configuration: the one rule of 9.8, 10.8 and the nightly script
+arch_policy_is_ok() { [[ "$(tr -s ' ' <<< "${1^^}")" =~ ^TO\ APPLIED\ ON\ (ALL\ )?STANDBY$ ]]; }
 ARCH_POLICY_OK=0; L98_ASK=0; L98_OLDPOL="-"; L98_TIMER_OFF=0; L98_CRON_OFF=""; L98_CRON_ON=0; L98_TIMER_ON=0
 c_9_8() {
   L98_ASK=0; L98_TIMER_OFF=0; L98_CRON_OFF=""; L98_CRON_ON=0; L98_TIMER_ON=0
@@ -12234,7 +12521,7 @@ c_9_8() {
   local v; v=$(first_line); L98_OLDPOL=$v
   # only "applied on (all) standby" deletes on a standby; a policy copied from the primary with "backed up n times"
   # never deletes here (nothing is backed up on the standby)
-  ARCH_POLICY_OK=0; [[ "$(tr -s ' ' <<< "${v^^}")" =~ ^TO\ APPLIED\ ON\ (ALL\ )?STANDBY$ ]] && ARCH_POLICY_OK=1
+  ARCH_POLICY_OK=0; arch_policy_is_ok "$v" && ARCH_POLICY_OK=1
   local mode=${ARCH_CLEANUP:-}
   if [[ "$mode" == oracle ]] && ! arch_in_fra; then
     NOW="ARCH_CLEANUP=oracle, but the archived logs go to $(arch_where), not to the recovery area. Oracle deletes nothing there."
@@ -12306,7 +12593,11 @@ c_9_8() {
                 [[ -f "$(arch_script)" && "$(cat "$(arch_script)")" == "$(arch_script_text)" ]] || cp_add_file "$(arch_script)" 755 "$(arch_script_text)"
                 # the log: a file of oracle in the log folder; the folder gets the install group so oracle can reach it
                 arch_log_traversable || { cp_add root "chgrp $INSTALL_GROUP $LOG_DIR"; cp_add root "chmod 750 $LOG_DIR"; }
-                [[ -f "$(arch_cron_log)" && "$(stat -c '%U' "$(arch_cron_log)" 2>/dev/null)" == "$ORACLE_USER" ]] || cp_add root "install -o $ORACLE_USER -g $INSTALL_GROUP -m 640 /dev/null $(arch_cron_log)"
+                # (a log that is there with another owner is given to oracle, not emptied: its error lines are kept)
+                if ! [[ -f "$(arch_cron_log)" && "$(stat -c '%U' "$(arch_cron_log)" 2>/dev/null)" == "$ORACLE_USER" ]]; then
+                  if [[ -f "$(arch_cron_log)" && ! -L "$(arch_cron_log)" ]]; then cp_add root "chown $ORACLE_USER:$INSTALL_GROUP $(arch_cron_log)"; cp_add root "chmod 640 $(arch_cron_log)"
+                  else cp_add root "install -o $ORACLE_USER -g $INSTALL_GROUP -m 640 /dev/null $(arch_cron_log)"; fi
+                fi
                 if [[ "$(arch_cron_ours)" != "$(arch_cron_line)" ]]; then
                   cp_add root "c=\$(crontab -u $ORACLE_USER -l 2>/dev/null) || { e=\$(crontab -u $ORACLE_USER -l 2>&1 >/dev/null); case \"\$e\" in 'no crontab for'*) c= ;; *) echo \"\$e\"; exit 1 ;; esac; }; { [ -z \"\$c\" ] || printf '%s\\n' \"\$c\" | grep -v -- ' $(arch_cron_tag)\$'; echo '$(arch_cron_line)'; } | crontab -u $ORACLE_USER -"
                   L98_CRON_ON=1
@@ -12502,6 +12793,13 @@ dropin_text() {
   if [[ "$(asm_method)" == "asmlib" ]]; then printf '[Unit]\nAfter=oracleasm.service\nWants=oracleasm.service\n'
   else printf '[Unit]\nAfter=systemd-udev-settle.service\nWants=systemd-udev-settle.service\n'; fi
 }
+srv_status_text() {
+  # read-only: "srvctl status database -verbose" of the standby, a few lines indented (empty when it gives nothing)
+  run_logged "srvctl status database" as_oracle timeout 60 "$DB_HOME/bin/srvctl" status database -db "$STANDBY_UNIQUE" -verbose || true
+  local o; o=$(grep -v '^[[:space:]]*$' <<< "$RUN_OUT" | head -n 4 | sed 's/^/  /')
+  [[ -n "$o" ]] && printf 'srvctl status database -db %s -verbose:\n%s' "$STANDBY_UNIQUE" "$o"
+  return 0
+}
 C97_FIX=""
 DGERR_PREV=""
 BOOT_ERR_SHOWN=0
@@ -12530,24 +12828,34 @@ c_9_7() {
       fi
       # Oracle Restart often mounts it within minutes (after a reboot): looked at again a few times, at most
       # 5 minutes in all whatever POLL_WAIT is
-      local n=0 pw=$POLL_WAIT; [[ $pw -gt 50 ]] && pw=50
+      local n=0 pw=$POLL_WAIT sub; [[ $pw -gt 50 ]] && pw=50
+      # a unit that has already ended (SubState exited, with RemainAfterExit) waits for nothing any more: no poll
+      sub=$(systemctl show -p SubState "$(unit_name)" 2>/dev/null | sed -n 's/^SubState=//p')
       # (STARTED on the way: Oracle Restart is mounting it, so it is looked at again too)
-      while [[ "$MODE" != check && ( "$LSTATE" == IDLE || "$LSTATE" == STARTED ) && $n -lt 6 ]]; do
+      while [[ "$MODE" != check && "$sub" != exited && ( "$LSTATE" == IDLE || "$LSTATE" == STARTED ) && $n -lt 6 ]]; do
         n=$((n + 1)); say "The standby is not mounted yet. Oracle Restart starts it. Checked again in $pw seconds ($n of 6)"
         nap "$pw"; local_state
       done
       # still in NOMOUNT after step 9.2 mounted it in this run: not a matter of waiting
       if [[ "$LSTATE" == STARTED && $n -gt 0 ]] && [[ "${STEP_RESULT[9.2]:-}" == OK || "${STEP_RESULT[9.2]:-}" == DONE ]]; then
         NOW="$(unit_name) is enabled, but the standby stays in NOMOUNT after step 9.2 mounted it in this run."
+        local sst; sst=$(srv_status_text); [[ -n "$sst" ]] && NOW+=$'\n'"$sst"
         PLAN="-- Find out why: the alert log of $STANDBY_SID, and as $ORACLE_USER:"$'\n'"srvctl status database -db $STANDBY_UNIQUE -verbose"$'\n'"-- Then answer r."
         MANUAL_WHERE="To check on this server ($(hostname -s))"; MANUAL_HOW="$ORACLE_USER"
         return 2
       fi
       if [[ "$LSTATE" == IDLE || ( "$LSTATE" == STARTED && $n -gt 0 ) ]]; then
         [[ "$LSTATE" == STARTED ]] && NOW+=$'\n'"It is started (NOMOUNT) but not mounted yet."
-        # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
-        NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
-        NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"
+        if [[ "$sub" == exited ]]; then
+          # the unit has ended: it does not start apply when the standby is mounted later
+          NOW+=$'\n'"The standby is not mounted now ($LSTATE), and $(unit_name) has already ended: it does not start redo apply"$'\n'"when Oracle Restart mounts the standby later. After the mount, start apply with step 9.4 (or:  systemctl restart $(unit_name))."
+        else
+          # the unit waits for Oracle Restart to mount the standby, then starts apply: nothing to do here yet
+          NOW+=$'\n'"The standby is not mounted now ($LSTATE). Oracle Restart mounts it (step 9.2); the unit then starts redo apply."
+        fi
+        local sst; sst=$(srv_status_text)
+        if [[ -n "$sst" ]]; then NOW+=$'\n'"$sst"$'\n'"If it stays so, see the alert log of $STANDBY_SID."
+        else NOW+=$'\n'"If it stays so, as $ORACLE_USER:  srvctl status database -db $STANDBY_UNIQUE -verbose  (and the alert log)"; fi
         CHECK_WAITS=1; return 0
       fi
     fi
@@ -12791,6 +13099,9 @@ c_10_2_once() {
       have=$(first_line); num "$have" || { unread=1; break; }
       [[ $have -lt $((hi - lo + 1)) ]] && { gone+="  thread $t, sequence $lo to $hi"$'\n'; gonel+="$t $lo-$hi"$'\n'; }
     done <<< "$gaps"
+  elif [[ -n "$gaps" ]]; then
+    # not looked at: said, so nobody waits for fal_server to send logs the primary may no longer have
+    NOW+=$'\n'"Whether the missing logs are still on the primary was not checked (no ssh connection to the primary)."
   fi
   [[ $unread -eq 1 ]] && NOW+=$'\n'"Whether the missing logs are still on the primary could not be read$([[ -n "$gone" ]] && printf ' for the other gaps')."
   if [[ -n "$gone" ]]; then
@@ -12963,16 +13274,16 @@ c_10_8() {
   need_built || return 2
   local_state
   [[ "$LSTATE" == "MOUNTED" || "$LSTATE" == "OPEN" ]] || { NOW="The standby is not mounted (step 9.2)"; return 2; }
-  local used recl real msg="" bad=0 warnl=0
+  local used recl real=0 msg="" bad=0 warnl=0 waits=0 lrc d
   # where the standby really archives (read from it, not from the settings: a standby made by hand may differ)
-  local rfra rarch v
+  local rfra dests v
   sql_local "select nvl(max(value),'-') from v\$parameter where name='db_recovery_file_dest';" || { NOW="Cannot read the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
   rfra=$(first_line); [[ "$rfra" == "-" ]] && rfra=""
   sql_local "select value from v\$parameter where name like 'log_archive_dest_%' and upper(value) like '%LOCATION=%' order by to_number(regexp_substr(name, '[0-9]+\$'));" || { NOW="Cannot read the archive destinations of the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
-  v=$(grep -oiE 'location=[^ ]+' <<< "$SQL_OUT" | head -n 1); rarch=${v#*=}
-  [[ -z "$rarch" && -n "$rfra" ]] && rarch=USE_DB_RECOVERY_FILE_DEST
-  [[ "${rarch^^}" == USE_DB_RECOVERY_FILE_DEST ]] && rarch=USE_DB_RECOVERY_FILE_DEST
-  [[ -n "$rarch" ]] || { NOW="The standby has no local archive destination (log_archive_dest_n with LOCATION) and no recovery area."; return 1; }
+  # every local destination, each once (a second one can fill up as well)
+  dests=$(grep -oiE 'location=[^ ]+' <<< "$SQL_OUT" | sed 's/^[^=]*=//' | awk 'toupper($0) == "USE_DB_RECOVERY_FILE_DEST" {$0 = "USE_DB_RECOVERY_FILE_DEST"} !s[$0]++')
+  [[ -z "$dests" && -n "$rfra" ]] && dests=USE_DB_RECOVERY_FILE_DEST
+  [[ -n "$dests" ]] || { NOW="The standby has no local archive destination (log_archive_dest_n with LOCATION) and no recovery area."; return 1; }
   # a disk group: its own free space counts too (a recovery area quota inside a full disk group still fails)
   _dg_low() {
     local g=${1#+}; g=${g%%/*}; local f t
@@ -12980,29 +13291,43 @@ c_10_8() {
     IFS='|' read -r f t <<< "$(first_line)"; num "$f" && num "$t" && [[ $t -gt 0 ]] || return 2
     DG_FREE_PCT=$(( f * 100 / t )); [[ $DG_FREE_PCT -lt 10 ]]
   }
-  if [[ "$rarch" == USE_DB_RECOVERY_FILE_DEST ]]; then
-    sql_local "select nvl(round(sum(percent_space_used)),0)||'|'||nvl(round(sum(percent_space_reclaimable)),0) from v\$recovery_area_usage;" \
-      || { NOW="Cannot read v\$recovery_area_usage ($(ora_errors "$SQL_OUT"))"; return 2; }
-    IFS='|' read -r used recl <<< "$(first_line)"
-    num "$used" && num "$recl" || { NOW="Unexpected answer from v\$recovery_area_usage: $(first_line)"; return 2; }
-    real=$(( used - recl )); [[ $real -lt 0 ]] && real=0
-    msg="Recovery area $rfra: ${used}% used, ${recl}% of it reclaimable (applied logs), ${real}% not reclaimable"
-    [[ $real -ge 90 ]] && bad=1; [[ $real -ge 80 && $real -lt 90 ]] && warnl=1
-    if [[ "$rfra" == +* ]]; then
-      local lrc=0; _dg_low "$rfra" || lrc=$?
-      [[ $lrc -eq 0 ]] && { msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free: the recovery area cannot grow to its size"; bad=1; }
+  # a folder: how full its file system is (DF_USED, percent); 1 when df cannot tell
+  _df_used() { DF_USED=$(df -P -- "$1" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'); num "$DF_USED"; }
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    msg+="${msg:+$'\n'}"
+    if [[ "$d" == USE_DB_RECOVERY_FILE_DEST ]]; then
+      sql_local "select nvl(round(sum(percent_space_used)),0)||'|'||nvl(round(sum(percent_space_reclaimable)),0) from v\$recovery_area_usage;" \
+        || { NOW="Cannot read v\$recovery_area_usage ($(ora_errors "$SQL_OUT"))"; return 2; }
+      IFS='|' read -r used recl <<< "$(first_line)"
+      num "$used" && num "$recl" || { NOW="Unexpected answer from v\$recovery_area_usage: $(first_line)"; return 2; }
+      real=$(( used - recl )); [[ $real -lt 0 ]] && real=0
+      msg+="Recovery area $rfra: ${used}% used, ${recl}% of it reclaimable (applied logs), ${real}% not reclaimable"
+      [[ $real -ge 90 ]] && bad=1; [[ $real -ge 80 && $real -lt 90 ]] && warnl=1
+      if [[ "$rfra" == +* ]]; then
+        # a disk group that cannot be read: cannot check, never OK (the same rule as an archive disk group)
+        lrc=0; _dg_low "$rfra" || lrc=$?
+        [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$rfra") (recovery area $rfra)"; return 2; }
+        if [[ $lrc -eq 0 ]]; then msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free: the recovery area cannot grow to its size"; bad=1
+        elif [[ $DG_FREE_PCT -lt 20 ]]; then msg+=$'\n'"Disk group $(dg_of "$rfra") has only ${DG_FREE_PCT}% free"; warnl=1; fi
+      elif [[ "$rfra" == /* ]]; then
+        # its size (db_recovery_file_dest_size) may be more than its file system really has free
+        _df_used "$rfra" || { NOW="Cannot read the free space of $rfra (df)"; return 2; }
+        msg+=$'\n'"Its file system: ${DF_USED}% used"
+        [[ $DF_USED -ge 90 ]] && bad=1; [[ $DF_USED -ge 80 && $DF_USED -lt 90 ]] && warnl=1
+      fi
+    elif [[ "$d" == +* ]]; then
+      lrc=0; _dg_low "$d" || lrc=$?
+      [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$d")"; return 2; }
+      msg+="Archive destination $d: ${DG_FREE_PCT}% of the disk group free"
+      # the same bands as a folder: less than 10% free is a problem, less than 20% needs attention
+      [[ $lrc -eq 0 ]] && bad=1; [[ $lrc -eq 1 && $DG_FREE_PCT -lt 20 ]] && warnl=1
+    else
+      _df_used "$d" || { NOW="Cannot read the free space of $d (df)"; return 2; }
+      msg+="Archive folder $d: ${DF_USED}% of its file system used"
+      [[ $DF_USED -ge 90 ]] && bad=1; [[ $DF_USED -ge 80 && $DF_USED -lt 90 ]] && warnl=1
     fi
-  elif [[ "$rarch" == +* ]]; then
-    local lrc=0; _dg_low "$rarch" || lrc=$?
-    [[ $lrc -eq 2 ]] && { NOW="Cannot read the free space of disk group $(dg_of "$rarch")"; return 2; }
-    msg="Archive destination $rarch: ${DG_FREE_PCT}% of the disk group free"
-    [[ $lrc -eq 0 ]] && bad=1
-  else
-    used=$(df -P -- "$rarch" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')
-    num "$used" || { NOW="Cannot read the free space of $rarch (df)"; return 2; }
-    msg="Archive folder $rarch: ${used}% of its file system used"
-    [[ $used -ge 90 ]] && bad=1; [[ $used -ge 80 && $used -lt 90 ]] && warnl=1
-  fi
+  done <<< "$dests"
   # the clean-up that ARCH_CLEANUP chose: did its last run work?
   local mode=${ARCH_CLEANUP:-} cmsg=""
   case "$mode" in
@@ -13020,15 +13345,32 @@ c_10_8() {
              # a cron line that has not run for two days (cron stopped, a wrong time)
              local lf; lf=$(arch_cron_log)
              if [[ $bad -eq 0 && -f "$lf" && -n "$(find "$lf" -mmin +$((49 * 60)) 2>/dev/null)" ]]; then cmsg+="; but its log has not changed for more than two days (is crond running?)"; warnl=1; fi ;;
-    oracle)  cmsg="Clean-up: left to the recovery area (ARCH_CLEANUP=oracle)" ;;
+    oracle)  # (the same rule as 9.8: Oracle deletes only in the recovery area)
+             local outside; outside=$(grep -vx USE_DB_RECOVERY_FILE_DEST <<< "$dests" | paste -sd' ' -)
+             if [[ -n "$outside" ]]; then
+               cmsg="ARCH_CLEANUP=oracle, but archived logs also go to $outside, not to the recovery area. Oracle deletes nothing there."$'\n'"Choose timer or crontab ($SELF --settings), then run step 9.8."; bad=1
+             else cmsg="Clean-up: left to the recovery area (ARCH_CLEANUP=oracle)"; fi ;;
     none)    cmsg="Clean-up: none (ARCH_CLEANUP=none): watch the space" ;;
-    *)       cmsg="Clean-up: not chosen yet (step 9.8)" ;;
+    *)       cmsg="Clean-up: not chosen yet (ARCH_CLEANUP is empty): nothing deletes applied logs here. Step 9.8 asks."; waits=1 ;;
   esac
-  NOW="$msg"$'\n'"$cmsg"
+  # the RMAN deletion policy that step 9.8 set (changed later, or the primary's back after a roll forward):
+  # attention, not a failure (read-only; the space above shows its effect)
+  if [[ "$mode" == timer || "$mode" == crontab || "$mode" == oracle ]]; then
+    if sql_local "select nvl(max(value),'-') from v\$rman_configuration where name='ARCHIVELOG DELETION POLICY';"; then
+      v=$(first_line)
+      arch_policy_is_ok "$v" || { cmsg+=$'\n'"RMAN archivelog deletion policy: ${v/#-/not set}, not TO APPLIED ON STANDBY. Applied logs may not be deleted here (step 9.8 sets it)."; waits=1; }
+    else
+      cmsg+=$'\n'"Cannot read the RMAN archivelog deletion policy ($(ora_errors "$SQL_OUT"))"; waits=1
+    fi
+  fi
+  # attention that comes from the clean-up part: its lines first (the --health summary shows the first two lines)
+  if [[ $waits -eq 1 && $bad -eq 0 ]]; then NOW="$cmsg"$'\n'"$msg"; else NOW="$msg"$'\n'"$cmsg"; fi
   if [[ $bad -eq 1 ]]; then
     [[ "$msg" == *"not reclaimable"* && $real -ge 90 ]] && NOW+=$'\n'"Logs that are not applied (or not reclaimable) fill the recovery area. Check redo apply (10.4) and the deletion policy (9.8)."
     return 1
   fi
+  # not chosen, or a policy that does not fit: waiting (WARNING in --health), never OK
+  [[ $waits -eq 1 ]] && { CHECK_WAITS=1; return 0; }
   if [[ $warnl -eq 1 ]]; then
     if [[ ${HEALTH:-0} -eq 1 ]]; then CHECK_WAITS=1; else warn "${NOW%%$'\n'*}"; fi
   fi
@@ -13150,11 +13492,18 @@ c_10_7() {
     IFS='|' read -r plog prc < "$pf"
     if [[ "$prc" == "0" && -f "$plog" ]] && ! grep -qE '^RMAN-0(3002|3009)|ERROR MESSAGE STACK' "$plog"; then
       local_state
+      # an OPEN standby runs already: it must be mounted again, not started (the same as a new roll forward)
+      if [[ "$LSTATE" == OPEN ]]; then
+        NOW="The roll forward of an earlier run has ended, but the standby is OPEN. Its clean-up needs it mounted."
+        KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server, sqlplus / as sysdba"
+        PLAN="shutdown immediate"$'\n'"startup mount"; return 1
+      fi
       [[ "$LSTATE" == MOUNTED ]] || { NOW="The roll forward of an earlier run has ended, but the standby is not mounted ($LSTATE). Start it (step 9.2), then run again."; return 2; }
       RF_FINISH=1
       local fb0; sql_local "select flashback_on from v\$database;" && fb0=$(first_line) || fb0="?"; RF_FB=$fb0
       NOW="The roll forward of an earlier run has ended without error (output: $plog)."$'\n'"It was not checked yet, and redo apply is stopped."
       [[ "$fb0" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
+      [[ "$fb0" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
       PLAN="-- Check the standby, set its standby redo logs and RMAN settings again (9.3, 9.8) and start redo apply.
 -- RMAN is not run again."
       return 1
@@ -13248,6 +13597,7 @@ c_10_7() {
   local fb; sql_local "select flashback_on from v\$database;" && fb=$(first_line) || fb="?"
   NOW="The standby can be rolled forward from the primary ($how)."
   [[ "$fb" == "YES" ]] && NOW+=$'\n'"Flashback database is on here. Its logs are no longer usable after the roll forward: turn it off and on again afterwards."
+  [[ "$fb" == "?" ]] && NOW+=$'\n'"Whether flashback database is on here could not be read ($(ora_errors "$SQL_OUT")). If it is on, turn it off and on again after the roll forward."
   RF_FB=$fb
   PLAN="-- 1) Redo apply is stopped, then RMAN, as $ORACLE_USER on this server:
 recover standby database from service $PRIMARY_TNS;
@@ -13297,13 +13647,17 @@ rf_after() {
   # 2) the archived logs and backups here, as RMAN knows them: the recovery area is catalogued again and every
   #    archived log is cross-checked (else the recovery area could not reclaim the old logs and fills up)
   local fra t lrc=0
-  sql_local "select nvl(value,'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="-"
+  # a recovery area that cannot be read is not taken as "none": the cross-check still runs, the catalog is
+  # reported as not done ("?": rf_redo_hint names it)
+  sql_local "select nvl(max(value),'-') from v\$parameter where name='db_recovery_file_dest';" && fra=$(first_line) || fra="?"
+  [[ -n "$fra" ]] || fra="?"
+  [[ "$fra" == "?" ]] && { warn "Cannot read db_recovery_file_dest ($(ora_errors "$SQL_OUT")): the recovery area is not catalogued."; rc=1; RF_FAILED+=" catalog"; RF_FRA="?"; }
   t=$(mktemp /tmp/dg_rman.XXXXXX) || { bad "Cannot create a temporary file in /tmp"; RF_FAILED+=" catalog policy"; RF_FRA=$fra; return 1; }; CLEANUP_FILES+=("$t")
-  { [[ "$fra" != "-" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
+  { [[ "$fra" != "-" && "$fra" != "?" ]] && printf 'catalog recovery area noprompt;\n'; printf 'crosscheck archivelog all;\nexit\n'; } \
     | as_oracle timeout 1800 "$DB_HOME/bin/rman" target / > "$t" 2>&1 || lrc=1
   RUN_OUT=$(cat "$t"); rm -f -- "$t"
   printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman catalog and crosscheck after the roll forward"
-  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; RF_FAILED+=" catalog"; RF_FRA=$fra; }
+  [[ $lrc -eq 0 ]] || { warn "RMAN could not catalog or cross-check the archived logs: $(ora_errors "$RUN_OUT")"; rc=1; [[ "$RF_FAILED" == *catalog* ]] || RF_FAILED+=" catalog"; RF_FRA=$fra; }
   # 3) the deletion policy of the standby (step 9.8): the primary's came with its control file
   #    (only the policy: the nightly schedule is not touched by the roll forward)
   local r8=0; c_9_8 >/dev/null 2>&1 || r8=$?
@@ -13390,6 +13744,7 @@ or start redo apply by hand (step 9.4).
   RF_DONE=1
   DONE_MSG="The standby was rolled forward from the primary: its standby redo logs and RMAN settings are set again, and redo apply runs. Output: $rlog"$'\n'"The temp files now have the primary's names. Check them before you open this standby or switch over to it."
   [[ "${RF_FB:-}" == YES ]] && DONE_MSG+=$'\n'"Flashback database: turn it off and on again (its logs are not usable after the roll forward)."
+  [[ "${RF_FB:-}" == "?" ]] && DONE_MSG+=$'\n'"Flashback database: its state could not be read. If it is on, turn it off and on again (its logs are not usable after the roll forward)."
   return 0
 }
 switchover_verify_cmd() { printf 'alter database switchover to %s verify;' "$STANDBY_UNIQUE"; }
@@ -13517,6 +13872,9 @@ health_main() {
   umask 077
   exec 7>&1
   MODE=check; PROBE_TIMEOUT=120
+  # one statement may take at most 60 seconds here (not the 600 of a setup run), so a run with a hung sqlplus
+  # still ends well within the 300 seconds a monitoring agent allows; DG_SQL_TIMEOUT, when set, is kept
+  [[ -n "${DG_SQL_TIMEOUT:-}" ]] || SQL_TIMEOUT=60
   # the logs of --health: 14 days, and never more than the newest 500 (a run every few minutes)
   find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -mtime +14 -delete 2>/dev/null
   find "$LOG_DIR" -maxdepth 1 -type f -name 'health_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +501 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --
@@ -13571,10 +13929,15 @@ health_main() {
   local -a again=()
   for c in "${checks[@]}"; do IFS='|' read -r id title fn <<< "$c"; health_run_check "$id" "$title" "$fn"; done
   # a short gap, a log or two behind, a lag peak: often gone within a minute. Those checks are done once more
-  # after 60 seconds before anything is reported (the patch check and NOLOGGING do not change in a minute)
-  for c in "${checks[@]:0:4}"; do
+  # after 60 seconds before anything is reported (the patch check and NOLOGGING do not change in a minute).
+  # Also once more: 10.8 when it failed, and any check that could not read (a dropped connection, a busy view);
+  # but not the checks that need the primary when there is no ssh connection to it at all (that stays so)
+  for c in "${checks[@]}"; do
     IFS='|' read -r id title fn <<< "$c"
-    [[ "${HEALTH_STATE[$id]}" == CRITICAL || "${HEALTH_STATE[$id]}" == WARNING ]] && again+=("$c")
+    case "$id:${HEALTH_STATE[$id]}" in
+      10.[1-4]:CRITICAL|10.[1-4]:WARNING|10.8:CRITICAL) again+=("$c") ;;
+      *:UNKNOWN) [[ $HEALTH_SSH_OPEN -eq 1 || ! "$id" =~ ^10\.[356]$ ]] && again+=("$c") ;;
+    esac
   done
   if [[ ${#again[@]} -gt 0 ]]; then
     printf '\n(checked once more in 60 seconds:%s)\n' "$(for c in "${again[@]}"; do printf ' %s' "${c%%|*}"; done)" >> "$HEALTH_LOG"
@@ -13595,6 +13958,10 @@ health_report() {
     health_out "$(printf '  %-9s %-5s %s' "${HEALTH_STATE[$id]}" "$([[ "$id" == 0.0 ]] || printf '%s' "$id")" "${HEALTH_TEXT[$id]}")"
   done
   [[ -n "$HEALTH_SSH_ERR" ]] && health_out "  Note: $HEALTH_SSH_ERR. The checks that need the primary were not done. See:  $SELF --help-step health"
+  # what the boot unit (step 9.7) reported at its start in this boot: a note, not a state (it stays in the journal
+  # until the next start of the unit, also after the problem was fixed; 0.0 and 10.4 show the effect itself)
+  local berr; berr=$(boot_errors_now 2>/dev/null)
+  [[ -n "$berr" ]] && health_out "  Note: at its start in this boot, $(unit_name) reported: $(head -n 1 <<< "$berr")$([[ $(grep -c . <<< "$berr") -gt 1 ]] && printf ' (and more)'). See:  journalctl -p err -u $(unit_name) -b"
   return 0
 }
 
@@ -14445,17 +14812,15 @@ EXPECT Finished Duplicate Db.
        RMAN-05535, or ORA-19527 / ORA-00312 about redo log files,
        are normal during the copy.
 IF     The copy failed: clean this server before you try again, and check every name twice.
-       The script shows the exact commands when you run it with --from 7.2.
-       On this server only ($S):
-         $SSQL
-         shutdown abort
-       ASM, as $GU:
-         [ "\$(hostname -s)" = "$(hostname -s)" ] && ORACLE_HOME=$GH ORACLE_SID=+ASM $GH/bin/asmcmd rm -rf +<DG>/$SUU
-         NEVER +<DG>/$PUU: those are the primary's files.
-       Folders: delete the files the copy left (step 7.2 lists them).
-       As $OU:
-         [ "\$(hostname -s)" = "$(hostname -s)" ] && rm -f $DBH/dbs/spfile$SID.ora $DBH/dbs/.dg_duplicate_done_$SID
-       Then run the script with:  --from 7.2
+       Run the script with --from 7.2. Its clean-up menu offers:
+         [y] Clean up for me      only for a copy this script started that did not finish:
+                                  it checks the host and the instance, lists what goes, asks
+                                  for the word CLEAN, then: shutdown abort, asmcmd rm -rf
+                                  +<DG>/$SUU, the standby's OMF folders, and it renames
+                                  spfile$SID.ora to spfile$SID.ora.failed_<run>
+         [m] Show the commands    the same commands in a short script file for you to read and run
+       NEVER +<DG>/$PUU: those are the primary's files.
+       init$SID.ora and orapw$SID are kept. The run then goes on and copies again.
 EOF
   ;;
   9.1) cat <<EOF
@@ -14920,6 +15285,15 @@ parse_only() {
   ONLY_PHASE=""; FROM_STEP=$a; TO_STEP=$b; TO_TEXT=$bt; ONLY_TEXT=${1,,}
   return 0
 }
+names_on_demand() { on_demand "${1%%-*}" || on_demand "${1#*-}"; }     # "10.7" or a range that starts or ends there
+on_demand_inside() {
+  # the steps that run only on demand (10.7) inside the range parse_only set (FROM_STEP-TO_STEP): they are left out
+  local s; [[ -n "$TO_STEP" && -n "$FROM_STEP" ]] || return 1
+  for s in $ON_DEMAND_STEPS; do
+    (( $(step_num "$s") >= $(step_num "$FROM_STEP") && $(step_num "$s") <= $(step_num "$TO_STEP") )) && printf '%s ' "$s"
+  done
+  return 0
+}
 range_text() {
   # the range of this run in words, for example "steps 2.1 to 2.4", "phase 3", "step 3.6"
   local a=${FROM_STEP%.0} b=$TO_TEXT
@@ -14956,7 +15330,8 @@ parse_args() {
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
       --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit $PX; }
-              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward (without --from or --only).\n'; exit $PX; }
+              names_on_demand "$2" && { printf 'Step 10.7 runs only with --roll-forward (without --from or --only).\n'; exit $PX; }
+              [[ -n "$(on_demand_inside)" ]] && printf 'Note: step 10.7 is left out of this range. It runs only with --roll-forward.\n'
               shift ;;
       --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit $PX; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -15023,13 +15398,13 @@ reenter_primary() {
   # the IP or the ssh user was wrong: ask again (the saved settings of another primary are not used)
   local ip u
   while true; do
-    ask "IP address or host name of the primary [$PRIMARY_IP]"
+    ask_value "IP address or host name of the primary [$PRIMARY_IP]"
     ip=${ANSWER:-$PRIMARY_IP}
     valid_value ip "$ip" && [[ "$ip" != "h" ]] && break
     say "This is not a valid IP address or host name."
   done
   while true; do
-    ask "OS user for ssh on the primary, the owner of the database [$PRIMARY_SSH_USER]"
+    ask_value "OS user for ssh on the primary, the owner of the database [$PRIMARY_SSH_USER]"
     u=${ANSWER:-$PRIMARY_SSH_USER}
     valid_value name "$u" && [[ "$u" != "root" ]] && break
     say "This is not a valid user name. root is not allowed."
@@ -15144,7 +15519,12 @@ start_menu() {
            ANSWER=${ANSWER//[[:space:]]/}
            [[ -z "$ANSWER" || "${ANSWER,,}" == b ]] && continue 2
            [[ "${ANSWER,,}" == q ]] && menu_quit
-           parse_only "$ANSWER" && break
+           if parse_only "$ANSWER"; then
+             # 10.7 runs only on demand (as --only): named, it would run nothing and report OK
+             if names_on_demand "$ANSWER"; then FROM_STEP=""; TO_STEP=""; TO_TEXT=""; ONLY_PHASE=""; ONLY_TEXT=""; say "Step 10.7 runs only with --roll-forward (menu item 10)."; continue; fi
+             [[ -n "$(on_demand_inside)" ]] && say "Step 10.7 is left out of this range. It runs only with --roll-forward (menu item 10)."
+             break
+           fi
            say "This is not a step or a range of steps. Examples:  2.1-2.4   3.6-3.11   5"
          done
          # phase 4 (commands for the primary) and phase 10 (checks) have no action on this server: no --yes question
@@ -15210,6 +15590,14 @@ main() {
   cd / || exit $ef
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
+  # the folders and files root writes or reads (DG_* in the environment can move them): plain absolute paths only,
+  # as they also go into commands and the crontab line
+  local pv
+  for pv in "$LOG_DIR" "$STATE_DIR" "$SHORT_DIR" "$FSTAB_FILE" "$SHM_UNIT_FILE" "$OS_RELEASE_FILE" "$MEMINFO_FILE" "$SYSTEMD_RUN_DIR"; do
+    v_path "$pv" || { printf 'Not a plain absolute path (only letters, digits and _ . / -): %s
+Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
+' "$pv"; exit $ef; }
+  done
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
   dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit $ef; }
   # it holds settings and password-file copies: only root reads it (only the script's own folder is changed)
@@ -15272,8 +15660,15 @@ main() {
   printf '  This server   %s (the new standby)\n' "$(hostname -s 2>/dev/null)"
   printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup%s' "$([[ $YES_MODE -eq 1 ]] && printf ', --yes: actions on this server without asking')")"
   printf '  Log           %s\n' "$LOG_FILE"
-  printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
-  printf '  the commands are shown for you to run, and the script then checks the result.\n'
+  if [[ "${PRIMARY_RUN:-no}" == yes && "$MODE" == run ]]; then
+    # PRIMARY_RUN=yes: say so, the default text below would not be true
+    printf '\n  PRIMARY_RUN=yes: on the primary the script may run only listed Data Guard statements\n'
+    printf '  (parameters, force logging, standby logs), only after you answer y at that step.\n'
+    printf '  Everything else for the primary is shown for you to run; the script then checks it.\n'
+  else
+    printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
+    printf '  the commands are shown for you to run, and the script then checks the result.\n'
+  fi
   printf '  %sAt each question: h shows help, q quits.%s\n' "$C_D" "$C_N"
   print_progress_board
   [[ $MENU_OK -eq 1 && "$MODE" == "run" ]] && start_menu
@@ -15289,14 +15684,14 @@ main() {
   fi
 
   while [[ -z "$PRIMARY_IP" ]]; do
-    ask "IP address or host name of the primary"
+    ask_value "IP address or host name of the primary"
     [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
     valid_value ip "$ANSWER" && [[ "${ANSWER,,}" != "h" ]] && PRIMARY_IP=$ANSWER || say "This is not a valid IP address or host name."
   done
   if [[ $first_run -eq 1 && -z "$CLI_USER" ]]; then
     say "The ssh user must own the database on the primary and be able to run  sqlplus / as sysdba."
     while true; do
-      ask "OS user for ssh on the primary [oracle]"
+      ask_value "OS user for ssh on the primary [oracle]"
       [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
       ANSWER=${ANSWER:-oracle}
       valid_value name "$ANSWER" && [[ "$ANSWER" != "root" ]] && { PRIMARY_SSH_USER=$ANSWER; break; }

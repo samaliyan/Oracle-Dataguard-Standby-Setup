@@ -79,6 +79,8 @@ net_speed_read() {
   # 64 MB of zeros from the primary to this server over the ssh connection (the primary reads and writes no
   # file: dd from /dev/zero to its output). A rough lower bound for the copy (RMAN uses SQL*Net, not ssh).
   [[ -n "$NET_MBS" ]] && return 0
+  # not in --check: it only reports, and 64 MB is load on the primary nobody asked for
+  [[ "${MODE:-}" == check ]] && return 1
   ssh_alive || return 1
   local t0 t1 rc=0 ms
   t0=$(date +%s%N)
@@ -96,12 +98,12 @@ copy_minutes() {
   local rate=100
   if num "${NET_MBS:-}"; then
     rate=$NET_MBS; [[ "${1:-hi}" == hi ]] && rate=$(( NET_MBS * 2 / 3 ))
-    local cap=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt $cap ]] && rate=$cap
+    local cap=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt $cap ]] && rate=$cap
     [[ $rate -lt 1 ]] && rate=1
-  elif [[ "${1:-hi}" == lo ]]; then rate=$(( ${AUX_CHANNELS:-4} * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
+  elif [[ "${1:-hi}" == lo ]]; then rate=$(( $(chan_n "${AUX_CHANNELS:-}" 4) * 150 )); [[ $rate -gt 1000 ]] && rate=1000; fi
   printf '%s' $(( ${PRIMARY_DB_MB:-0} / rate / 60 + 1 ))
 }
-copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured'; }
+copy_speed_text() { num "${NET_MBS:-}" && printf 'network measured: about %s MB/s from the primary' "$NET_MBS" || printf 'network not measured%s' "$([[ "${MODE:-}" == check ]] && printf ' in check mode')"; }
 fra_estimate_mb() {
   # the archived logs of the time the copy takes (the copy restores them into the recovery area to recover
   # the new standby), one day more for the standby itself, plus 30 %; at least 10 GB, in whole GB.
@@ -155,13 +157,20 @@ chan_suggest() {
   [[ $p -gt $a ]] && p=$a
   printf '%s %s' "$p" "$a"
 }
-prim_channels() { local p=${PRIMARY_CHANNELS:-}; [[ -n "$p" ]] || p=${AUX_CHANNELS:-4}; [[ $p -gt ${AUX_CHANNELS:-4} ]] && p=${AUX_CHANNELS:-4}; printf '%s' "$p"; }
+# a channel count as a plain number: a value that is not 1..64 (08, abc, empty) gives $2 instead. The summary
+# and the copy plan use the counts before the settings are checked; raw "08" would be a bash error there.
+chan_n() { if [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 64 )); then printf '%s' $((10#$1)); else printf '%s' "$2"; fi; }
+prim_channels() {
+  local a p; a=$(chan_n "${AUX_CHANNELS:-}" 4); p=$(chan_n "${PRIMARY_CHANNELS:-}" "$a")
+  [[ $p -gt $a ]] && p=$a
+  printf '%s' "$p"
+}
 
 # ---- the RMAN parts that place the files (one source for the copy, and later for a restore) ----
 rman_channel_lines() {
   local i out=""
   for ((i = 1; i <= $(prim_channels); i++)); do out+="  allocate channel p$i device type disk;"$'\n'; done
-  for ((i = 1; i <= AUX_CHANNELS; i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
+  for ((i = 1; i <= $(chan_n "${AUX_CHANNELS:-}" 4); i++)); do out+="  allocate auxiliary channel a$i device type disk;"$'\n'; done
   printf '%s' "$out"
 }
 place_newname_lines() {
@@ -205,6 +214,9 @@ ask_channels() {
       k) return 0 ;;
       s) return 1 ;;
       c) ask_default "Channels on the primary (1-64)" "$sp"; p=$ANSWER
+         # checked before any arithmetic: 08, 1.5 or a word would stop bash itself
+         [[ "$p" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 )) || { say "Use a number from 1 to 64."; continue; }
+         p=$((10#$p))
          ask_default "Channels on this server ($p-64, not fewer than on the primary)" "$(( sa > p ? sa : p ))"; a=$ANSWER
          if [[ "$p" =~ ^[0-9]{1,2}$ && "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 && 10#$a >= 10#$p && 10#$a <= 64 )); then
            PRIMARY_CHANNELS=$((10#$p)); AUX_CHANNELS=$((10#$a)); save_settings

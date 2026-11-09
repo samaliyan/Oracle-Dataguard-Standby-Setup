@@ -17,7 +17,9 @@
 #      (cat, id, stat, ls, md5sum, date, orabase, lsnrctl status, tnsping, sqlplus).
 #    * SQL sent to primary must be a single-line SELECT (readonly_guard).
 #    * Changes needed on primary are only PRINTED; you run them, the script
-#      checks them again with SELECT.
+#      checks them again with SELECT. Only with PRIMARY_RUN=yes in the settings
+#      may a primary step run its statements over ssh, from a fixed list
+#      (Data Guard parameters, force logging, standby logs), after you answer y.
 #    * The only process that works against primary is RMAN active duplicate
 #      (reads datafiles, normal log switches) after a typed confirmation.
 #==============================================================================
@@ -31,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.23"
+readonly SCRIPT_VERSION="5.24"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -347,6 +349,19 @@ This script asks questions. Run it in an interactive terminal, for example:  ssh
   done
 }
 
+ask_value() {
+  # $1 question: a free-text value (a host or a user name). A lone l or d is a screen key at every question,
+  # never the value: on the screen layout it opens the list or the details, else it asks again with a hint
+  while true; do
+    ask "$1"
+    case "${ANSWER,,}" in
+      l) if [[ $UI -eq 1 ]]; then ui_list; else say "l and d are screen keys, not values. Type the whole name."; fi ;;
+      d) if [[ $UI -eq 1 ]]; then ui_details "${CUR_STEP:-}"; else say "l and d are screen keys, not values. Type the whole name."; fi ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 ask_default() {
   # $1 question, $2 default. Result in ANSWER (default when Enter).
   ask "$1 [$2]"
@@ -413,7 +428,7 @@ distid_for() {
   elif [[ ${OS_MAJOR:-0} -ge 8 && -z "${RU_DIR:-}" ]]; then printf 'CV_ASSUME_DISTID=OEL7.8'; fi
   return 0
 }
-ORATMP_WARNED=0
+ORATMP_WARNED=""      # the causes already said (nodir, bad): each one once, a second cause is still said
 oracle_tmp() {
   # The Oracle installers run programs from their temporary folder. When /tmp is mounted noexec (hardened
   # servers) they fail, so a folder next to the inventory is used instead (root-owned, sticky, like /tmp).
@@ -430,12 +445,12 @@ oracle_tmp() {
 build_envs() {
   local oh gh dx=() gx=() v t
   t=$(oracle_tmp); [[ -n "$t" ]] && { dx+=("TMP=$t" "TMPDIR=$t"); gx+=("TMP=$t" "TMPDIR=$t"); }
-  # /tmp is noexec and no folder for the installers could be used (its parent is made by step 2.5): said once
-  if [[ -z "$t" && "$MODE" == "run" && $ORATMP_WARNED -eq 0 && ${HEALTH:-0} -eq 0 ]] \
+  # /tmp is noexec and no folder for the installers could be used (its parent is made by step 2.5): said once per cause
+  local tp tcause=bad; tp="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")"; [[ -d "$tp" ]] || tcause=nodir
+  if [[ -z "$t" && "$MODE" == "run" && " $ORATMP_WARNED " != *" $tcause "* && ${HEALTH:-0} -eq 0 ]] \
      && findmnt -n -o OPTIONS --target /tmp 2>/dev/null | tr ',' '\n' | grep -qx noexec; then
-    local tp; tp="$(dirname "${INVENTORY_DIR:-/u01/app/oraInventory}")"
-    ORATMP_WARNED=1
-    if [[ ! -d "$tp" ]]; then
+    ORATMP_WARNED+=" $tcause"
+    if [[ $tcause == nodir ]]; then
       warn "/tmp does not allow programs to run (noexec), and $tp does not exist yet (step 2.5 makes it)."$'\n'"Until then the Oracle installers would fail. Run phase 2 first."
     else
       warn "/tmp does not allow programs to run (noexec), and no folder for the installers could be made or used in $tp"$'\n'"($tp/dg_tmp must be a folder of root, mode 1777; the inventory path must be a plain path). The Oracle installers"$'\n'"may fail. Check:  ls -ld $tp $tp/dg_tmp"
@@ -903,9 +918,11 @@ srv_notfound() {
   # $1 the name asked for, $2 an extra code that means "not found" (optional). True only when the srvctl output
   # in RUN_OUT says that this resource is not registered: its own codes, or "could not be found" / "does not
   # exist" on a line that names it (any other failure, such as CRS down or a missing file, is no such answer)
-  local n=${1,,}
-  [[ "$n" =~ ^[a-z0-9_.$#-]+$ ]] || return 1
-  n=${n//./\\.}; n=${n//\$/\\$}
+  # (the pattern in a variable: written in [[ ]], bash would expand its $# and drop the characters)
+  local n=${1,,} re='^[a-z0-9_.$#+-]+$'
+  [[ "$n" =~ $re ]] || return 1
+  # the regex characters a name can hold (. $ +) as literals, escaped with sed (the same on bash 4.2 and 5)
+  n=$(printf '%s' "$n" | sed 's#[.$+]#\\&#g')
   [[ -n "${2:-}" ]] && grep -qE "$2" <<< "$RUN_OUT" && return 0
   # the name as the resource it is (database x, listener x, ora.x.db), never a path that only contains it, on the
   # line of the code or the message (a PRCR-1001 about another resource is no answer about this one)

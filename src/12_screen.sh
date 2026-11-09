@@ -591,8 +591,8 @@ ui_job_done() {
 
 # ---- the summary screen of step 1.4: on its own page, the question at its bottom ----
 ui_summary_ask() {
-  local -a L=(); local n h i f
-  f=$(mktemp) || { ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit"; return 0; }
+  local -a L=(); local n h i f mine=0
+  f=$(mktemp) || { ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"; return 0; }
   CLEANUP_FILES+=("$f")
   h=$((UI_ROWS - 4))
   summary_text > "$f"; mapfile -t L < <(ui_fold "      " < "$f")
@@ -601,16 +601,17 @@ ui_summary_ask() {
   rm -f -- "$f"
   n=${#L[@]}
   ui_live_clear
-  [[ $UI_ALT -eq 0 ]] && printf '\e[?1049h'
+  # UI_ALT=1: an interrupt (Ctrl-C) at this question then also leaves the separate screen
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
   printf '\e[r\e[H\e[2J %sSummary of this run%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s) -> standby of $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
   for ((i = 0; i < n && i < h - 1; i++)); do printf '%s\n' "${L[$i]}"; done
   [[ $n -ge $h ]] && printf ' %s%s %d more lines: d shows them%s\n' "$C_D" "$S_WAIT" $((n - h + 1)) "$C_N"
   [[ -n "${SUM_NOTE:-}" ]] && printf '\e[%d;1H\e[2K    %s%s %s%s' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${SUM_NOTE:0:$((UI_COLS - 8))}" "$C_N"
   SUM_NOTE=""
-  printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [q] Quit" "$C_N" "$S_END"
+  printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit" "$C_N" "$S_END"
   ANSWER=""; IFS= read -r ANSWER < "$PROMPT_IN" || ANSWER=q
   _log ASK "[1.4] summary -> ${ANSWER:-Enter}"
-  [[ $UI_ALT -eq 0 ]] && printf '\e[?1049l'
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
   ui_header; ui_region
   return 0
 }

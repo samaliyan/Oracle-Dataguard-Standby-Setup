@@ -87,7 +87,8 @@ cp_exec() {
   if [[ "${CP_ROLE[$i]}" == file ]]; then
     say "${C_D}Writing ${CP_CMD[$i]}${C_N}"
     local f=${CP_CMD[$i]}
-    install -d -m 755 -- "$(dirname "$f")" || { RUN_OUT="cannot make the folder of $f"; return 1; }
+    # only a missing folder is made: install -d would also reset the mode of one that exists
+    [[ -d "$(dirname "$f")" ]] || install -d -m 755 -- "$(dirname "$f")" || { RUN_OUT="cannot make the folder of $f"; return 1; }
     backup_file "$f" || { RUN_OUT="cannot keep a backup of $f"; return 1; }
     if printf '%s\n' "${CP_IN[$i]}" | write_as root "$f" "${CP_TO[$i]}"; then rc=0; RUN_OUT=""; else rc=1; RUN_OUT="cannot write $f"; fi
     command -v restorecon >/dev/null 2>&1 && restorecon "$f" 2>/dev/null
@@ -105,13 +106,14 @@ cp_exec() {
   CLEANUP_FILES+=("$tmp")
   if [[ -n "${CP_IN[$i]}" ]]; then
     # the input reaches the command through a pipe (printf is a builtin): never in an argument or a file
-    printf '%s\n' "${CP_IN[$i]}" | cp_role_run "${CP_ROLE[$i]}" timeout "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 || rc=$?
+    printf '%s\n' "${CP_IN[$i]}" | cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 || rc=$?
   else
-    cp_role_run "${CP_ROLE[$i]}" timeout "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 < /dev/null || rc=$?
+    cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 < /dev/null || rc=$?
   fi
   RUN_OUT=$(cat -- "$tmp"); rm -f -- "$tmp"
   # sqlplus ends with 0 also after an error: an ORA- or SP2- line in its output is a failure
-  [[ $rc -eq 0 && "$first" == sqlplus* ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
+  # (sqlplus by name or by a full path that ends in /sqlplus)
+  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
   { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
   return "$rc"
 }
@@ -151,7 +153,9 @@ short_script() {
   local name=$1 f
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   if [[ ! -d "$SHORT_DIR" ]]; then ( umask 077; mkdir -p -- "$SHORT_DIR" ) || return 1; fi
-  [[ ! -L "$SHORT_DIR" && "$(stat -c '%U' -- "$SHORT_DIR")" == root ]] || return 1
+  # root's own folder that nobody else can write (else another user could swap the file before it runs)
+  local own mode; read -r own mode <<< "$(stat -c '%U %a' -- "$SHORT_DIR" 2>/dev/null)"
+  [[ ! -L "$SHORT_DIR" && "$own" == root && "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 8#022) == 0 )) || return 1
   f="$SHORT_DIR/$name"
   rm -f -- "$f"
   ( umask 077; set -C
@@ -160,7 +164,7 @@ short_script() {
       printf 'set -x\n'
       cat
     } > "$f" ) || return 1
-  chmod 700 -- "$f"
+  chmod 700 -- "$f" || return 1
   printf '%s' "$f"
 }
 cp_script_text() {

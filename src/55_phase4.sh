@@ -51,18 +51,21 @@ create spfile from memory;
     return 1
   fi
   prim_sql "select log_mode||'|'||force_logging from v\$database;" || { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
-  local lm fl; IFS='|' read -r lm fl <<< "$(first_line)"
-  if [[ "$lm" == "ARCHIVELOG" && "$fl" == "YES" ]]; then NOW="ARCHIVELOG mode and FORCE LOGGING are on"; return 0; fi
+  local lm fl flok=0; IFS='|' read -r lm fl <<< "$(first_line)"
+  # STANDBY NOLOGGING (FOR DATA AVAILABILITY / LOAD PERFORMANCE) also keeps the standby complete, as in 8.1
+  # and 10.5 (docs/DESIGN.md)
+  [[ "$fl" == "YES" || "$fl" == "STANDBY NOLOGGING"* ]] && flok=1
+  if [[ "$lm" == "ARCHIVELOG" && $flok -eq 1 ]]; then NOW="ARCHIVELOG mode is on, force_logging is $fl"; return 0; fi
   NOW="log_mode is $lm, force_logging is $fl"
   PLAN=""
-  [[ "$fl" != "YES" ]] && PLAN+="alter database force logging;"$'\n'
+  [[ $flok -eq 0 ]] && PLAN+="alter database force logging;"$'\n'
   [[ "$lm" != "ARCHIVELOG" ]] && PLAN+="-- DOWNTIME: the next 4 lines restart the primary database
 shutdown immediate
 startup mount
 alter database archivelog;
 alter database open;"
   PLAN=${PLAN%$'\n'}
-  PLAN_UNDO=""; [[ "$fl" != "YES" ]] && PLAN_UNDO="alter database no force logging;"
+  PLAN_UNDO=""; [[ $flok -eq 0 ]] && PLAN_UNDO="alter database no force logging;"
   [[ "$lm" != "ARCHIVELOG" ]] && PLAN_UNDO+="${PLAN_UNDO:+ }-- keep ARCHIVELOG mode (every backup needs it)"
   return 1
 }
@@ -171,21 +174,23 @@ dg_config_names_ok() {
 }
 
 # ---- 4.4 ----
-DEST_N=""; DEST_FREE2=""
+DEST_N=""; DEST_FREE2=""; DEST_FOUND=""
 find_dest() {
   # Which log_archive_dest_N on primary ships (or will ship) to this standby. Read-only.
-  # 1) an N that already points to the standby alias, 2) dest_2 if it is free, 3) the first free N.
+  # 1) an N (1-31) that already points to the standby alias, 2) dest_2 if it is free, 3) the first free N (2-31).
   prim_sql "select name||'|'||nvl(value,'-') from v\$parameter where name like 'log_archive_dest_%';" || return 1
   local line n v used=" " found=""
   DEST_N=""; DEST_FREE2=""
   while IFS= read -r line; do
     [[ "$line" =~ ^log_archive_dest_([0-9]+)\|(.*)$ ]] || continue
     n=${BASH_REMATCH[1]}; v=$(tr '[:lower:]' '[:upper:]' <<< "${BASH_REMATCH[2]}" | tr -d "\"'" | sed -E 's/ *= */=/g')
-    num "$n" && [[ $n -ge 2 && $n -le 31 ]] || continue
+    num "$n" && [[ $n -ge 1 && $n -le 31 ]] || continue
+    # one that already ships to the standby alias counts from 1 (dest_1 too); a free one is chosen from 2
     [[ -z "$found" ]] && has_token "$v" "SERVICE=${STANDBY_TNS^^}" && found=$n
-    [[ "$v" == "-" ]] || used+="$n "
+    [[ $n -ge 2 && "$v" != "-" ]] && used+="$n "
   done <<< "$SQL_OUT"
   # a destination without a value (or not listed) is free; prefer 2
+  DEST_FOUND=$found
   if [[ -n "$found" ]]; then DEST_N=$found
   else for ((n = 2; n <= 31; n++)); do [[ "$used" == *" $n "* ]] || { DEST_N=$n; break; }; done; fi
   [[ -n "$DEST_N" ]] || return 1
@@ -209,7 +214,8 @@ c_4_4() {
     return 0
   fi
   NOW="log_archive_dest_$DEST_N = $(disp_val "$PVAL")"
-  [[ "$DEST_N" != "2" ]] && NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"
+  if [[ -n "$DEST_FOUND" ]]; then NOW+=$'\n'"log_archive_dest_$DEST_N already names the alias $STANDBY_TNS, so it is used"
+  elif [[ "$DEST_N" != "2" ]]; then NOW+=$'\n'"log_archive_dest_2 is used for something else, so log_archive_dest_$DEST_N is used"; fi
   PLAN=""
   # no local destination named at all (no recovery area, no log_archive_dest, no log_archive_dest_N LOCATION): the
   # primary archives to its built-in default folder. A first log_archive_dest_N may end that default, and then

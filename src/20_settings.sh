@@ -89,7 +89,8 @@ load_settings() {
   # Parses $SETTINGS_FILE. $1 = soft: problems are returned in LOAD_ERR (rc 1) instead of stopping.
   # Keys of the 3.x settings file are converted (GRID_ZIP, DB_ZIP) or dropped; unknown keys are dropped.
   local soft=${1:-} line key val spec t
-  LOAD_ERR=""; DROPPED_KEYS=""
+  # these describe the file read now: a second read (after an edit) must not keep the notes of the first
+  LOAD_ERR=""; DROPPED_KEYS=""; SETTINGS_UPGRADED=0; PLACEMENT_KEPT=0
   [[ -f "$SETTINGS_FILE" ]] || { LOAD_ERR="$SETTINGS_FILE is missing"; return 1; }
   if ! settings_file_safe "$SETTINGS_FILE"; then
     LOAD_ERR="$SETTINGS_FILE must be a file owned by root that others cannot write"
@@ -261,8 +262,9 @@ validate_settings() {
   [[ ${#STANDBY_SID} -le 12 ]] || { bad "STANDBY_SID '$STANDBY_SID' is longer than 12 characters."; bad_n=1; }
   [[ "$STANDBY_SID" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { bad "STANDBY_SID must start with a letter and use only letters, digits and _."; bad_n=1; }
   [[ ${#STANDBY_UNIQUE} -le 30 ]] || { bad "STANDBY_UNIQUE is longer than 30 characters."; bad_n=1; }
-  [[ "$AUX_CHANNELS" =~ ^[0-9]+$ && "$AUX_CHANNELS" -ge 1 && "$AUX_CHANNELS" -le 64 ]] || { bad "AUX_CHANNELS must be a number from 1 to 64."; bad_n=1; }
-  [[ -z "$PRIMARY_CHANNELS" || ( "$PRIMARY_CHANNELS" -ge 1 && "$PRIMARY_CHANNELS" -le 64 ) ]] || { bad "PRIMARY_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  # the pattern first (no leading 0): a value like 08 would otherwise print a bash error
+  [[ "$AUX_CHANNELS" =~ ^[1-9][0-9]?$ ]] && (( 10#$AUX_CHANNELS >= 1 && 10#$AUX_CHANNELS <= 64 )) || { bad "AUX_CHANNELS must be a number from 1 to 64."; bad_n=1; }
+  [[ -z "$PRIMARY_CHANNELS" ]] || { [[ "$PRIMARY_CHANNELS" =~ ^[1-9][0-9]?$ ]] && (( 10#$PRIMARY_CHANNELS >= 1 && 10#$PRIMARY_CHANNELS <= 64 )); } || { bad "PRIMARY_CHANNELS must be a number from 1 to 64."; bad_n=1; }
   if [[ "$ARCH_CLEANUP" == oracle && "$(arch_dest_sb 2>/dev/null)" != USE_DB_RECOVERY_FILE_DEST ]]; then bad "ARCH_CLEANUP=oracle works only when the archived logs go to the recovery area. Here they go to $(arch_dest_sb 2>/dev/null). Use timer or crontab."; bad_n=1; fi
   if [[ "$DATA_DEST" == +* || "$FRA_DEST" == +* ]] && ! use_grid; then bad "DATA_DEST or FRA_DEST names a disk group, but this standby has no ASM (the primary uses none)."; bad_n=1; fi
   [[ -z "$RU_DIR" || -d "$RU_DIR" ]] || { bad "RU_DIR $RU_DIR is not a folder."; bad_n=1; }

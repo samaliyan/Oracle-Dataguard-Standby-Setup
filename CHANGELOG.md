@@ -3,6 +3,57 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.24
+
+From an external review of 5.23 (four reports). Every finding was checked against the code; the ones that held
+are fixed here. No finding was a data-loss bug; several made a check say OK when it could not know.
+
+Fixes:
+- 10.8 / --health: no longer OK when the free space of the recovery-area disk group cannot be read, when no
+  archive clean-up was chosen (waits), or when ARCH_CLEANUP=oracle and logs are written outside the recovery
+  area (problem). A recovery area in a folder also gets a real `df` check; every local archive destination is
+  checked; ASM destinations warn below 20% free; the RMAN deletion policy is read again.
+- The nightly clean-up script refuses a "BACKED UP n TIMES" deletion policy (RMAN deleted nothing and the job
+  still reported success) and prints the policy it found.
+- 8.1 (pre-checks before the copy, also with `--from 8.1`): the release of this server's database software is
+  compared with the primary again (a patch-only difference is a warning: standby-first patching is allowed);
+  an unreadable spfile setting of the primary stops; FORCE LOGGING off stops. 4.1, 8.1 and 10.5 accept
+  STANDBY NOLOGGING.
+- 6.3 / TDE: every wallet folder is checked before the copy; LOCAL auto-login is judged per folder; an existing
+  local `cwallet.sso` is tested (age, `orapki wallet display`) and moved aside when it cannot open here; the old
+  3-column wallet query is used only after ORA-00904. 6.1 / 6.3: failed reads are "cannot check", never
+  "empty".
+- 7.2: leftovers that cannot be cleaned automatically are not reported as OK; ASM folders or primary file
+  names that cannot be read are listed as "not checked" and only the manual way is offered; `[y]` journals each
+  deletion after it worked; the `[m]` file checks the database (db_unique_name, standby role) before it
+  deletes; `rm -rf --one-file-system`; a failed mount does not use up the one try; a host name with domain is
+  accepted.
+- 9.1: the rollback `srvctl add` has a time limit; unreadable ASM only blocks when a disk group is involved;
+  attributes not carried over by a re-registration are listed. 9.7: no 5-minute wait when the boot unit has
+  already ended; `srvctl status` in the message. 9.8: a cron log with the wrong owner is chowned, not emptied.
+- 4.4 also finds an existing destination in `log_archive_dest_1`.
+- Channel counts: `abc`, `08` or `1.5` no longer end the script (at the question, in the settings file and on
+  the summary screen).
+- The summary names the right value numbers and shows `[h]`; Ctrl-C there restores the terminal; a lone `l` or
+  `d` is not taken as a host or user name; menu 7 and `--only` say that 10.7 runs only with `--roll-forward`.
+- `--check` no longer sends 64 MiB from the primary to measure the network.
+- The probe marker is random per run and must be on a line of its own; a failed host-key save stops;
+  `ssh -O check` and `mktemp` failures are reported as such; local ssh/sqlplus time limits kill after 30 s.
+- `DG_*` path overrides must be plain absolute paths; the folder for command files must be root-only.
+- 3.9: the listener.ora HOST fix escapes dots the same way on bash 4.2; a resource in state UNKNOWN is not
+  started blindly. The manual `find ... -delete` uses `-xdev`. Media plans list every missing file.
+- `--health`: a second look also for 10.8 and UNKNOWN results; SQL time limit 60 s (unless `DG_SQL_TIMEOUT`);
+  boot-unit errors shown as a note.
+- The startup line, `DESIGN.md` and both READMEs are accurate about `PRIMARY_RUN=yes`; the READMEs say what
+  the SQL guard covers and that Oracle Net encryption is not checked by the script.
+
+Not changed, by design (see the review notes): the listener port is opened per firewall zone (clients must
+reach it after a switchover); root runs Oracle's own root scripts; `$EDITOR`; the `-nt` guard of the `[m]`
+clean-up file.
+
+Tests: GitHub Actions CI (shellcheck, build check, the suite in 11 parallel parts, Oracle Linux 7 with bash
+4.2); 20 new checks for these fixes; mocks independent of the test machine (RAM, `/dev/shm`, IP address).
+
 ## 5.23
 
 From a real run on a standby (Oracle Restart 19c on OL7, a primary with files in folders and in ASM). The goal:

@@ -122,6 +122,15 @@ parse_only() {
   ONLY_PHASE=""; FROM_STEP=$a; TO_STEP=$b; TO_TEXT=$bt; ONLY_TEXT=${1,,}
   return 0
 }
+names_on_demand() { on_demand "${1%%-*}" || on_demand "${1#*-}"; }     # "10.7" or a range that starts or ends there
+on_demand_inside() {
+  # the steps that run only on demand (10.7) inside the range parse_only set (FROM_STEP-TO_STEP): they are left out
+  local s; [[ -n "$TO_STEP" && -n "$FROM_STEP" ]] || return 1
+  for s in $ON_DEMAND_STEPS; do
+    (( $(step_num "$s") >= $(step_num "$FROM_STEP") && $(step_num "$s") <= $(step_num "$TO_STEP") )) && printf '%s ' "$s"
+  done
+  return 0
+}
 range_text() {
   # the range of this run in words, for example "steps 2.1 to 2.4", "phase 3", "step 3.6"
   local a=${FROM_STEP%.0} b=$TO_TEXT
@@ -158,7 +167,8 @@ parse_args() {
         else FROM_STEP="$FROM_STEP.0"; fi
         shift ;;
       --only) [[ $# -ge 2 ]] && parse_only "$2" || { printf 'Use --only with a phase (1 to 10), os, grid, db, primary, or steps such as 2.1-2.4\n'; exit $PX; }
-              [[ "${2%%-*}" == 10.7 || "${2#*-}" == 10.7 ]] && { printf 'Step 10.7 runs only with --roll-forward (without --from or --only).\n'; exit $PX; }
+              names_on_demand "$2" && { printf 'Step 10.7 runs only with --roll-forward (without --from or --only).\n'; exit $PX; }
+              [[ -n "$(on_demand_inside)" ]] && printf 'Note: step 10.7 is left out of this range. It runs only with --roll-forward.\n'
               shift ;;
       --help-step) [[ $# -ge 2 ]] || { printf 'Use --help-step N.M, or --help-step all\n'; exit $PX; }; HELP_STEP=$2; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -225,13 +235,13 @@ reenter_primary() {
   # the IP or the ssh user was wrong: ask again (the saved settings of another primary are not used)
   local ip u
   while true; do
-    ask "IP address or host name of the primary [$PRIMARY_IP]"
+    ask_value "IP address or host name of the primary [$PRIMARY_IP]"
     ip=${ANSWER:-$PRIMARY_IP}
     valid_value ip "$ip" && [[ "$ip" != "h" ]] && break
     say "This is not a valid IP address or host name."
   done
   while true; do
-    ask "OS user for ssh on the primary, the owner of the database [$PRIMARY_SSH_USER]"
+    ask_value "OS user for ssh on the primary, the owner of the database [$PRIMARY_SSH_USER]"
     u=${ANSWER:-$PRIMARY_SSH_USER}
     valid_value name "$u" && [[ "$u" != "root" ]] && break
     say "This is not a valid user name. root is not allowed."
@@ -346,7 +356,12 @@ start_menu() {
            ANSWER=${ANSWER//[[:space:]]/}
            [[ -z "$ANSWER" || "${ANSWER,,}" == b ]] && continue 2
            [[ "${ANSWER,,}" == q ]] && menu_quit
-           parse_only "$ANSWER" && break
+           if parse_only "$ANSWER"; then
+             # 10.7 runs only on demand (as --only): named, it would run nothing and report OK
+             if names_on_demand "$ANSWER"; then FROM_STEP=""; TO_STEP=""; TO_TEXT=""; ONLY_PHASE=""; ONLY_TEXT=""; say "Step 10.7 runs only with --roll-forward (menu item 10)."; continue; fi
+             [[ -n "$(on_demand_inside)" ]] && say "Step 10.7 is left out of this range. It runs only with --roll-forward (menu item 10)."
+             break
+           fi
            say "This is not a step or a range of steps. Examples:  2.1-2.4   3.6-3.11   5"
          done
          # phase 4 (commands for the primary) and phase 10 (checks) have no action on this server: no --yes question
@@ -412,6 +427,14 @@ main() {
   cd / || exit $ef
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
+  # the folders and files root writes or reads (DG_* in the environment can move them): plain absolute paths only,
+  # as they also go into commands and the crontab line
+  local pv
+  for pv in "$LOG_DIR" "$STATE_DIR" "$SHORT_DIR" "$FSTAB_FILE" "$SHM_UNIT_FILE" "$OS_RELEASE_FILE" "$MEMINFO_FILE" "$SYSTEMD_RUN_DIR"; do
+    v_path "$pv" || { printf 'Not a plain absolute path (only letters, digits and _ . / -): %s
+Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
+' "$pv"; exit $ef; }
+  done
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
   dir_safe "$STATE_DIR" || { printf '%s must belong to root, and others must not be able to write to it.\nIt holds the settings and copies of the password file.\n' "$STATE_DIR"; exit $ef; }
   # it holds settings and password-file copies: only root reads it (only the script's own folder is changed)
@@ -474,8 +497,15 @@ main() {
   printf '  This server   %s (the new standby)\n' "$(hostname -s 2>/dev/null)"
   printf '  Mode          %s\n' "$([[ "$MODE" == check ]] && printf 'check only (nothing is changed)' || printf 'setup%s' "$([[ $YES_MODE -eq 1 ]] && printf ', --yes: actions on this server without asking')")"
   printf '  Log           %s\n' "$LOG_FILE"
-  printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
-  printf '  the commands are shown for you to run, and the script then checks the result.\n'
+  if [[ "${PRIMARY_RUN:-no}" == yes && "$MODE" == run ]]; then
+    # PRIMARY_RUN=yes: say so, the default text below would not be true
+    printf '\n  PRIMARY_RUN=yes: on the primary the script may run only listed Data Guard statements\n'
+    printf '  (parameters, force logging, standby logs), only after you answer y at that step.\n'
+    printf '  Everything else for the primary is shown for you to run; the script then checks it.\n'
+  else
+    printf '\n  The script never changes the primary itself. When the primary needs a change,\n'
+    printf '  the commands are shown for you to run, and the script then checks the result.\n'
+  fi
   printf '  %sAt each question: h shows help, q quits.%s\n' "$C_D" "$C_N"
   print_progress_board
   [[ $MENU_OK -eq 1 && "$MODE" == "run" ]] && start_menu
@@ -491,14 +521,14 @@ main() {
   fi
 
   while [[ -z "$PRIMARY_IP" ]]; do
-    ask "IP address or host name of the primary"
+    ask_value "IP address or host name of the primary"
     [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
     valid_value ip "$ANSWER" && [[ "${ANSWER,,}" != "h" ]] && PRIMARY_IP=$ANSWER || say "This is not a valid IP address or host name."
   done
   if [[ $first_run -eq 1 && -z "$CLI_USER" ]]; then
     say "The ssh user must own the database on the primary and be able to run  sqlplus / as sysdba."
     while true; do
-      ask "OS user for ssh on the primary [oracle]"
+      ask_value "OS user for ssh on the primary [oracle]"
       [[ "${ANSWER,,}" == "q" ]] && user_stop "Stopped by you"
       ANSWER=${ANSWER:-oracle}
       valid_value name "$ANSWER" && [[ "$ANSWER" != "root" ]] && { PRIMARY_SSH_USER=$ANSWER; break; }

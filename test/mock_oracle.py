@@ -625,6 +625,10 @@ def rman():
         print("RMAN-03002: failure of Duplicate Db command\nRMAN-05501: auxiliary not started"); return 1
     print("Starting Duplicate Db at 24-OCT-26\nchannel a1: restored backup piece 1\nFinished Duplicate Db at 24-OCT-26")
     inst["state"] = "mounted"; inst["srl"] = st.get("srl_after_dup", 0); inst["datafiles"] = load(PRI).get("datafiles", 10)
+    # the standby's recovery area is what the duplicate set (a folder on file-system storage, +FRA with ASM);
+    # a value a test set itself is kept
+    m = re.search(r"set db_recovery_file_dest='([^']+)'", data)
+    if m and "fra_param" not in inst: inst["fra_param"] = m.group(1)
     if st.pop("fra_full_errs", None): inst["df_errors"] = 0
     st["instances"][cfg["sid"]] = inst
     spf = os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora")
@@ -672,6 +676,13 @@ def lsnrctl():
 def orapki():
     # orapki wallet create -wallet <dir> -auto_login|-auto_login_local ; the password comes on stdin
     with open(os.path.join(STATE_DIR, "calls.log"), "a") as f: f.write(f"orapki args={args}\n")
+    # orapki wallet display -wallet <dir>: an auto-login wallet opens without a password, except a LOCAL one
+    # made on another host (a file with the word LOCALSSO in the tests)
+    if args[:2] == ["wallet", "display"] and "-wallet" in args:
+        sso = os.path.join(args[args.index("-wallet") + 1], "cwallet.sso")
+        if not os.path.exists(sso): print("PKI-02002: Unable to open the wallet. Check password and wallet location"); return 1
+        if "LOCALSSO" in open(sso, errors="replace").read(): print("PKI-02002: Unable to open the wallet. Check password and wallet location"); return 1
+        print("Oracle PKI Tool Release 19.0.0.0.0"); print("Requested Certificates:"); return 0
     if args[:2] != ["wallet", "create"] or "-wallet" not in args: print("PKI-01001: bad arguments"); return 1
     d = args[args.index("-wallet") + 1]
     pw = sys.stdin.readline().rstrip("\n")
