@@ -283,7 +283,7 @@ dg_standby_setup.sh   the ready-to-use script (built from src/)
 src/                  source, split by phase; build.sh joins them in a fixed order
 build.sh              rebuilds dg_standby_setup.sh from src/
 CHANGELOG.md          what changed in each version
-.github/workflows/    makes the release of each new version by itself (script, checksum, notes)
+.github/workflows/    CI on every push (ci.yml) and the release of each new version (release.yml)
 test/                 scenario tests against mock Oracle, ssh, installers and OS tools
 docs/DESIGN.md        design notes
 ```
@@ -301,6 +301,11 @@ a disk that is not empty, a failed duplicate, undo, and a check that no changing
 ./build.sh
 cd test && ./run_scenarios.sh
 ```
+
+The suite can also run in parts: `./run_scenarios.sh --list-parts` shows them, `--part 3` runs one, and
+`--sections A,Q` runs only the named sections. GitHub Actions (`.github/workflows/ci.yml`) runs shellcheck,
+the build check (`bash -n`, and the committed script must match the build of `src/`), every part as its own job, and
+sections A and Q on Oracle Linux 7 (bash 4.2) in a container.
 
 The mocks are not real Oracle. Before using the script in production, run `--check` on the real servers
 and read what it reports.

@@ -1,0 +1,102 @@
+# Checks on every push and pull request:
+#   shellcheck  errors in the built script, build.sh and the test scripts
+#   build       build.sh joins src/ into dg_standby_setup.sh: it must parse (bash -n) and be the committed file
+#   test        test/run_scenarios.sh, in parts (one part per job, run in parallel; the parts are in PARTS
+#               at the top of run_scenarios.sh). The tests make users and groups and write /etc, so they
+#               run as root (sudo) on a throw-away runner.
+#   ol7         a short part on Oracle Linux 7 itself (bash 4.2, Python 3.6), in a container
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (errors)
+        run: |
+          shellcheck --version
+          bash ./build.sh
+          shellcheck -S error -s bash dg_standby_setup.sh build.sh test/*.sh test/zipsrc/*
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build from src/
+        run: bash ./build.sh
+      - name: Syntax (bash -n)
+        run: |
+          for f in dg_standby_setup.sh build.sh test/*.sh test/zipsrc/*; do bash -n "$f" || { echo "::error file=$f::bash -n failed"; exit 1; }; done
+          python3 -m py_compile test/*.py
+      - name: The committed dg_standby_setup.sh is the build of src/
+        run: |
+          if ! git -c core.fileMode=false diff --quiet -- dg_standby_setup.sh; then
+            echo "::error file=dg_standby_setup.sh::dg_standby_setup.sh differs from the build of src/ (run bash build.sh and commit it)"
+            git -c core.fileMode=false diff --stat -- dg_standby_setup.sh
+            exit 1
+          fi
+      - name: Version
+        run: sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/version \1/p' dg_standby_setup.sh
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    name: test (part ${{ matrix.part }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          missing=""
+          for t in zip unzip perl python3 runuser timeout; do command -v $t >/dev/null || missing="$missing $t"; done
+          if [ -n "$missing" ]; then sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip perl; fi
+      - name: Part ${{ matrix.part }}
+        run: |
+          bash ./build.sh
+          bash test/run_scenarios.sh --list-parts | sed -n "s/^ *${{ matrix.part }}  /sections: /p"
+          sudo bash test/run_scenarios.sh --part ${{ matrix.part }}
+      - name: Keep what the failed checks saw
+        if: failure()
+        run: sudo tar czf test-part-${{ matrix.part }}.tgz --ignore-failed-read /tmp/dgt_fail /tmp/dgt_stuck /tmp/dgt/log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-part-${{ matrix.part }}
+          path: test-part-${{ matrix.part }}.tgz
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ol7:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: test on Oracle Linux 7 (bash 4.2)
+    steps:
+      # checkout runs on the runner: the actions need a newer glibc than Oracle Linux 7 has
+      - uses: actions/checkout@v4
+      - name: Sections A and Q in oraclelinux:7
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src oraclelinux:7-slim bash -c '
+            set -e
+            yum install -y -q python3 zip unzip perl procps-ng util-linux shadow-utils hostname findutils which >/dev/null
+            cat /etc/oracle-release; bash --version | head -n 1; python3 --version
+            bash ./build.sh
+            bash test/run_scenarios.sh --sections A,Q'

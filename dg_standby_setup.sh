@@ -9760,14 +9760,14 @@ tns_alias_present() {
   # the alias as plain text (a . in my.db is a dot, not "any character")
   local f a; f=$(tns_file); [[ -f "$f" ]] || return 1
   a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$1")
-  grep -qiE "^[[:space:]]*$a[[:space:]]*=" "$f"
+  grep -qiE "^[[:space:]]*${a}[[:space:]]*=" "$f"
 }
 tns_replace() {
   # $1 tnsnames.ora, $2 alias -> the file with the entry of that alias replaced by the right one (tns_block).
   # 1 unless: exactly one entry starts with "<alias> =" on its own line, its parentheses close, and nothing
   # else follows on the line where it ends. Comments inside it are kept above the new entry; other entries stay.
   local a n; a=$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "$2")
-  n=$(grep -ciE "^[[:space:]]*$a[[:space:]]*=" "$1"); [[ "$n" == 1 ]] || return 1
+  n=$(grep -ciE "^[[:space:]]*${a}[[:space:]]*=" "$1"); [[ "$n" == 1 ]] || return 1
   # the alias is compared as text (an awk pattern from -v would turn "\." into "any character")
   DG_ALIAS="$2" awk -v blk="$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")" '
     function cl(s) { t = s; sub(/#.*/, "", t); return t }

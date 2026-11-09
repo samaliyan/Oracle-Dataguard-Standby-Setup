@@ -288,7 +288,8 @@ def main():
         if time.time() > deadline:
             print("\nDRIVER TIMEOUT"); os.kill(pid, 9); break
     _, status = os.waitpid(pid, 0)
-    code = os.waitstatus_to_exitcode(status)
+    # os.waitstatus_to_exitcode is new in Python 3.9; this also runs on 3.6 (Oracle Linux 7)
+    code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
     with open(E("DG_TEST_OUT", "/tmp/dgt/last_output.txt"), "w") as f: f.write(full)
     if ui: snap("end")
     print(f"\n[driver] exit={code} prompts_answered={answered}")

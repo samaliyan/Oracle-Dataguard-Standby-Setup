@@ -238,7 +238,8 @@ def remote(cmd, stdin_data):
     m = re.fullmatch(r"env (?:-u \w+ )*ORACLE_HOME=(\S+) ORACLE_SID=(\S+) TNS_ADMIN=(\S+) timeout (\d+) (\S+)/bin/sqlplus -S /nolog", cmd)
     if m:
         env = dict(os.environ, DGT_REMOTE="1", ORACLE_SID=m.group(2), USER="oracle")
-        r = subprocess.run(["/tmp/dgt/remotebin/sqlplus"], input=stdin_data, text=True, capture_output=True, env=env)
+        r = subprocess.run(["/tmp/dgt/remotebin/sqlplus"], input=stdin_data, universal_newlines=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)  # Python 3.6 (OL7)
         sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); return r.returncode
     log(BAD, cmd)
     print("mock primary: command not allowed", file=sys.stderr); return 126

@@ -57,6 +57,9 @@ PRETTY_NAME="Oracle Linux Server $OSV.9"
 EOF
 
 # ---- media ----
+# The mock programs keep their execute bit even when the checkout lost it (a file uploaded on the GitHub web
+# page is stored as 644): every file under $1 that starts with #! is made executable.
+mkexec() { find "$1" -type f -exec sh -c 'for f; do [ "$(head -c 2 "$f")" = "#!" ] && chmod 755 "$f"; done; true' sh {} +; }
 db_payload() {   # $1 dir
   local d=$1 p
   mkdir -p "$d/bin" "$d/OPatch" "$d/network/admin" "$d/dbs"
@@ -66,6 +69,7 @@ db_payload() {   # $1 dir
   printf 'mock\n' > "$d/bin/oracle"; printf 'mock\n' > "$d/bin/oradism"
   mkdir -p "$d/inventory/oneoffs/35643107"
   cp "$TD/zipsrc/dbroot.sh" "$d/root.sh"; touch "$d/network/admin/README" "$d/dbs/init.ora"
+  mkexec "$d"
 }
 grid_payload() { # $1 dir
   local d=$1 p
@@ -77,9 +81,10 @@ grid_payload() { # $1 dir
   mkdir -p "$d/inventory/oneoffs/35643107"
   cp "$TD/zipsrc/root.sh" "$d/root.sh"; touch "$d/network/admin/README"
   cp "$TD/mock_installer.py" "$d/cfgtoollogs/configToolAllCommands"
+  mkexec "$d"
 }
 Z=$T/zipbuild; rm -rf "$Z"; mkdir -p "$Z"
-mkzip() { ( cd "$1" && zip -qr "$2" . ); chmod 644 "$2"; }
+mkzip() { mkexec "$1"; ( cd "$1" && zip -qr "$2" . ); chmod 644 "$2"; }
 db_tpl=$TD/templates/db19.rsp; [[ $MAJ -ge 23 ]] && db_tpl=$TD/templates/db23.rsp; [[ "$MEDIA" == "broken" ]] && db_tpl=$TD/templates/db_broken.rsp
 case "$MAJ" in 18) vtag=180000 ;; 19) vtag=193000 ;; 21) vtag=213000 ;; 23) vtag=237000 ;; *) vtag="" ;; esac
 if [[ "$MEDIA" == "staged" || "$MAJ" == "12" ]]; then
