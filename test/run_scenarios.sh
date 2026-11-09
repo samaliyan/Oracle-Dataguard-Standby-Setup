@@ -2215,5 +2215,5 @@ fi
 parts_done
 echo
 echo "RESULT: $PASS passed, $FAILN failed"
-for f in "${FAILED[@]}"; do echo "  - $f"; done
+for f in ${FAILED[@]+"${FAILED[@]}"}; do echo "  - $f"; done   # bash 4.2: an empty array is "unbound" under set -u
 [[ $FAILN -eq 0 ]]
