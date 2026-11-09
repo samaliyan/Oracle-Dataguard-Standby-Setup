@@ -8,7 +8,9 @@ PASS=0; FAILN=0; FAILED=()
 pass() { printf '  PASS  %s\n' "$1"; PASS=$((PASS+1)); }
 fail() { printf '  FAIL  %s\n' "$1"; FAILN=$((FAILN+1)); FAILED+=("$CUR: $1")
   local d=/tmp/dgt_fail/$(printf '%03d' $FAILN); mkdir -p $d; cp $T/*.txt $d/ 2>/dev/null; cp $T/state/calls.log $T/state/primary_cmds.log $d/ 2>/dev/null; printf '%s\n' "$1" > $d/CHECK; }
-check() { if eval "$2"; then pass "$1"; else fail "$1"; fi; }
+# (pipefail off while a condition runs: in "sed ... | grep -q x", grep ends at the first match and sed may then
+# get SIGPIPE; the result is the one of grep, as in a plain shell)
+check() { local ok=0; set +o pipefail; eval "$2" && ok=1; set -o pipefail; if [[ $ok -eq 1 ]]; then pass "$1"; else fail "$1"; fi; }
 fresh() { bash $TD/setup_env.sh "${1:-installed}" >/dev/null; }
 jset() { python3 - "$@" <<'EOF'
 import json,sys

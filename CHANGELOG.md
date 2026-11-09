@@ -3,6 +3,34 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.25
+
+What is shown is what runs, in every step. The notes of 5.23 said that every automatic step shows its exact
+commands under "Will run" before `[y]`; that was true for phases 3, 7.2 (clean-up), 9 and 10 only. Phases 2, 5
+and 6, parts of 7 and 8, and the installer jobs showed a description instead. Now every step that changes
+something on this server lists the exact command lines with their real values under "Will run" (passwords
+*****) before `[y]`, runs exactly that list, shows each command again when it runs ("Running as <user>: ..."),
+and logs it.
+
+- Phase 2: groups, users, packages (the proxy settings of the environment are passed on), limits, folders,
+  `/etc/hosts`, firewall, time sync, `.bash_profile`, ASM method, ASM disks (shown once the disks are chosen,
+  before the typed confirmation), `/dev/shm`.
+- Phase 3: the unzip, installer and root-script jobs show their exact command lines before `[y]`, and a job
+  that was not shown is not started; the response file is named with its path, and the values the script
+  sets in it are listed in a file under the log folder (passwords *****). OPatch, inventory fixes, disk
+  groups, `roohctl`, the listener port.
+- Phases 5 and 6: `listener.ora`, `tnsnames.ora`, `sqlnet.ora` (the block added, or the whole new file),
+  `lsnrctl start` / `reload`, the password file and wallet copies (the exact `scp`, the md5 check, the
+  install), `orapki` (the keystore password is typed when it runs and never shown). A file changed after the
+  check is not written.
+- Phases 7 and 8: instance folders, the pfile and `startup nomount`, `/etc/oratab`, `setasmgidwrap`, the RMAN
+  duplicate (its whole input). The 7.2 clean-up shows its commands before you type CLEAN.
+- Phases 9 and 10: `srvctl add` / `modify` / `remove` (and the command that would put the old registration
+  back), standby redo logs, redo apply, the boot unit files and `systemctl` commands, the roll forward and the
+  clean-up after it.
+- Each step works its list out again before it acts; if it differs from what was shown (something changed in
+  between), nothing is run and you are asked to check again.
+
 ## 5.24
 
 From an external review of 5.23 (four reports). Every finding was checked against the code; the ones that held
