@@ -57,7 +57,8 @@ for p in ssh scp ssh-keyscan ssh-keygen; do ln -sf "$T/mock_ssh.py" "$T/rootbin/
 cp "$TD/mock_shm.py" "$T/"; chmod 755 "$T/mock_shm.py"; for p in df mount; do ln -sf "$T/mock_shm.py" "$T/rootbin/$p"; done
 printf '/dev/mapper/ol-root  /  xfs  defaults  0 0\ntmpfs  /dev/shm  tmpfs  defaults,nodev  0 0\n' > "$T/fstab"
 # the RAM of the mock standby is 8 GB whatever the test machine has (the memory checks of step 2.16
-# compare the SGA and PGA of the mock primary with it); HugePages none
+# compare the SGA and PGA of the mock primary with it); HugePages none. /dev/shm is 4 GB (half the
+# RAM, as on a real server): shm_mb in os.json, read by mock_shm.py
 printf 'MemTotal:        8388608 kB\nMemFree:         6291456 kB\nMemAvailable:    7340032 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugepagesize:       2048 kB\n' > "$T/meminfo"
 ln -sf "$T/mock_oracle.py" "$T/remotebin/sqlplus"
 cat > "$T/os-release" <<EOF
@@ -181,7 +182,7 @@ EOF
 {"rpms": [], "asm": {"enabled": false, "uid": "", "gid": "", "loaded": false, "disks": {}},
  "disks": {"/dev/sda": {"mnt": "/", "parts": 0, "size_mb": 51200}, "/dev/sdb": {"size_mb": 204800}, "/dev/sdc": {"size_mb": 102400},
            "/dev/sdd": {"fs": "ext4"}, "/dev/sde": {"pttype": "gpt"}},
- "parts": {}, "services": {"firewalld": false, "chronyd": false}}
+ "parts": {}, "services": {"firewalld": false, "chronyd": false}, "shm_mb": 4096}
 EOF
 else
   for g in $GROUPS_LIST; do groupadd -g "${g##*:}" "${g%%:*}"; done
@@ -237,7 +238,7 @@ EOF
  "asm": {"enabled": true, "uid": "$GU", "gid": "asmadmin", "loaded": true, "disks": $DISKS},
  "disks": {"/dev/sda": {"mnt": "/", "parts": 1, "size_mb": 51200}, "/dev/sdb": {"parts": 1, "size_mb": 204800}, "/dev/sdc": {"parts": 1, "size_mb": 102400}},
  "parts": {"/dev/sdb1": "/dev/sdb", "/dev/sdc1": "/dev/sdc"},
- "services": {"firewalld": false, "chronyd": true}}
+ "services": {"firewalld": false, "chronyd": true}, "shm_mb": 4096}
 EOF
 fi
 chmod 666 "$T"/state/*.json
