@@ -955,7 +955,7 @@ check "Standard Edition -> stop at discovery, before any install" "[[ $rc -ne 0 
 # X17 patched primary + base media: told at 3.1, before installing
 fresh empty
 rc=$(DG_TEST_QUIT_AT=3.2 run $T/x17.txt)
-check "3.1 says the primary has patches and how to avoid patching by hand" "grep -q 'The primary has patches' $T/x17.txt && grep -q 'and OPATCH_ZIP in the settings' $T/x17.txt"
+check "3.1 says the primary has patches and how to avoid patching by hand" "grep -q 'The primary has patches' $T/x17.txt && grep -q 'set the value "Release Update"' $T/x17.txt && grep -q 'RU_DIR and OPATCH_ZIP' $T/x17.txt"
 # X18 a home in the inventory without a finished installer -> not 'installed'
 fresh; chown oracle $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oradism; rm -f $T/varlib/db_install.done
 rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/x18.txt --from 3.6)
@@ -2162,7 +2162,9 @@ sed -i 's/^DATA_DEST=.*/DATA_DEST=same/; s/^FRA_DEST=.*/FRA_DEST=same/' $T/varli
 check "DATA_DEST=same (the old way) still works: every file keeps its folder or disk group (set newname per file)" "full_ok $T/s1.txt && grep -q \"set newname for datafile 1 to '\" $T/log/duplicate_*.rman && ! grep -q 'set newname for database' $T/log/duplicate_*.rman"
 
 # ---- items 5, 6, 9: the copy fills the recovery area (ORA-19809) ----
-fresh empty; jset $S "d['rman_fra_full']=1"
+# (the primary's recovery area is 20 GB here: the standby gets the same size, and twice that still fits the
+# mock FRA disk of 100 GB, so the second copy is not stopped by 2.13 for lack of disk)
+fresh empty; jset $S "d['rman_fra_full']=1"; jset $P "d['params']['db_recovery_file_dest_size']=str(20*1024**3)"
 rc=$(run $T/f1.txt)
 check "8.2: ORA-19809 -> 'the recovery area on this server is full', the first real error (not RMAN-00571), next step named" "grep -q 'the recovery area on this server is full' $T/f1.txt && grep -A2 'First error:' $T/f1.txt | grep -q 'ORA-19809: limit exceeded' && grep -A3 'First error:' $T/f1.txt | grep -q 'ORA-19804' && ! grep -A3 'First error:' $T/f1.txt | grep -qE 'RMAN-00571|RMAN-03002|ORA-19849' && grep -q 'with a bigger recovery area' $T/f1.txt"
 cp $S /tmp/dgt_standby_f1.json; tar -C / -cf /tmp/dgt_f1.tar tmp/dgt

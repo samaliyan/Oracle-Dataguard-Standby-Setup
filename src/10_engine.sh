@@ -232,6 +232,8 @@ next_cmd() {
   for id in "${STEP_ORDER[@]+"${STEP_ORDER[@]}"}"; do
     [[ "$id" == 1.* ]] && continue
     step_ok_anywhere "$id" && continue
+    # (2.7 waiting for the visit to the primary in phase 4 is no place to go on from: phase 4 shows its command)
+    [[ "$id" == 2.7 && ${P27_DEFERRED:-0} -eq 1 ]] && continue
     n=$(step_num "$id"); [[ $n -lt $best ]] && { best=$n; nx=$id; }
   done
   # (record() clears it when that step is done later in the run; one set after the step was done, such as 7.2 after
@@ -252,6 +254,7 @@ next_cmd() {
     [[ "$id" == 1.* ]] && continue
     [[ $(step_num "$id") -lt $lim ]] || break
     is_optional "$id" && continue
+    [[ "$id" == 2.7 && ${P27_DEFERRED:-0} -eq 1 ]] && continue
     step_ok_anywhere "$id" || { printf '%s' "$SELF"; return 0; }
   done
   printf '%s --from %s' "$SELF" "$nx"
