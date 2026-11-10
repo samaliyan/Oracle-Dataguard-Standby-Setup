@@ -3,6 +3,16 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.28
+
+- `--verbose` shows what the checks read: every step in full, and under it each read-only query or command it
+  ran with its answer (`· STANDBY sqlplus: select count(*) from v$archive_gap;  ->  0`), also the probes on the
+  primary. Commands that change something are shown as before, with or without it.
+- `--health --verbose`: the queries of each check under its line. Without `--verbose` the output is the same as
+  before (the first line is still the status for monitoring).
+- `--health`: the checks no longer read the instance state, the role and the datafile headers again before each
+  check (they were read once at the start); its log is shorter.
+
 ## 5.27
 
 The five open points of the 5.26 review.

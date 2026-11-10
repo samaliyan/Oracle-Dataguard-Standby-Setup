@@ -3,7 +3,10 @@
 #------------------------------------------------------------------------------
 DG_DEAD_NOTE=""; REG_MODE=""; REG_OLD_OPT=""; REG_OLD_HOME=""; REG_OLD_PW=""; REG_MOD_ARGS=(); REG_OLD_DG=""; REG_NEW_DG=""; REG_OLD_DOM=""
 
+HEALTH_BUILT_OK=0
 need_built() {
+  # (--health found the standby built and mounted at its start: the checks do not read that again)
+  [[ ${HEALTH:-0} -eq 1 && $HEALTH_BUILT_OK -eq 1 ]] && return 0
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 1; }
   detect_built
   if [[ $STANDBY_BUILT -eq 1 && "$LSTATE" == "IDLE" && "${CUR_STEP%%.*}" == "10" ]]; then

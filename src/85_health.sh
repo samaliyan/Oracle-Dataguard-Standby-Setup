@@ -113,7 +113,9 @@ health_run_check() {
   NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""; CHECK_WAITS=0
   CUR_STEP=$id
   { printf '\n==== %s  %s ====\n' "$id" "$title"; } >> "$HEALTH_LOG"
+  vq_take > /dev/null      # (--verbose: the list of this check starts empty)
   rc=0; "$fn" >> "$HEALTH_LOG" 2>&1 || rc=$?
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[$id]=$(vq_take)
   if [[ $rc -eq 0 && $CHECK_WAITS -eq 0 ]]; then st=OK
   elif [[ $rc -eq 0 && $CHECK_WAITS -ge 2 ]]; then st=SKIPPED
   elif [[ $rc -eq 0 ]]; then st=WARNING
@@ -185,8 +187,11 @@ health_main() {
   fi
   detect_built >> "$HEALTH_LOG" 2>&1
   [[ $STANDBY_BUILT -eq 1 ]] || health_exit UNKNOWN "The standby database is not recorded as built here (phase 8). $SC_INFO"
+  # the checks below do not read the instance state, the role and the datafile headers again (need_built)
+  HEALTH_BUILT_OK=1
 
   health_ssh || _log WARN "health: $HEALTH_SSH_ERR"
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[0.0]=$(vq_take)
   local -a checks=("10.1|Transport and apply lag|c_10_1" "10.2|No archive gap|c_10_2_once" "10.3|Last log: primary and standby|c_10_3_once"
                    "10.4|Redo apply is running|c_10_4" "10.5|No unrecoverable (NOLOGGING) changes|c_10_5" "10.6|Patch level: primary and standby|c_10_6"
                    "10.8|Archived logs: space and nightly clean-up|c_10_8")
@@ -215,18 +220,27 @@ health_main() {
   # the state of Data Guard on this standby (role, protection mode, last applied log): a line of its own, and
   # kept for --status
   dg_state_read >> "$HEALTH_LOG" 2>&1
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[dg]=$(vq_take)
   health_report
   health_exit
 }
 
+declare -A HEALTH_VQ=()
+health_vq() {
+  # --verbose: the queries of check $1, under its line
+  local l; [[ -n "${HEALTH_VQ[$1]:-}" ]] || return 0
+  while IFS= read -r l; do [[ -n "$l" ]] && health_out "                  · $l"; done <<< "${HEALTH_VQ[$1]}"
+  return 0
+}
 health_report() {
   local id
   HEALTH_REPORTED=1
   [[ -n "$HEALTH_LOG" ]] && printf '\n==== Summary ====\n' >> "$HEALTH_LOG"
   for id in "${HEALTH_ORDER[@]}"; do
     health_out "$(printf '  %-9s %-5s %s' "${HEALTH_STATE[$id]}" "$([[ "$id" == 0.0 ]] || printf '%s' "$id")" "${HEALTH_TEXT[$id]}")"
+    health_vq "$id"
   done
-  [[ -n "${DGS_ROLE:-}" ]] && health_out "  Data Guard: $(dg_state_oneline)"
+  [[ -n "${DGS_ROLE:-}" ]] && { health_out "  Data Guard: $(dg_state_oneline)"; health_vq dg; }
   if [[ $HEALTH_SSH_NOKEY -eq 1 ]]; then
     health_out "  Note: $HEALTH_SSH_ERR (set it up with step 9.9:  $SELF --only 9.9; see --help-step 9.9 / README). 10.3 and 10.5: standby side only; 10.6 skipped."
   elif [[ -n "$HEALTH_SSH_ERR" ]]; then

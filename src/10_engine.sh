@@ -533,6 +533,7 @@ run_step() {
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
     ui_live_clear
+    vq_dump
     # (plain output: the title waits only for a step that is already correct; block and hint often run in a pipe,
     # where clearing PT_PENDING would not reach this shell)
     if [[ -n "$PT_PENDING" ]] && ! [[ $rc -eq 0 && $CHECK_WAITS -eq 0 && $PRIM_RAN -eq 0 && $acted -eq 0 && -z "$(primary_pending_get "$id")" ]]; then pt_flush; fi
@@ -688,7 +689,7 @@ run_step() {
     # where the log is now: the first error the action logs is found after this point (step_error)
     local logpos=0; [[ -n "$LOG_FILE" ]] && logpos=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || printf 0)
     DO_T0[$id]=$SECONDS
-    ui_flush; drc=0; IN_DO=1; "$dofn" || drc=$?; IN_DO=0
+    ui_flush; drc=0; IN_DO=1; "$dofn" || drc=$?; IN_DO=0; vq_dump
     _log DO "[$id] end, exit code $drc, after $(ui_dur $((SECONDS - DO_T0[$id])))"
     if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $(on_demand "$id" && printf '%s --roll-forward' "$SELF" || printf '%s --from %s' "$SELF" "$id")"; return 0; fi
     if [[ $drc -eq 0 ]]; then

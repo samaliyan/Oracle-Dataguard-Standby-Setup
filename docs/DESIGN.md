@@ -232,3 +232,13 @@ values are kept in settings.accepted and differences are shown. One run at a tim
   multiplexes its logs (PRIMARY_LOG_MEMBERS >= 2).
 - log_block: one SQL echo line is folded into the title; the SQL_MARK line is dropped; a block with exit code 0, no
   ORA-/SP2- and at most one line of answer is written as one line "title  ->  answer".
+
+## 5.28 notes
+
+- --verbose (VQ_FILE, vq_*): log_block and probe_log add one line per read-only query or command (a select of
+  sql_local / prim_sql / sql_asm, a probe on the primary, a local command that cmd_reads_only accepts) to a file;
+  a file, because many of them run in a subshell. run_step shows them after the check and after the action, and
+  ask() before a question (vq_dump; ui_out on the screen layout). --health keeps them per check (HEALTH_VQ) and
+  health_report prints them under each check's line. DG_TEST_NO_QUERIES=1 (set by the test suite, which runs with
+  DG_VERBOSE=1) leaves them out.
+- --health: HEALTH_BUILT_OK=1 after the start found the standby built; need_built then returns at once.

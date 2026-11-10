@@ -33,9 +33,10 @@ Setup
                          dg_standby_setup.sh --user oracle
   --plain              Plain scrolling output instead of the screen layout
                          dg_standby_setup.sh --plain
-  --verbose            The end summary lists every step (else a phase where every step is OK
-                       is one line; the log always has every step)
-                         dg_standby_setup.sh --verbose
+  --verbose            Every step in full, with each read-only query or command it runs and its
+                       answer ("· query  ->  answer"); the end summary lists every step.
+                       With --health: the queries of each check under its line.
+                         dg_standby_setup.sh --verbose      dg_standby_setup.sh --health --verbose
 After setup
   --only 10            Health check, with the screen and questions
                          dg_standby_setup.sh --only 10
@@ -431,6 +432,7 @@ main() {
   # a wrong command line is exit 2, but 3 (unknown) with --health: 2 means "critical" to a monitoring system
   local a; PX=2; for a in "$@"; do [[ "$a" == "--health" ]] && PX=3; done
   parse_args "$@"
+  vq_init
   if [[ -n "$HELP_STEP" ]]; then help_cli "$HELP_STEP"; exit 0; fi
   # a failure to start is "unknown" (3) for --health, as for a monitoring system (fd 7: its output, see health_out)
   local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }
