@@ -111,8 +111,8 @@ srl_statements() {
   [[ -n "$bclause" ]] && SRL_INFO_EXTRA="The online logs use 4096-byte blocks."$'\n'"The standby disks must support 4K sectors, or you get ORA-01378." || SRL_INFO_EXTRA=""
   # standby logs without a thread (thread 0) can serve any thread
   local pool0; pool0=$(awk -F'|' '$1==0 {print $2}' <<< "$good"); num "$pool0" || pool0=0
-  "$run" "select (select nvl(max(value),'-') from v\$parameter where name in ('db_create_file_dest','db_create_online_log_dest_1') and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
-  IFS='|' read -r omf maxg dir <<< "$(first_line)"
+  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
+  local ndest; IFS='|' read -r omf ndest maxg dir <<< "$(first_line)"; num "$ndest" || ndest=0
   num "$maxg" || return 2
   maxb=$(awk -F'|' '{if ($3 > m) m = $3} END {print m+0}' <<< "$threads")
   num "$maxb" && [[ $maxb -gt 0 ]] || return 2
@@ -124,7 +124,11 @@ srl_statements() {
     SRL_INFO+="Thread $t: $c online log groups. Standby logs: $have of $((c + 1)) needed (${mb}M each)"$'\n'
     while [[ $have -lt $((c + 1)) && $pool0 -gt 0 ]]; do have=$((have + 1)); pool0=$((pool0 - 1)); done
     while [[ $have -lt $((c + 1)) ]]; do
-      if [[ "$omf" != "-" && -n "$omf" ]]; then spec=""
+      # one member per standby log (MAA: a second member only slows the writes of the redo that arrives). With two
+      # or more OMF log destinations an empty spec would make one member in each: the first destination is named.
+      if [[ "$omf" != "-" && -n "$omf" && $ndest -lt 2 ]]; then spec=""
+      elif [[ "$omf" == +* ]]; then spec=" ('${omf%%/*}')"
+      elif [[ "$omf" != "-" && -n "$omf" ]]; then g=$((g + 1)); spec=" group $g ('${omf%/}/srl_t${t}_g${g}.log')"
       elif [[ "$dir" == +* ]]; then spec=" ('${dir%%/*}')"
       else g=$((g + 1)); spec=" group $g ('$dir/srl_t${t}_g${g}.log')"; fi
       SRL_STMTS+="alter database add standby logfile thread $t$spec size ${mb}M$bclause;"$'\n'

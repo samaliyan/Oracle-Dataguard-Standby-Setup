@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.26"
+readonly SCRIPT_VERSION="5.27"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -148,6 +148,23 @@ log_block() {
     grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])SP2-[0-9]{4}' && e+="${e:+/}SP2-"
     if [[ -n "$e" ]]; then body=$(sed "s#^(exit code 0)\$#(exit code 0, $e in output)#" <<< "$body"); t+=" (exit code 0, $e in output)"; fi
   fi
+  # SQL: the query is in the title once (not again as "SQL> ..."), the output marker of the probes is left out
+  local nq; nq=$(grep -c '^SQL> ' <<< "$body")
+  # (a statement of several lines keeps its block: its other lines follow "SQL> " indented)
+  [[ $nq -eq 1 ]] && awk 'p ~ /^SQL> / && /^     / {f = 1} {p = $0} END {exit !f}' <<< "$body" && nq=2
+  if [[ $nq -eq 1 && "$t" == *": "* ]]; then
+    local q; q=$(sed -n 's/^SQL> //p' <<< "$body")
+    [[ "${t#*: }" == "${q:0:20}"* ]] && { t="${t%%: *}: $q${e:+ (exit code 0, $e in output)}"; body=$(grep -v '^SQL> ' <<< "$body"); }
+  fi
+  body=$(grep -vx '__DG_SQL_OUTPUT__' <<< "$body")
+  # a short answer without an error: one line, "title  ->  answer"
+  if [[ -z "$e" && $nq -le 1 ]] && grep -qx '(exit code 0)' <<< "$body"; then
+    local res; res=$(grep -vx '(exit code 0)' <<< "$body" | sed '/^[[:space:]]*$/d')
+    if [[ $(grep -c '' <<< "$res") -le 1 && ${#res} -le 200 ]]; then
+      printf '%s | OUT    | %s  ->  %s\n' "$(ts)" "$t" "${res:-(no rows)}" | mask_pw >> "$LOG_FILE"
+      return 0
+    fi
+  fi
   {
     printf '%s | OUT    | --- %s ---\n' "$(ts)" "$t"
     [[ -n "$body" ]] && printf '%s\n' "$body" | sed 's/^/          /'
@@ -156,14 +173,18 @@ log_block() {
 }
 
 # Screen layout of a step:   "  Step 1.5  Title"  then 4 spaces + symbol + text; more lines of a message at 6 spaces
-say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else printf '      %s\n' "$*"; fi; _log INFO "$*"; }
+# Plain output, not --verbose: the title of a step waits (PT_PENDING) until the step prints something. A step that
+# is already correct prints one line instead (run_step: pt_ok_line); anything else prints the title first (pt_flush).
+PT_PENDING=""
+pt_flush() { [[ -n "$PT_PENDING" ]] || return 0; printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "${PT_PENDING%%$'\t'*}" "$C_N" "$C_W" "${PT_PENDING#*$'\t'}" "$C_N"; PT_PENDING=""; }
+say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else pt_flush; printf '      %s\n' "$*"; fi; _log INFO "$*"; }
 _mark() { # $1 color $2 symbol $3 log tag, rest = text (first line after the symbol, other lines under it)
   local col=$1 sym=$2 tag=$3 l first=1 o=""; shift 3
   while IFS= read -r l || [[ -n "$l" ]]; do
     if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s%s %s' "$col" "$sym" "$C_N" "$l")$'\n'; first=0
     else [[ -n "$l" ]] && o+="      $l"$'\n'; fi
   done <<< "$*"
-  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else pt_flush; printf '%s' "$o"; fi
   _log "$tag" "$*"
 }
 ok()   { _mark "$C_G" "$S_OK" OK "$*"; }
@@ -177,7 +198,7 @@ warn() {
     if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s %s%s' "$C_Y" "$S_WARN" "$l" "$C_N")$'\n'; first=0
     else [[ -n "$l" ]] && o+=$(printf '      %s%s%s' "$C_Y" "$l" "$C_N")$'\n'; fi
   done <<< "$*"
-  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else pt_flush; printf '%s' "$o"; fi
   WARN_COUNT=$((WARN_COUNT + 1)); WARN_LIST+=("$w")
 }
 warn_drop() {
@@ -200,7 +221,7 @@ hint() {
   # explanations and advice: plain text under the message they belong to (often tool output: masked on screen too)
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ $UI -eq 1 ]]; then ui_out 6 "      $line"; else printf '      %s\n' "$line"; fi
+    if [[ $UI -eq 1 ]]; then ui_out 6 "      $line"; else pt_flush; printf '      %s\n' "$line"; fi
     _log HINT "$line"
   done < <(mask_pw)
 }
@@ -208,6 +229,7 @@ hint() {
 block() {
   # $1 = label (Status / Plan / Details / Fix; old names Now: Plan: Using: are mapped), stdin = lines
   local label=$1 line first=1
+  [[ $UI -eq 1 ]] || pt_flush
   case "$label" in "Now:") label="Status" ;; "Plan:") label="Plan" ;; "Using:") label="Details" ;; "Fix:") label="Fix" ;; esac
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
@@ -346,7 +368,7 @@ ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
   [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
-    if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; fi
+    if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; else pt_flush; fi
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
       printf '\n'

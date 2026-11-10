@@ -110,6 +110,7 @@ declare -A STEP_T0=() DO_T0=()
 record() {
   # the result of a step: in memory, in the log, and in the progress file (so the next run can show
   # how far the last run got, and which steps are done)
+  [[ $UI -eq 1 ]] || pt_flush      # (a step that ends without a word still shows its title)
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}; STEP_WHEN[$1]=$(date +%H:%M)
   ui_flush
   ui_header
@@ -343,6 +344,7 @@ print_commands() {
   # typed (the end word of a here-document, an entry of tnsnames.ora or listener.ora that must start in column 1).
   # The same text goes to the screen, the log and the actions file.
   local where=$1 how=$2 line cmds who prep="" note="" t body=""
+  [[ $UI -eq 1 ]] || pt_flush
   cmds=$(cat)
   who=${how%%  ->  *}
   [[ "$how" == *"  ->  "* ]] && prep=${how#*  ->  }
@@ -511,6 +513,7 @@ run_step() {
   [[ " ${STEP_ORDER[*]-} " == *" $id "* ]] || STEP_ORDER+=("$id"); STEP_TITLE[$id]=$title; CUR_STEP=$id
   STEP_T0[$id]=$SECONDS; unset "DO_T0[$id]"
   if [[ $UI -eq 1 ]]; then ui_step_begin "$id" "$title"
+  elif [[ $VERBOSE -eq 0 ]]; then pt_flush; PT_PENDING="$id"$'\t'"$title"     # printed with the first output of the step
   else printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "$id" "$C_N" "$C_W" "$title" "$C_N"; fi
   _log STEP "[$id] $title"
   local rc drc acted=0 helped=0 opts w ferr=""
@@ -530,6 +533,9 @@ run_step() {
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
     ui_live_clear
+    # (plain output: the title waits only for a step that is already correct; block and hint often run in a pipe,
+    # where clearing PT_PENDING would not reach this shell)
+    if [[ -n "$PT_PENDING" ]] && ! [[ $rc -eq 0 && $CHECK_WAITS -eq 0 && $PRIM_RAN -eq 0 && $acted -eq 0 && -z "$(primary_pending_get "$id")" ]]; then pt_flush; fi
     kind=${KIND_NOW:-$kind0}
     # nothing is wrong, but the check itself could not be done now (NOW says when it is): waiting, never OK.
     # 2: an optional step that cannot be checked at all: skipped (optional), never OK
@@ -559,6 +565,15 @@ run_step() {
           local phow; phow=$(primary_pending_how "$id")
           journal PRIMARY "$id" "${P4_CHANGE[$id]:+changed: ${P4_CHANGE[$id]}; }${phow:+[as $phow] }$pend"; primary_pending_del "$id"
         fi
+      elif [[ -n "$PT_PENDING" ]]; then
+        # already correct and nothing printed yet: one line (the title and the first line of the result; the rest is in the log)
+        PT_PENDING=""
+        local t1=$title r1; [[ ${#t1} -gt 42 ]] && t1="${t1:0:41}…"
+        # the first line of the result (a line ending in ":" with the line after it)
+        r1=$(awk 'NR == 1 {l = $0; if (l !~ /:$/) {print l; exit}} NR == 2 {sub(/^ +/, ""); print l " " $0; exit} END {if (NR == 1 && l ~ /:$/) print l}' <<< "${NOW:-Already correct}")
+        [[ ${#r1} -gt 100 ]] && r1="${r1:0:99}…"
+        printf '  %s%s%s %-5s %-42s  %s%s%s\n' "$C_G" "$S_OK" "$C_N" "$id" "$t1" "$C_D" "$r1" "$C_N"
+        _log OK "${NOW:-Already correct}"; record "$id" OK
       else ok_lines "${NOW:-Already correct}"; record "$id" OK; fi
       return 0
     fi

@@ -112,7 +112,7 @@ ut_lsnr_host_esc() { # step 3.9's listener.ora HOST fix, taken from the script: 
 PARTS=(
   [1]="A B C D E F G H I J K"
   [2]="L M N O Q Z4 Z11"
-  [3]="P Z5 Z17 Z19 5.24"
+  [3]="P Z5 Z17 Z19 5.24 5.27"
   [4]="R Z16 Z21"
   [5]="S Z1 Z15"
   [6]="T U V Z3 5.22"
@@ -2357,6 +2357,28 @@ jset $S "d['dg_free_total']='ORA-15001: diskgroup \"FRA\" does not exist or is n
 rc=$(run $T/r24n.txt --only 10.8)
 check "10.8: recovery area in ASM, the disk group's free space query fails -> cannot check, not OK" "grep -q 'Cannot read the free space of disk group +FRA (recovery area +FRA)' $T/r24n.txt && [[ \$(res 10.8 $T/r24n.txt) != OK && \$(res 10.8 $T/r24n.txt) != WAITS ]]"
 jset $S "del d['dg_free_total']"
+fi
+if part 5.27; then
+CUR=5.27; echo "== 5.27  One member per standby log, log members in the space check, a short second run, --show-changes, the SQL log"
+# ---- a primary with two members per online log: the standby multiplexes its logs, the standby logs get one member ----
+fresh empty; jset $P "d['log_members']=2"
+rc=$(run $T/r27a.txt)
+check "multiplexed primary: a full setup completes" "[[ $rc -eq 0 ]] && grep -q 'Standby setup is complete' $T/r27a.txt"
+check "8.1: the logs get two places (+DATA +FRA), the RMAN copy sets db_create_online_log_dest_1 and _2" "grep -q \"the standby's logs get two, in +DATA +FRA\" $T/r27a.txt && grep -q \"set db_create_online_log_dest_2='+FRA'\" $T/log/duplicate_*.rman"
+check "8.1: the space of +FRA counts the second member of every online log (3 x 200 MB)" "grep -qE '\\+FRA: .* needed \\(second log members 600 MB, recovery area 50 GB\\)' $T/r27a.txt"
+check "9.3: each standby log is added with one place named ('+DATA'): one member, never one per OMF destination" "grep -q \"alter database add standby logfile thread 1 ('+DATA') size 200M;\" $T/r27a.txt && python3 -c \"import json,sys; i=json.load(open('$S'))['instances']['PRODDB_STBY']; sys.exit(0 if i.get('srl_members') and set(i['srl_members'])=={1} else 1)\""
+# ---- a second run, plain and not --verbose: one line per step that is already correct ----
+rc=$(DG_VERBOSE=0 run $T/r27b.txt)
+check "second run (not --verbose): an already-correct step is one line, its title not printed alone" "grep -qE '^  ✔ 2\\.1 +Groups \\(same names and ids as primary\\) +All 10 groups exist' $T/r27b.txt && ! grep -q '^  Step 2\\.1 ' $T/r27b.txt && grep -qE '^  ✔ 10\\.1 +Transport and apply lag' $T/r27b.txt"
+check "second run (not --verbose): a step that asks still shows its title once (1.5), and the run ends complete" "[[ \$(grep -c '^  Step 1\\.5 ' $T/r27b.txt) -eq 1 ]] && grep -q 'Standby setup is complete' $T/r27b.txt"
+check "second run: about 300 lines instead of about 450" "[[ \$(wc -l < $T/r27b.txt) -lt 330 ]]"
+# ---- --show-changes: overview, one line per step, notes once ----
+rc=$(run $T/r27c.txt --show-changes)
+check "--show-changes: overview (counts, auto / by hand, primary, runs), a table by step, then the details" "grep -qE 'On this server +[0-9]+ +\\([0-9]+ undone by --undo, [0-9]+ by hand\\)' $T/r27c.txt && grep -qE 'On the primary +[0-9]+' $T/r27c.txt && grep -qE '^    2\\.1 +Groups .* +10 +10 by hand' $T/r27c.txt && grep -q 'undo by hand: groupdel asmadmin' $T/r27c.txt"
+check "--show-changes: a note shared by a group is printed once, the steps in number order" "[[ \$(grep -c 'only if no file and no user uses it' $T/r27c.txt) -eq 1 ]] && [[ \$(grep -nE '^  Step 2\\.7 ' $T/r27c.txt | cut -d: -f1) -lt \$(grep -nE '^  Step 3\\.2 ' $T/r27c.txt | cut -d: -f1) ]]"
+# ---- the run log: one line for a short SQL answer, no marker ----
+f=$(ls -t $T/log/run_*.log | head -1)
+check "run log: a short SQL answer is one line (query -> answer), the output marker is never written" "grep -qE 'OUT +\\| STANDBY sqlplus: select status from v\\\$instance;  ->  MOUNTED' $f && ! grep -q '__DG_SQL_OUTPUT__' $T/log/run_*.log"
 fi
 parts_done
 echo

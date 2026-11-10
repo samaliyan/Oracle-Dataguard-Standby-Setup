@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.26"
+readonly SCRIPT_VERSION="5.27"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -148,6 +148,23 @@ log_block() {
     grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])SP2-[0-9]{4}' && e+="${e:+/}SP2-"
     if [[ -n "$e" ]]; then body=$(sed "s#^(exit code 0)\$#(exit code 0, $e in output)#" <<< "$body"); t+=" (exit code 0, $e in output)"; fi
   fi
+  # SQL: the query is in the title once (not again as "SQL> ..."), the output marker of the probes is left out
+  local nq; nq=$(grep -c '^SQL> ' <<< "$body")
+  # (a statement of several lines keeps its block: its other lines follow "SQL> " indented)
+  [[ $nq -eq 1 ]] && awk 'p ~ /^SQL> / && /^     / {f = 1} {p = $0} END {exit !f}' <<< "$body" && nq=2
+  if [[ $nq -eq 1 && "$t" == *": "* ]]; then
+    local q; q=$(sed -n 's/^SQL> //p' <<< "$body")
+    [[ "${t#*: }" == "${q:0:20}"* ]] && { t="${t%%: *}: $q${e:+ (exit code 0, $e in output)}"; body=$(grep -v '^SQL> ' <<< "$body"); }
+  fi
+  body=$(grep -vx '__DG_SQL_OUTPUT__' <<< "$body")
+  # a short answer without an error: one line, "title  ->  answer"
+  if [[ -z "$e" && $nq -le 1 ]] && grep -qx '(exit code 0)' <<< "$body"; then
+    local res; res=$(grep -vx '(exit code 0)' <<< "$body" | sed '/^[[:space:]]*$/d')
+    if [[ $(grep -c '' <<< "$res") -le 1 && ${#res} -le 200 ]]; then
+      printf '%s | OUT    | %s  ->  %s\n' "$(ts)" "$t" "${res:-(no rows)}" | mask_pw >> "$LOG_FILE"
+      return 0
+    fi
+  fi
   {
     printf '%s | OUT    | --- %s ---\n' "$(ts)" "$t"
     [[ -n "$body" ]] && printf '%s\n' "$body" | sed 's/^/          /'
@@ -156,14 +173,18 @@ log_block() {
 }
 
 # Screen layout of a step:   "  Step 1.5  Title"  then 4 spaces + symbol + text; more lines of a message at 6 spaces
-say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else printf '      %s\n' "$*"; fi; _log INFO "$*"; }
+# Plain output, not --verbose: the title of a step waits (PT_PENDING) until the step prints something. A step that
+# is already correct prints one line instead (run_step: pt_ok_line); anything else prints the title first (pt_flush).
+PT_PENDING=""
+pt_flush() { [[ -n "$PT_PENDING" ]] || return 0; printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "${PT_PENDING%%$'\t'*}" "$C_N" "$C_W" "${PT_PENDING#*$'\t'}" "$C_N"; PT_PENDING=""; }
+say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else pt_flush; printf '      %s\n' "$*"; fi; _log INFO "$*"; }
 _mark() { # $1 color $2 symbol $3 log tag, rest = text (first line after the symbol, other lines under it)
   local col=$1 sym=$2 tag=$3 l first=1 o=""; shift 3
   while IFS= read -r l || [[ -n "$l" ]]; do
     if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s%s %s' "$col" "$sym" "$C_N" "$l")$'\n'; first=0
     else [[ -n "$l" ]] && o+="      $l"$'\n'; fi
   done <<< "$*"
-  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else pt_flush; printf '%s' "$o"; fi
   _log "$tag" "$*"
 }
 ok()   { _mark "$C_G" "$S_OK" OK "$*"; }
@@ -177,7 +198,7 @@ warn() {
     if [[ $first -eq 1 ]]; then o+=$(printf '    %s%s %s%s' "$C_Y" "$S_WARN" "$l" "$C_N")$'\n'; first=0
     else [[ -n "$l" ]] && o+=$(printf '      %s%s%s' "$C_Y" "$l" "$C_N")$'\n'; fi
   done <<< "$*"
-  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
+  if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else pt_flush; printf '%s' "$o"; fi
   WARN_COUNT=$((WARN_COUNT + 1)); WARN_LIST+=("$w")
 }
 warn_drop() {
@@ -200,7 +221,7 @@ hint() {
   # explanations and advice: plain text under the message they belong to (often tool output: masked on screen too)
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ $UI -eq 1 ]]; then ui_out 6 "      $line"; else printf '      %s\n' "$line"; fi
+    if [[ $UI -eq 1 ]]; then ui_out 6 "      $line"; else pt_flush; printf '      %s\n' "$line"; fi
     _log HINT "$line"
   done < <(mask_pw)
 }
@@ -208,6 +229,7 @@ hint() {
 block() {
   # $1 = label (Status / Plan / Details / Fix; old names Now: Plan: Using: are mapped), stdin = lines
   local label=$1 line first=1
+  [[ $UI -eq 1 ]] || pt_flush
   case "$label" in "Now:") label="Status" ;; "Plan:") label="Plan" ;; "Using:") label="Details" ;; "Fix:") label="Fix" ;; esac
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
@@ -346,7 +368,7 @@ ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
   [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
-    if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; fi
+    if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; else pt_flush; fi
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
       printf '\n'
@@ -1188,6 +1210,7 @@ declare -A STEP_T0=() DO_T0=()
 record() {
   # the result of a step: in memory, in the log, and in the progress file (so the next run can show
   # how far the last run got, and which steps are done)
+  [[ $UI -eq 1 ]] || pt_flush      # (a step that ends without a word still shows its title)
   STEP_RESULT[$1]=$2; STEP_NOW[$1]=${NOW%%$'\n'*}; STEP_WHEN[$1]=$(date +%H:%M)
   ui_flush
   ui_header
@@ -1421,6 +1444,7 @@ print_commands() {
   # typed (the end word of a here-document, an entry of tnsnames.ora or listener.ora that must start in column 1).
   # The same text goes to the screen, the log and the actions file.
   local where=$1 how=$2 line cmds who prep="" note="" t body=""
+  [[ $UI -eq 1 ]] || pt_flush
   cmds=$(cat)
   who=${how%%  ->  *}
   [[ "$how" == *"  ->  "* ]] && prep=${how#*  ->  }
@@ -1589,6 +1613,7 @@ run_step() {
   [[ " ${STEP_ORDER[*]-} " == *" $id "* ]] || STEP_ORDER+=("$id"); STEP_TITLE[$id]=$title; CUR_STEP=$id
   STEP_T0[$id]=$SECONDS; unset "DO_T0[$id]"
   if [[ $UI -eq 1 ]]; then ui_step_begin "$id" "$title"
+  elif [[ $VERBOSE -eq 0 ]]; then pt_flush; PT_PENDING="$id"$'\t'"$title"     # printed with the first output of the step
   else printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "$id" "$C_N" "$C_W" "$title" "$C_N"; fi
   _log STEP "[$id] $title"
   local rc drc acted=0 helped=0 opts w ferr=""
@@ -1608,6 +1633,9 @@ run_step() {
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
     ui_live_clear
+    # (plain output: the title waits only for a step that is already correct; block and hint often run in a pipe,
+    # where clearing PT_PENDING would not reach this shell)
+    if [[ -n "$PT_PENDING" ]] && ! [[ $rc -eq 0 && $CHECK_WAITS -eq 0 && $PRIM_RAN -eq 0 && $acted -eq 0 && -z "$(primary_pending_get "$id")" ]]; then pt_flush; fi
     kind=${KIND_NOW:-$kind0}
     # nothing is wrong, but the check itself could not be done now (NOW says when it is): waiting, never OK.
     # 2: an optional step that cannot be checked at all: skipped (optional), never OK
@@ -1637,6 +1665,15 @@ run_step() {
           local phow; phow=$(primary_pending_how "$id")
           journal PRIMARY "$id" "${P4_CHANGE[$id]:+changed: ${P4_CHANGE[$id]}; }${phow:+[as $phow] }$pend"; primary_pending_del "$id"
         fi
+      elif [[ -n "$PT_PENDING" ]]; then
+        # already correct and nothing printed yet: one line (the title and the first line of the result; the rest is in the log)
+        PT_PENDING=""
+        local t1=$title r1; [[ ${#t1} -gt 42 ]] && t1="${t1:0:41}…"
+        # the first line of the result (a line ending in ":" with the line after it)
+        r1=$(awk 'NR == 1 {l = $0; if (l !~ /:$/) {print l; exit}} NR == 2 {sub(/^ +/, ""); print l " " $0; exit} END {if (NR == 1 && l ~ /:$/) print l}' <<< "${NOW:-Already correct}")
+        [[ ${#r1} -gt 100 ]] && r1="${r1:0:99}…"
+        printf '  %s%s%s %-5s %-42s  %s%s%s\n' "$C_G" "$S_OK" "$C_N" "$id" "$t1" "$C_D" "$r1" "$C_N"
+        _log OK "${NOW:-Already correct}"; record "$id" OK
       else ok_lines "${NOW:-Already correct}"; record "$id" OK; fi
       return 0
     fi
@@ -3493,22 +3530,63 @@ undo_text() {
 }
 
 show_changes_cli() {
-  # $1 step or empty
-  local l seq t run step kind obj det n=0 last_step=""
+  # $1 step or empty. Overview first (counts, runs, what --undo does by itself), one line per step, then every
+  # change on one line with its undo; a note that repeats in a group of the same kind is printed once under it.
+  local l seq t run step kind obj det n=0 last_step="" last_kind="" note="" pnote="" u cmd na=0 nh=0 np=0
   [[ -s "$JOURNAL_FILE" ]] || { printf '\n  No change is recorded yet (%s).\n' "$JOURNAL_FILE"; return 0; }
   journal_load_undone
-  printf '\n  %sChanges made by this script%s\n' "$C_W" "$C_N"
-  printf '  Journal         %s\n' "$JOURNAL_FILE"
-  printf '  undo auto       %s --undo STEP does it for you\n' "$(basename "$SELF")"
-  printf '  undo by hand    you run the command shown\n'
-  while IFS= read -r l; do
+  # (by step number, each step's changes oldest first: the primary visit makes 2.7 and phase 4 later than phase 3)
+  local -a E=(); mapfile -t E < <(journal_entries "${1:-}" | sort -s -t'|' -k4,4V)
+  if [[ ${#E[@]} -eq 0 ]]; then [[ -n "${1:-}" ]] && printf '\n  No change is recorded for step %s.\n' "$1" || printf '\n  No change is recorded, or every change was undone.\n'; return 0; fi
+  # ---- overview ----
+  declare -A SN=() SA=() SH=() SP=() RT=(); local -a SO=() RO=()
+  for l in "${E[@]}"; do
     IFS='|' read -r seq t run step kind obj det <<< "$l"
-    [[ "$step" != "$last_step" ]] && { printf '\n  %sStep %s%s  %s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")"; last_step=$step; }
-    printf '    %4s  %s  %-10s %s\n' "$seq" "${t:0:16}" "$kind" "$obj"
-    printf '          %sundo %s%s\n' "$C_D" "$(undo_text "$kind" "$obj" "$det")" "$C_N"
+    [[ -n "${SN[$step]:-}" ]] || { SO+=("$step"); SN[$step]=0; SA[$step]=0; SH[$step]=0; SP[$step]=0; }
+    [[ -n "${RT[$run]:-}" ]] || { RO+=("$run"); RT[$run]=${t:0:16}; }
+    SN[$step]=$((SN[$step] + 1))
+    if [[ "$kind" == PRIMARY ]]; then SP[$step]=$((SP[$step] + 1)); np=$((np + 1))
+    elif [[ "$(undo_text "$kind" "$obj" "$det")" == auto:* ]]; then SA[$step]=$((SA[$step] + 1)); na=$((na + 1))
+    else SH[$step]=$((SH[$step] + 1)); nh=$((nh + 1)); fi
+  done
+  printf '\n  %sChanges made by this script%s%s\n' "$C_W" "$C_N" "${1:+  (step $1)}"
+  printf '    On this server  %s   (%s undone by --undo, %s by hand)\n' "$((na + nh))" "$na" "$nh"
+  [[ $np -gt 0 ]] && printf '    On the primary  %s   (commands you ran there; undo them there, by hand)\n' "$np"
+  printf '    Runs            '; local r first=1
+  for r in "${RO[@]}"; do [[ $first -eq 1 ]] || printf '\n                    '; printf '%s  (%s)' "$r" "${RT[$r]}"; first=0; done; printf '\n'
+  printf '    Journal         %s\n' "$JOURNAL_FILE"
+  printf '    Undo a step     %s --undo STEP   (the auto ones; it shows the by-hand ones; newest step first)\n' "$SELF"
+  if [[ -z "${1:-}" && ${#SO[@]} -gt 1 ]]; then
+    printf '\n    %-6s %-44s %7s  %s\n' "Step" "" "changes" "undo"
+    for step in "${SO[@]}"; do
+      local how=""
+      [[ ${SA[$step]} -gt 0 ]] && how+="${SA[$step]} auto, "
+      [[ ${SH[$step]} -gt 0 ]] && how+="${SH[$step]} by hand, "
+      [[ ${SP[$step]} -gt 0 ]] && how+="${SP[$step]} on the primary, "
+      local tt; tt=$(step_title_of "$step"); [[ ${#tt} -gt 44 ]] && tt="${tt:0:43}…"
+      printf '    %-6s %-44s %7s  %s\n' "$step" "$tt" "${SN[$step]}" "${how%, }"
+    done
+  fi
+  # ---- every change ----
+  _sc_note() { [[ -n "$pnote" ]] && printf '            %s(%s)%s\n' "$C_D" "$pnote" "$C_N"; pnote=""; }
+  for l in "${E[@]}"; do
+    IFS='|' read -r seq t run step kind obj det <<< "$l"
+    u=$(undo_text "$kind" "$obj" "$det")
+    # a trailing "   (note)" that the next entries of the same kind share: printed once, after them
+    note=""; cmd=$u
+    if [[ "$u" =~ ^(.*[^ ])\ \ \ \((.*)\)$ ]]; then cmd=${BASH_REMATCH[1]}; note=${BASH_REMATCH[2]}; fi
+    if [[ "$step" != "$last_step" || "$kind" != "$last_kind" || "$note" != "$pnote" ]]; then _sc_note; fi
+    if [[ "$step" != "$last_step" ]]; then
+      printf '\n  %sStep %s%s  %s   %s%s%s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")" "$C_D" "${t:0:16}" "$C_N"
+      last_step=$step
+    fi
+    last_kind=$kind
+    printf '    %4s  %-10s %s\n' "$seq" "$kind" "$obj"
+    printf '            %sundo %s%s\n' "$C_D" "$cmd" "$C_N"
+    pnote=$note
     n=$((n + 1))
-  done < <(journal_entries "${1:-}")
-  if [[ $n -eq 0 ]]; then [[ -n "${1:-}" ]] && printf '\n  No change is recorded for step %s.\n' "$1" || printf '\n  No change is recorded, or every change was undone.\n'; fi
+  done
+  _sc_note
   return 0
 }
 change_word() {
@@ -10803,8 +10881,8 @@ srl_statements() {
   [[ -n "$bclause" ]] && SRL_INFO_EXTRA="The online logs use 4096-byte blocks."$'\n'"The standby disks must support 4K sectors, or you get ORA-01378." || SRL_INFO_EXTRA=""
   # standby logs without a thread (thread 0) can serve any thread
   local pool0; pool0=$(awk -F'|' '$1==0 {print $2}' <<< "$good"); num "$pool0" || pool0=0
-  "$run" "select (select nvl(max(value),'-') from v\$parameter where name in ('db_create_file_dest','db_create_online_log_dest_1') and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
-  IFS='|' read -r omf maxg dir <<< "$(first_line)"
+  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
+  local ndest; IFS='|' read -r omf ndest maxg dir <<< "$(first_line)"; num "$ndest" || ndest=0
   num "$maxg" || return 2
   maxb=$(awk -F'|' '{if ($3 > m) m = $3} END {print m+0}' <<< "$threads")
   num "$maxb" && [[ $maxb -gt 0 ]] || return 2
@@ -10816,7 +10894,11 @@ srl_statements() {
     SRL_INFO+="Thread $t: $c online log groups. Standby logs: $have of $((c + 1)) needed (${mb}M each)"$'\n'
     while [[ $have -lt $((c + 1)) && $pool0 -gt 0 ]]; do have=$((have + 1)); pool0=$((pool0 - 1)); done
     while [[ $have -lt $((c + 1)) ]]; do
-      if [[ "$omf" != "-" && -n "$omf" ]]; then spec=""
+      # one member per standby log (MAA: a second member only slows the writes of the redo that arrives). With two
+      # or more OMF log destinations an empty spec would make one member in each: the first destination is named.
+      if [[ "$omf" != "-" && -n "$omf" && $ndest -lt 2 ]]; then spec=""
+      elif [[ "$omf" == +* ]]; then spec=" ('${omf%%/*}')"
+      elif [[ "$omf" != "-" && -n "$omf" ]]; then g=$((g + 1)); spec=" group $g ('${omf%/}/srl_t${t}_g${g}.log')"
       elif [[ "$dir" == +* ]]; then spec=" ('${dir%%/*}')"
       else g=$((g + 1)); spec=" group $g ('$dir/srl_t${t}_g${g}.log')"; fi
       SRL_STMTS+="alter database add standby logfile thread $t$spec size ${mb}M$bclause;"$'\n'
@@ -13607,22 +13689,22 @@ CF_LIST=""
 srl_plan_space() {
   # Standby logs that step 9.3 still has to create (missing or smaller than the online logs), which are not in the
   # sizes read from the primary: SRL_MB, and SRL_LOC = where 9.3 puts them (the same rule as srl_statements:
-  # the OMF destination, else the first online-log folder outside the recovery area). Multiplexed OMF logs count twice.
+  # the OMF destination, else the first online-log folder outside the recovery area). One member each (srl_statements).
   SRL_MB=0; SRL_LOC=""
   prim_sql "select (select count(*)+count(distinct thread#) from v\$log)||'|'||(select count(*) from v\$standby_log where bytes>=(select max(bytes) from v\$log))||'|'||(select max(bytes) from v\$log)||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select nvl(max(value),'-') from v\$parameter where name in ('db_create_file_dest','db_create_online_log_dest_1') and value is not null)||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 0
-  local need have b copies omf dir; IFS='|' read -r need have b copies omf dir <<< "$(first_line)"
+  local need have b omf dir; IFS='|' read -r need have b _ omf dir <<< "$(first_line)"
   num "$need" && num "$have" && num "$b" || return 0
-  num "$copies" && [[ $copies -ge 1 ]] || copies=1
   [[ $need -gt $have ]] || return 0
   SRL_MB=$(( (need - have) * ((b + 1048575) / 1048576) ))
-  if [[ -n "$omf" && "$omf" != "-" ]]; then SRL_LOC=$omf; SRL_MB=$((SRL_MB * copies)); else SRL_LOC=$dir; fi
+  if [[ -n "$omf" && "$omf" != "-" ]]; then SRL_LOC=$omf; else SRL_LOC=$dir; fi
 }
 space_check() {
   # appends to PRE_INFO; sets PRE_FIX and returns 1 when a place here lacks space. Each place (a disk group, or the
   # file system of a folder) must hold what goes there TOGETHER: the database files (+10 %), the standby logs of
-  # step 9.3 and the recovery area (its full size, set as db_recovery_file_dest_size).
+  # step 9.3, the second member of each online log (multiplexed: in the recovery area's place) and the recovery
+  # area (its full size, set as db_recovery_file_dest_size).
   local l d mb key mnt f ff free need short="" sz
-  declare -A NEED_DB=() NEED_SRL=() NEED_FRA=() FREE=() THERE=() LABEL=()
+  declare -A NEED_DB=() NEED_SRL=() NEED_LOG=() NEED_FRA=() FREE=() THERE=() LABEL=()
   srl_plan_space
   [[ "$(place_mode)" != same && $SRL_MB -gt 0 ]] && SRL_LOC=$(data_dest)
   _sk() {
@@ -13640,11 +13722,19 @@ space_check() {
     NEED_DB[$KEY]=$(( ${NEED_DB[$KEY]:-0} + mb ))
   done < <(sb_loc_list)
   if [[ -n "$SRL_LOC" && $SRL_MB -gt 0 ]]; then _sk "$SRL_LOC" || return 1; NEED_SRL[$KEY]=$(( ${NEED_SRL[$KEY]:-0} + SRL_MB )); fi
+  # multiplexed logs (log_dests): the second member of every online log group goes to the second place. The
+  # first members are in the database files (read from the primary, all its members: more than needed there).
+  local sd; sd=$(second_dest)
+  if [[ "$(place_mode)" != same && -n "$sd" && ${PRIMARY_LOG_MEMBERS:-1} -ge 2 ]]; then
+    if prim_sql "select round(sum(bytes)/1048576) from v\$log;" && num "$(first_line)"; then
+      _sk "$sd" || return 1; NEED_LOG[$KEY]=$(first_line)
+    else PRE_FIX="Cannot read the size of the online logs of the primary (their second members go to $sd)"; return 1; fi
+  fi
   f=$(fra_dest)
   if [[ -n "$f" ]]; then _sk "$f" || return 1; NEED_FRA[$KEY]=$(fra_size_mb); fi
   # ASM: usable_file_mb, the space after mirroring. Files of an earlier copy in ASM are NOT counted as free (a new copy
   # creates new OMF files next to them).
-  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_FRA[@]}"; do
+  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_LOG[@]}" "${!NEED_FRA[@]}"; do
     [[ "$key" == +* && -z "${FREE[$key]:-}" ]] || continue
     free=0; sql_asm "select usable_file_mb from v\$asm_diskgroup where name=upper('${key#+}');" && free=$(first_line)
     num "$free" || free=0
@@ -13662,13 +13752,14 @@ space_check() {
     done <<< "$FS_FILENAMES"
   fi
   local seen=" "
-  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_FRA[@]}"; do
+  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_LOG[@]}" "${!NEED_FRA[@]}"; do
     [[ "$seen" == *" $key "* ]] && continue; seen+="$key "
-    local ndb=${NEED_DB[$key]:-0} nsrl=${NEED_SRL[$key]:-0} nfra=${NEED_FRA[$key]:-0} parts=""
-    need=$(( (ndb + nsrl) * 110 / 100 + nfra ))
+    local ndb=${NEED_DB[$key]:-0} nsrl=${NEED_SRL[$key]:-0} nlog=${NEED_LOG[$key]:-0} nfra=${NEED_FRA[$key]:-0} parts=""
+    need=$(( (ndb + nsrl + nlog) * 110 / 100 + nfra ))
     free=$(( ${FREE[$key]:-0} + ${THERE[$key]:-0} ))
     [[ $ndb -gt 0 ]] && parts+="database files $(human_mb "$ndb"), "
     [[ $nsrl -gt 0 ]] && parts+="standby logs $(human_mb "$nsrl"), "
+    [[ $nlog -gt 0 ]] && parts+="second log members $(human_mb "$nlog"), "
     [[ $nfra -gt 0 ]] && parts+="recovery area $(human_mb "$nfra"), "
     parts=${parts%, }
     if [[ $free -lt $need ]]; then
