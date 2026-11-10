@@ -230,18 +230,23 @@ journal_run_summary() {
   # the changes of THIS run, under the summary
   [[ "$MODE" == "run" && -s "$JOURNAL_FILE" ]] || return 0
   journal_load_undone
-  local l seq t run step kind obj det n=0 lines="" prim=""
+  local l seq t run step kind obj det n=0 lines="" prim="" steps=" "
   while IFS= read -r l; do
     IFS='|' read -r seq t run step kind obj det <<< "$l"
     # the commands you ran on the primary are listed apart (they are yours, not changes of this server)
     if [[ "$kind" == PRIMARY ]]; then prim+="${prim:+, }$step"; continue; fi
     n=$((n + 1))
+    [[ "$steps" == *" $step "* ]] || steps+="$step "
     [[ $n -le 12 ]] && lines+="$(printf '    %-6s %-9s %s' "$step" "$(change_word "$kind")" "$obj")"$'\n'
   done < <(journal_entries "" "$RUN_ID")
   [[ $n -gt 0 || -n "$prim" ]] || return 0
-  if [[ $n -gt 0 ]]; then
+  if [[ $n -gt 0 && ${VERBOSE:-0} -eq 1 ]]; then
     printf '\n  Changes on this server in this run (%s):\n%s' "$n" "$lines"
     [[ $n -gt 12 ]] && printf '    ... and %s more\n' "$((n - 12))"
+  elif [[ $n -gt 0 ]]; then
+    # (the end of a run keeps its verdict in view: the list itself is one command away)
+    steps=${steps# }; steps=${steps% }
+    printf '\n  Changes on this server in this run (%s), in steps: %s\n' "$n" "$(fold -s -w 80 <<< "${steps// /, }" | sed '2,$s/^/    /')"
   fi
   [[ -n "$prim" ]] && printf '\n  You changed the primary yourself in steps: %s\n' "$prim"
   printf '\n  All changes, with their undo:  %s --show-changes\n' "$SELF"

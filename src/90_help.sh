@@ -8,7 +8,7 @@ readonly HELP_IDS=(1.1 1.2 1.3 1.4 1.5 1.6
   3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11
   4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11
   5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2
-  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4 10.5 10.6 10.7 10.8)
+  9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 9.9 10.1 10.2 10.3 10.4 10.5 10.6 10.7 10.8)
 
 help_text() {
   local P=${PRIMARY_HOST:-<primary>} S=${STANDBY_HOST:-<standby>} SID=${STANDBY_SID:-<standby SID>}
@@ -25,8 +25,9 @@ help_text() {
   local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
   local DGS; DGS=$( [[ -n "${LOCS:-}" ]] && asm_dgs 2>/dev/null | paste -sd' ' - ); DGS=${DGS:-DATA FRA}
   # SQL on the primary by hand: the exact home and SID, so the environment of the user there does not matter
-  local PSQL="as $OU:  export ORACLE_HOME=$DBH ORACLE_SID=$PS ; \$ORACLE_HOME/bin/sqlplus / as sysdba"
-  local SSQL="as $OU:  export ORACLE_HOME=$DBH ORACLE_SID=$SID ; \$ORACLE_HOME/bin/sqlplus / as sysdba"
+  # (three lines: who, then two complete commands, each one copyable on its own)
+  local PSQL="As $OU:"$'\n'"       export ORACLE_HOME=$DBH ORACLE_SID=$PS"$'\n'"       \$ORACLE_HOME/bin/sqlplus / as sysdba"
+  local SSQL="As $OU:"$'\n'"       export ORACLE_HOME=$DBH ORACLE_SID=$SID"$'\n'"       \$ORACLE_HOME/bin/sqlplus / as sysdba"
   # 12.1 has no v$dataguard_process: the same information comes from v$managed_standby
   local DGP="v\$dataguard_process" DGN=name DGR=role DGS2=action
   [[ "${PRIMARY_VERSION:-}" == 12.1* ]] && { DGP="v\$managed_standby"; DGN=process; DGR=process; DGS2=status; }
@@ -156,10 +157,14 @@ WHERE  This server ($S), as root, file /etc/security/limits.d/oracle-grid.conf
 WHY    The preinstall package sets limits only for the user "oracle".
        Every other owner needs them too.
 RUN    Add these lines for each owner:
-       <user> soft nofile 1024     <user> hard nofile 65536
-       <user> soft nproc 16384     <user> hard nproc 16384
-       <user> soft stack 10240     <user> hard stack 32768
-       <user> soft memlock unlimited   <user> hard memlock unlimited
+       <user> soft nofile 1024
+       <user> hard nofile 65536
+       <user> soft nproc 16384
+       <user> hard nproc 16384
+       <user> soft stack 10240
+       <user> hard stack 32768
+       <user> soft memlock unlimited
+       <user> hard memlock unlimited
 EXPECT As <user>, after a new login:  ulimit -Hn  shows 65536
        A limit set by you counts when its hard value is at least the one above.
        memlock: with HugePages set on this server, at least their total size (in KB);
@@ -252,9 +257,13 @@ WHERE  This server ($S), as root
 WHY    ASMLib needs the UEK kernel (Oracle Linux 7 or 8). Otherwise udev rules are used;
        they work on every kernel.
 RUN    ASMLib:
-       oracleasm configure -u $GU -g $AG -e -s y ; oracleasm init ; systemctl enable oracleasm ; oracleasm status
-       udev: one rule per disk in step 2.13. systemd-udevd must run (the script starts it:
-       systemctl start systemd-udevd). Set ASM_METHOD=udev in the settings.
+       oracleasm configure -u $GU -g $AG -e -s y
+       oracleasm init
+       systemctl enable oracleasm
+       oracleasm status
+       udev: one rule per disk in step 2.13. systemd-udevd must run (the script starts it).
+       Set ASM_METHOD=udev in the settings.
+       systemctl start systemd-udevd
 EXPECT ASMLib: "Checking if ASM is loaded: yes",
        and  systemctl is-enabled oracleasm  shows enabled
 EOF
@@ -273,7 +282,9 @@ RUN    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,WWN
        oracleasm createdisk ${DD}_1 <partition> ; oracleasm scandisks ; oracleasm listdisks
        udev:
        udevadm info --query=property --name=<partition> | grep ID_PART_ENTRY_UUID
-       echo 'ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_PART_ENTRY_UUID}=="<uuid>", SYMLINK+="oraasm/${DD}_1", OWNER="$GU", GROUP="$AG", MODE="0660"' >> /etc/udev/rules.d/99-oracle-asmdevices.rules
+       echo 'ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition",' \\
+         'ENV{ID_PART_ENTRY_UUID}=="<uuid>", SYMLINK+="oraasm/${DD}_1",' \\
+         'OWNER="$GU", GROUP="$AG", MODE="0660"' >> /etc/udev/rules.d/99-oracle-asmdevices.rules
        udevadm control --reload-rules ; udevadm trigger --action=change ; ls -lL /dev/oraasm/
        Then add the label to ${STATE_DIR}/asm_disks as  LABEL|partition
        (or answer y when the script asks to use the disk).
@@ -343,8 +354,9 @@ EXPECT SGA is at most 80% of the RAM here. SGA + PGA over 90% is only a warning
        the size over it.
 IF     Too little RAM: add RAM to this server (virtual machine settings), then answer r.
        /dev/shm too small: the script does it (answer y). By hand:
-       mount -o remount,size=<MB>m /dev/shm, and the same size in /etc/fstab
-       (and in dev-shm.mount, if it exists; then systemctl daemon-reload).
+       mount -o remount,size=<MB>m /dev/shm
+       Then the same size in /etc/fstab (and in dev-shm.mount, if it exists), and:
+       systemctl daemon-reload
 EOF
   ;;
   3.1)
@@ -379,8 +391,8 @@ WHY    Needed only when the primary uses ASM.
 RUN    12.2 and newer:
        cd $GH ; unzip -q <grid zip> ; ./gridSetup.sh
        (with a Release Update, add:  -applyRU <folder>)
-       12.1:
-       unzip both zips into a stage folder ; ./grid/runInstaller
+       12.1 (both zips into one stage folder):
+       cd <stage folder> ; unzip -q <grid zip 1of2> ; unzip -q <grid zip 2of2> ; ./grid/runInstaller
        In the installer choose: Standalone Server (Oracle Restart),
        disk group $DD, External, base $GB,
        discovery path /dev/oracleasm/disks/* (ASMLib) or /dev/oraasm/* (udev).
@@ -398,8 +410,9 @@ RUN    12.1 on Oracle Linux 7 only, first apply patch 18370031:
        Then:
        $INV/orainstRoot.sh
        $GH/root.sh
-EXPECT As $GU:  crsctl check has
-       shows CRS-4638 Oracle High Availability Services is online
+EXPECT As $GU:
+       $GH/bin/crsctl check has
+       It shows: CRS-4638: Oracle High Availability Services is online
 IF     root.sh failed: undo it, then run it again:
        $GH/crs/install/roothas.sh -deconfig -force
        $GH/root.sh
@@ -423,7 +436,8 @@ EOF
 TITLE  ASM disk groups (same names as primary)
 WHERE  This server ($S), as $GU, in  sqlplus / as sysasm
 WHY    Each disk group of the primary ($DGS) needs a disk group with the same name here.
-RUN    create diskgroup <DG> external redundancy disk '<disk path>' attribute 'compatible.asm'='<as $DD>', 'compatible.rdbms'='<as $DD>';
+RUN    create diskgroup <DG> external redundancy disk '<disk path>'
+         attribute 'compatible.asm'='<as $DD>', 'compatible.rdbms'='<as $DD>';
        asmcmd lsdg
 EXPECT Every disk group of the primary is MOUNTED.
 IF     A disk group exists but is dismounted:
@@ -436,8 +450,8 @@ WHERE  This server ($S), as $OU
 RUN    18c and newer:
        cd $DBH ; unzip -q <db zip or gold image> ; ./runInstaller
        (with a Release Update, add:  -applyRU <folder>)
-       12.x:
-       unzip the zip(s) into a stage folder ; ./database/runInstaller
+       12.x (the zip or zips into one stage folder):
+       cd <stage folder> ; unzip -q <db zip> ; ./database/runInstaller
        In the installer choose: Set Up Software Only, Single instance, Enterprise Edition,
        home $DBH, base $OB.
 EXPECT The installer finishes. Then step 3.7.
@@ -519,8 +533,10 @@ RUN    $PSQL
        select log_mode, force_logging from v\$database;
        alter database force logging;
        -- only for NOARCHIVELOG (short downtime):
-       --   shutdown immediate / startup mount /
-       --   alter database archivelog; / alter database open;
+       --   shutdown immediate
+       --   startup mount
+       --   alter database archivelog;
+       --   alter database open;
 EXPECT log_mode ARCHIVELOG, force_logging YES
 EOF
   ;;
@@ -557,10 +573,12 @@ WHY    N is usually 2. If log_archive_dest_2 is used for something else,
        the script takes the first free N.
 RUN    $PSQL
        alter system set log_archive_dest_state_N=defer scope=both;
-       alter system set log_archive_dest_N='service=$ST async valid_for=(online_logfiles,primary_role) db_unique_name=$SU' scope=both;
+       alter system set log_archive_dest_N='service=$ST async
+         valid_for=(online_logfiles,primary_role) db_unique_name=$SU' scope=both;
 EXPECT show parameter log_archive_dest_N  shows the service $ST
 IF     ORA-16018 (the old parameter log_archive_dest is in use): first run
-       alter system set log_archive_dest='' scope=both; alter system set log_archive_dest_1='location=<same folder>' scope=both;
+       alter system set log_archive_dest='' scope=both;
+       alter system set log_archive_dest_1='location=<same folder>' scope=both;
 EOF
   ;;
   4.5) cat <<EOF
@@ -709,8 +727,9 @@ RUN    On the primary, find the file:
        $PSQL
        select file_name from v\$passwordfile_info;
        -- 12.2 and newer; on 12.1 the file is usually \$ORACLE_HOME/dbs/orapw<SID>
-       If the name starts with +, on the primary as $GU
-       (export ORACLE_HOME=$GH ORACLE_SID=+ASM):
+       exit
+       If the name starts with +, on the primary as $GU:
+         export ORACLE_HOME=$GH ORACLE_SID=+ASM
          rm -f /tmp/orapw_for_standby_$SID
          (umask 077; \$ORACLE_HOME/bin/asmcmd pwcopy '<file_name>' /tmp/orapw_for_standby_$SID)
          chgrp $IG /tmp/orapw_for_standby_$SID ; chmod 640 /tmp/orapw_for_standby_$SID
@@ -736,6 +755,7 @@ WHERE  The primary ($P), then this server ($S)
 RUN    On the primary:
        $PSQL
        select wrl_type, wrl_parameter, status, wallet_type from v\$encryption_wallet;
+       exit
        Copy ewallet.p12 to the same folder here.
        Copy cwallet.sso too, unless wallet_type is LOCAL_AUTOLOGIN:
        scp ${PRIMARY_SSH_USER:-oracle}@$P:<folder>/ewallet.p12 <folder>/
@@ -815,7 +835,7 @@ EOF
 TITLE  /etc/oratab entry for $SID
 WHERE  This server ($S), as root
 RUN    echo '$SID:$DBH:N' >> /etc/oratab
-       /etc/oratab as a link: the script writes the file it points to only when the link is
+       If /etc/oratab is a link: the script writes the file it points to only when the link is
        owned by root and every folder above that file can be changed only by root.
        Otherwise the line is added by hand.
 EXPECT As $OU, . oraenv (answer $SID) sets ORACLE_HOME=$DBH
@@ -823,7 +843,7 @@ EOF
   ;;
   8.1)
     printf 'TITLE  Pre-checks: space, storage, logins, parameters\nWHERE  This server (%s)\n' "$S"
-    printf 'RUN    %s\n       select status from v$instance;      (STARTED)\n' "$SSQL"
+    printf 'RUN    %s\n       select status from v$instance;      (STARTED)\n       exit\n' "$SSQL"
     [[ $G -eq 1 ]] && printf '       As %s:  asmcmd lsdg      (Free_MB of %s)\n' "$GU" "$DGS"
     [[ -n "${LOCS:-}" ]] && fs_dirs >/dev/null 2>&1 && [[ -n "$(fs_dirs)" ]] && printf '       df -m %s\n' "$(fs_dirs | paste -sd' ' -)"
     printf '       Size of the primary in MB:\n       sqlplus sys@%s as sysdba\n       select round(sum(bytes)/1024/1024) from v$datafile;\n' "$PT"
@@ -866,9 +886,10 @@ RUN    srvctl config database -db $SU
          -dbname ${DB_NAME:-<db_name>} -instance $SID -diskgroup $(tr ' ' ',' <<< "$DGS")${PRIMARY_DOMAIN:+ -domain $PRIMARY_DOMAIN}
 EXPECT srvctl config database -db $SU
        shows the instance name exactly $SID, its disk groups include $(tr ' ' ',' <<< "$DGS")${PRIMARY_DOMAIN:+,
-       and the domain $PRIMARY_DOMAIN}. Missing disk groups or a wrong domain are changed in place
-       (srvctl modify database). A new registration keeps the management policy, stop option,
-       disk groups and domain of the old one. A registered disk group this server does not
+       and the domain $PRIMARY_DOMAIN}.
+       Missing disk groups or a wrong domain are changed in place (srvctl modify database).
+       A new registration keeps the management policy, stop option, disk groups and domain of
+       the old one. A registered disk group this server does not
        have is taken out (srvctl modify); a domain the primary does not set is reported. When the
        disk groups of this server cannot be read, the step waits (it is not passed).
 IF     "Connected to an idle instance": the -instance value is wrong.
@@ -877,13 +898,18 @@ EOF
   9.2) cat <<EOF
 TITLE  Standby instance running (MOUNT)
 WHERE  This server ($S), as $OU
-RUN    With Grid:
-       sqlplus / as sysdba  ->  shutdown immediate
+RUN    With Grid (the instance the copy left running is stopped, then Oracle Restart starts it).
+       $SSQL
+       shutdown immediate
+       exit
        srvctl start database -db $SU
        Without Grid:
-       sqlplus / as sysdba  ->  startup mount
+       $SSQL
+       startup mount
+       exit
        Check:
-       sqlplus / as sysdba  ->  select instance_name, status from v\$instance;
+       $SSQL
+       select instance_name, status from v\$instance;
 EXPECT $SID  MOUNTED
        Never OPEN read only without an Active Data Guard license.
 EOF
@@ -955,10 +981,9 @@ EOF
     if [[ $G -eq 0 ]]; then
       [[ -z "${USE_GRID:-}" ]] && printf '       Without Grid:\n'
       printf '%s A script (owned by root, run as %s). At start:\n' "$([[ -z "${USE_GRID:-}" ]] && printf '      ' || printf 'RUN   ')" "$OU"
-      printf '         lsnrctl start %s ; startup mount ;\n' "$SL"
-      printf '         alter database recover managed standby database disconnect from session;\n'
-      printf '       At shutdown:\n'
-      printf '         shutdown immediate ; lsnrctl stop %s\n' "$SL"
+      printf '       It starts the listener (lsnrctl start %s), then in sqlplus / as sysdba: startup mount,\n' "$SL"
+      printf '       and alter database recover managed standby database disconnect from session;\n'
+      printf '       At shutdown, in sqlplus / as sysdba: shutdown immediate; then lsnrctl stop %s.\n' "$SL"
       printf '       A systemd unit (User=%s, Type=oneshot + RemainAfterExit,\n' "$OU"
       printf '       LimitNOFILE/NPROC/STACK/MEMLOCK as for %s). Then:\n' "$OU"
       printf '       systemctl enable <unit>\n'
@@ -985,6 +1010,7 @@ WHY    Without a deletion policy the archived logs fill the recovery area or the
        never deletes anything here.
 RUN    rman target /
        CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON STANDBY;
+       exit
        Then the nightly clean-up that ARCH_CLEANUP sets ($SELF --settings):
        timer    systemd timer $(STANDBY_SID=$SID arch_timer) runs $(STANDBY_SID=$SID arch_script)
        crontab  a line in the crontab of $OU, marked "$(STANDBY_SID=$SID arch_cron_tag)"
@@ -1000,6 +1026,36 @@ EXPECT select value from v\$rman_configuration where name='ARCHIVELOG DELETION P
        shows TO APPLIED ON STANDBY
        timer:   systemctl list-timers $(STANDBY_SID=$SID arch_timer)
        crontab: crontab -u $OU -l
+EOF
+  ;;
+  9.9)
+    local KF="/root/.ssh/dg_health_<standby unique, lower case>"; [[ -n "${STANDBY_UNIQUE:-}" ]] && KF=$(health_key_file)
+    local SIP=${STANDBY_IP:-<address of this server>} SU9=${PRIMARY_SSH_USER:-oracle}
+    cat <<EOF
+TITLE  ssh key for --health (monitoring)
+WHERE  This server ($S) as root, then the primary ($P) as $SU9
+WHY    --health runs from cron and cannot type a password: it logs in to the primary with this
+       key of root. The primary accepts it only from this server, without a terminal or forwarding.
+       Optional: without it --health checks this standby only (10.3 and 10.5 on the standby side,
+       10.6 SKIPPED), and says so in its output.
+RUN    On this server, as root:
+       install -d -m 700 $(dirname "$KF")
+       ssh-keygen -q -t ed25519 -N '' -C 'dg_standby_setup health $S' -f $KF
+       cat $KF.pub
+       On the primary, as $SU9 (the line: from="..." options, then the whole line of $KF.pub):
+       mkdir -p ~/.ssh
+       chmod 700 ~/.ssh
+       echo 'from="$SIP",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty <line of $KF.pub>' \\
+         >> ~/.ssh/authorized_keys
+       chmod 600 ~/.ssh/authorized_keys
+       Test, on this server as root:
+       ssh -i $KF -o BatchMode=yes -o UserKnownHostsFile=${STATE_DIR:-/var/lib/dg_standby_setup}/primary_known_hosts \\
+         $SU9@${PRIMARY_IP:-<primary IP>} echo OK
+EXPECT OK, without a password question. The step shows the exact line with the real key.
+IF     "Permission denied": the line is not in ~$SU9/.ssh/authorized_keys, the from= address is
+       not the one this server uses to reach the primary, or ~/.ssh or the file are writable by others
+       (sshd StrictModes). "Host key verification failed": step 1.2 (the primary's host key).
+       To take it back: remove that line on the primary, and  $SELF --undo 9.9  here.
 EOF
   ;;
   10.1) cat <<EOF
@@ -1064,14 +1120,21 @@ WHERE  The primary ($P) and this server ($S), SQL*Plus as sysdba
 WHY    NOLOGGING work on the primary writes no redo for the data. The standby only learns that
        the blocks are invalid; the error (ORA-01578, ORA-26040) shows when the data is read,
        often only after a failover. Force logging on the primary prevents it.
-RUN    On the primary:  select force_logging from v\$database;
-       On this server (12.2 and later):  select count(*), sum(blocks) from v\$nonlogged_block;
+RUN    On the primary, in sqlplus / as sysdba:
+       select force_logging from v\$database;
+       On this server (12.2 and later), in sqlplus / as sysdba:
+       select count(*), sum(blocks) from v\$nonlogged_block;
 EXPECT force_logging YES (or STANDBY NOLOGGING ..., set on purpose) and no nonlogged blocks.
        12.1 has no list of nonlogged blocks: only force logging is checked there.
-IF     Nonlogged blocks: fetch them from the primary, on this server:
-         sqlplus / as sysdba:  alter database recover managed standby database cancel;
-         rman target /:        recover database nonlogged block;
-         sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
+IF     Nonlogged blocks: fetch them from the primary. On this server, as $OU:
+       \$ORACLE_HOME/bin/sqlplus / as sysdba
+       alter database recover managed standby database cancel;
+       exit
+       \$ORACLE_HOME/bin/rman target /
+       recover database nonlogged block;
+       exit
+       \$ORACLE_HOME/bin/sqlplus / as sysdba
+       alter database recover managed standby database disconnect from session;
        Force logging off: on the primary  alter database force logging;
        (force logging can also be set per PDB or per tablespace; check those if you use them).
 EOF
@@ -1096,8 +1159,12 @@ WHY    A recovery area that is full of applied (reclaimable) logs is fine: Oracl
        transport. The nightly clean-up of step 9.8 must also really run.
 RUN    sqlplus / as sysdba
        select file_type, percent_space_used, percent_space_reclaimable from v\$recovery_area_usage;
-       timer:   systemctl status $(STANDBY_SID=$SID arch_service) ; journalctl -u $(STANDBY_SID=$SID arch_service)
-       crontab: tail $(STANDBY_SID=$SID arch_cron_log)
+       exit
+       timer:
+       systemctl status $(STANDBY_SID=$SID arch_service)
+       journalctl -u $(STANDBY_SID=$SID arch_service)
+       crontab:
+       tail $(STANDBY_SID=$SID arch_cron_log)
 EXPECT Not reclaimable below 80 %. The last clean-up without RMAN- or ORA- errors.
 EOF
   ;;
@@ -1107,9 +1174,14 @@ WHERE  This server ($S), as $OU; only with  --roll-forward
 WHY    When the standby cannot catch up (archived logs it needs were deleted on the primary),
        or after NOLOGGING work: the standby fetches what it misses as incremental backups,
        instead of a whole new copy. Needs 18c or later.
-RUN    sqlplus / as sysdba:   alter database recover managed standby database cancel;
-       rman target sys@$ST:   recover standby database from service $PT;
-       sqlplus / as sysdba:   alter database recover managed standby database disconnect from session;
+RUN    $SSQL
+       alter database recover managed standby database cancel;
+       exit
+       \$ORACLE_HOME/bin/rman target sys@$ST
+       recover standby database from service $PT;
+       exit
+       \$ORACLE_HOME/bin/sqlplus / as sysdba
+       alter database recover managed standby database disconnect from session;
 EXPECT RMAN restarts the standby instance, takes the control file of the primary, copies the
        datafiles added since, and applies the changes. Then redo apply runs again.
        The script checks first: the standby is mounted, no RMAN session or long job runs, the
@@ -1131,28 +1203,72 @@ EOF
   health) cat <<EOF
 TITLE  Unattended health check (--health)
 WHERE  This server ($S), as root, from cron or a monitoring agent
-WHY    The checks of phase 10 without questions and without changes. One line per check,
-       the details in $LOG_DIR/health_<time>.log (kept 14 days).
+WHY    The checks of phase 10 without questions and without changes.
+       The first line is the status for a monitoring system (Nagios form), for example:
+         OK - standby $SU, redo apply running; lag: transport 0 s, apply 1 s (limit 300 s) | transport_lag=0s;;300;0 apply_lag=1s;;300;0
+       Then one line per check, the role and protection mode, and the last line
+       "Result: ... Details: $LOG_DIR/health_<time>.log" (logs kept 14 days).
 RUN    $SELF --health
-       For example in root's crontab (no mail when all is well):
-         17 6 * * *  $SELF --health >/dev/null || <your alert command>
+       In root's crontab, with the output in the alert (only when not OK):
+         17 6 * * *  out=\$($SELF --health) || <your alert command> "\$out"
+       (in a crontab file, % must be written \%; the line above has none)
        From a monitoring agent (NRPE and the like): allow 300 seconds (a problem is looked at
        twice, 60 seconds apart), for example  check_nrpe ... -t 300
 EXPECT Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check), as monitoring systems
-       expect. CRITICAL counts first, then UNKNOWN, then WARNING.
+       expect. CRITICAL counts first, then UNKNOWN, then WARNING; SKIPPED counts as nothing.
        A problem in 10.1 to 10.4 (lag, gap, last log, apply) is checked once more after
        60 seconds before it is reported. HEALTH_LAG_MAX in the settings: the accepted lag in
        seconds (300 if empty, at least 30). The standby instance is checked first: down is
        CRITICAL at once. After a switchover (this server is the primary) the result is UNKNOWN.
-IF     The checks that need the primary need ssh without a password: a key of root for
-       ${PRIMARY_SSH_USER:-oracle}@$P. Best with a restricted key on the primary, in
-       ~/.ssh/authorized_keys there:  from="<this server's address>",no-pty,no-port-forwarding ssh-ed25519 ...
-       Without a key the local checks still run, and the others show UNKNOWN.
+IF     The checks of the primary need ssh without a password: the key of step 9.9
+       ($SELF --only 9.9, or --help-step 9.9 for the commands).
+       Without a key the primary is not checked: 10.3 (last log) and 10.5 (NOLOGGING) are done on
+       the standby side only, 10.6 (patch level) is SKIPPED, and a note line says so. The result
+       comes from the checks that ran. Other ssh errors (no answer, a changed host key): UNKNOWN.
        While another run of the script or a long job (copy, roll forward) runs: UNKNOWN.
 EOF
   ;;
   *) return 1 ;;
   esac
+}
+
+help_cmd_block() {
+  # stdin: the lines of the "How" part of a help text (their 7-space indent removed). stdout: the same in a form
+  # that can be copied: commands and file contents at column 0 (a here-document end word, an entry of
+  # tnsnames.ora or listener.ora must start in column 1), explanations as notes: "# " in a shell, "-- " inside
+  # sqlplus or rman (a line that starts sqlplus or rman opens it, "exit" closes it). A note at the end of a
+  # command line ("cmd      (only if ...)") goes on its own line above the command.
+  local l prev=cmd sql=0 prose c n
+  local re_note='^(.*[^[:space:]])[[:space:]]{4,}(\([^()]*\))$' re_shellish="[;|&>='\"]"
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    [[ -z "$l" ]] && { printf '\n'; prev=cmd; continue; }
+    prose=0
+    if [[ "$l" == --* ]]; then printf '%s\n' "$l"; prev=cmd; continue        # an SQL remark, as written
+    elif [[ "$l" == *: ]]; then prose=1                                            # "On the primary:", "Then:"
+    elif [[ "$l" =~ ^[A-Z][a-z] || "$l" =~ ^(A|I)[[:space:]][a-z] ]]; then prose=1  # a sentence (commands start lower case)
+    elif [[ "$l" =~ ^\<[^\>]+\>[[:space:]]+(is|are)[[:space:]] ]]; then prose=1      # "<zone> is the zone ..."
+    elif [[ "$l" =~ ^\([^\)=]*[[:space:]][a-z] && "$l" != "(umask"* ]]; then prose=1   # "(with a Release Update ...)"
+    elif [[ "$l" =~ ^[0-9]\.[[:space:]] ]]; then prose=1                           # "1. Unzip ..."
+    elif [[ "$l" =~ ^[0-9][0-9.]*(c|ai)?[[:space:]][a-z\(] ]]; then prose=1         # "18c and newer: ..."
+    elif [[ "$l" =~ ^[a-z]+[[:space:]]{2,}[a-z] ]]; then prose=1                    # a table: "timer    systemd ..."
+    elif [[ "$l" =~ ^[[:space:]]+[0-9]+(\.[0-9]+|c|ai)?[[:space:]]{2,} ]]; then prose=1   # "  12.1  oracle-rdbms-..."
+    elif [[ $prev == prose && ! "$l" =~ ^[[:space:]] ]]; then prose=1                # the sentence goes on
+    elif [[ "$l" == *. && ! "$l" =~ $re_shellish && $(wc -w <<< "$l") -ge 6 ]]; then prose=1   # "<zone> is the zone of ..."
+    fi
+    c="# "; [[ $sql -eq 1 ]] && c="-- "
+    if [[ $prose -eq 1 ]]; then
+      printf '%s%s\n' "$c" "$l"
+      # a sentence that ends (with . or :) does not go on into the next line
+      if [[ "$l" == *. || "$l" == *: || "$l" == *\) ]]; then prev=end; else prev=prose; fi
+      continue
+    fi
+    prev=cmd
+    if [[ "$l" =~ $re_note ]]; then printf '%s%s\n' "$c" "${BASH_REMATCH[2]}"; l=${BASH_REMATCH[1]}; fi
+    printf '%s\n' "$l"
+    n=${l#"${l%%[![:space:]]*}"}
+    if [[ "$n" =~ ^(exit|EXIT|quit)\;?$ ]]; then sql=0
+    elif [[ "$n" =~ (^|/)(sqlplus|rman)([[:space:]]|$) && "$n" != *"|"* && "$n" != *" -V"* ]]; then sql=1; fi
+  done
 }
 
 show_help() {
@@ -1164,16 +1280,29 @@ show_help() {
   local t="Help $S_DOT $([[ "$id" == *.* ]] && printf 'Step ')$id  $title" lbl
   if [[ ${#t} -le 62 ]]; then printf '\n    %s%s %s %s%s\n' "$C_C" "$(rule 2)" "$t" "$(rule $((64 - ${#t})))" "$C_N"
   else printf '\n    %s%s %s%s\n    %s%s%s\n' "$C_C" "$(rule 2)" "$t" "$C_N" "$C_C" "$(rule 70)" "$C_N"; fi   # a long title: the rule goes under it
+  # the "How" lines are collected and printed as one block that can be copied (help_cmd_block), between two rules
+  local inrun=0 run=""
+  _help_flush_run() {
+    [[ $inrun -eq 1 ]] || return 0
+    printf '\n      %s%-8s%s %s\n' "$C_Y" "How" "$C_N" "(copy the lines between the rules; # and -- lines are notes)"
+    printf '%s%s%s\n' "$C_D" "$(rule 70)" "$C_N"
+    help_cmd_block <<< "${run%$'\n'}"
+    printf '%s%s%s\n' "$C_D" "$(rule 70)" "$C_N"
+    inrun=0; run=""
+  }
   while IFS= read -r line || [[ -n "$line" ]]; do
     key=${line:0:6}; rest=${line:7}
     case "$key" in
       "TITLE ") ;;
-      "WHERE "|"WHY   "|"RUN   "|"EXPECT"|"IF    ")
-        case "$key" in "WHERE ") lbl="Where" ;; "WHY   ") lbl="Why" ;; "RUN   ") lbl="How" ;; "EXPECT") lbl="Expect" ;; *) lbl="Problems" ;; esac
+      "RUN   ") _help_flush_run; inrun=1; run="$rest"$'\n' ;;
+      "WHERE "|"WHY   "|"EXPECT"|"IF    ")
+        _help_flush_run
+        case "$key" in "WHERE ") lbl="Where" ;; "WHY   ") lbl="Why" ;; "EXPECT") lbl="Expect" ;; *) lbl="Problems" ;; esac
         printf '\n      %s%-8s%s %s\n' "$C_Y" "$lbl" "$C_N" "$rest" ;;
-      *) printf '               %s\n' "${line:7}" ;;
+      *) if [[ $inrun -eq 1 ]]; then run+="${line:7}"$'\n'; else printf '               %s\n' "${line:7}"; fi ;;
     esac
   done <<< "$txt"
+  _help_flush_run
   printf '    %s%s%s\n\n' "$C_C" "$(rule 70)" "$C_N"
   _log HELP "Help shown for step $id"
 }

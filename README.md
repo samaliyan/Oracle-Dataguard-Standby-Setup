@@ -73,8 +73,8 @@ Before each step the script shows what it found and what it will do, and asks:
 | 6 | Password file and TDE wallet |
 | 7 | Start the standby instance in NOMOUNT and test all four logins |
 | 8 | RMAN active duplicate |
-| 9 | Register with Oracle Restart, start redo apply and redo shipping, start at boot, archive log clean-up |
-| 10 | Check: lag (and whether data still arrives), gaps, redo apply, NOLOGGING blocks, patch level; known errors explained (daily, or unattended with `--health`) |
+| 9 | Register with Oracle Restart, start redo apply and redo shipping, start at boot, archive log clean-up, and (optional, 9.9) the ssh key that `--health` uses for the primary |
+| 10 | Check: lag (and whether data still arrives), gaps, redo apply, NOLOGGING blocks, patch level; known errors explained. At the end: role, open mode, protection mode, apply, lag and the last applied log. Daily: `--health` from cron (needs the 9.9 key for the primary checks), or `--only 10` by hand |
 
 Phase 4 can be done first, to batch all primary changes into one maintenance window:
 
@@ -96,12 +96,13 @@ None of them changes the primary.
 | `--only <part>` | One phase, part or step range, then stop |
 | `--yes` | Do the actions on this server without the [y] question (the risky ones are still asked) |
 | `--settings` | Review or edit the saved values, then stop |
-| `--status` | Result of every phase and step so far; connects to nothing |
+| `--status` | Data Guard state, then the result of every phase and step so far, with the runs and their logs |
 | `--plain` | Plain scrolling output instead of the screen layout |
+| `--verbose` | At the end, the full table of every step (also `DG_VERBOSE=1`) |
 | `--show-changes [step]` | Every change made on this server, with its undo |
 | `--undo <step>` | Undo the changes of one step |
 | `--help-step <step>` | The manual way of a step (`all` for every step, `health` for --health) |
-| `--health` | Unattended health check for cron or monitoring (exit 0/1/2/3) |
+| `--health` | Unattended health check for cron or monitoring (first line = status, exit 0/1/2/3) |
 | `--roll-forward` | Bring a standby that cannot catch up up to date from the primary (18c+) |
 | `-h`, `--help` | Short help |
 
@@ -165,12 +166,21 @@ Shows the summary screen and the values of the setup (a number changes one, `e` 
 `$EDITOR`), then stops.
 
 ### `--status`
-Prints the result of every phase, then every step with its result, when it ran and, for a step that is not
-done, why (ok, done, waiting, failed, skipped). Connects to nothing, so it also works when the primary is down.
+First a short Data Guard block: role and open mode, protection mode, redo apply (MRP), transport and apply lag,
+and the last applied log per thread. It is read now, read-only, when the standby instance runs on this server;
+otherwise the values recorded by the last `--health` or phase 10 are shown, with their time. Then when
+`--health` and phase 10 last ran (with the result and the log), the result of every phase, every step with its
+result, when it ran and, for a step that is not done, why (ok, done, waiting, failed, skipped), and the runs
+behind these results with the path of each run log. It never connects to the primary, so it also works when
+the primary is down.
 
 ### `--plain`
 Plain scrolling output, as in earlier versions: every message stays on the screen in order. Used by itself
 when the terminal is smaller than 80 x 24 or is not a terminal.
+
+### `--verbose`
+At the end of a run, the full table of every step and its result (by default only the steps that need
+attention are listed). `DG_VERBOSE=1` in the environment does the same.
 
 ### `--show-changes [step]`
 Lists every change the script made on this server (files written, settings, users, disks, services,
@@ -183,17 +193,34 @@ shown for you to undo there.
 
 ### `--help-step <step>`
 How to do a step by hand: where, as which user, the commands, the expected result. `--help-step all`
-prints every step; `--help-step health` explains `--health`. The commands use your saved names.
+prints every step; `--help-step health` explains `--health`. The commands use your saved names. They are
+printed at column 0 between two rules, so they can be copied as they are; explanations in that block are
+`#` lines (`--` inside sqlplus or rman).
 
 ### `--health`
 The checks of phase 10 for cron or a monitoring agent: no questions, no changes, no terminal needed.
 Checks, in this order: the standby instance (down is CRITICAL at once), 10.1 transport and apply lag
 (and whether data from the primary still arrives), 10.2 archive gap (and whether missing logs are still on
 the primary), 10.3 last log on both sides, 10.4 redo apply and real-time apply, 10.5 NOLOGGING blocks,
-10.6 patch level of both database homes. A problem in 10.1-10.4 is checked once more after 60 seconds.
-Prints one line per check; details go to `health_<time>.log` (14 days, at most 500 files).
-Exit code: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (could not check, another run active, after a
-switchover, or a wrong option). The checks on the primary need an ssh key of root (see below).
+10.6 patch level of both database homes, 10.8 archived logs (space and the nightly clean-up). A problem in
+10.1-10.4 is checked once more after 60 seconds.
+
+The **first line** is the status in the form monitoring systems read (Nagios), with the lag as perfdata:
+
+```
+OK - standby PRODDB_STBY, redo apply running; lag: transport 0 s, apply 1 s (limit 300 s); protection MAXIMUM PERFORMANCE | transport_lag=0s;;300;0 apply_lag=1s;;300;0
+```
+
+Then the title, one line per check, a `Data Guard:` line (role, open mode, protection mode, last applied log),
+notes, and `Result: <state> (exit N). Details: <log>`. Details go to `health_<time>.log` (14 days, at most
+500 files). Exit code: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (could not check, another run active,
+after a switchover, or a wrong option).
+
+The checks on the primary need an ssh key of root (step 9.9, see below). Without a key the primary is
+**not checked** and that does not make the result UNKNOWN: 10.3 and 10.5 are done on the standby side only
+(the last log received against the last applied; the standby's list of NOLOGGING blocks), 10.6 is
+`SKIPPED`, and a note line says `primary not checked: no ssh key for root ...`. Other ssh errors (no
+answer, a changed host key) still give UNKNOWN for those checks.
 
 ### `--roll-forward`
 For a standby that cannot catch up (archived logs it needs were deleted on the primary) or after
@@ -223,22 +250,56 @@ manual way.
 - `PRIMARY_RUN`: `yes` lets primary steps offer to run their listed statements over ssh (default `no`).
 
 ### Exit codes
-`0` every step OK; `1` stopped, or some steps are not OK or skipped (normal for `--check` on a new
-server); `2` wrong option or unknown step. With `--health`: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN.
+`0` every step OK; `1` stopped by you, or some steps are not OK or skipped (normal for `--check` on a new
+server); `2` wrong option or unknown step; `4` a step failed. With `--health`: `0` OK, `1` WARNING,
+`2` CRITICAL, `3` UNKNOWN.
 
 ## Daily check from cron
 
+The daily check is `--health` (from cron or a monitoring agent). By hand, with the screen and questions:
+`./dg_standby_setup.sh --only 10`.
+
 ```bash
-# root's crontab on the standby
-17 6 * * *  /root/dg_standby_setup.sh --health >/dev/null || /usr/local/bin/my-alert "Data Guard standby needs attention"
+# root's crontab on the standby: the alert gets the output (its first line is the status)
+17 6 * * *  out=$(/root/dg_standby_setup.sh --health) || /usr/local/bin/my-alert "$out"
 ```
 
-The checks on the primary need ssh with a key of root (no password can be typed from cron); without it the
-local checks still run and the others show UNKNOWN. A restricted key is best, for example in
-`~/.ssh/authorized_keys` of the oracle user on the primary:
-`from="<standby address>",no-pty,no-port-forwarding ssh-ed25519 AAAA...`.
-Details are in `/var/log/dg_standby_setup/health_<time>.log` (kept 14 days, at most 500 files). A problem in
-the lag, gap, last-log or apply check is checked once more after 60 seconds before it is reported.
+Do not send the output to `/dev/null`: the alert would then not say what is wrong. (In a crontab line a `%`
+must be written `\%`; the line above has none.) A monitoring agent (NRPE and the like) should allow 300
+seconds, since a problem is looked at twice, 60 seconds apart.
+
+### The ssh key for the primary checks (step 9.9)
+
+Cron cannot type a password, so `--health` logs in to the primary with a key of root. Step 9.9 makes it
+(`/root/.ssh/dg_health_<standby unique>`, ed25519, no passphrase, mode 600) and shows the exact line for the
+primary. It is optional: skipped, `--health` checks the standby only (see above). To do it later:
+`./dg_standby_setup.sh --only 9.9`. By hand:
+
+```bash
+# 1) on the standby, as root
+ssh-keygen -q -t ed25519 -N '' -C 'dg_standby_setup health stby01' -f /root/.ssh/dg_health_proddb_stby
+cat /root/.ssh/dg_health_proddb_stby.pub
+```
+
+```bash
+# 2) on the primary, as the ssh user (oracle): one line, the standby's address, then the whole .pub line
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+echo 'from="192.0.2.20",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... dg_standby_setup health stby01' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+```bash
+# 3) test on the standby, as root: prints OK without a password question
+ssh -i /root/.ssh/dg_health_proddb_stby -o BatchMode=yes \
+  -o UserKnownHostsFile=/var/lib/dg_standby_setup/primary_known_hosts oracle@192.0.2.10 echo OK
+```
+
+`from=` lets the key in only from the standby's address; `no-pty` and the `no-*-forwarding` options give it
+no terminal and no tunnels. `--health` uses this key when the file exists (`IdentityFile`, `BatchMode=yes`,
+and the same host key check as the setup). To take it back: remove the line on the primary, and
+`./dg_standby_setup.sh --undo 9.9` on the standby.
+
 HEALTH_LAG_MAX in the settings sets the accepted lag (300 seconds by default, at least 30).
 
 ## When the standby cannot catch up
@@ -281,6 +342,10 @@ Files:
 /var/lib/dg_standby_setup/   settings.conf, progress, changes.log
 /var/log/dg_standby_setup/   run logs, the commands shown to you, RMAN and installer output
 ```
+
+In the log folder, `run_<id>.log` is the whole run, `actions_<id>.txt` every command shown to you, and
+`commands_<step>_<id>.txt` the commands of one step as a runnable script (`bash commands_8.2_<id>.txt`, or
+read it first with `less`).
 
 ## Repository layout
 

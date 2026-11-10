@@ -131,15 +131,26 @@ mask_pw() {
 }
 
 _log() {
+  # every line of a message gets the time and the tag (grep and less show each line with its context)
   [[ -n "$LOG_FILE" ]] || return 0
-  printf '%s | %-6s | %s\n' "$(ts)" "$1" "$2" | sed 's/\x1b\[[0-9;]*m//g' | mask_pw >> "$LOG_FILE"
+  local p; p=$(printf '%s | %-6s | ' "$(ts)" "$1"); p=${p//\\/\\\\}; p=${p//\//\\/}; p=${p//&/\\&}
+  printf '%s\n' "$2" | sed -e 's/\x1b\[[0-9;]*m//g' -e "s/^/$p/" | mask_pw >> "$LOG_FILE"
 }
 
 log_block() {
+  # $1 title, stdin = the output (its last line is often "(exit code N)"). An output with ORA- / SP2- error lines
+  # and exit code 0 (sqlplus without WHENEVER SQLERROR) is marked: "(exit code 0, ORA- in output)"
   [[ -n "$LOG_FILE" ]] || { cat > /dev/null; return 0; }
+  local body t=$1 e=""
+  body=$(cat)
+  if grep -qx '(exit code 0)' <<< "$body"; then
+    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])ORA-[0-9]{4,5}' && e="ORA-"
+    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])SP2-[0-9]{4}' && e+="${e:+/}SP2-"
+    if [[ -n "$e" ]]; then body=$(sed "s#^(exit code 0)\$#(exit code 0, $e in output)#" <<< "$body"); t+=" (exit code 0, $e in output)"; fi
+  fi
   {
-    printf '%s | OUT    | --- %s ---\n' "$(ts)" "$1"
-    sed 's/^/          /'
+    printf '%s | OUT    | --- %s ---\n' "$(ts)" "$t"
+    [[ -n "$body" ]] && printf '%s\n' "$body" | sed 's/^/          /'
     printf '%s | OUT    | --- end ---\n' "$(ts)"
   } | mask_pw >> "$LOG_FILE"
 }
@@ -168,6 +179,18 @@ warn() {
   done <<< "$*"
   if [[ $UI -eq 1 ]]; then ui_out 6 "${o%$'\n'}"; else printf '%s' "$o"; fi
   WARN_COUNT=$((WARN_COUNT + 1)); WARN_LIST+=("$w")
+}
+warn_drop() {
+  # $1 step, $2 pattern (glob) of the warning text, $3 why: warnings a later check has made void leave the list
+  # (and the end summary); the log keeps them, with the reason
+  local -a keep=(); local x n=0
+  for x in "${WARN_LIST[@]+"${WARN_LIST[@]}"}"; do
+    # shellcheck disable=SC2053
+    if [[ "$x" == "[$1] "$2 ]]; then n=$((n + 1)); else keep+=("$x"); fi
+  done
+  [[ $n -gt 0 ]] || return 0
+  WARN_LIST=("${keep[@]+"${keep[@]}"}"); WARN_COUNT=$((WARN_COUNT - n)); [[ $WARN_COUNT -ge 0 ]] || WARN_COUNT=0
+  _log INFO "$n warning(s) of step $1 no longer apply: $3"
 }
 bad()  { _mark "$C_R" "$S_BAD" FAIL "$*"; }
 todo() { _mark "$C_M" "$S_TODO" TODO "$*"; }
@@ -340,7 +363,7 @@ This script asks questions. Run it in an interactive terminal, for example:  ssh
                   elif [[ -n "$CUR_STEP" ]]; then show_help "$CUR_STEP" || true
                   else say "No help for this question. All options:  $SELF --help"; fi ;;
       # the step text was cut to fit the screen ("N more lines: d shows all"): d shows it here too
-      d) if [[ $UI -eq 1 && ${UI_CUT:-0} -eq 1 && -n "$CUR_STEP" ]]; then
+      d) if [[ $UI -eq 1 && -n "$CUR_STEP" ]] && [[ ${UI_CUT:-0} -eq 1 || -s "$UI_BUF_FILE.cut" ]]; then
            # the whole text of the step, uncut (the details from the log: l, then the step number)
            if [[ -s "$UI_BUF_FILE.cut" ]]; then ui_page "$UI_BUF_FILE.cut" "Step $CUR_STEP  (the whole text)"; else ui_details "$CUR_STEP"; fi
          else return 0; fi ;;
@@ -687,26 +710,85 @@ job_detach_question() {
   user_stop "Left running: $1"
 }
 
+dur_text() {
+  # $1 seconds -> "45 s", "6 min 12 s", "2 h 05 min"
+  local s=${1:-0}
+  if [[ $s -lt 60 ]]; then printf '%d s' "$s"
+  elif [[ $s -lt 3600 ]]; then printf '%d min %d s' $((s / 60)) $((s % 60))
+  else printf '%d h %02d min' $((s / 3600)) $((s % 3600 / 60)); fi
+}
+JOB_PROGRESS_FN=""   # set by the caller of run_long: a function "$fn OUTPUT_FILE START_SECONDS" that prints one short
+                     # progress text of the job ("" = nothing known yet); run_long clears it when the job has ended
+JOB_PROGRESS=""      # its last text (the screen layout shows it on the live line)
+RUN_LONG_OUT=""      # the output file run_long really used (a retry in the same run gets <name>_2.log, _3.log ...)
+JOB_TAIL_LOG=30      # lines of a job's output copied into the run log (all of it stays in its own file)
+job_progress_poll() {
+  # $1 output file, $2 start (SECONDS): JOB_PROGRESS from the caller's function (read-only, never fatal)
+  [[ -n "$JOB_PROGRESS_FN" ]] && declare -F "$JOB_PROGRESS_FN" >/dev/null || return 0
+  JOB_PROGRESS=$("$JOB_PROGRESS_FN" "$1" "$2" 2>/dev/null | head -n 1) || JOB_PROGRESS=""
+  return 0
+}
+job_live_title() {
+  # $1 title: the title and the progress for the one live line of the screen layout, cut to the terminal width
+  # (the live line itself adds about 56 columns: the time and the keys l and d)
+  local t=$1 room=$(( ${UI_COLS:-80} - 58 ))
+  [[ -n "$JOB_PROGRESS" ]] || { printf '%s' "$t"; return 0; }
+  t="$1  $JOB_PROGRESS"
+  [[ ${#t} -le $room ]] || t="${1%% *}  $JOB_PROGRESS"
+  if [[ ${#t} -gt $room && $room -gt 10 ]]; then t=${t:0:$room}; t="${t% *}"; fi
+  [[ ${#t} -le $room ]] || t=$1
+  printf '%s' "$t"
+}
+job_log_tail() {
+  # the end of a job's output for the run log: the last JOB_TAIL_LOG lines, error lines from before them, the file
+  # $1 output file, $2 exit code (the header and footer lines "#| " of the file are left out)
+  local f=$1 n k=$JOB_TAIL_LOG
+  n=$(grep -vc '^#| ' "$f" 2>/dev/null); num "$n" || n=0
+  if [[ $n -gt $k ]]; then
+    printf '(%s lines of output; the last %s are below. All of them: %s)\n' "$n" "$k" "$f"
+    local el
+    el=$(grep -v '^#| ' "$f" 2>/dev/null | head -n $((n - k)) | grep -nE '^(ORA|RMAN|INS|PRV[FG]|CLSRSC|PRCZ)-[0-9]+|\[FATAL\]|SEVERE|ERROR' | head -n 20)
+    [[ -n "$el" ]] && printf 'Error lines before them (line: text):\n%s\n--- the last %s lines ---\n' "$el" "$k"
+  fi
+  grep -v '^#| ' "$f" 2>/dev/null | tail -n "$k"
+  printf '(exit code %s)\n' "$2"
+}
 run_long() {
   # $1 title, $2 output file, $3 filter regex for the screen ("" = every line),
   # $4 who (root | oracle | grid), rest = command. The command reads the stdin of run_long.
   # JOB_KEEP (comma list): files the job needs (response files); the job removes them when it ends.
-  # Returns the exit code of the command. The full output is in $2 (and in the log).
+  # JOB_PROGRESS_FN (optional): see above; the progress is shown every minute (plain) or on the live line.
+  # Returns the exit code of the command. The full output is in $2 (RUN_LONG_OUT: the file really used), with a
+  # header (command, user, start) and a footer (end, exit code, duration); the run log gets its last lines.
   local title=$1 out=$2 filt=$3 who=$4; shift 4
   local -a pre=()
   ui_flush
+  # a retry in the same run keeps the output of the earlier try: the new one is <name>_2.log (_3, ...)
+  if [[ -e "$out" ]]; then
+    local ob=$out ox="" k=2; [[ "$out" == *.log ]] && { ob=${out%.log}; ox=.log; }
+    while [[ -e "${ob}_$k$ox" ]]; do k=$((k + 1)); done
+    _log JOB "$out exists (an earlier try): this one writes to ${ob}_$k$ox"
+    out="${ob}_$k$ox"
+  fi
+  RUN_LONG_OUT=$out; JOB_PROGRESS=""
   case "$who" in
     oracle) pre=(runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}") ;;
     grid)   pre=(runuser -u "$GRID_USER" -- env -i "${GRID_ENV[@]}") ;;
     *)      pre=(env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C LC_ALL=C) ;;
   esac
-  rm -f -- "$out" "$out.rc" "$out.pid" "$out.rc.t" "$out.pid.t"
-  ( umask 077; : > "$out" ) || { bad "Cannot write $out."; return 1; }
+  rm -f -- "$out.rc" "$out.pid" "$out.rc.t" "$out.pid.t"
+  # the header of the output file: what runs, as whom, since when (no error codes in it: the file is searched for them)
+  local hcmd; hcmd=$(cmd_display "$@"); hcmd=${hcmd#*|}
+  { ( umask 077; { printf '#| %s %s, run %s, step %s: %s\n' "${SELF##*/}" "$SCRIPT_VERSION" "$RUN_ID" "${CUR_STEP:--}" "$title"
+                   printf '#| as %s, started %s: %s\n' "$(cp_user "$who" 2>/dev/null || printf '%s' "$who")" "$(ts)" "$hcmd"
+                   printf '#| ---- output ----\n'; } | mask_pw > "$out" ); } 2>/dev/null || { bad "Cannot write $out."; JOB_PROGRESS_FN=""; return 1; }
   # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
   # .pid and .rc are written to a temp name and moved: a reader never sees a half-written file
   setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid.t" && mv -f -- "$1.pid.t" "$1.pid"; f=$1; k=$2; sp=$3; shift 3
-    "$@" > "$f" 2>&1; r=$?; echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
+    "$@" >> "$f" 2>&1; r=$?; d=$SECONDS
+    printf "#| ---- end %s, exit code %s, after %s min %s s ----\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$r" $((d / 60)) $((d % 60)) >> "$f"
+    echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
     kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 9>&- &
   local bg=$! n=0 jpid=""
   while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
@@ -733,12 +815,19 @@ If this run stops, the next run will not know that $title is still running."
     [[ "${title:-}" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
   fi
   RL_INT=0; trap 'RL_INT=1' INT
-  local t0=$SECONDS hb=0 ui_on=$UI
+  local t0=$SECONDS hb=0 ui_on=$UI pg_t=$SECONDS pg_said="" pg_said_t=$SECONDS
+  # how often the progress is read: every 15 s for the live line, every 60 s in plain mode (shown when it changed,
+  # at least every 5 minutes); with the test timing every 2 s
+  local pg_live=15 pg_plain=60; [[ $FAST_WAITS -eq 1 ]] && { pg_live=2; pg_plain=2; }
   TAIL_PID=""
   if [[ $ui_on -eq 1 ]]; then
-    # the screen layout: one live line (time, keys l and d) instead of the output; the output stays in its file
+    # the screen layout: one live line (time, progress, keys l and d) instead of the output; the output stays in its file
     while [[ $UI -eq 1 ]] && kill -0 "$jpid" 2>/dev/null; do
-      ui_job_tick "$title" "$out" "$t0"
+      if (( SECONDS - pg_t >= pg_live )) || [[ $pg_t -eq $t0 ]]; then
+        pg_t=$SECONDS; job_progress_poll "$out" "$t0"
+        [[ -n "$JOB_PROGRESS" && "$JOB_PROGRESS" != "$pg_said" && $(( SECONDS - pg_said_t )) -ge 300 ]] && { pg_said=$JOB_PROGRESS; pg_said_t=$SECONDS; _log JOB "$title: $JOB_PROGRESS"; }
+      fi
+      ui_job_tick "$(job_live_title "$title")" "$out" "$t0"
       if [[ $RL_INT -eq 1 ]]; then
         RL_INT=0; ui_live_clear
         job_detach_question "$title" "$jpid" "$out"
@@ -752,9 +841,9 @@ If this run stops, the next run will not know that $title is still running."
   # the output is shown by a background pipeline; waiting for it can be interrupted by HUP/TERM at once
   if [[ $ui_on -eq 1 ]]; then :
   elif [[ -n "$filt" ]]; then
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | mask_pw | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -E -- "$filt" | grep --line-buffered -v '^#| ' | mask_pw | sed -u 's/^/        /'; } 9>&- &
   else
-    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | mask_pw | sed -u 's/^/        /'; } 9>&- &
+    { tail -n +1 -f --pid="$jpid" -- "$out" 2>/dev/null | grep --line-buffered -v '^#| ' | mask_pw | sed -u 's/^/        /'; } 9>&- &
   fi
   [[ $ui_on -eq 1 ]] || TAIL_PID=$!
   while [[ -n "$TAIL_PID" ]] && kill -0 "$TAIL_PID" 2>/dev/null; do
@@ -763,14 +852,18 @@ If this run stops, the next run will not know that $title is still running."
       RL_INT=0; printf '\n'
       job_detach_question "$title" "$jpid" "$out"
     fi
+    if [[ -n "$JOB_PROGRESS_FN" ]] && (( SECONDS - pg_t >= pg_plain )); then
+      # the progress the caller can read (an RMAN copy: datafiles and GB done, time left): when it changed, and
+      # at least every 5 minutes
+      pg_t=$SECONDS; job_progress_poll "$out" "$t0"
+      if [[ -n "$JOB_PROGRESS" ]] && [[ "$JOB_PROGRESS" != "$pg_said" || $(( SECONDS - pg_said_t )) -ge 300 ]]; then
+        pg_said=$JOB_PROGRESS; pg_said_t=$SECONDS; hb=$(( (SECONDS - t0) / 600 ))
+        say "${C_D}$title, $(dur_text $((SECONDS - t0))):${C_N} $JOB_PROGRESS"
+      fi
+    fi
     if (( SECONDS - t0 >= 600 * (hb + 1) )); then
       hb=$((hb + 1))
-      if [[ "$title" == "RMAN duplicate"* ]]; then
-        # progress of the copy: datafiles RMAN has finished so far
-        say "$title still running after $(( (SECONDS - t0) / 60 )) minutes. Datafile lines done: $(grep -cE 'restoring datafile|datafile copy complete|copying datafile' "$out" 2>/dev/null)"
-      else
-        say "$title still running after $(( (SECONDS - t0) / 60 )) minutes. Output so far: $(du -h -- "$out" 2>/dev/null | cut -f1)"
-      fi
+      say "$title still running after $(( (SECONDS - t0) / 60 )) minutes. Output so far: $(du -h -- "$out" 2>/dev/null | cut -f1)"
     fi
   done
   TAIL_PID=""
@@ -801,10 +894,19 @@ If this run stops, the next run will not know that $title is still running."
   # the output file may contain the passwords only if a tool printed them; mask it to be sure
   if [[ -n "$SYS_PW$ASM_PW" ]]; then ( umask 077; mask_pw < "$out" > "$out.m" ) && mv -f -- "$out.m" "$out"; rm -f -- "$out.m"; fi
   chmod 640 "$out" 2>/dev/null
-  RUN_OUT=$(cat "$out")
-  printf '%s\n(exit code %s)\n' "$RUN_OUT" "$rc" | log_block "$title (full output: $out)"
-  _log JOB "end pid=$jpid rc=$rc $title"
+  # RUN_OUT: the output of the command only (without the header and footer lines of the file)
+  RUN_OUT=$(grep -v '^#| ' "$out")
+  job_log_tail "$out" "$rc" | log_block "$title (output: $out)"
+  local jd; jd=$(dur_text $((SECONDS - t0)))
+  # the last progress (an RMAN copy: datafiles done of all), then the time the job took
+  if [[ -n "$JOB_PROGRESS_FN" ]]; then job_progress_poll "$out" "$t0"; [[ -n "$JOB_PROGRESS" ]] && _log JOB "$title at its end: $JOB_PROGRESS"; fi
+  _log JOB "end pid=$jpid rc=$rc $title, after $jd"
+  local jok=0; [[ "$rc" == 0 || ( "$rc" == 6 && ( "$title" == *installer* || "$title" == *"configuration tools"* ) ) ]] && jok=1
+  # plain: always the time it took; the screen layout says it for a job that worked (ui_job_done), here for one that did not
+  if [[ $UI -ne 1 ]]; then say "$title ended after $jd (exit code $rc)."
+  elif [[ $jok -eq 0 ]]; then ui_live_clear; say "$title ended after $jd (exit code $rc)."; fi
   ui_job_done "$title" "$rc" "$t0" "$out"
+  JOB_PROGRESS_FN=""; JOB_PROGRESS=""
   ui_drain
   return "$rc"
 }

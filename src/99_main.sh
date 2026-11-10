@@ -33,6 +33,9 @@ Setup
                          dg_standby_setup.sh --user oracle
   --plain              Plain scrolling output instead of the screen layout
                          dg_standby_setup.sh --plain
+  --verbose            The end summary lists every step (else a phase where every step is OK
+                       is one line; the log always has every step)
+                         dg_standby_setup.sh --verbose
 After setup
   --only 10            Health check, with the screen and questions
                          dg_standby_setup.sh --only 10
@@ -89,13 +92,15 @@ Files
   Progress   $STATE_DIR/progress, and changes.log for --undo
   Logs       $LOG_DIR/run_<date>.log  (--health: health_<date>.log, kept 14 days)
              actions_<date>.txt: the commands shown for you
+             commands_<step>_<date>.txt: a long "Will run" list, as a script you can run
              duplicate_<date>.rman and .log, installer and root script output
   Editor     The settings open in \$EDITOR (default vi).
 
 Exit codes
   0  Every step is OK
-  1  Stopped, or some steps are not OK or skipped (normal for --check on a new server)
+  1  Stopped by you, or some steps are not OK or skipped (normal for --check on a new server)
   2  Wrong option or unknown step
+  4  A step failed and the run cannot go on (the last lines name the step, its error and what to do)
   With --health:  0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check, or a wrong option)
 
 Run with no option to see all of this as a menu.
@@ -152,6 +157,7 @@ parse_args() {
       --status) STATUS_ONLY=1 ;;
       --yes) YES_MODE=1 ;;
       --plain) PLAIN_OPT=1 ;;
+      --verbose) VERBOSE=1 ;;
       --show-changes) SHOW_CHANGES=all
         if [[ $# -ge 2 && "$2" != -* ]]; then
           valid_step "$2" || { printf 'There is no step %s. Use --show-changes, or --show-changes N.M (to list the steps:  --help-step all)\n' "$2"; exit $PX; }
@@ -316,14 +322,17 @@ menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
 start_menu() {
   # shown when the script is run without options: one grouped menu. Next to each item, in grey, the switch that does
   # the same from the command line (for scripts and cron). Every item reaches the same code as its switch.
-  local c yesq st
+  local c st mn def=1
   # Ctrl+C here only leaves the menu: nothing has started, the record of the last run stays as it is
   trap 'printf "\n"; menu_quit' INT
   while true; do
     load_progress
+    # a finished standby: the daily check is the usual choice (Enter), a full setup is a check of every step again
+    mn=$(menu_next); def=1; [[ "$mn" == "all done" ]] && def=9
     printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
     printf '\n  %sSetup%s\n' "$C_B" "$C_N"
-    menu_line 1 "Full setup ($(menu_next))" "(no option)"
+    if [[ $def -eq 9 ]]; then menu_line 1 "Full setup again (all done; checks every step)" "(no option)"
+    else menu_line 1 "Full setup ($mn)" "(no option)"; fi
     menu_line 2 "Check only, change nothing" "--check"
     menu_line 3 "OS preparation only (phase 2)" "--only os"
     menu_line 4 "Grid Infrastructure and ASM only" "--only grid"
@@ -341,16 +350,15 @@ start_menu() {
     menu_line 14 "Settings" "--settings"
     printf '\n   q) Quit\n\n'
     CUR_STEP=""
-    ask "Choice [1]"
-    c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=1
-    yesq=1
+    ask "Choice [$def]"
+    c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=$def
     case "$c" in
       1) break ;;
-      2) MODE=check; yesq=0; break ;;
+      2) MODE=check; break ;;
       3) parse_only os; break ;;
       4) parse_only grid; break ;;
       5) parse_only db; break ;;
-      6) parse_only primary; yesq=0; break ;;        # phase 4 only shows commands for the primary
+      6) parse_only primary; break ;;
       7) while true; do
            ask "Steps to run, for example 2.1-2.4, 3.6 or 2-3 (Enter = back)"
            ANSWER=${ANSWER//[[:space:]]/}
@@ -364,9 +372,6 @@ start_menu() {
            fi
            say "This is not a step or a range of steps. Examples:  2.1-2.4   3.6-3.11   5"
          done
-         # phase 4 (commands for the primary) and phase 10 (checks) have no action on this server: no --yes question
-         local p1 p2 pp; p1=${ONLY_PHASE:-${FROM_STEP%%.*}}; p2=${ONLY_PHASE:-${TO_STEP%%.*}}; yesq=0
-         for ((pp = p1; pp <= p2; pp++)); do [[ $pp -eq 4 || $pp -eq 10 ]] || yesq=1; done
          break ;;
       8) while true; do
            ask "Start from which step, for example 7.2 or 9 (Enter = back)"
@@ -379,8 +384,8 @@ start_menu() {
            say "There is no step $st. To list the steps:  $SELF --help-step all"
          done
          break ;;
-      9) parse_only 10; yesq=0; break ;;
-      10) ROLL_FORWARD=1; parse_only 10; yesq=0; break ;;
+      9) parse_only 10; break ;;
+      10) ROLL_FORWARD=1; parse_only 10; break ;;
       11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100 ;;
       12) menu_records ;;
       13) while true; do
@@ -391,7 +396,7 @@ start_menu() {
             { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; break; }
             say "There is no step $st. To list the steps:  $SELF --help-step all"
           done ;;
-      14) REVIEW_SETTINGS=1; ONLY_PHASE=1; yesq=0; break ;;
+      14) REVIEW_SETTINGS=1; ONLY_PHASE=1; break ;;
       q) menu_quit ;;
       *) say "Please type a number from 1 to 14, or q." ;;
     esac
@@ -400,22 +405,28 @@ start_menu() {
   if [[ -n "$TO_STEP" ]]; then say "This run: $(range_text). It stops after it. Phase 1 (the primary) runs first."
   elif [[ -n "$ONLY_PHASE" && $REVIEW_SETTINGS -eq 0 ]]; then say "This run: phase $ONLY_PHASE only. Phase 1 (the primary) runs first."
   elif [[ -n "$FROM_STEP" ]]; then say "This run: from $(range_word "${FROM_STEP%.0}"). Phase 1 (the primary) runs first."; fi
-  if [[ $yesq -eq 1 && $YES_MODE -eq 0 ]]; then
-    say "${C_D}With --yes, the actions on this server are done without asking. Still asked: disk erasure,"
-    say "clean-up, the copy, the host key, passwords, the listener restart (3.10), the restart steps"
-    say "(9.1-9.3, 9.7) and the deletion setting of archived logs (9.8).${C_N}"
-    say "${C_D}You can also answer a at any step question: yes to all from there.${C_N}"
-    ask "Answer y automatically for this server (--yes)?  [y] Yes   [N] No   [q] Quit"
-    case "${ANSWER,,}" in
-      y|yes) YES_MODE=1; _log INFO "--yes chosen in the menu"; ok "Mode: setup, --yes: actions on this server without asking" ;;
-      q) menu_quit ;;
-    esac
-  fi
+  # (no --yes question here: value 2 "Yes to all" of the summary screen (step 1.4) sets it for this run, and a at
+  # any step question does the same from there)
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
   return 0
 }
 
+run_end() {
+  # the EXIT trap: the last line of the run log says how the run ended and how long it took (a log without it was
+  # cut off: the server stopped, or the script was killed), then the clean-up as always
+  local rc=$1 last="" r
+  if [[ -n "$LOG_FILE" && ${RUN_END_LOGGED:-0} -eq 0 ]]; then
+    RUN_END_LOGGED=1
+    [[ ${#STEP_ORDER[@]} -gt 0 ]] && last=${STEP_ORDER[${#STEP_ORDER[@]}-1]}
+    [[ "${CUR_STEP:-}" =~ ^[0-9]+\.[0-9]+$ ]] && last=$CUR_STEP
+    if [[ -n "$last" ]]; then r=${STEP_RESULT[$last]:-not finished}; last=", last step $last $r"; fi
+    _log END "exit code $rc, run time $(ui_dur $(( $(date +%s) - RUN_START )))$last"
+  fi
+  cleanup
+}
 main() {
+  # (replaces the plain clean-up trap of the core: the same clean-up, after the END line of the log)
+  trap 'run_end $?' EXIT
   [[ $# -eq 0 ]] && MENU_OK=1
   # a wrong command line is exit 2, but 3 (unknown) with --health: 2 means "critical" to a monitoring system
   local a; PX=2; for a in "$@"; do [[ "$a" == "--health" ]] && PX=3; done
@@ -451,8 +462,10 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
     printf '  This server   %s\n' "$(hostname -s 2>/dev/null)"
     [[ -n "$PRIMARY_UNIQUE" ]] && printf '  Primary       %s on %s\n  Standby       %s\n' "$PRIMARY_UNIQUE" "${PRIMARY_HOST:-$PRIMARY_IP}" "${STANDBY_UNIQUE:-?}"
     if [[ $STATUS_ONLY -eq 1 ]]; then
+      dg_status_block
       print_progress_board
       printf '\n  %sEvery step%s\n' "$C_W" "$C_N"; ui_list_text 100
+      status_runs_block
       [[ -s "$JOURNAL_FILE" ]] && printf '\n  Changes made on this server: %s --show-changes\n' "$SELF"
     fi
     [[ -n "$SHOW_CHANGES" ]] && show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"
@@ -556,7 +569,11 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   write_last_run "$([[ $bad_n -eq 0 ]] && printf 'ended, every step OK' || printf 'ended, %s step(s) not OK' "$bad_n")"
   if [[ "$MODE" == "run" && $bad_n -eq 0 ]]; then
     if [[ -z "$ONLY_PHASE" ]] && [[ -z "$FROM_STEP" || "${FROM_STEP%%.*}" -le 9 ]] && [[ -n "${STEP_RESULT[10.1]:-}" ]]; then
-      printf '\n  %sStandby setup is complete.%s  Daily check:  %s --only 10\n' "$C_G" "$C_N" "$SELF"
+      printf '\n  %sStandby setup is complete.%s\n' "$C_G" "$C_N"
+      printf '  Daily check:  %s --health    (from cron; it checks the primary with the key of step 9.9)\n' "$SELF"
+      printf '                %s --only 10   (by hand, the same checks with the screen)\n' "$SELF"
+      [[ "${STEP_RESULT[9.9]:-}" == OK || "${STEP_RESULT[9.9]:-}" == DONE ]] || \
+        printf '  %s--health will not check the primary (no ssh key for it):  %s --only 9.9%s\n' "$C_Y" "$SELF" "$C_N"
       printf '  Keep in mind:\n'
       printf '    - After a sys password change on the primary, copy the password file again:\n        %s --from 6.1\n' "$SELF"
       [[ -n "$TDE_INFO" ]] && printf '    - After a new TDE master key on the primary, copy the wallet again:\n        %s --from 6.3\n' "$SELF"

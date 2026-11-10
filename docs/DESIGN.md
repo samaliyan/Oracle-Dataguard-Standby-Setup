@@ -81,6 +81,10 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
 - STATE_DIR/progress: the last result of every step (id|result|time|run|reason). Every run starts with the
   "Where you are" board (one line per phase: DONE / OPEN / PARTLY / -), the last run, the steps not done and
   the --from hint; --status prints it without connecting. STATE_DIR/last_run: when and how the last run ended.
+  --status (5.26) puts a Data Guard block on top (dg_status_block: read now, read-only and local, when the
+  instance's pmon runs; else the values of STATE_DIR/dg_state_health or dg_state_run with their time) and the
+  last --health / phase 10 result with its log; status_runs_block lists the runs behind the step results (from
+  the run field of the progress file) with the path of each run log.
 - Summary: legend, the reason under every step that is not OK, the changes of the run, "Next: --from X".
 - Phase 4: the checks run first and every primary SQL command is printed in ONE box (with "-- undo" lines), so
   the admin goes to the primary once; the steps then pass one by one. The first run offers phase 4 right after
@@ -130,7 +134,31 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   interactive master is never touched) and its own memory of Data Guard errors. The instance is checked first
   (down: CRITICAL, nothing else). Checks are called directly, not through run_step (no progress record). A
   problem in 10.1-10.4 is checked once more after 60 seconds. Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN
-  (worst first: CRITICAL, UNKNOWN, WARNING); a start failure, a wrong option or fatal() give 3.
+  (worst first: CRITICAL, UNKNOWN, WARNING; SKIPPED counts as nothing); a start failure, a wrong option or
+  fatal() give 3.
+- --health output (5.26): the lines are kept (health_out) and printed at the end, so the FIRST line is the status
+  in Nagios form: "STATE - summary | transport_lag=Ns;;LIM;0 apply_lag=Ns;;LIM;0" (the worst check with its text,
+  "(+N more not OK)", the lag from 10.1, the protection mode, "primary not checked (no ssh key)"). Then the
+  title, the check lines, a "Data Guard:" line (dg_state_read: role, open mode, protection mode, MRP, last
+  applied log; read-only on the standby), notes, and "Result: ...". The values are also kept for --status in
+  STATE_DIR/dg_state_health (and dg_state_run by the end of phase 10 in a normal run): key=value lines, read back
+  by a parser (dg_state_load), never sourced.
+- No key for the primary (5.26): when the health master gets "Permission denied", HEALTH_SSH_NOKEY=1 and the
+  primary is "not checked", which is not UNKNOWN: 10.3 and 10.5 run on the standby side only (c_10_3_sb: last
+  log received per thread in v$archived_log against the last applied, plus the apply lag; c_10_5_sb: the
+  standby's v$nonlogged_block, 12.1: SKIPPED), and 10.6 is SKIPPED. Any other ssh failure stays UNKNOWN for them.
+- Step 9.9 (5.26, optional): the key for --health, STATE_DIR-independent at /root/.ssh/dg_health_<unique>
+  (DG_SSH_DIR moves the folder, for the tests). Check: the key and .pub exist, root owns it, mode 600, and a
+  BatchMode master to the primary opens with it (health_key_test: its own control path, the same host-key
+  options as every connection). Action: ssh-keygen (Will run), journaled NEW (--undo 9.9 removes it). Then a
+  primary box (as the ssh user) with mkdir/chmod/echo/chmod of the restricted authorized_keys line
+  (from="<standby ip>",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty), PLAN_UNDO names the
+  line. health_ssh and health_key_test pass -o IdentityFile=<key> when the file exists.
+- Help (5.26): show_help prints the RUN part as one block between two rules, commands at column 0
+  (help_cmd_block): explanations become "# " lines ("-- " between a line that starts sqlplus/rman and "exit"),
+  a trailing "      (note)" goes on its own line above its command. The prose is recognised by its form (a
+  capital first word, a line ending in ":", "(text ...)", a table row, the continuation of a sentence); a new
+  help text keeps commands lower case at the start and prose as sentences.
 - 10.1 also reads datum_time (no data from the primary for longer than the limit is a problem even with lag 0)
   and, when the lag is high, the primary's destination for this standby (gv$archive_dest, read-only).
 - 10.5: v$nonlogged_block on the standby (12.2+) is the proof; force logging of the primary is advice

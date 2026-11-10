@@ -344,6 +344,17 @@ def keyscan():
 
 def keygen():
     # ssh-keygen -F host -f file  |  ssh-keygen -lf file  |  ssh-keygen -R host [-f file]
+    # | ssh-keygen [-q] -t ed25519 -N '' -C comment -f file  (step 9.9: a new key pair, mode 600 / 644)
+    a = sys.argv[1:]
+    if "-t" in a and "-f" in a:
+        f = a[a.index("-f") + 1]; c = a[a.index("-C") + 1] if "-C" in a else "mock"
+        if os.path.exists(f): print(f + " already exists.", file=sys.stderr); return 1
+        old = os.umask(0o077)
+        with open(f, "w") as h: h.write("-----BEGIN OPENSSH PRIVATE KEY-----\nmock\n-----END OPENSSH PRIVATE KEY-----\n")
+        os.umask(old)
+        with open(f + ".pub", "w") as h: h.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAImock " + c + "\n")
+        os.chmod(f + ".pub", 0o644)
+        return 0
     if "-F" in a:
         host = a[a.index("-F") + 1]; f = a[a.index("-f") + 1]
         try: lines = open(f).read().splitlines()

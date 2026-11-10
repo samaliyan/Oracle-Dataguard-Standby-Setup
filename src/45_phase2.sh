@@ -412,8 +412,9 @@ make_dir_plan() {
     if [[ ! -e "$p" && ! -L "$p" ]]; then
       if [[ $held -eq 1 ]]; then cmd="install -d -o $owner -g $grp -m 775 $qp"
       else
-        # below a folder another user can change: made as $owner; a folder that cannot get the group is taken back
-        cmd="runuser -u $owner -- mkdir -m 775 -- $qp && { runuser -u $owner -- chgrp -h $grp -- $qp || { runuser -u $owner -- rmdir -- $qp; echo '$owner is not a member of the group $grp (step 2.2)'; exit 1; }; }"
+        # below a folder another user can change: made as $owner, with the group $grp as its process group (runuser
+        # -g, root only): the folder gets that group at once, no chgrp and no clean-up guard are needed
+        cmd="runuser -u $owner -g $grp -- mkdir -m 775 -- $qp"
       fi
       P2_MDOUT+="DIR|$p|$owner|$cmd"$'\n'; P2_MADE+="$p=$owner"$'\n'
     elif [[ ! -d "$p" ]]; then P2_MDWHY="$p exists, but it is not a folder. It is not changed."; return 1; fi
@@ -684,7 +685,33 @@ d_2_6() {
 
 # ---- 2.7 primary resolves standby ----
 PRIMARY_FQ=""; PRIMARY_V4S=""
+# One visit to the primary: when /etc/hosts of the primary needs a line, the command is not asked for here. It is
+# shown in the combined primary block of phase 4 (PRIMARY_BATCH_EXTRA, the box "as root"), and phase 4 checks this
+# step again right after that block (P27_RECHECK). Only in a normal run whose phase 4 comes later in this run, and
+# not when the script runs the primary commands itself (PRIMARY_RUN=yes: one step at a time, as before).
+P27_DEFERRED=0; P27_RECHECK=0
+p27_defer_ok() {
+  [[ "$MODE" == run && "${PRIMARY_RUN:-no}" != yes && $P27_RECHECK -eq 0 && ${PHASE4_FIRST:-0} -eq 0 && -z "${BATCH_TTY:-}" ]] || return 1
+  [[ "${CUR_STEP:-}" == 2.7 ]] && step_in_range 4.1
+}
 c_2_7() {
+  local rc=0; c_2_7_check || rc=$?
+  if [[ $rc -eq 1 && -n "$PLAN" ]] && p27_defer_ok; then
+    local -a keep=(); local e
+    for e in ${PRIMARY_BATCH_EXTRA[@]+"${PRIMARY_BATCH_EXTRA[@]}"}; do [[ "$e" == 2.7\|* ]] || keep+=("$e"); done
+    PRIMARY_BATCH_EXTRA=(${keep[@]+"${keep[@]}"} "2.7|root|$PLAN${PLAN_UNDO:+$'\n'-- Undo, if ever needed: $PLAN_UNDO}")
+    # the commands count as shown: when the check passes later, the change is journaled as done by you
+    primary_pending_add 2.7 "$PLAN_UNDO"
+    P27_DEFERRED=1
+    NOW+=$'\n'"The command for /etc/hosts of the primary (as root) is shown with the other primary commands in phase 4,"
+    NOW+=$'\n'"so you go to the primary once. This step is checked again there."
+    PLAN=""; PLAN_UNDO=""; CHECK_WAITS=1
+    return 0
+  fi
+  [[ $rc -eq 1 ]] && not_done_yet
+  return $rc
+}
+c_2_7_check() {
   need_ssh || return 2
   # first the primary's own name on the primary (its listener needs it, as here)
   local pp prc=0; primary_name_problems > /dev/null || prc=$?; pp=$PNP_OUT
@@ -973,7 +1000,16 @@ asm_method() {
 }
 asm_disk_dir() { if [[ "$(asm_method)" == "asmlib" ]]; then printf '/dev/oracleasm/disks'; else printf '/dev/oraasm'; fi; }
 # the OSASM group: owner group of the ASM disks, OSASM in the Grid installation, group of the oracle binary
-asm_owner_group() { grp_or asmadmin dba "$GRID_PGROUP"; }
+asm_owner_group() {
+  # the first of asmadmin, dba, the grid user's group that exists here, or that step 2.1 creates (it is in the
+  # group list of the primary): --check, before 2.1, then plans the same group as the real run
+  local g
+  for g in asmadmin dba "$GRID_PGROUP"; do
+    [[ -n "$g" ]] || continue
+    if getent group "$g" >/dev/null 2>&1 || [[ ",${GROUP_GIDS:-}," == *",$g:"* ]]; then printf '%s' "$g"; return 0; fi
+  done
+  printf '%s' "$INSTALL_GROUP"
+}
 readonly UDEV_RULES=/etc/udev/rules.d/99-oracle-asmdevices.rules
 A212_MODE=""
 c_2_12() {

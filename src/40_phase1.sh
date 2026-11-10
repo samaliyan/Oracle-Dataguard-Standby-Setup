@@ -42,14 +42,14 @@ c_1_6() {
       12.1) [[ $OS_MAJOR -ge 8 ]] && w="12.1 is certified on Oracle Linux 7 only."
             [[ "$v" == 12.1.0.1* && $OS_MAJOR -eq 7 ]] && w="12.1.0.1 is not certified on Oracle Linux 7. Only 12.1.0.2 is." ;;
       12.2|18) [[ $OS_MAJOR -ge 8 ]] && w="$r is not certified on Oracle Linux $OS_MAJOR. Its installer stops there."$'\n'"Use Oracle Linux 7 for this standby." ;;
-      19)   [[ $OS_MAJOR -ge 9 && -z "$RU_DIR" ]] && w="19c on Oracle Linux 9 must be installed together with Release Update 19.19 or newer."$'\n'"1. Unzip that Release Update on this server. Also get the newest OPatch zip (p6880880)."$'\n'"2. Answer s here. In step 1.4 choose e, then set RU_DIR and OPATCH_ZIP." ;;
+      19)   [[ $OS_MAJOR -ge 9 && -z "$RU_DIR" ]] && w="19c on Oracle Linux 9 must be installed together with Release Update 19.19 or newer."$'\n'"1. Unzip that Release Update on this server. Also get the newest OPatch zip (p6880880)."$'\n'"2. Answer s here. In step 1.4 change the value Release Update (RU_DIR and OPATCH_ZIP)." ;;
       # 21c on Oracle Linux 9: certified from Release Update 21.12 (installed together with that RU, as 19c)
       21)   if [[ $OS_MAJOR -ge 9 ]]; then
               # the RU is judged only from a full 21.x version of the database (21.0.0.0.0 = not known; a 21c Grid
               # with an older database has no 21c database version)
               local ru21=""; [[ "$v" == 21.* ]] && ru21=$(cut -d. -f2 <<< "$v")
               if [[ "$ru21" =~ ^[0-9]+$ && $ru21 -gt 0 && $ru21 -lt 12 ]]; then w="21c on Oracle Linux 9 is certified from Release Update 21.12. The primary has $v."$'\n'"Patch the primary to 21.12 or newer first, or use Oracle Linux 8 for the standby."
-              elif [[ -z "$RU_DIR" ]]; then w="21c on Oracle Linux 9 must be installed together with Release Update 21.12 or newer."$'\n'"1. Unzip that Release Update on this server. Also get the newest OPatch zip (p6880880)."$'\n'"2. Answer s here. In step 1.4 choose e, then set RU_DIR and OPATCH_ZIP."; fi
+              elif [[ -z "$RU_DIR" ]]; then w="21c on Oracle Linux 9 must be installed together with Release Update 21.12 or newer."$'\n'"1. Unzip that Release Update on this server. Also get the newest OPatch zip (p6880880)."$'\n'"2. Answer s here. In step 1.4 change the value Release Update (RU_DIR and OPATCH_ZIP)."; fi
             fi ;;
       *)    [[ $OS_MAJOR -le 7 ]] && w="$r needs Oracle Linux 8 or newer." ;;
     esac

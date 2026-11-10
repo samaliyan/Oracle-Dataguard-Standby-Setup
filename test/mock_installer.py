@@ -64,8 +64,23 @@ def copy_payload(src, home):
 def prereq_check(kind):
     st = load(ST)
     if st.get(kind + "_prereq_fail") and not (opt("-ignorePrereqFailure") or opt("-ignorePrereq")):
+        # like 19c: the failed checks are only in the installer's log (written as the installing user, in /tmp)
+        import time
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S%p")
+        d = "/tmp/%s%s" % ("GridSetupActions" if kind == "grid" else "InstallActions", ts)
+        log = os.path.join(d, "%s%s.log" % ("gridSetupActions" if kind == "grid" else "installActions", ts))
+        os.makedirs(d, exist_ok=True)
+        with open(log, "w") as f:
+            f.write("INFO:  [Nov 9, 2026 10:00:01 AM] ------------------List of failed Tasks------------------\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] *********************************************\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] Swap Size: This is a prerequisite condition to test whether sufficient total swap space is available on the system.\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] Severity:IGNORABLE\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] OverallStatus:VERIFICATION_FAILED\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] -----------------End of failed Tasks List----------------\n"
+                    "INFO:  [Nov 9, 2026 10:00:01 AM] Error Message:PRVF-7573 : Sufficient swap size is not available on node \"vm\" [Required = 16GB (1.6777216E7KB) ; Found = 2GB (2097148.0KB)]\n")
         print("[FATAL] [INS-13013] Target environment does not meet some mandatory requirements.")
-        print("   CAUSE: Some of the mandatory prerequisites are not met. See logs for details. /u01/app/oraInventory/logs/InstallActions2026.log")
+        print("   CAUSE: Some of the mandatory prerequisites are not met. See logs for details. " + log)
+        print("   ACTION: Identify the list of failed prerequisite checks from the log: " + log + ". Then either from the log file or from installation manual find the appropriate configuration to meet the prerequisites and fix it manually.")
         sys.exit(1)
 
 def grid_install(home, rsp, staged):

@@ -1110,6 +1110,50 @@ phase_9() {
   run_step 9.6 check   "Redo arrives on this server (RFS)" c_9_6
   run_step 9.7 auto    "Start at boot (mount and apply)" c_9_7 d_9_7
   run_step 9.8 auto    "Clean-up of archived logs on the standby" c_9_8 d_9_8
+  run_step 9.9 auto    "ssh key for --health (monitoring)" c_9_9 d_9_9
+}
+
+# ---- 9.9 ssh key for --health ----
+# --health (cron) cannot type a password: it logs in to the primary with a key of root, made for this purpose
+# (health_key_file), that the primary accepts only from this server, without a terminal or forwarding. Optional:
+# without it --health checks this standby only (10.3 and 10.5 on the standby side, 10.6 skipped).
+c_9_9() {
+  local kf m o; kf=$(health_key_file)
+  [[ -n "${PRIMARY_IP:-}" && -n "${PRIMARY_SSH_USER:-}" ]] || { NOW="The primary is not known yet (step 1.2)"; return 2; }
+  v_path "$kf" || { NOW="Unusual path for the key: $kf"; return 2; }
+  if [[ ! -f "$kf" || ! -f "$kf.pub" ]]; then
+    NOW="No ssh key for --health yet ($kf)."$'\n'"Without it, --health checks this standby only (10.3 and 10.5 on the standby side; 10.6 is skipped)."
+    command -v ssh-keygen >/dev/null 2>&1 || { NOW="ssh-keygen is not installed on this server (package openssh). Install it, then answer r:"$'\n'"${PKG:-yum} install -y openssh"; return 2; }
+    [[ -e "$kf" || -e "$kf.pub" ]] && { NOW="Only one half of the key $kf exists (the key and $kf.pub belong together). Remove it, then answer r:"$'\n'"rm -f $kf $kf.pub"; return 2; }
+    cp_add root "install -d -m 700 $(dirname "$kf")"
+    cp_add root "ssh-keygen -q -t ed25519 -N '' -C 'dg_standby_setup health $(hostname -s)' -f $kf"
+    return 1
+  fi
+  m=$(stat -c '%a' -- "$kf" 2>/dev/null); o=$(stat -c '%U' -- "$kf" 2>/dev/null)
+  if [[ "$o" != root || "$m" != 600 ]]; then
+    NOW="The key $kf must belong to root with mode 600 (now: $o, $m)."
+    cp_add root "chown root:root $kf"; cp_add root "chmod 600 $kf"
+    return 1
+  fi
+  if health_key_test; then
+    NOW="Key $kf: root logs in to $PRIMARY_SSH_USER@$PRIMARY_IP without a password (BatchMode). --health checks the primary too."
+    return 0
+  fi
+  NOW="The key $kf exists, but the primary does not accept it yet (ssh with BatchMode=yes, the host key as in step 1.2)."
+  KIND_NOW=primary; PRIMARY_HOW_STEP=$PRIMARY_SSH_USER
+  PLAN="mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+echo '$(health_key_line)' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys"
+  PLAN_UNDO="remove the line ending with 'dg_standby_setup health $(hostname -s)' from ~$PRIMARY_SSH_USER/.ssh/authorized_keys"
+  return 1
+}
+d_9_9() {
+  local kf; kf=$(health_key_file)
+  cp_run || return 1
+  [[ -f "$kf" ]] && journal NEW "$kf" "md5=$(file_md5 "$kf")"
+  [[ -f "$kf.pub" ]] && journal NEW "$kf.pub" "md5=$(file_md5 "$kf.pub")"
+  return 0
 }
 
 #------------------------------------------------------------------------------
@@ -1186,6 +1230,8 @@ c_10_1() {
     sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-')||'|'||nvl(to_char(max(case when name='transport lag' and datum_time is not null then round((sysdate-to_date(datum_time,'MM/DD/YYYY HH24:MI:SS'))*86400) end)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
     IFS='|' read -r tl al age <<< "$(first_line)"
     tls=$(lag_seconds "$tl"); als=$(lag_seconds "$al")
+    # kept for the status line and the perfdata of --health
+    HC_TLS=$tls; HC_ALS=$als; HC_LIM=$lim
     # old values are no measurement, whatever they say: that diagnosis comes first
     if [[ "$age" =~ ^[0-9]+$ && $age -gt $lim ]]; then
       NOW="No data from the primary for $age seconds (the last lag values, transport $tl and apply $al, are old)"
@@ -1259,6 +1305,8 @@ c_10_3_once() {
   # every enabled redo thread of the primary (a RAC primary has more than thread 1; a disabled thread of an
   # old RAC sends no redo any more and is left out)
   need_built || return 2
+  # --health without ssh to the primary: what the standby itself knows
+  if [[ ${HEALTH:-0} -eq 1 && ${HEALTH_SSH_OPEN:-0} -eq 0 ]]; then c_10_3_sb; return; fi
   need_ssh || return 2
   prim_sql "select thread#||' '||max(sequence#) from v\$archived_log where standby_dest='NO' and resetlogs_change#=(select resetlogs_change# from v\$database) and thread# in (select thread# from v\$thread where enabled<>'DISABLED') group by thread# order by thread#;" || { NOW="Cannot read the primary"; return 2; }
   local pout sout t p a line behind="" info=""
@@ -1278,6 +1326,35 @@ c_10_3_once() {
   if [[ -z "$behind" ]]; then NOW=$info; return 0; fi
   NOW="Apply is behind:"$'\n'"$behind"
   PLAN="Wait a few minutes for apply to catch up, then answer r."
+  return 1
+}
+c_10_3_sb() {
+  # 10.3 on the standby side only (--health when root has no ssh key for the primary): per thread, the last log
+  # this standby received (v$archived_log) against the last one it applied, and the apply lag (v$dataguard_stats).
+  # A primary that stops sending is found by 10.1 (no data for N seconds); this finds apply that does not follow
+  local rout aout t r a behind="" info="" tl="-" al="-" lbl="Standby side only (the primary was not checked)"
+  sql_local "select 'R:'||thread#||' '||max(sequence#) from v\$archived_log where resetlogs_change#=(select resetlogs_change# from v\$database) group by thread# order by thread#;" || { NOW="$lbl: cannot read v\$archived_log: $(ora_errors "$SQL_OUT")"; return 2; }
+  rout=$(sed -n 's/^[[:space:]]*R://p' <<< "$SQL_OUT" | grep -E '^[0-9]+ [0-9]+[[:space:]]*$')
+  sql_local "select thread#||' '||max(sequence#) from v\$archived_log where applied in ('YES','IN-MEMORY') and resetlogs_change#=(select resetlogs_change# from v\$database) group by thread# order by thread#;" || { NOW="$lbl: cannot read v\$archived_log: $(ora_errors "$SQL_OUT")"; return 2; }
+  aout=$(grep -E '^[[:space:]]*[0-9]+ [0-9]+[[:space:]]*$' <<< "$SQL_OUT")
+  sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-') from v\$dataguard_stats;" && IFS='|' read -r tl al <<< "$(first_line)"
+  local -A applied=()
+  while read -r t a; do [[ -n "$t" ]] && applied[$t]=$a; done <<< "$aout"
+  if [[ -n "$rout" ]]; then
+    while read -r t r; do
+      [[ -n "$t" ]] || continue
+      a=${applied[$t]:-0}
+      info+="${info:+; }thread $t received $r, applied $a"
+      [[ $a -ge $((r - 1)) ]] || behind+="${behind:+; }thread $t received $r, applied $a"
+    done <<< "$rout"
+  else
+    # the received logs could not be listed: the applied ones alone
+    while read -r t a; do [[ -n "$t" ]] && info+="${info:+; }thread $t applied $a"; done <<< "$aout"
+  fi
+  [[ -n "$info" ]] || { NOW="$lbl: no log has been applied on this standby yet"; return 1; }
+  if [[ -z "$behind" ]]; then NOW="$lbl: $info; apply lag ${al:--}"; return 0; fi
+  NOW="$lbl: apply is behind what arrived: $behind; apply lag ${al:--}"
+  PLAN="Wait a few minutes for apply to catch up. If it stays behind, check redo apply (10.4) and the alert log."
   return 1
 }
 # a gap or a standby that is a few logs behind is often gone within a minute or two (fal_server, apply catching
@@ -1366,6 +1443,8 @@ c_10_5() {
   # The proof is the standby's list of such blocks (12.2 and later); force logging on the primary is advice.
   # Read-only on both sides
   need_built || return 2
+  # --health without ssh to the primary: the standby's own list only
+  if [[ ${HEALTH:-0} -eq 1 && ${HEALTH_SSH_OPEN:-0} -eq 0 ]]; then c_10_5_sb; return; fi
   need_ssh || return 2
   prim_sql "select force_logging from v\$database;" || { NOW="Cannot read force_logging of the primary: $(ora_errors "$SQL_OUT")"; return 2; }
   local fl n b fnote=""
@@ -1386,16 +1465,7 @@ c_10_5() {
     [[ $nrc -eq 0 ]] || { NOW="Cannot read v\$nonlogged_block on the standby: $(ora_errors "$SQL_OUT")"; return 2; }
     read -r n b <<< "$(first_line)"
     num "$n" && num "$b" || { NOW="Unexpected answer from the standby: $(first_line)"; return 2; }
-    if [[ $n -gt 0 ]]; then
-      NOW="$b block(s) in $n range(s) were changed on the primary without redo (NOLOGGING). They are not usable here."
-      KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server ($(hostname -s))"
-      PLAN="-- Fetch these blocks from the primary:
--- 1) sqlplus / as sysdba:  alter database recover managed standby database cancel;
--- 2) rman target /:        recover database nonlogged block;
--- 3) sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
--- So it does not happen again, on the primary:  alter database force logging;"
-      return 1
-    fi
+    if [[ $n -gt 0 ]]; then nonlogged_found "$n" "$b"; return 1; fi
   fi
   case "${fl^^}" in
     YES) if [[ -n "$fnote" ]]; then NOW="Force logging is on at the primary. $fnote"; else NOW="No unrecoverable changes; force logging is on at the primary"; fi; return 0 ;;
@@ -1405,6 +1475,36 @@ c_10_5() {
   esac
   NOW="$([[ -n "$fnote" ]] && printf 'Force logging is off at the primary' || printf 'No unrecoverable changes so far, but force logging is off at the primary') (force_logging = $fl)."$'\n'"A NOLOGGING load there would leave unusable blocks on the standby. On the primary:  alter database force logging;"$'\n'"(Force logging set per PDB or per tablespace is not looked at here.)${fnote:+$'\n'$fnote}"
   CHECK_WAITS=1
+  return 0
+}
+nonlogged_found() {
+  # $1 ranges, $2 blocks: what 10.5 says when the standby lists nonlogged blocks
+  NOW="$2 block(s) in $1 range(s) were changed on the primary without redo (NOLOGGING). They are not usable here."
+  KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER"; MANUAL_WHERE="On this server ($(hostname -s))"
+  PLAN="-- Fetch these blocks from the primary:
+-- 1) sqlplus / as sysdba:  alter database recover managed standby database cancel;
+-- 2) rman target /:        recover database nonlogged block;
+-- 3) sqlplus / as sysdba:  alter database recover managed standby database disconnect from session;
+-- So it does not happen again, on the primary:  alter database force logging;"
+}
+c_10_5_sb() {
+  # 10.5 on the standby side only (--health when root has no ssh key for the primary): the standby's list of
+  # nonlogged blocks (12.2 and later) is the proof; force logging of the primary is not looked at.
+  # 12.1 keeps no such list: SKIPPED (nothing could be checked without the primary)
+  local n b r121=0 lbl="Standby side only (the primary was not checked)"
+  sb_version
+  if [[ "$SB_VER" =~ ^12\.1\. ]]; then r121=1
+  elif ! sql_local "select count(*)||' '||nvl(sum(blocks),0) from v\$nonlogged_block;"; then
+    [[ -z "$SB_VER" ]] && grep -q 'ORA-00942' <<< "$SQL_OUT" && r121=1
+    [[ $r121 -eq 1 ]] || { NOW="$lbl: cannot read v\$nonlogged_block: $(ora_errors "$SQL_OUT")"; return 2; }
+  fi
+  if [[ $r121 -eq 1 ]]; then
+    NOW="Not checked: 12.1 keeps no list of nonlogged blocks on the standby, and the primary was not checked"; CHECK_WAITS=2; return 0
+  fi
+  read -r n b <<< "$(first_line)"
+  num "$n" && num "$b" || { NOW="$lbl: unexpected answer: $(first_line)"; return 2; }
+  if [[ $n -gt 0 ]]; then nonlogged_found "$n" "$b"; return 1; fi
+  NOW="$lbl: no unrecoverable (NOLOGGING) blocks on the standby; force logging of the primary not checked"
   return 0
 }
 # ---- 10.8 archived logs: space and the nightly clean-up ----
@@ -1523,6 +1623,10 @@ c_10_6() {
   # the primary). A difference is normal for a short time (standby-first patching), so it is "attention", not a
   # failure; a home that cannot be read is "cannot check"
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 2; }
+  # --health without a key for the primary: nothing to compare with (SKIPPED; the note says how to set up a key)
+  if [[ ${HEALTH:-0} -eq 1 && ${HEALTH_SSH_OPEN:-0} -eq 0 && ${HEALTH_SSH_NOKEY:-0} -eq 1 ]]; then
+    NOW="Not checked: no ssh key for root to the primary"; CHECK_WAITS=2; return 0
+  fi
   need_ssh || return 2
   local pp lp onlyp onlyh
   pp=$(primary_patches "$DB_HOME") || { NOW="Cannot read $DB_HOME/inventory on the primary (the ssh user must be able to read it)"; return 2; }
@@ -1928,10 +2032,32 @@ or start redo apply by hand (step 9.4).
 }
 switchover_verify_cmd() { printf 'alter database switchover to %s verify;' "$STANDBY_UNIQUE"; }
 phase10_footer() {
-  # every check of phase 10 OK: the standby is ready as far as this script can tell. The readiness check of
-  # Oracle itself runs on the primary and changes nothing there (12.1 and later): shown, never run
-  local id
-  for id in 10.1 10.2 10.3 10.4 10.5 10.6 10.8; do [[ "${STEP_RESULT[$id]:-}" == OK || ( "$id" == 10.5 && "${STEP_RESULT[$id]:-}" == NOT_ON_RELEASE ) ]] || return 0; done
+  # after the checks of phase 10: the state of Data Guard in a few lines (role, protection mode, apply, lag,
+  # last applied log; read-only, on this server), whether --health from cron can reach the primary, and, when every
+  # check is OK, the readiness check of Oracle itself (it runs on the primary and changes nothing there, 12.1 and
+  # later: shown, never run)
+  local id all_ok=1
+  for id in 10.1 10.2 10.3 10.4 10.5 10.6 10.8; do [[ "${STEP_RESULT[$id]:-}" == OK || ( "$id" == 10.5 && "${STEP_RESULT[$id]:-}" == NOT_ON_RELEASE ) ]] || all_ok=0; done
+  if [[ -n "${STEP_RESULT[10.1]:-}" ]] && db_sw_ok; then
+    local_state
+    if [[ "$LSTATE" == MOUNTED || "$LSTATE" == OPEN ]]; then
+      dg_state_read
+      printf '\n'
+      say "Data Guard now (read on this standby):"
+      local l; while IFS= read -r l; do say "$l"; done < <(dg_state_lines "  ")
+      [[ "$MODE" == run ]] && dg_state_save run "$([[ $all_ok -eq 1 ]] && printf 'OK' || printf 'not every check OK')" "${LOG_FILE:-}"
+      # --health (cron) logs in to the primary with a key of root only: said here, with the commands, when it cannot
+      if [[ -n "${PRIMARY_IP:-}" ]] && ! health_key_test; then
+        printf '\n'
+        say "--health (from cron) cannot reach the primary: root has no working ssh key for $PRIMARY_SSH_USER@$PRIMARY_IP."
+        say "It still checks this standby (10.3 and 10.5 on the standby side only; 10.6 is SKIPPED). For the full check,"
+        say "a restricted key (step 9.9; see:  $SELF --help-step 9.9):"
+        local kh; kh=$(health_key_hint "  ")
+        printf '%s\n' "$kh"; _log INFO "key for --health, commands shown:"$'\n'"$kh"
+      fi
+    fi
+  fi
+  [[ $all_ok -eq 1 ]] || return 0
   printf '\n'
   say "Before a planned switchover, Oracle can check the readiness. On the primary, in sqlplus / as sysdba:"
   printf '  %s\n' "$(switchover_verify_cmd)"

@@ -28,7 +28,7 @@ SIP=$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | grep -E '^[0-9.]+$' | head 
 pkill -f 'dgt_port_listener' 2>/dev/null || true
 [[ -f /etc/hosts.dgt_orig ]] || cp -p /etc/hosts /etc/hosts.dgt_orig
 { printf '%s    %s\n' "$SIP" "$SH"; grep -vw "$SH" /etc/hosts.dgt_orig; } > /etc/hosts
-rm -rf "$T" /etc/oraInst.loc /etc/oracle /etc/security/limits.d/oracle-grid.conf /etc/hosts.bak_* /dev/oraasm \
+rm -rf "$T" /tmp/GridSetupActions* /tmp/InstallActions* /etc/oraInst.loc /etc/oracle /etc/security/limits.d/oracle-grid.conf /etc/hosts.bak_* /dev/oraasm \
        /etc/udev/rules.d/99-oracle-asmdevices.rules* /etc/systemd/system/oracle-standby-*.service \
        /usr/local/sbin/dg_standby_*.sh /etc/systemd/system/oracle-ohasd.service.d /etc/oratab.bak_* \
        /usr/local/sbin/dg_arch_cleanup_*.sh* /etc/systemd/system/dg-arch-cleanup-* /root/dg

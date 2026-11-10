@@ -106,6 +106,7 @@ ok_lines() {
   return 0
 }
 
+declare -A STEP_T0=() DO_T0=()
 record() {
   # the result of a step: in memory, in the log, and in the progress file (so the next run can show
   # how far the last run got, and which steps are done)
@@ -114,7 +115,19 @@ record() {
   ui_header
   # the step a "Next" line pointed to is done now: the pointer would only mislead later
   [[ "$RESUME_STEP" == "$1" && ( "$2" == OK || "$2" == DONE || "$2" == DONE_BY_YOU ) ]] && RESUME_STEP=""
-  _log RESULT "[$1] $2  ${STEP_TITLE[$1]:-}"
+  # how long it took: from its action when it had one (the question before it is not counted), else from its start
+  local dt="" t0=${DO_T0[$1]:-${STEP_T0[$1]:-}}
+  if [[ "$1" == "${CUR_STEP:-}" && -n "$t0" ]]; then
+    dt=$((SECONDS - t0))
+    # plain output: the time of a step that took a while, under its result
+    [[ $UI -eq 0 && $dt -ge 5 ]] && printf '      %s(%s)%s\n' "$C_D" "$(ui_dur "$dt")" "$C_N"
+    dt=" ($(ui_dur "$dt")$([[ -n "${DO_T0[$1]:-}" ]] && printf ' action'))"
+  fi
+  _log RESULT "[$1] $2$dt  ${STEP_TITLE[$1]:-}${STEP_NOW[$1]:+  -- ${STEP_NOW[$1]}}"
+  # the values of this run (the summary screen of step 1.4, as accepted): once in the log, so the log is complete
+  if [[ "$1" == 1.4 && ( "$2" == OK || "$2" == DONE ) && ${VALUES_LOGGED:-0} -eq 0 && -s "$LOG_DIR/summary_$RUN_ID.txt" ]]; then
+    VALUES_LOGGED=1; log_block "values of this run (step 1.4, as accepted; also in $LOG_DIR/summary_$RUN_ID.txt)" < "$LOG_DIR/summary_$RUN_ID.txt"
+  fi
   [[ -n "$PROGRESS_FILE" ]] || return 0
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
@@ -196,6 +209,8 @@ print_progress_board() {
     printf '    - the sys password (step 1.5)\n'
     printf '    - with ASM: the disks to use (step 2.13) and a new ASM password (step 3.2)\n'
     printf '    - the word DUPLICATE before the copy starts (step 8.2)\n'
+    printf '    - commands on the primary, in one visit (phase 4): as oracle (SQL), as grid (listener, password file)\n'
+    printf '      and as root (one /etc/hosts line, if needed); a short downtime only if the primary is in NOARCHIVELOG\n'
   fi
   return 0
 }
@@ -257,7 +272,7 @@ write_last_run() {
 }
 
 # Steps that are useful but not needed for a working standby (switchover preparation)
-readonly OPTIONAL_STEPS=" 4.8 4.10 4.11 "
+readonly OPTIONAL_STEPS=" 4.8 4.10 4.11 9.9 "
 is_optional() { [[ "$OPTIONAL_STEPS" == *" $1 "* ]]; }
 # steps that run only when asked for (10.7: --roll-forward): never "next", never needed for a phase to be done
 readonly ON_DEMAND_STEPS=" 10.7 "
@@ -290,10 +305,41 @@ how_by_hand() {
   show_help "$1" || true
 }
 
+paste_safe() {
+  # stdin = shell lines to type (or paste) in an interactive shell; stdout = the same lines, safe to paste:
+  # a line that can end with "exit" (a guard such as  ... || { rm -f "$t"; exit 1; }) runs in a subshell ( ... ),
+  # so a failure ends that line only, never the shell of the user. A line that starts a here-document gets its ")"
+  # after the end word of the here-document. Lines inside a here-document are data: never changed.
+  local line hd="" close=0 re='<<-?[[:space:]]*['"'"'"]?([A-Za-z_][A-Za-z0-9_]*)'
+  local rx='(^|[;&|{([:space:]])exit([[:space:]]+[0-9]+)?[[:space:]]*($|[;}&|)])'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$hd" ]]; then
+      printf '%s\n' "$line"
+      if [[ "$line" == "$hd" ]]; then hd=""; [[ $close -eq 1 ]] && printf ')\n'; close=0; fi
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*# || ! "$line" =~ $rx ]]; then
+      printf '%s\n' "$line"
+      [[ "$line" =~ ^[[:space:]]*# ]] || { [[ "$line" =~ $re ]] && hd=${BASH_REMATCH[1]}; }
+      continue
+    fi
+    if [[ "$line" =~ $re ]]; then hd=${BASH_REMATCH[1]}; close=1; printf '( %s\n' "$line"
+    else printf '( %s )\n' "$line"; fi
+  done
+}
+box_width() {
+  # the width of the rules around commands: 70, less on a narrow screen (the top and bottom rules are the same)
+  local w=70
+  [[ ${UI_COLS:-0} -gt 0 && $((UI_COLS - 6)) -lt $w ]] && w=$((UI_COLS - 6))
+  [[ $w -lt 30 ]] && w=30
+  printf '%d' "$w"
+}
 print_commands() {
   # $1 where, $2 run as ("user  ->  env ; program" or a user name), stdin = commands.
-  # The commands have no frame at the start of the line, so they can be copied as they are.
-  local where=$1 how=$2 line cmds who prep="" note="" t
+  # The commands are printed at column 0 between the two rules: copied from the screen, they are exactly what must be
+  # typed (the end word of a here-document, an entry of tnsnames.ora or listener.ora that must start in column 1).
+  # The same text goes to the screen, the log and the actions file.
+  local where=$1 how=$2 line cmds who prep="" note="" t body=""
   cmds=$(cat)
   who=${how%%  ->  *}
   [[ "$how" == *"  ->  "* ]] && prep=${how#*  ->  }
@@ -304,27 +350,39 @@ print_commands() {
     "ON THIS SERVER ("*") - you do it") where="Run on this server ${where#ON THIS SERVER }"; where=${where% - you do it} ;;
   esac
   t="$where, as $who"
+  # remarks in a shell box are shell comments (# ...), in an SQL or RMAN box they stay "-- ..."
+  local shellbox=1; [[ "$how" == *sqlplus* || "$how" == *rman* || "$how" == *asmcmd* ]] && shellbox=0
+  # the text to type, built once
+  [[ -n "$note" ]] && body+="# $note"$'\n'
+  if [[ -n "$prep" ]]; then
+    while IFS= read -r line; do line=${line# }; [[ -n "$line" ]] && body+="$line"$'\n'; done <<< "${prep// ; /$'\n'}"
+    body+=$'\n'
+  fi
+  local sh=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ $shellbox -eq 1 && "$line" == "-- "* ]] && line="# ${line#-- }"
+    [[ $shellbox -eq 1 && "$line" == "--" ]] && line="#"
+    sh+="$line"$'\n'
+  done <<< "$cmds"
+  # in a shell box, a guard that ends with "exit" runs in a subshell (it must not close the shell of the user)
+  if [[ $shellbox -eq 1 ]]; then body+=$(printf '%s' "$sh" | paste_safe); else body+=${sh%$'\n'}; fi
   ui_live_clear
   # (on the screen layout every line goes to the step area, so the box is laid out with the step text)
   _pc() { if [[ $UI -eq 1 ]]; then ui_emit "$1"; else printf '%s\n' "$1"; fi; }
-  local w=$((64 - ${#t})); [[ $w -lt 2 ]] && w=2
+  local bw w; bw=$(box_width); w=$((bw - 4 - ${#t})); [[ $w -lt 2 ]] && w=2
   _pc ""; _pc "$(printf '    %s%s %s %s%s' "$C_M" "$(rule 2)" "$t" "$(rule $w)" "$C_N")"
-  # remarks in a shell box are shell comments (# ...), in an SQL or RMAN box they stay "-- ..."
-  local shellbox=1; [[ "$how" == *sqlplus* || "$how" == *rman* ]] && shellbox=0
-  [[ -n "$note" ]] && _pc "$(printf '      %s%s%s' "$C_D" "$note" "$C_N")"
-  if [[ -n "$prep" ]]; then
-    while IFS= read -r line; do line=${line# }; [[ -n "$line" ]] && _pc "      $line"; done <<< "${prep// ; /$'\n'}"
-    _pc ""
-  fi
+  local inhd="" hre='<<-?[[:space:]]*['"'"'"]?([A-Za-z_][A-Za-z0-9_]*)'
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == "-- "* ]]; then [[ $shellbox -eq 1 ]] && line="# ${line#-- }"; _pc "$(printf '      %s%s%s' "$C_D" "$line" "$C_N")"
-    elif [[ "$line" == "#"* ]]; then _pc "$(printf '      %s%s%s' "$C_D" "$line" "$C_N")"
-    else _pc "      $line"; fi
-  done <<< "$cmds"
-  _pc "$(printf '    %s%s%s' "$C_M" "$(rule 70)" "$C_N")"; _pc ""
-  printf '%s\n' "$cmds" | log_block "commands for: $where ($how)"
+    # comments dim (never inside a here-document: that is the text of a file)
+    if [[ -z "$inhd" && ( "$line" == "#"* || "$line" == "-- "* || "$line" == "( #"* ) ]]; then _pc "$C_D$line$C_N"
+    else _pc "$line"; fi
+    if [[ -n "$inhd" ]]; then [[ "$line" == "$inhd" ]] && inhd=""
+    elif [[ "$line" =~ $hre && "$line" != "#"* ]]; then inhd=${BASH_REMATCH[1]}; fi
+  done <<< "$body"
+  _pc "$(printf '    %s%s%s' "$C_M" "$(rule "$bw")" "$C_N")"; _pc ""
+  printf '%s\n' "$body" | log_block "commands for: $where (as $who)"
   if [[ -n "$ACTIONS_FILE" ]]; then
-    { printf '\n# ===== %s | step %s | %s | run as: %s\n' "$(ts)" "$CUR_STEP" "$where" "$how"; printf '%s\n' "$cmds"; } | mask_pw >> "$ACTIONS_FILE"
+    { printf '\n# ===== %s | step %s | %s, as %s\n' "$(ts)" "$CUR_STEP" "$where" "$who"; printf '%s\n' "$body"; } | mask_pw >> "$ACTIONS_FILE"
   fi
 }
 
@@ -408,14 +466,51 @@ job_wait_loop() {
   done
 }
 
+step_error() {
+  # $1 = a byte position in the run log. The first real error the action logged after it: the first line of its ✘
+  # messages with an error code (ORA-, RMAN-, INS-, PRVF-, TNS-, SP2-, CRS- ..., [FATAL]), else the first such message.
+  # One line, as it is in the log (masked).
+  [[ -n "$LOG_FILE" && -r "$LOG_FILE" ]] || return 0
+  tail -c +$(( ${1:-0} + 1 )) -- "$LOG_FILE" 2>/dev/null | awk '
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9:]+ \| / {
+      infail = index($0, "| FAIL   | ") > 0
+      if (!infail) next
+      t = $0; sub(/^[^|]*\| FAIL   \| /, "", t)
+    }
+    !/^[0-9][0-9][0-9][0-9]-/ { if (!infail) next; t = $0 }
+    {
+      gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == "") next
+      if (first == "" && t !~ /:$/) first = t
+      if (code == "" && t ~ /((ORA|RMAN|INS|PRV[FGE]|TNS|SP2|CRS|PRC[A-Z]|CLSRSC|ASMCMD|DBT|LRM|OPATCH|UDE|DGM)-[0-9]+)|\[FATAL\]/) code = t
+    }
+    END { r = (code != "" ? code : first); if (length(r) > 150) r = substr(r, 1, 147) "..."; printf "%s", r }'
+}
+EXIT_STEP_FAILED=4
+step_failed_stop() {
+  # $1 step, $2 its error. A failed step after which nothing can be chosen (no retry, no skip): the run ends here,
+  # without a question. The last lines say so, with the error and what to do next. Exit code 4 (a quit is 1).
+  local id=$1 err=$2
+  say "${C_D}How to do this step by hand:  $SELF --help-step $id${C_N}"
+  _log STOP "step $id failed: $err"
+  tty_restore; ui_end
+  CUR_STEP=$id
+  summary "Stopped: step $id failed${err:+ ($err)}"
+  FATAL_SEEN=1            # (a stop from here on prints no second summary)
+  write_last_run "stopped, the step failed"
+  exit "$EXIT_STEP_FAILED"
+}
+
 run_step() {
   local id=$1 kind0=$2 kind=$2 title=$3 checkfn=$4 dofn=${5:-}
   step_in_range "$id" || return 0
-  STEP_ORDER+=("$id"); STEP_TITLE[$id]=$title; CUR_STEP=$id
+  # (a step checked twice in a run, like 2.7 waiting in phase 2 and checked again after the phase-4 visit, is listed once)
+  [[ " ${STEP_ORDER[*]-} " == *" $id "* ]] || STEP_ORDER+=("$id"); STEP_TITLE[$id]=$title; CUR_STEP=$id
+  STEP_T0[$id]=$SECONDS; unset "DO_T0[$id]"
   if [[ $UI -eq 1 ]]; then ui_step_begin "$id" "$title"
   else printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "$id" "$C_N" "$C_W" "$title" "$C_N"; fi
   _log STEP "[$id] $title"
-  local rc drc acted=0 helped=0 opts w
+  local rc drc acted=0 helped=0 opts w ferr=""
   PRIM_RAN=0
   # (phase 4 needs nothing of this server: it is judged also while a job runs)
   if [[ -n "$JOB_BUSY_PHASE" && "${id%%.*}" -ge "$JOB_BUSY_PHASE" && "${id%%.*}" != 4 ]]; then
@@ -459,7 +554,7 @@ run_step() {
         if [[ -n "$pend" ]]; then
           [[ "$pend" == "-" ]] && pend="(nothing to take back; see --help-step $id)"
           local phow; phow=$(primary_pending_how "$id")
-          journal PRIMARY "$id" "${phow:+[as $phow] }$pend"; primary_pending_del "$id"
+          journal PRIMARY "$id" "${P4_CHANGE[$id]:+changed: ${P4_CHANGE[$id]}; }${phow:+[as $phow] }$pend"; primary_pending_del "$id"
         fi
       else ok_lines "${NOW:-Already correct}"; record "$id" OK; fi
       return 0
@@ -513,7 +608,8 @@ run_step() {
       esac
     fi
     # rc 1: something must be done
-    is_optional "$id" && say "${C_D}Optional: needed only for switchover and the broker, not to build the standby.${C_N}"
+    if [[ "$id" == 9.9 ]]; then say "${C_D}Optional: needed only for --health to check the primary, not to build the standby.${C_N}"
+    else is_optional "$id" && say "${C_D}Optional: needed only for switchover and the broker, not to build the standby.${C_N}"; fi
     [[ -n "$NOW" ]] && printf '%s\n' "$NOW" | block "Now:"
     if [[ "$kind" == "primary" || "$kind" == "manual" ]]; then
       local where how
@@ -571,7 +667,11 @@ run_step() {
     fi
     _log DO "[$id] start"
     JOURNAL_STEP_ENTRIES=0
+    # where the log is now: the first error the action logs is found after this point (step_error)
+    local logpos=0; [[ -n "$LOG_FILE" ]] && logpos=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || printf 0)
+    DO_T0[$id]=$SECONDS
     ui_flush; drc=0; IN_DO=1; "$dofn" || drc=$?; IN_DO=0
+    _log DO "[$id] end, exit code $drc, after $(ui_dur $((SECONDS - DO_T0[$id])))"
     if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $(on_demand "$id" && printf '%s --roll-forward' "$SELF" || printf '%s --from %s' "$SELF" "$id")"; return 0; fi
     if [[ $drc -eq 0 ]]; then
       NOW=""; CHECK_WAITS=0; "$checkfn"; rc=$?
@@ -594,17 +694,27 @@ run_step() {
         # the action did its part; one more thing must be done by hand (shown next, then checked)
         say "Done so far. One more thing must be done by hand:"; acted=1; continue
       fi
+      if [[ $rc -eq 1 && "$KIND_NOW" == "primary" ]]; then
+        # the action did its part here (9.9: the key); the rest is on the primary (shown next, then checked).
+        # acted stays 0: nothing was done on the primary yet, so no "Not done yet" line before the box
+        ok_lines "Done on this server. Now on the primary:"; continue
+      fi
+      # the error is what the check says now
+      ferr=${NOW%%$'\n'*}
       bad "The action ran, but the check still fails. ${NOW:-}"
     else
+      # the error is the first one the action reported (an ORA-, RMAN-, INS- ... line, else its first ✘ message)
+      ferr=$(step_error "$logpos")
       bad "The action did not finish."
     fi
+    [[ -n "$ferr" ]] || ferr="the action did not finish"
     if [[ $DO_FAIL_STOP_ONLY -eq 1 ]]; then
-      # a retry here would build on what the failed action left: the clean-up is in an earlier step
+      # a retry here would build on what the failed action left: the clean-up is in an earlier step.
+      # Nothing can be chosen here, so nothing is asked: the run ends with the error (exit code 4)
       DO_FAIL_STOP_ONLY=0
-      record "$id" FAILED
+      NOW=$ferr; record "$id" FAILED
       say "The script cannot go on from here. The next run first shows how to clean up this server (step 7.2)."
-      while true; do ask_choice "[h] Help   [q] Quit" "hq"; [[ "$ANSWER" == "q" ]] && break; show_help "$id" || true; done
-      user_stop "Stopped after the failed step $id"
+      step_failed_stop "$id" "$ferr"
     fi
     [[ $helped -eq 0 ]] && { how_by_hand "$id"; helped=1; }
     opts="[r] Try again   [s] Skip   [h] Help   [q] Quit"; local allowed2="rshq"
@@ -612,8 +722,9 @@ run_step() {
     [[ "$id" == "1.2" ]] && { opts="[r] Try again   [i] Other IP address or user   [h] Help   [q] Quit"; allowed2="rihq"; }
     ask_choice "$opts" "$allowed2"
     case "$ANSWER" in
-      s) warn "Skipped after an error."; record "$id" FAILED_SKIPPED; [[ "$id" == 1.* ]] || AUTO_WAIT["step $id"]=1; return 0 ;;
-      q) user_stop "Stopped by you" ;;
+      s) NOW=$ferr; warn "Skipped after an error."; record "$id" FAILED_SKIPPED; [[ "$id" == 1.* ]] || AUTO_WAIT["step $id"]=1; return 0 ;;
+      # (the step failed, then you quit: it is recorded as failed, with its error, not as "stopped here")
+      q) NOW=$ferr; record "$id" FAILED; user_stop "Stopped by you" ;;
       h) show_help "$id" || true; continue ;;
       i) reenter_primary; UI_RETRY=1; continue ;;
       *) UI_RETRY=1; continue ;;
@@ -621,8 +732,38 @@ run_step() {
   done
 }
 
+VERBOSE=${DG_VERBOSE:-0}       # 1 (--verbose): the end summary lists every step (else a fully OK phase is one line)
+step_good() { case "$1" in OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE) return 0 ;; esac; return 1; }
+summary_step_line() {
+  # one step of the summary: number, result, title, and under a step that is not ok its reason or error
+  local id=$1 r=$2
+  printf '    %-5s %s%-18s%s %s\n' "$id" "$(result_color "$r")" "$(result_label "$r")" "$C_N" "${STEP_TITLE[$id]}"
+  case "$r" in
+    OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|TODO) ;;
+    *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '          %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:110}" "$C_N" ;;
+  esac
+}
+summary_dg_now() {
+  # the state of Data Guard at the end of a run that reached phase 10: only what the steps of this run found
+  # (no new query), one line each
+  [[ -n "${STEP_RESULT[10.1]:-}${STEP_RESULT[10.4]:-}" ]] || return 0
+  local -a ids=(9.2 10.4 9.5 10.1 10.2 10.3 10.8) labels=("Standby" "Redo apply" "Transport" "Lag" "Gap" "Last log" "Archived logs")
+  local i id r txt out=""
+  for ((i = 0; i < ${#ids[@]}; i++)); do
+    id=${ids[$i]}; r=${STEP_RESULT[$id]:-}
+    [[ -n "$r" && -n "${STEP_NOW[$id]:-}" ]] || continue
+    txt=${STEP_NOW[$id]}; txt=${txt#Done by you. }; txt=${txt#Done. }
+    step_good "$r" || txt="$(result_label "$r"): $txt"
+    out+="$(printf '    %-14s %s%s%s' "${labels[$i]}" "$(step_good "$r" || printf '%s' "$C_Y")" "${txt:0:100}" "$C_N")"$'\n'
+  done
+  [[ -n "$out" ]] || return 0
+  printf '\n  %sData Guard now%s  %s%s (%s) -> %s (%s), from the checks of this run%s\n%s' "$C_W" "$C_N" "$C_D" \
+    "${PRIMARY_UNIQUE:-primary}" "${PRIMARY_HOST:-$PRIMARY_IP}" "${STANDBY_UNIQUE:-standby}" "$(hostname -s 2>/dev/null)" "$C_N" "$out"
+}
 summary() {
-  local id r col n_ok=0 n_opt=0 n_done=0 n_skip=0 n_bad=0 n_todo=0 n_wait=0 n_prob=0 first_bad=""
+  # $1 (optional): the verdict line of a run that stops here (a failed step); it is printed last, before "Next"
+  local verdict=${1:-}
+  local id r n_ok=0 n_opt=0 n_done=0 n_skip=0 n_bad=0 n_todo=0 n_wait=0 n_prob=0 n_stop=0
   local t="Summary"
   printf '\n\n  %s%s %s %s%s\n' "$C_B" "$(rule 2 "$S_HR2")" "$t" "$(rule $((66 - ${#t})) "$S_HR2")" "$C_N"
   printf '  %sok = was already correct   done = done by the script   done by you = you did it, the script checked it%s\n\n' "$C_D" "$C_N"
@@ -636,17 +777,43 @@ summary() {
       TODO) n_todo=$((n_todo + 1)) ;;
       WAITS|RUNNING) n_wait=$((n_wait + 1)) ;;
       PROBLEM) n_prob=$((n_prob + 1)) ;;
+      NOT_FINISHED) n_stop=$((n_stop + 1)) ;;
       *) n_bad=$((n_bad + 1)) ;;
-    esac
-    col=$(result_color "$r")
-    printf '    %-5s %s%-18s%s %s\n' "$id" "$col" "$(result_label "$r")" "$C_N" "${STEP_TITLE[$id]}"
-    case "$r" in
-      OK|DONE|DONE_BY_YOU|SKIPPED_OPTIONAL|NOT_ON_RELEASE|TODO) ;;
-      *) [[ -n "${STEP_NOW[$id]:-}" ]] && printf '          %s%s%s\n' "$C_D" "${STEP_NOW[$id]:0:100}" "$C_N"
-         [[ -n "$first_bad" ]] || first_bad=$id ;;
     esac
     _log SUM "$id $r ${STEP_TITLE[$id]}"
   done
+  if [[ $VERBOSE -eq 1 ]]; then
+    # every step (--verbose)
+    for id in "${STEP_ORDER[@]}"; do summary_step_line "$id" "${STEP_RESULT[$id]:-NOT_FINISHED}"; done
+  else
+    # one line per phase; under it only the steps that need a look. A phase where every step is fine is one line.
+    local p seen=" " g n nd ws wl
+    for id in "${STEP_ORDER[@]}"; do
+      p=${id%%.*}; [[ "$seen" == *" $p "* ]] && continue; seen+="$p "
+      g=0; n=0; nd=0; ws=0; wl=""
+      local sid
+      for sid in "${STEP_ORDER[@]}"; do
+        [[ "${sid%%.*}" == "$p" ]] || continue
+        r=${STEP_RESULT[$sid]:-NOT_FINISHED}; n=$((n + 1))
+        step_good "$r" && g=$((g + 1))
+        [[ "$r" == DONE || "$r" == DONE_BY_YOU ]] && nd=$((nd + 1))
+      done
+      if [[ $g -eq $n ]]; then
+        printf '    Phase %-3s %-38s %s%s/%s ok%s%s\n' "$p" "${PHASE_TITLES[$p]:-}" "$C_G" "$g" "$n" "$C_N" "$([[ $nd -gt 0 ]] && printf '  (%s done in this run)' "$nd")"
+        continue
+      fi
+      printf '    Phase %-3s %-38s %s/%s ok\n' "$p" "${PHASE_TITLES[$p]:-}" "$g" "$n"
+      for sid in "${STEP_ORDER[@]}"; do
+        [[ "${sid%%.*}" == "$p" ]] || continue
+        r=${STEP_RESULT[$sid]:-NOT_FINISHED}
+        step_good "$r" && continue
+        # check mode: the steps that wait were each shown above; here they are only named
+        if [[ "$MODE" == "check" && "$r" == WAITS ]]; then ws=$((ws + 1)); wl+=" $sid"; continue; fi
+        summary_step_line "$sid" "$r"
+      done
+      [[ $ws -gt 0 ]] && printf '          %s%s waiting (shown above):%s%s\n' "$C_D" "$ws" "$wl" "$C_N"
+    done
+  fi
   local el=$(( $(date +%s) - RUN_START ))
   printf '\n'
   if [[ "$MODE" == "check" ]]; then
@@ -654,8 +821,9 @@ summary() {
     printf '  %sCheck mode changes nothing in Oracle, the OS or the primary, so on a new server most steps are "to do" or "waiting". That is normal.\n' "$C_D"
     printf '  Only "problem" steps need your attention: see the Fix lines above.%s\n' "$C_N"
   else
-    printf '  %s already ok, %s done in this run, %s skipped, %s not ok, %s warnings%s\n' \
-      "$n_ok" "$n_done" "$((n_skip + n_opt))" "$((n_bad + n_todo + n_wait + n_prob))" "$WARN_COUNT" "$( [[ $el -ge 60 ]] && printf '   (run time %s)' "$(human_min $((el / 60)))")"
+    printf '  %s already ok, %s done in this run, %s skipped, %s not ok%s, %s warnings%s\n' \
+      "$n_ok" "$n_done" "$((n_skip + n_opt))" "$((n_bad + n_todo + n_wait + n_prob))" "$([[ $n_stop -gt 0 ]] && printf ', %s stopped here' "$n_stop")" "$WARN_COUNT" \
+      "$( [[ $el -ge 60 ]] && printf '   (run time %s)' "$(ui_dur "$el")")"
     [[ $n_wait -gt 0 ]] && printf '  %s"waiting" steps need a step that was not done in this run. They are checked again next time.%s\n' "$C_D" "$C_N"
   fi
   if [[ ${#WARN_LIST[@]} -gt 0 ]]; then
@@ -672,9 +840,13 @@ summary() {
   # (not again when step 9.7 ran in this run: it showed them)
   local be=""; [[ ${BOOT_ERR_SHOWN:-0} -eq 1 ]] || be=$(boot_errors_now 2>/dev/null)
   [[ -n "$be" ]] && printf '\n  %sAt this boot, the start-at-boot unit reported:%s\n%s\n  To see it all:  journalctl -p err -u %s\n' "$C_Y" "$C_N" "$(sed 's/^/    /' <<< "$be")" "$(unit_name)"
-  printf '\n  Log:        %s\n' "$LOG_FILE"
-  [[ -s "$ACTIONS_FILE" ]] && printf '  Commands:   %s\n' "$ACTIONS_FILE"
-  printf '  %s\n' "$(primary_note)"
+  summary_dg_now
+  # the footer, once: at a stop the stop itself (fatal) prints the log and what the script did on the primary
+  printf '\n'
+  [[ ${FATAL_SEEN:-0} -eq 1 ]] || printf '  Log:               %s\n' "$LOG_FILE"
+  [[ -s "$ACTIONS_FILE" ]] && printf '  Commands for you:  %s\n' "$ACTIONS_FILE"
+  [[ ${FATAL_SEEN:-0} -eq 1 ]] || printf '  %s\n' "$(primary_note)"
+  [[ -n "$verdict" ]] && printf '\n  %s%s %s%s\n' "$C_R" "$S_BAD" "$verdict" "$C_N"
   if [[ "$MODE" == "check" ]]; then
     [[ $((n_todo + n_prob + n_bad)) -gt 0 ]] && printf '\n  %sNext:%s fix the "problem" steps (if any), then run without --check:  %s\n' "$C_W" "$C_N" "$SELF"
   else
@@ -720,9 +892,9 @@ batch_primary_steps() {
   [[ "$MODE" == "run" ]] || return 0
   # the script may run them itself (PRIMARY_RUN=yes): one step at a time, each with its own [y] question
   if [[ "${PRIMARY_RUN:-no}" == yes ]]; then say "${C_D}PRIMARY_RUN=yes: each primary step offers to run its commands over ssh (only the allowed statements).${C_N}"; return 0; fi
-  local id cf rc all="" n=0 how="" BATCH_ERR
+  local id cf rc all="" restart="" n=0 how="" BATCH_ERR
   # file changes (tnsnames.ora, listener.ora, .bash_profile) are shell commands: a second box per user
-  local -a fhow=() fplan=()
+  local -a fhow=() fplan=() fstep=()
   # the connection is opened visibly first: the checks below run quietly
   need_ssh || return 0
   BATCH_ERR=$(mktemp /tmp/dg_batch.XXXXXX) && CLEANUP_FILES+=("$BATCH_ERR") || BATCH_ERR=/dev/null
@@ -744,7 +916,7 @@ batch_primary_steps() {
     # hand follows on its own)
     if [[ " 4.9 4.11 " == *" $id "* ]]; then
       [[ "$PLAN" == *"cat >>"* ]] || { primary_pending_del "$id"; continue; }
-      n=$((n + 1)); fhow+=("${PRIMARY_HOW_STEP%%  ->  *}  ->  shell")
+      n=$((n + 1)); fhow+=("${PRIMARY_HOW_STEP%%  ->  *}  ->  shell"); fstep+=("$id")
       # comment lines of a plan are shell comments in this box
       fplan+=("# Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$(sed 's/^-- /# /' <<< "$PLAN")"$'\n'"${PLAN_UNDO:+# Undo, if ever needed: $PLAN_UNDO}")
       continue
@@ -752,10 +924,25 @@ batch_primary_steps() {
     [[ "$id" == "4.1" ]] && in41=1; [[ "$id" == "4.7" ]] && in47=1
     n=$((n + 1))
     [[ -n "$how" ]] || how=${PRIMARY_HOW_STEP:-$PRIMARY_HOW}
-    all+="-- Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$PLAN"$'\n'"${PLAN_UNDO:+-- Undo, if ever needed: $PLAN_UNDO}"$'\n\n'
+    # a restart of the primary (the "-- DOWNTIME" part of a plan) goes into its own box, after the online changes
+    local on=$PLAN down=""
+    if grep -q '^-- DOWNTIME' <<< "$PLAN"; then
+      on=$(sed '/^-- DOWNTIME/,$d' <<< "$PLAN"); down=$(sed -n '/^-- DOWNTIME/,$p' <<< "$PLAN")
+      restart+="-- Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$down"$'\n\n'
+    fi
+    grep -q '[^[:space:]]' <<< "$(grep -v '^--' <<< "$on")" \
+      && all+="-- Step $id: ${STEP_TITLE_HINT[$id]:-}"$'\n'"$on"$'\n'"${PLAN_UNDO:+-- Undo, if ever needed: $PLAN_UNDO}"$'\n\n'
   done
   CUR_STEP=""
   exec {BATCH_TTY}>&-; BATCH_TTY=""
+  # shell commands for the primary of steps outside this batch (PRIMARY_BATCH_EXTRA): in the same visit
+  local ex xs xu xc
+  for ex in ${PRIMARY_BATCH_EXTRA[@]+"${PRIMARY_BATCH_EXTRA[@]}"}; do
+    xs=${ex%%|*}; ex=${ex#*|}; xu=${ex%%|*}; xc=${ex#*|}
+    [[ "$xs" =~ ^[0-9]+\.[0-9]+$ && -n "$xu" && -n "$xc" ]] || continue
+    n=$((n + 1)); fhow+=("$xu  ->  shell"); fstep+=("$xs")
+    fplan+=("# Step $xs: ${STEP_TITLE_HINT[$xs]:-$(step_title_of "$xs" 2>/dev/null)}"$'\n'"$(sed 's/^-- /# /' <<< "$xc")")
+  done
   # warnings of the quiet checks are shown here (the steps do not repeat them)
   local wi wl wf
   for ((wi = wbefore; wi < ${#WARN_LIST[@]}; wi++)); do
@@ -766,23 +953,31 @@ batch_primary_steps() {
   done
   [[ $n -ge 2 ]] || return 0
   printf '\n  %s%s steps need commands on the primary. They are shown together below, in order.%s\n' "$C_W" "$n" "$C_N"
-  if grep -q '^shutdown immediate' <<< "$all"; then
-    printf '\n    %s%s Step 4.1 restarts the primary database (shutdown immediate, startup mount).%s\n' "$C_Y" "$S_WARN" "$C_N"
-    printf '      %sPlan a short downtime, or choose [o] and run the steps one at a time.%s\n\n' "$C_Y" "$C_N"
+  if [[ -n "$restart" ]] || grep -q '^shutdown immediate' <<< "$all"; then
+    printf '\n    %s%s Step 4.1 restarts the primary database: its own box (DOWNTIME), after the online changes.%s\n' "$C_Y" "$S_WARN" "$C_N"
+    printf '      %sRun it in your change window, or choose [o] and run the steps one at a time.%s\n\n' "$C_Y" "$C_N"
   fi
   CUR_STEP="${1%%.*}.x"
   if [[ -n "$all" ]]; then
     say "The first two lines start SQL*Plus; the rest runs inside SQL*Plus (a line marked SHELL runs in a shell)."
     printf '%s' "${all%$'\n\n'}" | print_commands "Run on the PRIMARY ($PRIMARY_HOST)" "$how"
   fi
-  # the file changes, in a shell, grouped by the user they run as
-  local fi2 fj u done_u=" "
-  for ((fi2 = 0; fi2 < ${#fhow[@]}; fi2++)); do
-    u=${fhow[$fi2]}; [[ "$done_u" == *"|$u|"* ]] && continue; done_u+="|$u|"
+  # the shell commands (file changes, and the extra entries), one box per user on the primary: root first, then
+  # the others in the order they first appear; inside a box the steps in step order
+  local fi2 fj u done_u=" " ord="" k
+  for ((fi2 = 0; fi2 < ${#fhow[@]}; fi2++)); do ord+="$(step_num "${fstep[$fi2]}") $fi2"$'\n'; done
+  local -a fidx=(); [[ -n "$ord" ]] && mapfile -t fidx < <(sort -n -k1,1 -s <<< "${ord%$'\n'}" | cut -d' ' -f2)
+  local -a users=()
+  for k in ${fidx[@]+"${fidx[@]}"}; do [[ "${fhow[$k]}" == "root  ->  shell" ]] && { users=("root  ->  shell"); break; }; done
+  [[ ${#users[@]} -gt 0 ]] && done_u="|${users[0]}|"
+  for k in ${fidx[@]+"${fidx[@]}"}; do u=${fhow[$k]}; [[ "$done_u" == *"|$u|"* ]] || { users+=("$u"); done_u+="|$u|"; }; done
+  for u in ${users[@]+"${users[@]}"}; do
     local fb=""
-    for ((fj = fi2; fj < ${#fhow[@]}; fj++)); do [[ "${fhow[$fj]}" == "$u" ]] && fb+="${fplan[$fj]}"$'\n\n'; done
-    printf '%s' "${fb%$'\n\n'}" | print_commands "Then, in a shell on the PRIMARY ($PRIMARY_HOST)" "$u"
+    for fj in ${fidx[@]+"${fidx[@]}"}; do [[ "${fhow[$fj]}" == "$u" ]] && fb+="${fplan[$fj]}"$'\n\n'; done
+    printf '%s' "${fb%$'\n\n'}" | print_commands "$([[ -n "$all" ]] && printf 'Then, in')$([[ -z "$all" ]] && printf 'In') a shell on the PRIMARY ($PRIMARY_HOST)" "$u"
   done
+  # the restart of the primary last, in its own box: a change window can be planned for it alone
+  [[ -n "$restart" ]] && printf '%s' "${restart%$'\n\n'}" | print_commands "DOWNTIME: restart of the PRIMARY ($PRIMARY_HOST), in your change window" "${how:-$PRIMARY_HOW}"
   [[ $inedit -eq 1 ]] && say "Edits of a file by hand (the static listener entry of 4.10, a changed alias in 4.9), if needed, follow on their own."
   CUR_STEP=""
   say "Afterwards the script checks every step again."
@@ -798,4 +993,9 @@ batch_primary_steps() {
   return 0
 }
 declare -A STEP_TITLE_HINT=()
+# Hook: shell commands for the primary from a step outside phase 4, shown in the combined phase-4 block, so the DBA
+# goes to the primary once. One entry per step and user:  PRIMARY_BATCH_EXTRA+=("2.7|root|<commands>")
+# (commands: shell lines, "-- " or "# " comments; they are printed at column 0 in the box of that user). The entry
+# only prints the commands: the step that added it checks the result at its own time (and journals it as usual).
+declare -a PRIMARY_BATCH_EXTRA=()
 LAST_PLAN_UNDO=""

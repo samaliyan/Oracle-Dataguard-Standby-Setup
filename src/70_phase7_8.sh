@@ -420,7 +420,9 @@ l77_build() {
     # the backup once per run (a backup this run made already is kept: it holds the content before the run)
     [[ -e "$b" || -L "$b" ]] || cp_add root "cp -p --remove-destination $f $b && chmod o-rwx $b"
     # written in place; a write that fails puts the old content back from the backup
-    cp_add root "cat > $f || { cat $b > $f; echo 'The old content was put back.'; exit 1; }" "$txt"
+    # (in braces: the here-document of the shown command feeds the cat, also when it is typed by hand; "false", not
+    # "exit", so that a hand-typed failure does not close the shell)
+    cp_add root "{ cat > $f || { cat $b > $f; echo 'The old content was put back.'; false; }; }" "$txt"
     return 0
   fi
   L77_LINE="$STANDBY_SID:$DB_HOME:N"
@@ -473,7 +475,7 @@ d_7_7() {
     # journaled after each success, as before: the backup, the whole file written again, or the line added
     case "${CP_CMD[$i]}" in
       "cp -p "*) BACKUPS_MADE["$f.bak_$RUN_ID"]=1 ;;
-      "cat > "*) journal_file_written "$f" 1 ;;
+      "cat > "*|"{ cat > "*) journal_file_written "$f" 1 ;;
       "printf "*)
         after=$(stat -c '%s' -- "$f" 2>/dev/null); num "$after" || after=$before
         txt=$L77_LINE; [[ $L77_LEAD -eq 1 ]] && txt=$'\n'"$txt"
@@ -818,7 +820,9 @@ l72_start_list() {
   if ! [[ -f "$p" && "$(cat -- "$p")" == "$(pfile_text)" ]]; then
     [[ -f "$p" && ! -L "$p" && ! -e "$b" && ! -L "$b" ]] && cp_add oracle "cp -p $p $b && chmod o-rwx $b"
     # (written through the open standard input: a non-root user cannot open /dev/stdin when root made the pipe)
-    cp_add oracle "cat > $p && chmod 644 $p" "$(pfile_text)"
+    # two entries: shown as "cat > FILE <<'EOF' ... EOF" and then "chmod 644 FILE", right when typed by hand too
+    cp_add oracle "cat > $p" "$(pfile_text)"
+    cp_add oracle "chmod 644 $p"
   fi
   cp_add oracle "sqlplus -S / as sysdba" "startup nomount pfile='$p'" 1800
 }
@@ -1062,9 +1066,20 @@ space_check() {
       PRE_INFO+="${LABEL[$key]}: $(human_mb "$free") free, $(human_mb "$need") needed ($parts)"$'\n'
     fi
   done
+  # a recovery area set smaller than the primary's on purpose (FRA_SIZE): said, not a stop
+  if [[ -n "$f" && "$(fra_src)" == set ]] && num "${FRA_MB:-}" && [[ ${FRA_MB:-0} -gt 0 && $(fra_size_mb) -lt $FRA_MB ]]; then
+    PRE_INFO+="Warning: the recovery area here ($(human_mb "$(fra_size_mb)"), FRA_SIZE in the settings) is smaller than the primary's ($(human_mb "$FRA_MB")). After a switchover it may not hold the archived logs the primary keeps."$'\n'
+  fi
   [[ -z "$short" ]] && return 0
   PRE_FIX="Not enough space here for the copy:"$'\n'"${short%$'\n'}"
-  [[ -n "$f" && -z "${FRA_SIZE:-}" ]] && PRE_FIX+=$'\n'"The recovery area size ($(human_mb "$(fra_size_mb)")) is an estimate: $(fra_size_why)."
+  if [[ -n "$f" && "$(fra_src)" == primary ]]; then
+    PRE_FIX+=$'\n'"The recovery area here gets the size of the primary's: $(human_mb "$(fra_size_mb)") (db_recovery_file_dest_size of the primary: $(human_mb "$FRA_MB")),"
+    PRE_FIX+=$'\n'"so that after a switchover it holds the same archived logs. Two ways out:"
+    PRE_FIX+=$'\n'"  - add space to $(fra_dest) (and run the check again), or"
+    PRE_FIX+=$'\n'"  - set a smaller size on purpose: $SELF --settings  (FRA_SIZE, in GB; it must fit the free space above). Then 8.1 warns instead of stopping."
+  elif [[ -n "$f" && "$(fra_src)" == estimate ]]; then
+    PRE_FIX+=$'\n'"The recovery area size ($(human_mb "$(fra_size_mb)")) is an estimate: $(fra_size_why)."
+  fi
   [[ -n "$f" ]] && PRE_FIX+=$'\n'"To use another size or place: $SELF --settings  (FRA_SIZE, FRA_DEST, DATA_DEST)"
   local dg
   for dg in $(asm_dgs); do
@@ -1077,6 +1092,8 @@ space_check() {
 dup_prechecks() {
   # read-only. Sets PRE_OK, PRE_INFO (lines), PRE_FIX, DUP_EXTRA, CF_LIST, DEST_N, NEWNAMES.
   PRE_OK=0; PRE_INFO=""; PRE_FIX=""; DUP_EXTRA=""; CF_LIST=""; NEWNAMES=""
+  # the RMAN channels: the values of the settings / the summary, else the suggestion from the CPUs (asked at 8.2)
+  chan_apply
   local_state
   [[ "$LSTATE" == "STARTED" ]] || { PRE_FIX="The standby instance must be in NOMOUNT, but it is $LSTATE (step 7.2)"; return 1; }
   if spfile_from_failed_copy; then PRE_FIX="The instance runs from the spfile of an unfinished copy. Clean up first (step 7.2)"; return 1; fi
@@ -1096,6 +1113,17 @@ dup_prechecks() {
   else
     PRE_INFO+="Release $rel; the patches of $DB_HOME were not compared with the primary (an inventory cannot be read)"$'\n'
   fi
+  # the logs of the standby are multiplexed like the primary's (two members per group or more: a second OMF
+  # destination, the recovery area; 22_storage.sh log_dests). Not read: one member, as before
+  PRIMARY_LOG_MEMBERS=1
+  if [[ "$(place_mode)" != same ]]; then
+    if prim_sql "select nvl(max(count(*)),1) from v\$logfile where type='ONLINE' group by group#;" && num "$(first_line)" && [[ "$(first_line)" -ge 1 ]]; then
+      PRIMARY_LOG_MEMBERS=$(first_line)
+    else _log INFO "the members per log group of the primary could not be read: the standby logs get one place"; fi
+    if [[ $PRIMARY_LOG_MEMBERS -ge 2 && -n "$(second_dest)" ]]; then PRE_INFO+="Logs: the primary has $PRIMARY_LOG_MEMBERS members per group; the standby's logs get two, in $(log_dests | paste -sd' ' -)"$'\n'
+    elif [[ $PRIMARY_LOG_MEMBERS -ge 2 ]]; then PRE_INFO+="Logs: the primary has $PRIMARY_LOG_MEMBERS members per group; the standby's logs get one (no second place of the same kind here)"$'\n'; fi
+    [[ -n "$(second_dest)" ]] && PRE_INFO+="Control files: two, in $(data_dest) and $(second_dest)"$'\n'
+  fi
   # the disk group of the logs must fit the block size of the primary's redo (else ORA-01378 after the copy, at 9.3)
   if use_grid && grid_sw_ok; then
     # every disk group that gets log files: the data disk group (or db_create_file_dest), the disk groups of
@@ -1103,7 +1131,7 @@ dup_prechecks() {
     # not proven = not passed: an unread block size, an unread list of disk groups, an unread sector size
     [[ ${PRIMARY_REDO_BS_KNOWN:-0} -eq 1 ]] || { PRE_FIX="The redo block size of the primary could not be read, so the disk groups for the logs cannot be checked"; return 1; }
     local ldg ldgs="" pm; pm=$(place_mode)
-    if [[ "$pm" == asm ]]; then ldgs=$(data_dest); ldgs=${ldgs#+}       # every log of the standby goes to its data disk group
+    if [[ "$pm" == asm ]]; then ldgs=$(log_dests | grep '^+' | sed 's/^+//' | tr '\n' ' ')   # the log destinations of the standby (data disk group, and the second one when multiplexed)
     elif [[ "$pm" == same ]]; then
       ldgs="$DATA_DG"; [[ "$CFD" == +* ]] && { ldg=$(norm_loc "$CFD"); ldgs=${ldg#+}; }
       if ! prim_sql "select distinct upper(substr(v, 2, decode(instr(v, '/'), 0, length(v), instr(v, '/') - 2))) from (select member v from v\$logfile where member like '+%' union all select value from v\$parameter where name like 'db_create_online_log_dest_%' and value like '+%');"; then
@@ -1130,6 +1158,8 @@ dup_prechecks() {
       fi
       PRE_INFO+="+$ldg: sector size $ss bytes fits the redo block size ${PRIMARY_REDO_BS:-512}"$'\n'
     done
+    # the sector size step 2.13 could not read is proven now: its warnings leave the end summary
+    [[ "$seen" != " " ]] && warn_drop 2.13 "The sector size of * cannot be read here.*" "step 8.1 read the sector size of the disk groups for the logs:$seen"
   fi
   # the copy takes the spfile of the primary (duplicate ... spfile): a primary started from a pfile fails there
   # (a failed query or an answer that is not a value is "could not be read", never "has an spfile")
@@ -1466,24 +1496,22 @@ c_8_2() {
   net_speed_read || true
   local est_lo est_hi; est_lo=$(copy_minutes lo); est_hi=$(copy_minutes hi)
   dup_job_add
-  PLAN="Copy the database from the primary with RMAN (active duplicate), as $ORACLE_USER.
-It runs as a job in its own session: $DB_HOME/bin/rman with the input under \"Will run\"
-(the passwords travel on its standard input only). Output: $(dup_rman_log)$([[ -f "$(pfile_path)" ]] && printf '\nAfter a finished copy, as %s:  mv -f %s %s.pre_duplicate_%s  (the instance uses its spfile then)' "$ORACLE_USER" "$(pfile_path)" "$(pfile_path)" "$RUN_ID")
-Size to copy: about $(human_mb "$PRIMARY_DB_MB"), with $(prim_channels) channels on the primary and $AUX_CHANNELS on this server
+  # the Plan: what the DBA approves, the essential lines first (size, time, channels, load on the primary, the RMAN
+  # statement); how it runs after them. The spfile settings are in the RMAN input under "Will run" only.
+  local fd nset; fd=$(fra_dest); nset=$(grep -c '^      set ' <<< "$DUP_SCRIPT")
+  PLAN="Copy the database from the primary with RMAN (active duplicate), as $ORACLE_USER: about $(human_mb "$PRIMARY_DB_MB").
 Rough time: $(human_min "$est_lo") to $(human_min "$est_hi") ($(copy_speed_text))
-The primary database is only read: nothing is created, dropped or changed in it.
-On the primary during the copy: extra disk and network load, log switches,
-a snapshot control file in its \$ORACLE_HOME/dbs, and an audit file for each login.
-Run the copy when the load is low, for example at night."
-  local fd; fd=$(fra_dest)
-  USING="RMAN command: duplicate target database for standby from active database
-  (dorecover, spfile, nofilenamecheck)
-Database files go to: $(place_text "$(data_dest)")
-Recovery area: $(place_text "$fd")${fd:+, $(human_mb "$(fra_size_mb)")}
-Settings written to the standby spfile:
-$(sed -n 's/^      set /  /p' <<< "$DUP_SCRIPT")
+Channels: $(prim_channels) on the primary, $AUX_CHANNELS on this server ($(chan_src_text))
+The primary is only read (nothing in it is created, dropped or changed), but it gets extra disk and network
+load, log switches, a snapshot control file in its \$ORACLE_HOME/dbs and an audit file per login. Run it when the load is low.
+RMAN: duplicate target database for standby from active database$([[ -n "${DUP_SECTION:-}" ]] && printf ' section size %s' "$DUP_SECTION")
+  dorecover, spfile with $nset settings (the \"set\" lines under \"Will run\"), nofilenamecheck
+It runs as a job in its own session, with the input under \"Will run\" (the passwords only on its standard input).
+Output: $(dup_rman_log)$([[ -f "$(pfile_path)" ]] && printf '\nAfter a finished copy, as %s:  mv -f %s %s.pre_duplicate_%s  (the instance uses its spfile then)' "$ORACLE_USER" "$(pfile_path)" "$(pfile_path)" "$RUN_ID")"
+  USING="Database files go to: $(place_text "$(data_dest)")
+Recovery area: $(place_text "$fd")${fd:+, $(human_mb "$(fra_size_mb)") ($(fra_src_short))}$([[ -n "$(second_dest)" ]] && printf '\nControl files: two, in %s and %s; logs in %s' "$(data_dest)" "$(second_dest)" "$(log_dests | paste -sd' ' -)")
 The RMAN script (the input without the two connect lines) is saved first as $(dup_rman_file)"
-  [[ -z "${TMUX:-}${STY:-}" ]] && USING+=$'\n'"The copy runs in its own session: closing the terminal does not stop it."$'\n'"Run the script again to watch it."
+  [[ -z "${TMUX:-}${STY:-}" ]] && USING+=$'\n'"Closing the terminal does not stop the copy. Run the script again to watch it."
   # Grid is here, but files would go to a file system: said before the copy (the confirmation asks)
   if use_grid && grid_sw_ok && [[ -n "$(fs_dirs)" ]]; then
     warn "This server has ASM, but files of the standby go to the file system: $(fs_dirs | paste -sd' ' -)"$'\n'"To put everything into ASM: answer s, then $SELF --settings (DATA_DEST, FRA_DEST)."
@@ -1530,11 +1558,16 @@ d_8_2() {
   install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
   journal DUPLICATE "$STANDBY_UNIQUE" "RMAN duplicate started: files of the standby are created in $(all_locs | cut -d: -f1 | paste -sd' ' -)"
   local rc=0 nl
+  # the datafiles of the primary and their sizes (read-only), for the progress while the copy runs
+  dup_progress_prepare
   # shown while it starts, as cp_exec does; the whole input (masked) is in the log
   nl=$(grep -c '' <<< "${CP_IN[0]}")
   say "${C_D}Running as $ORACLE_USER (a job):${C_N} $(mask_pw <<< "${CP_CMD[0]}  ->  $(head -n 1 <<< "${CP_IN[0]}")  (and $((nl - 1)) more lines)")"
   { printf 'as %s (a job, output %s): ' "$ORACLE_USER" "$rlog"; cp_entry_text 0; } | mask_pw | log_block "RUN"
+  JOB_PROGRESS_FN=dup_progress
   run_long "RMAN duplicate" "$rlog" 'Starting|Finished|ORA-|RMAN-|copy complete|output file name|restoring|backup set complete' oracle "${CP_CMD[0]}" < <(printf '%s\n' "${CP_IN[0]}") || rc=$?
+  # (a second try in the same run writes to duplicate_<run>_2.log)
+  [[ -n "$RUN_LONG_OUT" ]] && rlog=$RUN_LONG_OUT
   if dup_log_ok "$rlog" "$rc"; then
     # "Finished" in the RMAN output is not the whole proof: the standby itself is looked at first. Only a
     # verified copy gets the "duplicate" marker (otherwise later steps would take the standby as built)
@@ -1555,25 +1588,133 @@ d_8_2() {
   fi
   install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
   RESUME_STEP=7.2; DO_FAIL_STOP_ONLY=1
-  local fe; fe=$(rman_first_error "$rlog")
+  local fe stk; fe=$(rman_first_error "$rlog"); stk=$(rman_error_stack "$rlog")
   dup_cause_record "$rlog"
+  # the summary line of the step: the error, not the status before the copy
+  NOW="The RMAN copy failed (exit code $rc)${fe:+: ${fe%%$'\n'*}}"
   if [[ "$(dup_cause)" == FRA_FULL ]]; then
     bad "The copy did not finish: the recovery area on this server is full ($(fra_dest), $(human_mb "$(fra_full_mb)"))."
   else
     bad "The copy did not finish (exit code $rc)."
   fi
+  local causes; causes=$(dup_cause_lines "$fe"$'\n'"$stk")
   {
     [[ -n "$fe" ]] && printf 'First error:\n%s\n' "$(sed 's/^/  /' <<< "$fe")"
+    if [[ -n "$causes" ]]; then printf 'Likely cause:\n%s\n' "$causes"
+    else dup_cause_lines --all | sed '1i Common causes (no code of the output matched one of them):'; fi
+    printf 'Alert log of the standby:  %s\n' "$(standby_alert_log)"
+    # the whole first error stack, as RMAN printed it (without the ===== frame), when it has more than the first error
+    if [[ -n "$stk" && "$(grep -c '' <<< "$stk")" -gt "$(grep -c '' <<< "${fe:-x}")" ]]; then
+      printf 'The error stack of the RMAN output:\n%s\n' "$(sed 's/^/  /' <<< "$stk")"
+    fi
     printf 'Full output: %s\n' "$rlog"
-    printf 'Common causes:\n'
-    printf '  ORA-19809, ORA-19804   the recovery area here is full (db_recovery_file_dest_size)\n'
-    printf '  ORA-19504, ORA-17502   a disk group is missing or not mounted\n'
-    printf '  ORA-01017              the password files differ (step 6.1)\n'
-    printf '  ORA-12528, ORA-12514   listener or tnsnames.ora (phase 5)\n'
-    printf '  ORA-15025, ORA-27041   the oracle binary cannot open the ASM disks (setasmgidwrap, step 8.1)\n'
+    dup_left_behind
     printf 'Next: run the script again. Step 7.2 offers to clean up this server%s.\n' "$([[ "$(dup_cause)" == FRA_FULL ]] && printf ', with a bigger recovery area (%s), and the copy runs again' "$(human_mb "$(fra_size_mb)")")"
   } | hint
   return 1
+}
+
+# ---- progress of the copy (read-only: the RMAN output, and the datafile sizes read from the primary before) ----
+DUP_DF_FILE=""; DUP_DF_COUNT=""
+dup_progress_prepare() {
+  # the file "file#|MB" of the primary's datafiles; else only their count (then the GB come from the database size)
+  DUP_DF_COUNT=""
+  [[ -n "$DUP_DF_FILE" ]] || { DUP_DF_FILE=$(mktemp /tmp/dg_dfsizes.XXXXXXXX) && CLEANUP_FILES+=("$DUP_DF_FILE") || DUP_DF_FILE=""; }
+  [[ -n "$DUP_DF_FILE" ]] && : > "$DUP_DF_FILE"
+  if prim_sql "select file#||'|'||round(bytes/1048576) from v\$datafile;" && grep -qE '^[0-9]+\|[0-9]+$' <<< "$SQL_OUT"; then
+    [[ -n "$DUP_DF_FILE" ]] && grep -E '^[0-9]+\|[0-9]+$' <<< "$SQL_OUT" > "$DUP_DF_FILE"
+    DUP_DF_COUNT=$(grep -cE '^[0-9]+\|[0-9]+$' <<< "$SQL_OUT")
+  elif prim_sql "select count(*) from v\$datafile;" && num "$(first_line)"; then
+    DUP_DF_COUNT=$(first_line)
+  fi
+  return 0
+}
+dup_progress() {
+  # $1 RMAN output, $2 start (SECONDS). One line: "datafiles 4 of 10, 49 of 117 GB (42%), about 16 min left".
+  # Read from the RMAN output: a datafile counts when its channel reports the end of its piece (backup sets:
+  # "restoring datafile N" ... "restore complete"; image copies: "input datafile file number=N" ... "datafile copy
+  # complete"); a section counts as its part of the file. The GB use the primary's datafile sizes.
+  local r df nf dmb tot rec el left="" pct
+  r=$(awk -v szf="${DUP_DF_FILE:-/dev/null}" -v nf0="${DUP_DF_COUNT:-0}" -v tot0="${PRIMARY_DB_MB:-0}" '
+    BEGIN { while ((getline l < szf) > 0) { split(l, a, "|"); if (a[1] ~ /^[0-9]+$/) { mb[a[1] + 0] = a[2] + 0; tot += a[2] + 0; nf++ } }
+            if (!nf) { nf = nf0 + 0; tot = tot0 + 0 } }
+    /^channel [^ :]+:/ { ch = $2; sub(/:$/, "", ch) }
+    /restoring datafile [0-9]+/ { if (match($0, /restoring datafile [0-9]+/)) { n = substr($0, RSTART + 19, RLENGTH - 19) + 0; pend[ch] = pend[ch] " " n; if (!(ch in frac)) frac[ch] = 1 } next }
+    /restoring section [0-9]+ of [0-9]+/ { if (match($0, /of [0-9]+/)) { m = substr($0, RSTART + 3, RLENGTH - 3) + 0; if (m > 0) frac[ch] = 1 / m } next }
+    /input datafile file number=[0-9]+/ { if (match($0, /number=[0-9]+/)) { n = substr($0, RSTART + 7, RLENGTH - 7) + 0; pend[ch] = pend[ch] " " n } next }
+    /restore complete|datafile copy complete/ {
+      k = split(pend[ch], p, " "); f = (ch in frac) ? frac[ch] : 1
+      for (i = 1; i <= k; i++) { d[p[i]] += f; if (d[p[i]] > 1) d[p[i]] = 1 }
+      pend[ch] = ""; delete frac[ch]; next }
+    /starting media recovery|Starting recover/ { rec = 1 }
+    END { for (x in d) { if (x in mb) dmb += d[x] * mb[x]; else if (nf) dmb += d[x] * tot / nf; if (d[x] >= 0.999) df++ }
+          printf "%d|%d|%d|%d|%d\n", df, nf, dmb, tot, rec }' "$1" 2>/dev/null) || return 0
+  IFS='|' read -r df nf dmb tot rec <<< "$r"
+  num "$df" && num "$nf" && num "$dmb" && num "$tot" || return 0
+  [[ $nf -gt 0 && $df -gt $nf ]] && df=$nf
+  [[ $tot -gt 0 && $dmb -gt $tot ]] && dmb=$tot
+  if [[ "$rec" == 1 ]]; then printf 'datafiles copied (%s of %s); now the recovery with the archived logs' "$df" "${nf:-?}"; return 0; fi
+  [[ $nf -gt 0 || $tot -gt 0 ]] || return 0
+  el=$(( SECONDS - ${2:-$SECONDS} ))
+  if [[ $tot -gt 0 ]]; then
+    pct=$(( dmb * 100 / tot ))
+    # a time left only once there is something to go by (2 % and a minute)
+    [[ $dmb -gt 0 && $pct -ge 2 && $el -ge 60 ]] && left=", about $(dur_text $(( el * (tot - dmb) / dmb ))) left"
+    printf 'datafiles %s of %s, %s of %s (%s%%)%s' "$df" "$nf" "$(human_mb "$dmb")" "$(human_mb "$tot")" "$pct" "$left"
+  else
+    printf 'datafiles %s of %s' "$df" "$nf"
+  fi
+}
+
+# ---- a failed copy: the error stack, its likely cause, and what it left on this server ----
+standby_alert_log() { printf '%s/diag/rdbms/%s/%s/trace/alert_%s.log' "${DIAG_DEST:-$ORACLE_BASE}" "${STANDBY_UNIQUE,,}" "$STANDBY_SID" "$STANDBY_SID"; }
+rman_error_stack() {
+  # the first error stack of the RMAN output as RMAN printed it (from "ERROR MESSAGE STACK FOLLOWS", else from the
+  # first RMAN-/ORA- line), without the ===== frame lines; with the lines that continue a message (no code of their
+  # own, for example "Linux-x86_64 Error: 2"). At most 15 lines.
+  local fr=0; grep -qE '^RMAN-00569|ERROR MESSAGE STACK FOLLOWS' "$1" 2>/dev/null && fr=1
+  awk -v fr="$fr" '
+    /^RMAN-00569|ERROR MESSAGE STACK FOLLOWS/ { if (on && n) exit; on = 1; next }
+    /^RMAN-00571/ { next }
+    !on && !fr && /^(RMAN|ORA)-[0-9]+/ { on = 1 }
+    !on { next }
+    /^(RMAN|ORA)-[0-9]+/ { if (n < 15) print; n++; gap = 0; next }
+    /^[[:space:]]*$/ || /^Recovery Manager complete/ || /^RMAN>/ || /^#\| / { if (n) exit; next }
+    { if (!n) next; gap++; if (gap > 2) exit; if (n < 15) print; n++ }
+    END { if (n > 15) printf "... %d more lines in the full output\n", n - 15 }' "$1" 2>/dev/null
+}
+dup_cause_lines() {
+  # $1 error text: the matching rows of the known causes (by ORA code), "--all": every row
+  local t=${1:-} row codes
+  while IFS='|' read -r codes row; do
+    if [[ "$t" == --all ]] || grep -qE "(^|[^0-9])(${codes//,/|})([^0-9]|$)" <<< "$t"; then printf '  %s  (%s)\n' "$row" "${codes//,/, }"; fi
+  done <<'EOF'
+ORA-19809,ORA-19804|the recovery area here is full (db_recovery_file_dest_size)
+ORA-19504,ORA-17502,ORA-15001,ORA-15041,ORA-15040|a disk group is missing, full or not mounted (as grid: asmcmd lsdg)
+ORA-01017|the password files differ (step 6.1)
+ORA-12528,ORA-12514,ORA-12541,ORA-12154|listener or tnsnames.ora (phase 5)
+ORA-15025,ORA-27041|the oracle binary cannot open the ASM disks (setasmgidwrap, step 8.1)
+EOF
+}
+dup_left_behind() {
+  # what the failed copy left on this server (read-only), and what the clean-up of step 7.2 does with it
+  local st lf w=() x
+  local_state
+  case "$LSTATE" in STARTED) st="running in NOMOUNT" ;; MOUNTED) st="MOUNTED (by the copy)" ;; OPEN) st="OPEN" ;; IDLE) st="not running" ;; *) st="${LSTATE,,} (could not be read)" ;; esac
+  printf 'Left on this server now:\n  instance %s: %s\n' "$STANDBY_SID" "$st"
+  [[ "$LSTATE" == IDLE || "$LSTATE" == NOSW ]] || w+=("shutdown abort")
+  if [[ -f "$(spfile_path)" ]]; then printf '  spfile %s (made by the copy)\n' "$(spfile_path)"; w+=("the spfile renamed")
+  else printf '  no spfile (the instance still uses %s)\n' "$(basename "$(pfile_path)")"; fi
+  lf=$(leftover_files 2>/dev/null)
+  if [[ -n "$lf" ]]; then
+    printf '  files of the copy:\n%s\n' "$(sed 's/^/  /' <<< "$lf")"
+    while IFS= read -r x; do [[ -n "$x" ]] && w+=("asmcmd rm -rf $x"); done < <(grep -oE '\+[A-Za-z0-9_$#]+/[A-Za-z0-9_$#]+' <<< "$lf")
+    grep -q '^ */' <<< "$lf" && w+=("the files of the copy in folders removed")
+  else printf '  no files of the copy found\n'; fi
+  if [[ ${#w[@]} -gt 0 ]]; then
+    local t; t=$(printf '%s; ' "${w[@]}"); printf 'Step 7.2 shows its exact commands first: %s.\n' "${t%; }"
+  fi
+  return 0
 }
 
 # ---- the first real error of a failed RMAN run, and its cause ----
@@ -1583,16 +1724,18 @@ rman_first_error() {
   # skipped, and so are errors that only follow from another one (ORA-19849, ORA-19660/19661/19662 after a failed
   # restore). The first real error is shown with the real errors right after it (ORA-19809 + ORA-19804).
   # Nothing left: the first error that is not part of the frame.
-  local out
-  out=$(awk '
+  # (an output with an error stack: read from its start, so that warnings printed before it are not taken)
+  local out fr=0
+  grep -qE '^RMAN-00569|ERROR MESSAGE STACK FOLLOWS' "$1" 2>/dev/null && fr=1
+  out=$({ if [[ $fr -eq 1 ]]; then sed -n '/^RMAN-00569\|ERROR MESSAGE STACK FOLLOWS/,$p' "$1"; else cat -- "$1"; fi; } 2>/dev/null | awk '
     /^(RMAN|ORA)-[0-9]+/ {
       code = $0; sub(/:.*/, "", code)
-      if (code ~ /^RMAN-0(0571|0569|3002|5501|3009|3015)$/ || code ~ /^ORA-(19849|19660|19661|19662)$/) { if (n) stop = 1; next }
+      if (code ~ /^RMAN-0(0571|0569|3002|5501|3009|3015)$/ || code ~ /^ORA-(19849|19660|19661|19662|19870)$/) { if (n) stop = 1; next }
       if (stop) exit
       if (n < 3) { print; n++ }
       next
     }
-    n { stop = 1 }' "$1" 2>/dev/null)
+    n { stop = 1 }')
   [[ -n "$out" ]] || out=$(grep -E '^(RMAN|ORA)-[0-9]+' "$1" 2>/dev/null | grep -vE '^RMAN-0(0571|0569)' | head -n 1)
   printf '%s' "$out"
 }
@@ -1607,12 +1750,12 @@ dup_cause_record() {
     # in the RMAN script of that copy; the estimate of this run only when it is known (a copy that ended unwatched is
     # recorded before the primary is read)
     local b mb="" sz
+    # the size this copy set (its RMAN input: the newest .rman file, or the input in the output), else the
+    # limit ORA-19804 names; the larger of the two
+    sz=$(grep -hoE "db_recovery_file_dest_size='[0-9]+[GM]'" "$1" "$(ls -t "$LOG_DIR"/duplicate_*.rman 2>/dev/null | head -n 1)" 2>/dev/null | tail -n 1 | grep -oE '[0-9]+[GM]')
+    case "$sz" in *G) mb=$(( ${sz%G} * 1024 )) ;; *M) mb=${sz%M} ;; esac
     b=$(grep -m1 -oE 'from [0-9]+ bytes limit' "$1" 2>/dev/null | grep -oE '[0-9]+')
-    num "$b" && mb=$(( b / 1048576 ))
-    if [[ -z "$mb" ]]; then
-      sz=$(grep -hoE "db_recovery_file_dest_size='[0-9]+[GM]'" "$1" "$(ls -t "$LOG_DIR"/duplicate_*.rman 2>/dev/null | head -n 1)" 2>/dev/null | tail -n 1 | grep -oE '[0-9]+[GM]')
-      case "$sz" in *G) mb=$(( ${sz%G} * 1024 )) ;; *M) mb=${sz%M} ;; esac
-    fi
+    num "$b" && { [[ -z "$mb" ]] || [[ $(( b / 1048576 )) -gt $mb ]]; } && mb=$(( b / 1048576 ))
     [[ -z "$mb" && -n "${PRIMARY_DB_MB:-}" ]] && mb=$(fra_size_mb)
     num "$mb" && printf '%s\n' "$mb" > "$(fra_full_file)"
   fi

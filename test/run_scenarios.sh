@@ -20,7 +20,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -347,9 +347,9 @@ fresh empty; rc=$(DG_TEST_CTRLC_AT=3.4 run $T/h4.txt)
 check "Ctrl-C -> stopped, message" "[[ $rc -ne 0 ]] && grep -q 'Interrupted' $T/h4.txt"
 check "Ctrl-C: no response file left, ssh closed" "! ls -d /tmp/dg_rsp.* 2>/dev/null | grep -q . && [[ ! -e $T/varlib/ssh_ctl ]]"
 out=$(cd $T && DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log bash ./dg_standby_setup.sh --help-step all 2>&1); n=$(grep -cE 'Help .{1,3} Step [0-9]' <<< "$out")
-check "--help-step all prints every step (76) and the help of --health" "[[ $n -eq 76 ]] && grep -q 'Unattended health check' <<< \"\$out\""
+check "--help-step all prints every step (77, with 9.9) and the help of --health" "[[ $n -eq 77 ]] && grep -q 'Unattended health check' <<< \"\$out\""
 check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\""
-out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.9 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
+out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.10 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help 2>&1); check "--help shows usage" "grep -q -- '--primary' <<< \"\$out\""
 for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 2.16 3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11 5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2 9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4; do
   grep -q "run_step $st " $T/dg_standby_setup.sh || fail "step $st exists in the script"
@@ -375,7 +375,7 @@ if part J; then
 CUR=J; echo "== J. Primary side not done by the DBA"
 fresh; rc=$(DG_TEST_NOFIX=4.3,4.8,4.10 run $T/j.txt)
 check "4.3 SKIPPED, optional 4.8 / 4.10 SKIPPED_OPTIONAL, others continue" "[[ \$(res 4.3 $T/j.txt) == SKIPPED && \$(res 4.8 $T/j.txt) == SKIPPED_OPTIONAL && \$(res 4.10 $T/j.txt) == SKIPPED_OPTIONAL && \$(res 5.1 $T/j.txt) != '' ]]"
-check "commands for primary were printed, never run" "grep -q \"alter system set log_archive_config='dg_config=(proddb,PRODDB_STBY)' scope=both;\" $T/j.txt && safe_primary"
+check "commands for primary were printed, never run" "grep -q \"alter system set log_archive_config='dg_config=(PRODDB,PRODDB_STBY)' scope=both;\" $T/j.txt && safe_primary"
 fresh; jset $P "d['tns_stby']=1; d['tns_stby_host']='wronghost'"
 rc=$(run $T/j2.txt)
 check "primary alias pointing to a wrong host detected" "grep -q 'is different: HOST is wronghost' $T/j2.txt"
@@ -427,6 +427,7 @@ CUR=N; echo "== N. Software problems"
 fresh empty; jset $S "d['grid_prereq_fail']=1"
 rc=$(run $T/n1.txt)
 check "grid prereq failure -> IGNORE retry -> installed" "grep -q 'Retry and ignore the failed prerequisite checks' $T/n1.txt && grep -q 'ignorePrereqFailure' $T/state/calls.log && [[ \$(res 3.2 $T/n1.txt) == DONE ]]"
+check "grid prereq failure: the failed checks are read from the installer's log and shown before the question" "grep -q 'Failed prerequisite checks:' $T/n1.txt && grep -q 'Swap Size' $T/n1.txt && grep -q 'PRVF-7573' $T/n1.txt && grep -q 'Installer log: /tmp/GridSetupActions' $T/n1.txt && [[ \$(grep -n 'PRVF-7573' $T/n1.txt | head -n 1 | cut -d: -f1) -lt \$(grep -n 'Retry and ignore the failed prerequisite checks' $T/n1.txt | head -n 1 | cut -d: -f1) ]]"
 fresh empty; rc=$(DG_TEST_ASMPW=Asm_Pass123 DG_TEST_ASMPW2=Other_999x DG_TEST_QUIT_AT=3.3 run $T/n2.txt)
 check "ASM password mismatch -> not installed" "grep -q 'The two passwords are not the same' $T/n2.txt && [[ \$(res 3.2 $T/n2.txt) == FAILED_SKIPPED ]]"
 fresh empty; rc=$(DG_TEST_ASMPW=short DG_TEST_QUIT_AT=3.3 run $T/n3.txt)
@@ -489,7 +490,7 @@ check "primary SGA bigger than standby RAM -> no duplicate, clear message" "grep
 fresh; jset $P "d['mem']={'sga_target':str(1024**3),'sga_max_size':str(1024**3),'memory_target':'0','memory_max_target':'0','use_large_pages':'ONLY','db_recovery_file_dest_size':str(900*1024**3)}"
 rc=$(run $T/p6.txt)
 check "use_large_pages=ONLY without HugePages -> TRUE on standby" "grep -q \"set use_large_pages='TRUE'\" $T/log/duplicate_*.rman"
-check "recovery area size from the redo of the primary, not its 900 GB" "grep -qE \"set db_recovery_file_dest_size='[0-9]+G'\" $T/log/duplicate_*.rman && ! grep -qE \"db_recovery_file_dest_size='(900G|921600M)'\" $T/log/duplicate_*.rman"
+check "recovery area size as on the primary (its db_recovery_file_dest_size, 50G in the mock), not an estimate" "grep -qE \"set db_recovery_file_dest_size='50G'\" $T/log/duplicate_*.rman"
 fresh; jset $P "d['params']['log_archive_dest']='/arch'; d['params'].pop('log_archive_dest_1', None)"
 rc=$(DG_TEST_NOFIX=4.4 run $T/p7.txt)
 check "old-style log_archive_dest cleared on standby" "grep -q \"set log_archive_dest=''\" $T/log/duplicate_*.rman"
@@ -510,7 +511,7 @@ fresh; jset $P "d['ids']['oracle']=d['ids']['oracle']+',10(wheel),990(docker)'"
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
 fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/claude-hosts.$$; cat /etc/hosts >> /tmp/claude-hosts.$$; cp /tmp/claude-hosts.$$ /etc/hosts; rm -f /tmp/claude-hosts.$$
-rc=$(DG_TEST_QUIT_AT=2.7 run $T/p12.txt)
+rc=$(DG_TEST_QUIT_AT=2.8 run $T/p12.txt)
 # the address the script puts in: the first non-loopback one of this machine (as in setup_env.sh)
 SIPRE=$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | grep -E '^[0-9.]+$' | head -n 1); SIPRE=${SIPRE//./\\.}
 check "standby host name on loopback -> found and fixed by the script (backup kept)" "grep -q 'resolves to 127.0.1.1 (loopback)' $T/p12.txt && ! grep -qE '^127\.0\.1\.1[[:space:]].*\b'\$(hostname -s)'\b' /etc/hosts && grep -qE '^${SIPRE}[[:space:]]+(.* )?'\$(hostname -s)'( |$)' /etc/hosts && ls /etc/hosts.bak_* >/dev/null 2>&1 && grep -q '|2.6|EDIT|/etc/hosts|' $T/varlib/changes.log"
@@ -666,7 +667,7 @@ chmod 755 $T/ed2.sh
 rc=$(EDITOR=$T/ed2.sh DG_TEST_SETTINGS=e,q run $T/s5b.txt --settings)
 check "--settings shows accepted settings; edit: primary value refused, standby value taken" "grep -q 'These values come from the primary and cannot be changed here: DB_HOME' $T/s5b.txt && grep -q 'Changed: AUX_CHANNELS=8' $T/s5b.txt"
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/s5c.txt)
-check "edited but not accepted -> the summary shows what changed and asks again" "grep -q 'AUX_CHANNELS: 4 -> 8' $T/s5c.txt && grep -q 'Changed since the last run' $T/s5c.txt && grep -q '\[Enter\] Start   \[number\] Change' $T/s5c.txt"
+check "edited but not accepted -> the summary shows what changed and asks again" "grep -qE 'AUX_CHANNELS: [0-9]+ -> 8' $T/s5c.txt && grep -q 'Changed since the last run' $T/s5c.txt && grep -q '\[Enter\] Start   \[number\] Change' $T/s5c.txt"
 # S6 only one run at a time
 fresh; mkdir -p $T/varlib; ( flock $T/varlib/lock sleep 15 ) & lp=$!; sleep 1
 rc=$(run $T/s6.txt); kill $lp 2>/dev/null; wait $lp 2>/dev/null
@@ -735,51 +736,51 @@ if part U; then
 CUR=U; echo "== U. Audit round 3"
 # U1 the same file system UUID as on primary, test file not seen: copy or the SAME disk -> not proven
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1a.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u1a.txt)
 check "same file system UUID -> not accepted, compare the disks, no advice to change the disk" "grep -q 'same file system UUID (aaaa1111' $T/u1a.txt && ! grep -q 'xfs_admin' $T/u1a.txt && grep -q 'Type SEPARATE to continue' $T/u1a.txt && ! grep -qE '^    2\.15 +(ok|done)' $T/u1a.txt"
 touch $T/varlib/storage_clone_confirmed; echo bbbb1111-2222-3333-4444-555566667777 > $T/varlib/storage_clone_ok
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1b.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u1b.txt)
 check "... a general confirmation file or another UUID does not count" "! grep -qE '^    2\.15 +ok' $T/u1b.txt"
 echo aaaa1111-2222-3333-4444-555566667777 >> $T/varlib/storage_clone_ok
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1c.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u1c.txt)
 check "... accepted after the confirmation for exactly this UUID" "grep -qE '^    2\.15 +ok' $T/u1c.txt && grep -q 'you confirmed it is a separate disk' $T/u1c.txt"
 # U1d same UUID on the same disk WWN -> shared (DANGER)
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'"
 jset $O "d['disks']['/dev/vdb']={'mnt':'/u02','size_mb':102400,'wwn':'0x5000c500aaaa0001'}"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1d.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u1d.txt)
 check "same UUID on the same disk WWN -> DANGER, shared" "grep -q 'DANGER' $T/u1d.txt && grep -q 'on the same disk 0x5000c500aaaa0001 as on the primary' $T/u1d.txt"
 # U1e same UUID, other disk ids -> still not proven (ids that differ do not prove two disks)
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'"
 jset $O "d['disks']['/dev/vdb']={'mnt':'/u02','size_mb':102400,'wwn':'0x5000c500bbbb0002','serial':'STBYDISK1'}"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u1e.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u1e.txt)
 check "same UUID, other disk ids -> not accepted without confirmation" "! grep -qE '^    2\.15 +ok' $T/u1e.txt && grep -q 'or the same disk mounted on both servers' $T/u1e.txt"
 # U2 same UUID and the primary user cannot look into the folder -> not proven
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']='/dev/vdb aaaa1111-2222-3333-4444-555566667777'; d['canlook']='NO'"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u2.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u2.txt)
 check "same UUID, folder not visible on primary -> not accepted" "grep -q 'same file system UUID (aaaa1111' $T/u2.txt && ! grep -qE '^    2\.15 +ok' $T/u2.txt"
 # U3 the primary does not show a UUID for one of its file systems, folder not visible -> not proven
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['fsid']=''; d['canlook']='NO'"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u3.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u3.txt)
 check "primary list of UUIDs incomplete, folder not visible -> not proven" "grep -q 'It cannot be proven that this is not the storage of the primary' $T/u3.txt && grep -q 'does not show the UUID of every file system' $T/u3.txt && ! grep -qE '^    2\.15 +ok' $T/u3.txt"
 # U4 folder not visible, but the primary shows all its file systems and this UUID is not one of them -> not shared
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['canlook']='NO'"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u4.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u4.txt)
 check "UUID not mounted on primary (complete list) -> accepted" "grep -qE '^    2\.15 +ok' $T/u4.txt && grep -q 'is not mounted on the primary' $T/u4.txt"
 # U5 test file not seen, but the list of the primary is incomplete -> not proven; U6 confirmed -> accepted
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['mount_uuids']=['']"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u5.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u5.txt)
 check "incomplete UUID list on primary -> not accepted even when the test file is not seen" "! grep -qE '^    2\.15 +ok' $T/u5.txt && grep -q 'does not show the UUID of every file system' $T/u5.txt"
 echo aaaa1111-2222-3333-4444-555566667777 > $T/varlib/storage_clone_ok
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u6.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u6.txt)
 check "... accepted after the confirmation for this disk" "grep -qE '^    2\.15 +ok' $T/u6.txt"
 # U7 the local file system UUID is a file system the primary mounts at ANOTHER path -> not accepted
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['mount_uuids']=['aaaa1111-2222-3333-4444-555566667777']"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u7.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u7.txt)
 check "UUID mounted on primary at another path -> not accepted" "grep -q 'same file system UUID (aaaa1111' $T/u7.txt && ! grep -qE '^    2\.15 +ok' $T/u7.txt"
 # U8 a local disk WWN is a disk under a file system of the primary (other UUID) -> not accepted
 ( export DGT_STORAGE=fs; bash $TD/setup_env.sh empty >/dev/null ); jset $P "d['devid']='TYPE=\"disk\" WWN=\"0x5000c500cccc0003\" SERIAL=\"X\"'"
 jset $O "d['disks']['/dev/vdb']={'mnt':'/u02','size_mb':102400,'wwn':'0x5000c500cccc0003'}"
-rc=$(DG_TEST_QUIT_AT=3.1 run $T/u8.txt)
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/u8.txt)
 check "local disk WWN is under a file system of the primary -> not accepted" "! grep -qE '^    2\.15 +ok' $T/u8.txt && grep -q 'is also under a file system of the primary' $T/u8.txt"
 
 fi
@@ -1353,7 +1354,7 @@ fresh
 rc=$(run $T/z49.txt --only 2.1-2.4)
 check "--only 2.1-2.4: only steps 2.1 to 2.4 (after phase 1), then it stops" "grep -q '^  Step 2.4' $T/z49.txt && ! grep -q '^  Step 2.5' $T/z49.txt && grep -q 'Done: steps 2.1 to 2.4' $T/z49.txt"
 fresh empty
-rc=$(DG_TEST_MENU=7 DG_TEST_MENU_STEPS=x9,2.1-2.2 DG_TEST_MENU_YES=y run $T/z50.txt)
+rc=$(DG_TEST_MENU=7 DG_TEST_MENU_STEPS=x9,2.1-2.2 DG_TEST_SUMMARY=2, run $T/z50.txt)
 check "menu 7 with --yes: a wrong range is asked again, then 2.1-2.2 runs without the [y] question" "grep -q 'This is not a step or a range of steps' $T/z50.txt && grep -q '^  Step 2.2' $T/z50.txt && ! grep -q '^  Step 2.3' $T/z50.txt && grep -q 'Yes (yes to all)' $T/z50.txt && ! grep -q '\[y\] Yes, do it' $T/z50.txt"
 rc=$(DG_TEST_MENU=12,q DG_TEST_MENU_REC=s run $T/z51.txt)
 check "menu 12 then q: shows the status again and stops without running a step (exit 0)" "[[ $rc -eq 0 ]] && [[ \$(grep -c '^  Progress' $T/z51.txt) -ge 2 ]] && ! grep -q '^  Step ' $T/z51.txt"
@@ -1826,7 +1827,7 @@ check "--health, all well: exit 0, one line per check, a log readable by root on
 check "--health asks nothing and opens no password connection" "! grep -q '\\[y\\]\\|password of' $T/z201.txt && grep -q 'master opened by .* with a key' $T/state/primary_cmds.log"
 jset $P "d['root_key']=0"
 rc=$(run $T/z202.txt --health)
-check "--health without an ssh key: local checks done, the primary ones UNKNOWN (exit 3) with a note" "[[ $rc == 3 ]] && grep -qE '^  OK +10\.1 ' $T/z202.txt && grep -qE '^  UNKNOWN +10\.3 ' $T/z202.txt && grep -q 'needs a key for root' $T/z202.txt"
+check "--health without an ssh key: OK from the standby side, the primary checks SKIPPED (not UNKNOWN) with a note naming step 9.9" "[[ $rc == 0 ]] && grep -qE '^OK - ' $T/z202.txt && grep -qE '^  OK +10\.1 ' $T/z202.txt && grep -qE '^  OK +10\.3 ' $T/z202.txt && grep -qE '^  SKIPPED +10\.6 ' $T/z202.txt && grep -q 'primary not checked: no ssh key for root' $T/z202.txt && grep -q 'only 9.9' $T/z202.txt"
 jset $P "d['root_key']=1"
 jset $S "d['instances']['PRODDB_STBY']['dg_stats']='+00 00:00:00|+00 00:00:01|900'"
 rc=$(run $T/z203.txt --health)
@@ -2043,14 +2044,15 @@ check "screen: l lists every step on a separate screen, opened at the current ph
 check "screen: d shows the details of the current step (from the log), h its help, both on a separate screen" "grep -q 'Result   in progress (the current step)' $SN/a/*_alt_3.2_d.txt && grep -q 'status Grid is not installed yet' $SN/a/*_alt_3.2_d.txt && grep -q 'Help  ·  step 3.2' $SN/a/*_alt_3.2_h.txt && grep -q 'Where' $SN/a/*_alt_3.2_h.txt"
 check "screen: the installer output is not on the screen (in its file only), its result is" "! grep -q 'Successfully Setup Software' $T/z500.txt && grep -q 'Grid installer finished' $T/z500.txt && grep -q 'Successfully Setup Software' $T/log/Grid_installer_*.log"
 # a failed install and "try again" in an 80 x 24 terminal: attempt 2 starts on a clean area
-fresh empty; jset $S "d['grid_prereq_fail']=1"
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/b DG_TEST_SNAP=3.2#6 DG_TEST_IGNORE=n DG_TEST_RETRY=3.2 DG_TEST_QUIT_AT=3.3 DG_TEST_TIMEOUT=400 run $T/z501.txt)
+# (3.2 fails here because the two ASM passwords typed differ; a prerequisite failure has its own [r]/[i] question)
+fresh empty
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/b DG_TEST_SNAP=3.2#6 DG_TEST_ASMPW2=Other_999x DG_TEST_RETRY=3.2 DG_TEST_QUIT_AT=3.3 DG_TEST_TIMEOUT=400 run $T/z501.txt)
 check "screen: try again -> 'attempt 2' on a clean area (the earlier attempt is not mixed in), short keys in 80 columns" "grep -q 'Step 3.2  Grid Infrastructure software (Oracle Restart)   attempt 2' $SN/b/*_try6.txt && ! grep -q 'Grid installer failed' $SN/b/*_try6.txt && grep -q 'l: steps  d: details  h: help' $SN/b/*_try6.txt"
 # a long job: one live line; d shows its output so far; an install with warnings (exit code 6) before root.sh
 fresh empty; jset $S "d['installer_sleep']=4; d['grid_warn']=1"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=30x100 DG_TEST_SNAPDIR=$SN/c DG_TEST_SNAP=3.3 DG_TEST_JOBKEYS="Grid installer:d" DG_TEST_QUIT_AT=3.4 DG_TEST_TIMEOUT=400 run $T/z502.txt)
 check "screen: a long job shows one live line (time, keys), d opens its output so far" "grep -q 'Grid installer   running, ' $T/z502.txt && ls $SN/c/*_alt_job_output.txt >/dev/null 2>&1"
-check "3.2: an installer that ends with warnings (exit 6) before root.sh -> done, the warning under it; 3.3 runs root.sh" "grep -qE '✔ 3.2 +Grid Infrastructure software \( done' $SN/c/*_step_3.3.txt && grep -q '! Grid installer finished with warnings' $SN/c/*_step_3.3.txt && grep -q 'Its root scripts have not run yet' $SN/c/*_step_3.3.txt"
+check "3.2: an installer that ends with warnings (exit 6) before root.sh -> done, the warning under it; 3.3 runs root.sh" "grep -qE '✔ 3.2 +Grid Infrastructure software… +done' $SN/c/*_step_3.3.txt && grep -q '! Grid installer finished with warnings' $SN/c/*_step_3.3.txt && grep -q 'Its root scripts have not run yet' $SN/c/*_step_3.3.txt"
 check "3.2: bin/crsctl does not exist before root.sh (as in a real home), and is there after it" "[[ \$(res 3.3 $T/z502.txt) == DONE && -x \$(ls -d $T/u01/app/*/grid | head -n 1)/bin/crsctl ]] && ! grep -q 'cannot confirm the installation' $T/z502.txt"
 # plain output: a small terminal, and --plain
 fresh empty
@@ -2142,7 +2144,7 @@ check "ARCH_CLEANUP_TIME=25:00 is refused (like other wrong values)" "grep -q 'I
 SN=/tmp/dgt_snaps; rm -rf $SN/s1; built523; jset $S "d['srvctl']={}"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/s1 DG_TEST_SNAP=9.1 DG_TEST_QUIT_AT=9.2 DG_TEST_TIMEOUT=300 run $T/w1.txt --from 9.1)
 f=$(ls $SN/s1/*step_9.1.txt 2>/dev/null | head -1)
-check "screen 80x24: a long step keeps its title and the question in view; what does not fit is named (N more lines: d shows all)" "[[ -n '$f' ]] && grep -q 'Step 9.1  Registration in Oracle Restart' $f && grep -q 'Yes, do it' $f && { grep -q 'more lines: d shows all' $f || [[ \$(grep -c -- ' -' $f) -ge 9 ]]; }"
+check "screen 80x24: step 9.1 keeps its title, the Will run heading, the srvctl command and the question in view" "[[ -n '$f' ]] && grep -q 'Step 9.1  Registration in Oracle Restart' $f && grep -q 'Yes, do it' $f && grep -q 'Will run as oracle' $f && grep -q 'srvctl add database -db PRODDB_STBY' $f"
 # the cut part never holds where the commands run, and d shows the whole text (not the log)
 rm -rf $SN/s1b; built523; jset $P "d['static']=0"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/s1b DG_TEST_SNAP=4.10 DG_TEST_KEYS=4.10:d DG_TEST_QUIT_AT=4.10 DG_TEST_TIMEOUT=300 run $T/w2.txt --only 4.10)

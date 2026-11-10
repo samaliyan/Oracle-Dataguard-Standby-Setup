@@ -100,7 +100,7 @@ prim_probe() {
   PROBE_TIMED_OUT=0; PROBE_ERR=""; PROBE_REACHED=0
   [[ $rc -eq 124 ]] && { printf 'no answer from the primary within %s s (%s)\n' "$PROBE_TIMEOUT" "$p" >> "$err"; PROBE_TIMED_OUT=1; warn "The primary did not answer in time ($p). The result of this check is unknown.
 Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
-  { printf '%s\n' "$out"; printf -- '--- stderr ---\n'; cat "$err"; printf '(exit code %s)\n' "$rc"; } | log_block "PRIMARY probe $p: $cmd"
+  probe_log "$p" "$cmd" "$rc" "$out" "$err"
   PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
   rm -f "$err"
   # PROBE_REACHED: the command ran on the primary (the marker came back on a line of its own); else ssh itself failed
@@ -108,6 +108,23 @@ Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
   if [[ "$nl" == *$'\n'"$PROBE_MARK"$'\n'* ]]; then RUN_OUT=${nl#*$'\n'"$PROBE_MARK"$'\n'}; RUN_OUT=${RUN_OUT%$'\n'}; PROBE_REACHED=1
   else RUN_OUT=""; PROBE_REACHED=0; [[ $rc -eq 0 ]] && rc=1; fi
   return $rc
+}
+probe_log() {
+  # $1 probe, $2 command, $3 rc, $4 output, $5 stderr file: a read-only probe in the run log, compact. The marker
+  # line is left out; no output and no stderr = one line; else a header with the rc and the lines under it
+  # (stderr lines marked "stderr:"), without an end line.
+  [[ -n "$LOG_FILE" ]] || return 0
+  local o n e=""
+  o=$(grep -vxF -- "$PROBE_MARK" <<< "$4" | sed '/^[[:space:]]*$/d')
+  [[ -s "$5" ]] && e=$(sed 's/^/stderr: /' -- "$5")
+  [[ -n "$e" ]] && o+="${o:+$'\n'}$e"
+  n=$(grep -c . <<< "$o")
+  if [[ $n -eq 0 ]]; then _log PROBE "PRIMARY $1 (rc $3, no output): $2"
+  elif [[ $n -eq 1 && ${#o} -le 160 ]]; then _log PROBE "PRIMARY $1 (rc $3): $2  ->  $(grep . <<< "$o")"
+  else
+    { printf '%s | PROBE  | PRIMARY %s (rc %s, %s lines): %s\n' "$(ts)" "$1" "$3" "$n" "$2"; sed 's/^/          /' <<< "$o"; } | mask_pw >> "$LOG_FILE"
+  fi
+  return 0
 }
 # new for every run: a login script on the primary cannot print it by chance (or on purpose)
 PROBE_MARK="__DG_PROBE_$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc '0-9a-f')${RANDOM}${RANDOM}__"
