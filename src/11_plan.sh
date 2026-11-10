@@ -56,16 +56,69 @@ cp_text() {
     cp_entry_text "$i" | sed 's/^/  /'
   done
 }
+cp_env_lines() {
+  # the environment of role $1 as export lines (the same values the script gives the command: ORA_ENV / GRID_ENV)
+  local -a e=(); local v
+  case "$1" in
+    oracle) e=(${ORA_ENV[@]+"${ORA_ENV[@]}"}); [[ ${#e[@]} -gt 0 ]] || e=("ORACLE_HOME=$DB_HOME" "ORACLE_SID=$STANDBY_SID" "PATH=$DB_HOME/bin:/usr/bin:/bin") ;;
+    grid)   e=(${GRID_ENV[@]+"${GRID_ENV[@]}"}); [[ ${#e[@]} -gt 0 ]] || e=("ORACLE_HOME=$GRID_HOME" "ORACLE_SID=+ASM" "PATH=$GRID_HOME/bin:/usr/bin:/bin") ;;
+  esac
+  for v in ${e[@]+"${e[@]}"}; do printf 'export %s=%q\n' "${v%%=*}" "${v#*=}"; done
+}
+cp_script_view() {
+  # the whole list as a script that can be run as root (bash FILE) or pasted block by block into a root shell:
+  # here-documents and their end words at column 0, a file as  cat > FILE <<'EOF' ... EOF  and  chmod MODE FILE,
+  # the commands of another user in a  runuser -u USER -- bash -s  block with the same environment the script uses.
+  # Never "exit" in the shell of the user: a guard that ends with exit runs in a subshell (paste_safe).
+  local i r prev="" u e cmd
+  printf '#!/bin/bash\n'
+  printf '# Step %s  %s\n' "${CUR_STEP:-?}" "${STEP_TITLE[${CUR_STEP:-x}]:-}"
+  printf '# The commands of "Will run", in the order the script runs them (it stops at the first one that fails).\n'
+  printf '# Written %s by dg_standby_setup.sh %s. Run as root on %s:  bash %s\n' "$(ts)" "$SCRIPT_VERSION" "$(hostname -s 2>/dev/null)" "${CP_FILE:-FILE}"
+  printf '# When you paste it by hand, paste one block at a time and check its output before the next one.\n'
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    r=${CP_ROLE[$i]}; [[ "$r" == file ]] && r=root
+    if [[ "$r" != "$prev" ]]; then
+      [[ "$prev" == grid || "$prev" == oracle ]] && printf 'END_AS_%s\n' "${prev^^}"
+      printf '\n# ---- as %s\n' "$(cp_user "$r")"
+      if [[ "$r" != root ]]; then
+        # the commands of the block read the script as their input: those without input of their own get /dev/null
+        printf "runuser -u %s -- bash -s <<'END_AS_%s'\n" "$(cp_user "$r")" "${r^^}"
+        printf 'cd / || exit 1\n'
+        cp_env_lines "$r"
+      fi
+      prev=$r
+    fi
+    if [[ "${CP_ROLE[$i]}" == file ]]; then
+      # (the script keeps the old file first, as here)
+      printf 'if [ -e %s ]; then cp -p -- %s "%s.bak_$(date +%%Y%%m%%d_%%H%%M%%S)"; fi\n' "${CP_CMD[$i]}" "${CP_CMD[$i]}" "${CP_CMD[$i]}"
+      printf "cat > %s <<'EOF'\n%s\nEOF\n" "${CP_CMD[$i]}" "${CP_IN[$i]}"
+      printf 'chmod %s %s\n' "${CP_TO[$i]}" "${CP_CMD[$i]}"
+      continue
+    fi
+    cmd=${CP_CMD[$i]}
+    if [[ -n "${CP_IN[$i]}" ]]; then cmd+=$' <<\'EOF\'\n'"${CP_IN[$i]}"$'\nEOF'
+    elif [[ "$r" != root ]]; then cmd+=" < /dev/null"; fi
+    # (inside a runuser block an exit ends that block only: the guard stays as it is)
+    if [[ "$r" == root ]]; then printf '%s\n' "$cmd" | paste_safe; else printf '%s\n' "$cmd"; fi
+  done
+  [[ "$prev" == grid || "$prev" == oracle ]] && printf 'END_AS_%s\n' "${prev^^}"
+  return 0
+}
 cp_show() {
   # before [y]: the list under "Will run" (masked); a long list: its first lines, and the file with all of it
+  # (the file is a script that runs as it is: see cp_script_view)
   cp_any || return 0
-  local txt n
+  local txt n sv
   txt=$(cp_text | mask_pw)
   n=$(grep -c '' <<< "$txt")
   if [[ $n -gt $CP_SHOW_MAX ]]; then
     CP_FILE="$LOG_DIR/commands_${CUR_STEP:-x}_$RUN_ID.txt"
-    if ( umask 077; printf '%s\n' "$txt" > "$CP_FILE" ) 2>/dev/null; then
-      txt="$(head -n $((CP_SHOW_MAX - 2)) <<< "$txt")"$'\n'"... $((n - CP_SHOW_MAX + 2)) more lines. All of them:  $CP_FILE"
+    sv=$(cp_script_view | mask_pw)
+    [[ "$sv" == *'*****'* ]] && sv=$(sed '2a\
+# Passwords are shown as *****: put the real ones in before you run it.' <<< "$sv")
+    if ( umask 077; printf '%s\n' "$sv" > "$CP_FILE" ) 2>/dev/null; then
+      txt="$(head -n $((CP_SHOW_MAX - 2)) <<< "$txt")"$'\n'"... $((n - CP_SHOW_MAX + 2)) more lines. All of them, as a script:  $CP_FILE"
     else CP_FILE=""; fi
   fi
   printf '%s\n' "$txt" | block "Will run"

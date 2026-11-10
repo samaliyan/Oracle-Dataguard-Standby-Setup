@@ -267,10 +267,14 @@ c_3_1() {
   fi
   media_room "$F_GRID" "$F_DB" || return 1
   NOW="Installer files found"
+  # only the settings of this script change (nothing on the server): saved without a question (kind ask: the do
+  # part runs at once, and its result shows them again)
+  KIND_NOW=ask
   PLAN="Use these installer files:"
   [[ $need_g -eq 1 ]] && PLAN+=$'\n'"  Grid:      $(media_desc "$F_GRID")"
   [[ $need_d -eq 1 ]] && PLAN+=$'\n'"  Database:  $(media_desc "$F_DB")"
-  PLAN+=$'\n'"Save them in $SETTINGS_FILE:"
+  if [[ "$MODE" == check ]]; then PLAN+=$'\n'"A normal run saves them in $SETTINGS_FILE, without a question (only the script's settings change):"
+  else PLAN+=$'\n'"Saved now in $SETTINGS_FILE (only the script's settings change, so there is no question):"; fi
   [[ $need_g -eq 1 ]] && PLAN+=$'\n'"  GRID_MEDIA=$F_GRID"
   [[ $need_d -eq 1 ]] && PLAN+=$'\n'"  DB_MEDIA=$F_DB"
   USING="Files of another release than $(want_rel) are ignored."$'\n'"A gold image must come from the primary."
@@ -280,9 +284,9 @@ c_3_1() {
   elif [[ -n "$pp" && -z "$RU_DIR" ]]; then
     USING+=$'\n'"The primary has patches ($pp ...). These base files do not have them."
     USING+=$'\n'"Step 3.11 then asks you to apply them by hand (opatchauto, about an hour)."
-    USING+=$'\n'"Faster: unzip the primary's Release Update on this server now and set RU_DIR"
-    USING+=$'\n'"and OPATCH_ZIP in the settings. The installer then applies it."
-    USING+=$'\n'"To do that: answer q, run $SELF --settings and choose e."
+    USING+=$'\n'"Faster: unzip the primary's Release Update on this server and set the value \"Release Update\""
+    USING+=$'\n'"(RU_DIR and OPATCH_ZIP) on the summary screen of step 1.4: the installer then applies it."
+    USING+=$'\n'"To do that now: answer q at the next question and run $SELF again (or $SELF --settings)."
   fi
   [[ -n "$MEDIA_REFUSED" ]] && USING+=$'\n'"Not used, because of owner or mode: ${MEDIA_REFUSED//$'\n'/ }"
   return 1
@@ -299,7 +303,12 @@ base_media_name() {
     *) printf 'the %s %s home zip file from edelivery.oracle.com' "$2" "$1" ;;
   esac
 }
-d_3_1() { [[ -n "$F_GRID" ]] && GRID_MEDIA=$F_GRID; [[ -n "$F_DB" ]] && DB_MEDIA=$F_DB; save_settings; }
+d_3_1() {
+  # no question before it (kind ask): it only records the files the check found and showed
+  [[ -n "$F_GRID" ]] && GRID_MEDIA=$F_GRID; [[ -n "$F_DB" ]] && DB_MEDIA=$F_DB
+  save_settings || return 1
+  DONE_MSG="Installer files saved in $SETTINGS_FILE"
+}
 
 #------------------------------------------------------------------------------
 # Response files: copy the template from the media, set only the keys it has
@@ -446,13 +455,15 @@ job_show_add() {
   # $1 who (root | grid | oracle), rest = the command of a job the do part starts
   local who=$1; shift
   JOB_SHOWN+=("$who|$(argv_text "$@")")
-  order_add "job, as $(job_user "$who"):  $(argv_text "$@")$(job_env_note "$who")"
+  order_add "as $(job_user "$who") (a job):  $(argv_text "$@")$(job_env_note "$who")"
 }
 order_text() {
-  # the numbered list for PLAN (empty when there is nothing)
+  # the numbered list for PLAN (empty when there is nothing): every job and command of the step, in the order
+  # they run, once. A job is shown here with its exact command; a command of the "Will run" list is named here
+  # and shown there (the jobs are not in that list: they do not run from it)
   local i n=${#ORDER_LINES[@]}
   [[ $n -gt 0 ]] || return 0
-  printf 'In this order (a job runs in its own session, its output goes to a file in %s):\n' "$LOG_DIR"
+  printf 'In this order (a job runs in its own session; its output goes to a file in %s):\n' "$LOG_DIR"
   for ((i = 0; i < n; i++)); do printf '  %s. %s\n' "$((i + 1))" "${ORDER_LINES[$i]}"; done
 }
 job_say() { local who=$1; shift; say "${C_D}Running as $(job_user "$who") (a job):${C_N} $(argv_text "$@" | mask_pw)"; }
@@ -499,10 +510,98 @@ It must not contain a space, a quote, @ / & \$ \` or a backslash."; continue
   return 1
 }
 
+#------------------------------------------------------------------------------
+# The installer's own log after a failure (the failed prerequisite checks are only there)
+#   19c/21c/23ai: /tmp/GridSetupActions<date>/gridSetupActions<date>.log, /tmp/InstallActions<date>/installActions<date>.log
+#   (copied to <inventory>/logs/GridSetupActions<date>/ at the end); 12.x: <inventory>/logs/installActions<date>.log
+#   (/tmp/OraInstall<date>/ while it runs). The installer names its log in its output; else the newest one is taken.
+#------------------------------------------------------------------------------
+installer_log_find() {
+  # $1 installer output, $2 start time (epoch seconds), $3 user the installer ran as. Prints the log file: the first
+  # one the output names that this user can read, else the newest installer log written since $2
+  local f u=$3 t inv; inv=$(inventory_dir)
+  while IFS= read -r f; do
+    [[ -n "$f" && "$f" != *..* && -f "$f" && ! -L "$f" ]] || continue
+    runuser -u "$u" -- test -r "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+  done < <(grep -oE '/[A-Za-z0-9_.,:+@%=/-]+\.log' <<< "$1" | awk -v d="$LOG_DIR/" 'index($0, d) != 1 && !s[$0]++')
+  # newest first; only files of this run of the installer (written since it started)
+  while IFS= read -r f; do
+    [[ -n "$f" && ! -L "$f" ]] || continue
+    t=$(stat -c '%Y' -- "$f" 2>/dev/null) || continue
+    [[ $t -ge $(( $2 - 5 )) ]] || continue
+    runuser -u "$u" -- test -r "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+  done < <(ls -1t -- /tmp/GridSetupActions*/gridSetupActions*.log /tmp/InstallActions*/installActions*.log \
+             /tmp/OraInstall*/installActions*.log "$inv"/logs/*Actions*/*Actions*.log "$inv"/logs/[Ii]nstallActions*.log 2>/dev/null)
+  return 1
+}
+installer_failed_checks() {
+  # $1 log file, $2 user who can read it (the installer user: never root, so the output names no other file).
+  # Prints the failed checks: the "List of failed Tasks" section (name and severity), then the PRVF-/PRVG-/PRVE-
+  # messages; without either, the lines that say a check failed. At most 15 lines.
+  runuser -u "$2" -- cat -- "$1" 2>/dev/null | awk '
+    { l = $0; sub(/\r$/, "", l)
+      # INFO:  [Mar 21, 2020 10:56:20 AM] text   (12.x: INFO: text)
+      sub(/^(INFO|WARNING|SEVERE|CONFIG|FINE|ERROR):[[:space:]]*(\[[^]]*\][[:space:]]*)?/, "", l)
+      sub(/^[[:space:]]+/, "", l); sub(/[[:space:]]+$/, "", l) }
+    l ~ /List of failed Tasks/ { sec = 1; want = 1; next }
+    l ~ /End of failed Tasks/  { sec = 0; next }
+    sec && l ~ /^\*+$/ { want = 1; next }
+    sec && want && l != "" { t = l; if (match(l, /: This is /)) t = substr(l, 1, RSTART - 1); else sub(/: .*/, "", t); if (!(t in seen)) { seen[t] = 1; task[++nt] = t }; cur = t; want = 0; next }
+    sec && l ~ /^Severity:/ { s = l; sub(/^Severity:[[:space:]]*/, "", s); if (cur != "") sev[cur] = s; next }
+    # PRVF-7573 : Sufficient swap size is not available ...   (the message of a failed check; once per id)
+    match(l, /PRV[FGE]-[0-9]+ *:/) { m = substr(l, RSTART); if (length(m) > 150) m = substr(m, 1, 147) "..."
+      id = m; sub(/ *:.*/, "", id); if (!(id in pseen)) { pseen[id] = 1; prv[++np] = m }; next }
+    l ~ /Verification .*(failed|FAILED)|Status:[[:space:]]*FAILED|:[[:space:]]*FAILED$|\.\.\.FAILED|^Result: .*failed/ {
+      if (length(l) > 150) l = substr(l, 1, 147) "..."; if (!(l in fseen)) { fseen[l] = 1; other[++no] = l } }
+    END {
+      n = 0
+      for (i = 1; i <= nt && n < 10; i++) { printf "%s%s\n", task[i], (sev[task[i]] != "" ? "  (" sev[task[i]] ")" : ""); n++ }
+      for (i = 1; i <= np && n < 15; i++) { print prv[i]; n++ }
+      if (n == 0) for (i = 1; i <= no && i <= 10; i++) print other[i]
+    }'
+}
+PREREQ_NAMES=""
+prereq_report() {
+  # after a failed installer run: $1 output, $2 start time, $3 user. Shows its log and the failed checks in it.
+  # PREREQ_NAMES: the names of the failed checks, for the summary
+  local log chk
+  PREREQ_NAMES=""
+  log=$(installer_log_find "$1" "$2" "$3") || log=""
+  if [[ -z "$log" ]]; then
+    local named; named=$(grep -oE '/[A-Za-z0-9_.,:+@%=/-]+\.log' <<< "$1" | awk -v d="$LOG_DIR/" 'index($0, d) != 1' | head -n 1)
+    printf 'Installer log: %s\n' "${named:-not named in its output, and none found in /tmp or $(inventory_dir)/logs}${named:+  (not found, or $3 cannot read it)}" | hint
+    printf 'The failed checks are listed in that log only.\n' | hint
+    return 0
+  fi
+  printf 'Installer log: %s\n' "$log" | hint
+  chk=$(installer_failed_checks "$log" "$3")
+  if [[ -z "$chk" ]]; then
+    printf 'No failed check could be read from it. Look for "List of failed Tasks" or PRVF- / PRVG- in it:\n  grep -nE "List of failed Tasks|PRV[FGE]-" %s\n' "$log" | hint
+    return 0
+  fi
+  printf 'Failed prerequisite checks:\n' | hint
+  sed 's/^/  /' <<< "$chk" | hint
+  PREREQ_NAMES=$(grep -vE '^PRV|^Verification|Status:|^Result:' <<< "$chk" | sed 's/  (.*//' | head -n 4 | paste -sd',' - | sed 's/,/, /g')
+  [[ -n "$PREREQ_NAMES" ]] || PREREQ_NAMES=$(grep -oE '^PRV[FGE]-[0-9]+' <<< "$chk" | head -n 4 | paste -sd',' - | sed 's/,/, /g')
+  return 0
+}
+installer_prereq_failed() { grep -qE 'INS-13013|INS-13014|INS-13016|PRVF-|PRVG-|PRVE-' <<< "$1"; }
+strip_ru_args() {
+  # the words of $@ without -applyRU / -applyPSU and their folder, into STRIP_ARGV (a retry never applies a Release
+  # Update a second time: the failed try may have applied it already)
+  STRIP_ARGV=(); local -a a=("$@"); local i=0
+  while [[ $i -lt ${#a[@]} ]]; do
+    if [[ "${a[$i]}" == "-applyRU" || "${a[$i]}" == "-applyPSU" ]]; then i=$((i + 2)); continue; fi
+    STRIP_ARGV+=("${a[$i]}"); i=$((i + 1))
+  done
+}
+STRIP_ARGV=()
+
 INS08101_RETRIED=0
 run_installer() {
   # $1 title, $2 runner (as_oracle | as_grid), $3 "ignore prerequisites" flag of this installer, rest = command.
-  # Exit codes 0 and 6 are success. Offers one retry that ignores prerequisite failures.
+  # Exit codes 0 and 6 are success. After failed prerequisite checks: shows them, then offers to run it again
+  # (after a fix) or to run it again ignoring them (typed IGNORE).
   local title=$1 runner=$2 ign=$3; shift 3
   INS08101_RETRIED=0
   local who=oracle; [[ "$runner" == "as_grid" ]] && who=grid
@@ -514,21 +613,21 @@ run_installer() {
   esac
   local out; out="$LOG_DIR/$(tr -c 'A-Za-z0-9\n' '_' <<< "$title" | tr -s '_' | tr -d '\n')_$RUN_ID.log"
   say "Starting the $title. It runs silently and takes several minutes."
-  local rc=0 keep=$JOB_KEEP
+  local rc=0 keep=$JOB_KEEP t0; t0=$(date +%s)
   job_launch "$title" "$out" "$who" "$@" < /dev/null || rc=$?
-  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && WARN_DEDUP=0 warn "$title finished with warnings. Output: $out"; installer_done_record "$title"; return 0; fi
+  if [[ $rc -eq 0 || $rc -eq 6 ]]; then [[ $rc -eq 6 ]] && WARN_DEDUP=0 warn "$title finished with warnings. Output: ${RUN_LONG_OUT:-$out}"; installer_done_record "$title"; return 0; fi
   bad "$title failed (exit code $rc)"
-  grep -E 'INS-[0-9]+|PRVF-|PRVG-|PRCZ-|\[FATAL\]|\[WARNING\]|SEVERE' <<< "$RUN_OUT" | head -n 15 | hint
-  grep -oE '(/[A-Za-z0-9_./-]+/(logs|cfgtoollogs)/[A-Za-z0-9_./-]+\.log)' <<< "$RUN_OUT" | sort -u | head -n 3 | sed 's/^/Installer log: /' | hint
+  grep -E 'INS-[0-9]+|PRVF-|PRVG-|PRVE-|PRCZ-|\[FATAL\]|\[WARNING\]|SEVERE' <<< "$RUN_OUT" | head -n 15 | hint
+  # a prerequisite failure: its log and the failed checks are shown below, before the question
+  local lg=""
+  if ! { [[ -n "$ign" ]] && installer_prereq_failed "$RUN_OUT"; }; then
+    lg=$(installer_log_find "$RUN_OUT" "$t0" "$(job_user "$who")") && printf 'Installer log: %s\n' "$lg" | hint
+  fi
   # the retries below never apply a Release Update a second time (the failed try may have applied it already)
   local -a args=("$@"); local home; home=$([[ "$who" == "grid" ]] && printf '%s' "$GRID_HOME" || printf '%s' "$DB_HOME")
   if ru_applied "$home"; then
-    local -a a2=(); local i=0
-    while [[ $i -lt ${#args[@]} ]]; do
-      if [[ "${args[$i]}" == "-applyRU" || "${args[$i]}" == "-applyPSU" ]]; then i=$((i + 2)); continue; fi
-      a2+=("${args[$i]}"); i=$((i + 1))
-    done
-    args=("${a2[@]}"); say "The Release Update is already in $home. A retry does not apply it again."
+    strip_ru_args "${args[@]}"; args=("${STRIP_ARGV[@]}")
+    say "The Release Update is already in $home. A retry does not apply it again."
   fi
   if grep -qE 'INS-32035|INS-32039' <<< "$RUN_OUT"; then
     if [[ ! -f /etc/oraInst.loc ]]; then
@@ -558,7 +657,7 @@ Its group must be %s with write access for the group (mode 770).
       say "Trying again with CV_ASSUME_DISTID=$did, the usual workaround."
       local -a saved_o=("${ORA_ENV[@]}") saved_g=("${GRID_ENV[@]}")
       ORA_ENV+=("CV_ASSUME_DISTID=$did"); GRID_ENV+=("CV_ASSUME_DISTID=$did")
-      rc=0; JOB_KEEP=$keep
+      rc=0; JOB_KEEP=$keep; t0=$(date +%s)
       say "The same command again, with CV_ASSUME_DISTID=$did in its environment:"
       job_say "$who" "${args[@]}"
       run_long "$title (CV_ASSUME_DISTID=$did)" "${out%.log}_distid.log" "" "$who" "${args[@]}" < /dev/null || rc=$?
@@ -575,20 +674,50 @@ Its group must be %s with write access for the group (mode 770).
     fi
     printf 'INS-08101: this installer does not know this Oracle Linux release.\nUse a newer Release Update: unzip it on this server, then set RU_DIR=<folder>\nand OPATCH_ZIP in the settings:\n  %s --settings   (choose e)\nThen run the script again.\n' "$SELF" | hint
   fi
-  if [[ -n "$ign" ]] && grep -qE 'INS-13013|INS-13014|INS-13016|PRVF-|PRVG-' <<< "$RUN_OUT"; then
-    printf 'Some prerequisite checks failed (see the lines above). Fix them if you can.\n' | hint
-    ru_applied "$home" && { local -a a3=(); local j=0; while [[ $j -lt ${#args[@]} ]]; do if [[ "${args[$j]}" == "-applyRU" || "${args[$j]}" == "-applyPSU" ]]; then j=$((j + 2)); continue; fi; a3+=("${args[$j]}"); j=$((j + 1)); done; args=("${a3[@]}"); }
-    printf 'The retry runs, as %s (a job):\n  %s\n' "$(job_user "$who")" "$(argv_text "${args[@]}" "$ign")" | hint
-    if confirm_word "Retry and ignore the failed prerequisite checks" "IGNORE"; then
-      rc=0
-      JOB_KEEP=$keep
-      job_say "$who" "${args[@]}" "$ign"
-      run_long "$title (ignore prereq)" "${out%.log}_2.log" "" "$who" "${args[@]}" "$ign" < /dev/null || rc=$?
-      if [[ $rc -eq 0 || $rc -eq 6 ]]; then warn "$title finished. Failed prerequisite checks were ignored."; installer_done_record "$title"; return 0; fi
-      bad "$title failed again (exit code $rc)"
-      grep -E 'INS-[0-9]+|\[FATAL\]|SEVERE' <<< "$RUN_OUT" | head -n 10 | hint
+  # prerequisite checks failed: show which (from the installer's log), then [r] run it again after a fix,
+  # [i] run it again ignoring them (typed IGNORE), [q] quit. Each run is a job shown before it starts.
+  local n=1 asked=0
+  while [[ -n "$ign" ]] && installer_prereq_failed "$RUN_OUT"; do
+    if [[ $asked -eq 0 ]]; then
+      prereq_report "$RUN_OUT" "$t0" "$(job_user "$who")"
+      ru_applied "$home" && { strip_ru_args "${args[@]}"; args=("${STRIP_ARGV[@]}"); }
+      printf 'Fix them if you can. Then:
+  r runs, as %s (a job):  %s
+  i runs, as %s (a job):  %s
+    (%s: the installer goes on although these checks fail)
+' \
+        "$(job_user "$who")" "$(argv_text "${args[@]}")" "$(job_user "$who")" "$(argv_text "${args[@]}" "$ign")" "$ign" | hint
+      asked=1
     fi
-  fi
+    ask_choice "[r] I fixed them, run it again   [i] Run it again, ignore them   [q] Quit" "riq"
+    case "$ANSWER" in
+      q) user_stop "Stopped by you" ;;
+      i)
+        confirm_word "Retry and ignore the failed prerequisite checks" "IGNORE" || continue
+        rc=0; JOB_KEEP=$keep
+        job_say "$who" "${args[@]}" "$ign"
+        run_long "$title (ignore prereq)" "${out%.log}_ign.log" "" "$who" "${args[@]}" "$ign" < /dev/null || rc=$?
+        if [[ $rc -eq 0 || $rc -eq 6 ]]; then
+          warn "$title finished. Failed prerequisite checks were ignored${PREREQ_NAMES:+: $PREREQ_NAMES}."
+          installer_done_record "$title"; return 0
+        fi
+        bad "$title failed again (exit code $rc)"
+        grep -E 'INS-[0-9]+|\[FATAL\]|SEVERE' <<< "$RUN_OUT" | head -n 10 | hint
+        return 1 ;;
+      r)
+        n=$((n + 1)); rc=0; JOB_KEEP=$keep; t0=$(date +%s); asked=0
+        job_say "$who" "${args[@]}"
+        run_long "$title (run $n)" "${out%.log}_$n.log" "" "$who" "${args[@]}" < /dev/null || rc=$?
+        if [[ $rc -eq 0 || $rc -eq 6 ]]; then
+          [[ $rc -eq 6 ]] && WARN_DEDUP=0 warn "$title finished with warnings. Output: ${RUN_LONG_OUT:-${out%.log}_$n.log}"
+          installer_done_record "$title"; return 0
+        fi
+        bad "$title failed again (exit code $rc)"
+        grep -E 'INS-[0-9]+|PRVF-|PRVG-|PRVE-|\[FATAL\]|SEVERE' <<< "$RUN_OUT" | head -n 10 | hint
+        # another error this time: its log (a prerequisite failure again: shown at the top of the loop)
+        installer_prereq_failed "$RUN_OUT" || { lg=$(installer_log_find "$RUN_OUT" "$t0" "$(job_user "$who")") && printf 'Installer log: %s\n' "$lg" | hint; } ;;
+    esac
+  done
   return 1
 }
 
@@ -665,9 +794,34 @@ run_root_script() {
   [[ -x "$1" ]] || { bad "Root script not found: $1"; return 1; }
   root_prog_ok "$1" || return 1
   local out; out="$LOG_DIR/root_$(basename "$(dirname "$1")")_$(basename "$1" .sh)_$RUN_ID.log"
+  local t0; t0=$(date +%s)
   if job_launch "root script $1" "$out" root "$1" < /dev/null; then say "$1 finished without error."; return 0; fi
   bad "$1 failed. The last lines of its output:"; printf '%s\n' "$RUN_OUT" | tail -n 15 | hint
+  # the reason is often only in its own log (Grid: roothas_<date>.log, named in the output)
+  root_log_report "$RUN_OUT" "$t0"
   return 1
+}
+root_log_report() {
+  # $1 output of a failed root script, $2 its start time: its log (the one the output names, else the newest
+  # roothas / rootcrs log written since $2) and the error lines at its end
+  local f lg="" t d
+  while IFS= read -r f; do
+    [[ -n "$f" && "$f" != *..* && -f "$f" && ! -L "$f" ]] && { lg=$f; break; }
+  done < <(grep -oE '/[A-Za-z0-9_.,:+@%=/-]+\.log' <<< "$1" | awk -v d="$LOG_DIR/" 'index($0, d) != 1' | tail -n 3 | tac)
+  if [[ -z "$lg" ]]; then
+    # 12.2+: <Grid base>/crsdata/<host>/crsconfig; 12.1: <Grid home>/cfgtoollogs/crsconfig
+    for d in "${GRID_BASE:-/nonexistent}/crsdata/$(hostname -s)/crsconfig" "${GRID_HOME:-/nonexistent}/cfgtoollogs/crsconfig"; do
+      f=$(ls -1t -- "$d"/roothas_*.log "$d"/rootcrs_*.log 2>/dev/null | head -n 1)
+      [[ -n "$f" && ! -L "$f" ]] || continue
+      t=$(stat -c '%Y' -- "$f" 2>/dev/null) || continue
+      [[ $t -ge $(( $2 - 5 )) ]] && { lg=$f; break; }
+    done
+  fi
+  [[ -n "$lg" ]] || return 0
+  printf 'Its log: %s\n' "$lg" | hint
+  local err; err=$(tail -n 400 -- "$lg" 2>/dev/null | grep -E 'CLSRSC-[0-9]+|CRS-[0-9]+|PRC[A-Z]-[0-9]+|ORA-[0-9]+|Died at|[Ee]rror|[Ff]ailed' | grep -vE 'CRS-4123|CLSRSC-4002|CLSRSC-4003' | tail -n 10 | cut -c 1-200)
+  [[ -n "$err" ]] && { printf 'The last error lines in it:\n'; sed 's/^/  /' <<< "$err"; } | hint
+  return 0
 }
 ru_args() {
   # with RU_DIR the image installer (gridSetup.sh, 18c+ runInstaller) applies that Release Update first
@@ -721,7 +875,7 @@ opatch_plan() {
   opatch_cmds "$1" "$3" || { order_add "(the step stops here: RU_DIR is set, but OPATCH_ZIP cannot be used: ${OP_ERR%%$'\n'*})"; return 0; }
   [[ -n "$OP_CMDS" ]] || return 0
   while IFS= read -r c; do [[ -n "$c" ]] && cp_add "$2" "$c"; done <<< "$OP_CMDS"
-  order_add "the OPatch commands under \"Will run\" (the Release Update needs a newer OPatch than the media has)"
+  order_add "as $(job_user "$2"): put the newer OPatch into $1 (the commands under \"Will run\"; the Release Update needs it)"
 }
 new_opatch() {
   # $1 home, $2 runner, $3 owner: the Release Update needs a newer OPatch than the base media has.
@@ -781,9 +935,9 @@ unzip_failed_check() {
   [[ -n "$list" ]] || return 0
   NOW="An earlier unzip did not finish. Its folder is incomplete:"$'\n'"${list%$'\n'}"
   if [[ $manual -eq 0 ]]; then
-    PLAN="Empty that folder (nothing is installed there), then unpack the files again"
+    PLAN="Nothing is installed there: it is emptied, then the files are unpacked again."
     local i; for i in "${!SW_UNZIP_DIRS[@]}"; do [[ -d "${SW_UNZIP_DIRS[$i]}" ]] && sw_empty_plan "${SW_UNZIP_DIRS[$i]}"; done
-    order_add "the commands under \"Will run\" that empty the incomplete folder"
+    order_add "as root: empty the incomplete folder (the command under \"Will run\")"
     return 1
   fi
   SW_UNZIP_DIRS=(); SW_UNZIP_OUTS=()
@@ -834,8 +988,12 @@ sw_in_use() {
 sw_empty_cmd() {
   # $1 folder (a plain path, checked with sw_folder_ok): the command that empties it, run as root.
   # find -delete works relative to the folders it has open (no path is read again): a folder above that the
-  # software owner swaps for a link meanwhile cannot lead the deletion anywhere else
-  printf "find %s -xdev -mindepth 1 ! -path '%s/lost+found' ! -path '%s/lost+found/*' -delete" "$1" "$1" "$1"
+  # software owner swaps for a link meanwhile cannot lead the deletion anywhere else.
+  # The plain command; only a folder that is a mount point with lost+found gets the guard that keeps it (shown
+  # so on the screen too: the same text runs). A lost+found made between the check and [y] makes the do part
+  # refuse: the command it would build is no longer the one shown.
+  if [[ -d "$1/lost+found" ]]; then printf "find %s -xdev -mindepth 1 ! -path '%s/lost+found' ! -path '%s/lost+found/*' -delete" "$1" "$1" "$1"
+  else printf 'find %s -xdev -mindepth 1 -delete' "$1"; fi
 }
 sw_empty_plan() { cp_add root "$(sw_empty_cmd "$1")" "" 3600; }     # check: the emptying of folder $1 in the shown list
 sw_empty_folder() {
@@ -945,7 +1103,7 @@ stage_dir() { printf '%s/dg_stage_%s' "$(dirname "$INVENTORY_DIR")" "$1"; }   # 
 unpack_plan() {
   # check: $1 comma list of zip files, $2 target folder, $3 who (grid | oracle): the unzip jobs of unpack_media
   local f; local -a uz=(); IFS=',' read -ra uz <<< "$1"
-  [[ -d "$2" ]] || order_add "make the folder $2 (owner $(job_user "$3"), group $INSTALL_GROUP, mode 775)"
+  [[ -d "$2" ]] || order_add "as root: make the folder $2 (owner $(job_user "$3"), group $INSTALL_GROUP, mode 775)"
   for f in "${uz[@]}"; do job_show_add "$3" unzip -q -o "$f" -d "$2"; done
 }
 unpack_media() {
@@ -1031,7 +1189,7 @@ half_installed_plan() {
   inventory_mark_plan "$1" || PLAN+=$'\n'"     (c stops: the HOME entry of $1 in the inventory cannot be marked)"
   sw_empty_plan "$1"
   [[ -d "$5" ]] && sw_empty_plan "$5"
-  order_add "the commands under \"Will run\": the inventory entry of $1, then emptying it"
+  order_add "as the owner of the inventory, then as root: mark $1 as removed in the inventory, then empty it (the commands under \"Will run\")"
   return 0
 }
 grid_installer() {
@@ -1129,7 +1287,7 @@ plan_jobs_text() {
   # response file, added to PLAN
   local inst=$1; shift
   PLAN+="${PLAN:+$'\n'}$(order_text)"
-  PLAN+=$'\n'"If prerequisite checks fail, you are asked whether to run the installer again with $([[ "$inst" == */gridSetup.sh || "$inst" == "$DB_HOME/runInstaller" ]] && printf -- '-ignorePrereqFailure' || printf -- '-ignorePrereq') added (type IGNORE)."
+  PLAN+=$'\n'"If prerequisite checks fail, they are shown. You then choose: run it again after a fix,"$'\n'"or run it again with $([[ "$inst" == */gridSetup.sh || "$inst" == "$DB_HOME/runInstaller" ]] && printf -- '-ignorePrereqFailure' || printf -- '-ignorePrereq') added (you type IGNORE)."
   PLAN+=$'\n'"$(rsp_plan_text "$@")"
 }
 
@@ -1150,14 +1308,12 @@ inventory_fix_plan() {
     leftover)
       NOW+="${NOW:+$'\n'}$INVENTORY_DIR is not empty, but no Oracle home is registered in it and /etc/oraInst.loc is missing."
       NOW+=$'\n'"These are files of an earlier installer run that did not finish. The installer would stop with INS-32035."
-      PLAN="Move $INVENTORY_DIR aside to $INVENTORY_DIR.old_$RUN_ID (nothing is deleted),"$'\n'"and create it again empty, owner $1, group $INSTALL_GROUP."$'\n'"${PLAN}"
       cp_add root "$(inv_move_cmd)"
-      order_add "the command under \"Will run\" that moves $INVENTORY_DIR aside; then the folder is made again (owner $1, group $INSTALL_GROUP, mode 775)" ;;
+      order_add "as root: move $INVENTORY_DIR aside to $INVENTORY_DIR.old_$RUN_ID, nothing is deleted (the command under \"Will run\"), then make it again, empty (owner $1, group $INSTALL_GROUP, mode 775)" ;;
     registered)
       NOW+="${NOW:+$'\n'}$INVENTORY_DIR holds an inventory with Oracle homes, but /etc/oraInst.loc is missing."
-      PLAN="Write /etc/oraInst.loc (inventory_loc=$INVENTORY_DIR, inst_group=$INSTALL_GROUP), so the installer uses it."$'\n'"${PLAN}"
       cp_add_file /etc/oraInst.loc 644 "$(inv_loc_text)"
-      order_add "the file /etc/oraInst.loc under \"Will run\"" ;;
+      order_add "as root: write /etc/oraInst.loc (shown under \"Will run\"), so the installer uses that inventory" ;;
   esac
 }
 inv_move_cmd() { argv_text mv -T -- "$INVENTORY_DIR" "$INVENTORY_DIR.old_$RUN_ID"; }
@@ -1221,10 +1377,7 @@ c_3_2() {
   local ist; ist=$(inventory_state)
   [[ "$ist" != ok ]] && SW_FIX=inv
   [[ "$ist" == leftover ]] && YES_HOLD=1      # moving the inventory folder aside: asked also with --yes
-  if [[ "$GSTATE" == "NEED_UNZIP" ]]; then
-    if media_is_staged "$GRID_MEDIA"; then PLAN="Unzip ${GRID_MEDIA//,/ + } into $(stage_dir grid), as $GRID_USER"$'\n'
-    else PLAN="Unzip $GRID_MEDIA into $GRID_HOME, as $GRID_USER"$'\n'; fi
-  fi
+  # (the unzip and the installer are jobs: the numbered list below shows them)
   PLAN+="Install Grid silently as $GRID_USER: Oracle Restart for a single server${RU_DIR:+,}
 ${RU_DIR:+  with the Release Update in $RU_DIR}
   Disk group +$DATA_DG, external redundancy, disks $(asm_labels "$DATA_DG" | paste -sd' ' -)
@@ -1288,7 +1441,8 @@ c_3_3() {
       NOW="Oracle Restart is configured (olr.loc exists), but High Availability Services is not running."$'\n'"root.sh may have failed."
       KIND_NOW=manual; MANUAL_HOW="root  ->  shell"
       PLAN="$GRID_HOME/bin/crsctl start has
--- If that fails, read $GRID_HOME/cfgtoollogs/crsconfig/roothas_*.log.
+-- If that fails, read the newest roothas_*.log in ${GRID_BASE:-<Grid base>}/crsdata/$(hostname -s)/crsconfig
+-- (12.1: in $GRID_HOME/cfgtoollogs/crsconfig).
 -- Then undo the configuration and run root.sh again:
 $GRID_HOME/crs/install/roothas.sh -deconfig -force
 $GRID_HOME/root.sh"
@@ -1309,10 +1463,10 @@ $GRID_HOME/OPatch/opatch napply -oh $GRID_HOME -local <folder>/18370031
   NOW="Grid is installed. Its root scripts have not run yet."
   local invd; invd=$(inventory_dir)
   PLAN=""
-  [[ -x "$invd/orainstRoot.sh" ]] && { PLAN="Run $invd/orainstRoot.sh"$'\n'; job_show_add root "$invd/orainstRoot.sh"; }
-  PLAN+="Run $GRID_HOME/root.sh. It configures Oracle Restart on this server."$'\n'"Its questions get the default answers."
+  [[ -x "$invd/orainstRoot.sh" ]] && job_show_add root "$invd/orainstRoot.sh"
   job_show_add root "$GRID_HOME/root.sh"
-  PLAN+=$'\n'"$(order_text)"$'\n'"(as root with a clean environment: PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin, no input)"
+  PLAN="root.sh configures Oracle Restart on this server."
+  PLAN+=$'\n'"$(order_text)"$'\n'"(as root with a clean environment: PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin;"$'\n'"no input, so their questions get the default answers)"
   return 1
 }
 d_3_3() {
@@ -1338,9 +1492,7 @@ c_3_4() {
     NEED_CONFIGTOOLS)
       NOW="Oracle Restart is running. ASM is not configured yet."
       local rspd; rsp_plan_dir >/dev/null; rspd=$RSP_NEXT   # (not in $( ): the name must stay for the action)
-      if [[ -x "$GRID_HOME/gridSetup.sh" ]]; then PLAN="Run gridSetup.sh -executeConfigTools -silent as $GRID_USER"
-      else PLAN="Run $GRID_HOME/cfgtoollogs/configToolAllCommands as $GRID_USER (12.1)"; fi
-      PLAN+=$'\n'"It creates ASM, +$DATA_DG and the listener."
+      PLAN="The Grid configuration tools create ASM, +$DATA_DG and the listener."
       [[ -n "$ASM_PW" ]] || PLAN+=$'\n'"Ask you for the ASM password for SYS and ASMSNMP: the one from step 3.2"$'\n'"(it was not used yet), or a new one"
       if [[ -x "$GRID_HOME/gridSetup.sh" ]]; then
         local tpl; tpl=$(grid_template)
@@ -1642,10 +1794,7 @@ c_3_6() {
   [[ "$DSTATE" == "NEED_UNZIP" ]] && { media_room "" "$DB_MEDIA" || return 1; }
   NOW="Database software is not installed yet"
   PLAN=""
-  if [[ "$DSTATE" == "NEED_UNZIP" ]]; then
-    if media_is_staged "$DB_MEDIA"; then PLAN="Unzip ${DB_MEDIA//,/ + } into $(stage_dir db), as $ORACLE_USER"$'\n'
-    else PLAN="Unzip $DB_MEDIA into $DB_HOME, as $ORACLE_USER"$'\n'; fi
-  fi
+  # (the unzip and the installer are jobs: the numbered list below shows them)
   PLAN+="Install the database software silently as $ORACLE_USER: Software Only, Enterprise Edition${RU_DIR:+,}
 ${RU_DIR:+  with the Release Update in $RU_DIR}
   Home $DB_HOME, base $ORACLE_BASE, OS groups as on the primary"
@@ -1701,10 +1850,9 @@ c_3_7() {
     DONE) NOW="root.sh of the database home has run"; return 0 ;;
     NEED_ROOT)
       NOW="The database software is installed. Its root.sh has not run yet."
-      PLAN=""; [[ -x "$(inventory_dir)/orainstRoot.sh" && ! -f /etc/oraInst.loc ]] && { PLAN="Run $(inventory_dir)/orainstRoot.sh"$'\n'; job_show_add root "$(inventory_dir)/orainstRoot.sh"; }
-      PLAN+="Run $DB_HOME/root.sh. Its questions get the default answers."
+      [[ -x "$(inventory_dir)/orainstRoot.sh" && ! -f /etc/oraInst.loc ]] && job_show_add root "$(inventory_dir)/orainstRoot.sh"
       job_show_add root "$DB_HOME/root.sh"
-      PLAN+=$'\n'"$(order_text)"$'\n'"(as root with a clean environment: PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin, no input)"
+      PLAN="$(order_text)"$'\n'"(as root with a clean environment: PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin;"$'\n'"no input, so their questions get the default answers)"
       return 1 ;;
     HALF_INSTALLED) NOW="The database installer did not finish (step 3.6)"; return 2 ;;
     *) NOW="Database software is not installed yet (step 3.6)"; return 2 ;;

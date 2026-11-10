@@ -40,7 +40,11 @@ init_settings() {
   local k
   for k in $(all_setting_keys); do printf -v "$k" '%s' ""; done
   AUX_CHANNELS=4; PRIMARY_RUN=no
+  # 1 = the RMAN channels are not chosen yet (no value in the settings file): the summary then uses the suggestion
+  # from the CPUs of both servers (chan_default_apply) instead of 4
+  CHAN_DEFAULT=1
 }
+CHAN_DEFAULT=1
 
 valid_value() {
   # $1 type, $2 value
@@ -126,6 +130,7 @@ load_settings() {
       continue        # a primary value is read again from the primary anyway
     fi
     printf -v "$key" '%s' "$val"
+    [[ "$key" == AUX_CHANNELS || "$key" == PRIMARY_CHANNELS ]] && CHAN_DEFAULT=0     # chosen (or accepted) before
   done < "$SETTINGS_FILE"
   if [[ -n "$LOAD_ERR" ]]; then
     [[ "$soft" == "soft" ]] && return 1
@@ -165,7 +170,7 @@ save_settings() {
     printf '# than one channel; 0 = none).\n'
     printf '# DATA_DEST: where the database files go here: +DG (a disk group), same (the paths of the primary) or\n'
     printf '# /folder; empty = automatic (the data disk group when this server has ASM). FRA_DEST: the same for the\n'
-    printf '# recovery area. FRA_SIZE: its size, for example 60G (empty = estimated from the redo of the primary).\n'
+    printf '# recovery area. FRA_SIZE: its size, for example 60G (empty = as on the primary: its db_recovery_file_dest_size;\n# an estimate only when the primary has no recovery area. Smaller on purpose: a warning at step 8.1).\n'
     printf '# PRIMARY_CHANNELS: RMAN channels on the primary (empty = AUX_CHANNELS; never more than AUX_CHANNELS).\n'
     printf '# PRIMARY_RUN: yes = the script may run the listed primary commands over ssh after you agree (step by step).\n'
     printf '# ARCH_CLEANUP: how applied archived logs are deleted on the standby (step 9.8):\n'

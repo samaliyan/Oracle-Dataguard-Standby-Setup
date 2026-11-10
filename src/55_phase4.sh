@@ -37,7 +37,7 @@ dg_config_has() {
 }
 
 # ---- 4.1 ----
-c_4_1() {
+p4c_4_1() {
   need_ssh || return 2
   # every change of phase 4 (scope=spfile/both) and the duplicate (spfile clause) needs a primary started from an spfile
   prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" || { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
@@ -45,7 +45,7 @@ c_4_1() {
     NOW="The primary was started from a text pfile, not from an spfile."$'\n'"The changes of this phase and the RMAN copy need an spfile."
     PLAN="create pfile='?/dbs/init${PRIMARY_SID}_before_dg.ora' from memory;
 create spfile from memory;
--- Then restart the primary once (shutdown immediate; startup) at a quiet time.
+-- Then restart the primary once at a quiet time ($(prim_restart && printf 'srvctl stop database -db %s; srvctl start database -db %s' "$PRIMARY_UNIQUE" "$PRIMARY_UNIQUE" || printf 'shutdown immediate; startup')).
 -- After the restart it uses the spfile. The other changes of this phase need it."
     PLAN_UNDO="delete \$ORACLE_HOME/dbs/spfile${PRIMARY_SID}.ora, then restart with:  startup pfile='?/dbs/init${PRIMARY_SID}_before_dg.ora'"
     return 1
@@ -58,16 +58,40 @@ create spfile from memory;
   if [[ "$lm" == "ARCHIVELOG" && $flok -eq 1 ]]; then NOW="ARCHIVELOG mode is on, force_logging is $fl"; return 0; fi
   NOW="log_mode is $lm, force_logging is $fl"
   PLAN=""
-  [[ $flok -eq 0 ]] && PLAN+="alter database force logging;"$'\n'
-  [[ "$lm" != "ARCHIVELOG" ]] && PLAN+="-- DOWNTIME: the next 4 lines restart the primary database
-shutdown immediate
-startup mount
-alter database archivelog;
-alter database open;"
+  # two parts with a title each: the online change (no downtime), then the restart. A DBA runs the first part at
+  # once and the second in the change window (the restart part always starts with the line "-- DOWNTIME").
+  if [[ $flok -eq 0 ]]; then
+    [[ "$lm" != "ARCHIVELOG" ]] && PLAN+="-- ONLINE (no downtime):"$'\n'
+    PLAN+="alter database force logging;"$'\n'
+  fi
+  [[ "$lm" != "ARCHIVELOG" ]] && PLAN+=$(p41_restart_text)
   PLAN=${PLAN%$'\n'}
   PLAN_UNDO=""; [[ $flok -eq 0 ]] && PLAN_UNDO="alter database no force logging;"
   [[ "$lm" != "ARCHIVELOG" ]] && PLAN_UNDO+="${PLAN_UNDO:+ }-- keep ARCHIVELOG mode (every backup needs it)"
   return 1
+}
+
+prim_restart() { [[ -n "${GRID_HOME:-}" ]]; }     # the primary runs under Oracle Restart (it has a Grid home)
+p41_restart_text() {
+  # the restart part of 4.1 (ARCHIVELOG mode), for SQL*Plus as sysdba. Under Oracle Restart the database is stopped
+  # and started with srvctl (from SQL*Plus with host), so the state of its resource stays right; then sqlplus
+  # connects again.
+  printf '%s\n' "-- DOWNTIME (restart of the primary database): run this part in your change window."
+  if prim_restart; then
+    printf '%s\n' "-- Oracle Restart: srvctl stops and starts the database; after the stop SQL*Plus connects again."
+    printf 'host $ORACLE_HOME/bin/srvctl stop database -db %s -stopoption immediate\n' "$PRIMARY_UNIQUE"
+    printf 'host $ORACLE_HOME/bin/srvctl start database -db %s -startoption mount\n' "$PRIMARY_UNIQUE"
+    printf 'connect / as sysdba\n'
+  else
+    printf 'shutdown immediate\nstartup mount\n'
+  fi
+  printf 'alter database archivelog;\nalter database open;\n'
+}
+p_restart_lines() {
+  # a plain restart of the primary (for 4.1 spfile, 4.7): srvctl under Oracle Restart, else sqlplus
+  if prim_restart; then
+    printf 'host $ORACLE_HOME/bin/srvctl stop database -db %s -stopoption immediate\nhost $ORACLE_HOME/bin/srvctl start database -db %s\n' "$PRIMARY_UNIQUE" "$PRIMARY_UNIQUE"
+  else printf 'shutdown immediate\nstartup\n'; fi
 }
 
 # ---- 4.2 ----
@@ -112,7 +136,7 @@ srl_statements() {
   SRL_INFO=${SRL_INFO%$'\n'}; SRL_STMTS=${SRL_STMTS%$'\n'}
   [[ -z "$SRL_STMTS" ]]
 }
-c_4_2() {
+p4c_4_2() {
   need_ssh || return 2
   local rc=0; srl_statements prim_sql || rc=$?
   [[ $rc -eq 2 ]] && { NOW="Query on the primary failed ($(ora_errors "$SQL_OUT"))"; return 2; }
@@ -127,7 +151,7 @@ c_4_2() {
 }
 
 # ---- 4.3 ----
-c_4_3() {
+p4c_4_3() {
   need_ssh || return 2
   p_param log_archive_config || { NOW="Query on the primary failed"; return 2; }
   if dg_config_has "$PVAL" "$PRIMARY_UNIQUE" && dg_config_has "$PVAL" "$STANDBY_UNIQUE"; then NOW="log_archive_config = $(disp_val "$PVAL")"; return 0; fi
@@ -146,7 +170,8 @@ dg_config_merged() {
   for t in $(tr ',' ' ' <<< "$inner") "$PRIMARY_UNIQUE" "$STANDBY_UNIQUE"; do
     [[ -n "$t" ]] || continue
     [[ "$seen" == *" ${t^^} "* ]] && continue
-    seen+="${t^^} "; out+="${out:+,}$t"
+    # upper case, as Oracle shows the names (v$dataguard_config) and as the standby's spfile gets them
+    seen+="${t^^} "; out+="${out:+,}${t^^}"
   done
   printf '%s' "$out"
 }
@@ -199,7 +224,7 @@ find_dest() {
   for ((n = 2; n <= 31; n++)); do [[ "$n" != "$DEST_N" && "$used" != *" $n "* ]] && { DEST_FREE2=$n; break; }; done
   return 0
 }
-c_4_4() {
+p4c_4_4() {
   need_ssh || return 2
   # log_archive_dest may have been moved on the primary since it was read (answer r): read it again
   if [[ -n "$OLD_ARCH_DEST" || ( -z "$ARCH_LOC" && -z "$FRA_LOC" ) ]]; then read_arch_params || { NOW="Cannot read the archive parameters on the primary"; return 2; }; fi
@@ -260,7 +285,7 @@ alter system set log_archive_dest_$DEST_N='service=$STANDBY_TNS async valid_for=
 }
 
 # ---- 4.5 ----
-c_4_5() {
+p4c_4_5() {
   need_ssh || return 2
   p_param standby_file_management || { NOW="Query on the primary failed"; return 2; }
   [[ "$PVAL" == "AUTO" ]] && { NOW="standby_file_management = AUTO"; return 0; }
@@ -272,7 +297,7 @@ c_4_5() {
 }
 
 # ---- 4.6 ----
-c_4_6() {
+p4c_4_6() {
   need_ssh || return 2
   # read again from the primary: a change made at this step is seen at once
   local of=$FRA_LOC oa=$ARCH_LOC
@@ -323,7 +348,7 @@ alter system set db_recovery_file_dest='${ORACLE_BASE:-/u01/app/oracle}/fast_rec
 }
 
 # ---- 4.7 ----
-c_4_7() {
+p4c_4_7() {
   need_ssh || return 2
   p_param remote_login_passwordfile || { NOW="Query on the primary failed"; return 2; }
   local rlp=$PVAL
@@ -341,9 +366,8 @@ c_4_7() {
       NOW+=$'\n'"remote_login_passwordfile=$sp is already in the spfile."
       NOW+=$'\n'"It takes effect when the primary restarts."
       NOW+=$'\n'"Answer s for now. The RMAN copy (step 8.1) does not start until the primary has restarted."
-      PLAN="-- Restart the primary at a quiet time (as $ORACLE_USER, sqlplus / as sysdba):
-shutdown immediate
-startup"
+      PLAN="-- DOWNTIME (restart of the primary database): at a quiet time, in SQL*Plus as sysdba:
+$(p_restart_lines)"
     else
       PLAN+="alter system set remote_login_passwordfile=exclusive scope=spfile;
 -- Then restart the primary at a quiet time."$'\n'
@@ -399,7 +423,7 @@ orapwd file=\$ORACLE_HOME/dbs/orapw$PRIMARY_SID format=$fmt"$'\n'"$PLAN"
 RLP_PENDING=0
 
 # ---- 4.8 ----
-c_4_8() {
+p4c_4_8() {
   need_ssh || return 2
   p_param fal_server || { NOW="Query on the primary failed"; return 2; }
   if has_token "$PVAL" "${STANDBY_TNS^^}"; then NOW="fal_server = $PVAL"; return 0; fi
@@ -449,7 +473,7 @@ tnsping_class() {
   elif grep -qE 'TNS-03505|TNS-12154' <<< "$1" || ! grep -qi 'adapter' <<< "$1"; then printf 'MISSING'
   else printf 'OTHER'; fi
 }
-c_4_9() {
+p4c_4_9() {
   need_ssh || return 2
   PRIMARY_HOW_STEP="$ORACLE_USER  ->  shell"
   local cls=MISSING
@@ -497,7 +521,7 @@ env ORACLE_HOME=$DB_HOME TNS_ADMIN=$PRIMARY_TNS_ADMIN $DB_HOME/bin/tnsping $STAN
 }
 
 # ---- 4.10 ----
-c_4_10() {
+p4c_4_10() {
   need_ssh || return 2
   local lown; lown=$([[ "$PRIMARY_LISTENER_HOME" == "$DB_HOME" ]] && printf '%s' "$ORACLE_USER" || printf '%s' "$GRID_USER")
   PRIMARY_HOW_STEP="$lown  ->  shell"
@@ -534,7 +558,7 @@ ORACLE_HOME=$PRIMARY_LISTENER_HOME $PRIMARY_LISTENER_HOME/bin/lsnrctl reload $LI
 }
 
 # ---- 4.11 environment of oracle on primary (information) ----
-c_4_11() {
+p4c_4_11() {
   need_ssh || return 2
   PRIMARY_HOW_STEP="$ORACLE_USER  ->  Adds 4 lines to ~/.bash_profile"
   if [[ "$PRIMARY_SSH_USER" == "$ORACLE_USER" ]]; then prim_probe profile || true
@@ -565,11 +589,85 @@ EOF"
   return 1
 }
 
+# ---- every check of phase 4 through p4_track: what changed on the primary (parameter, before, after) is recorded,
+# and a check that still fails after you answered r says so first ("Not done yet") ----
+declare -A P4_CHANGE=()        # step -> "before  ->  after" of a change you made in this run (for the journal and the end)
+p4_before_file() { printf '%s/primary_before' "$STATE_DIR"; }
+not_done_yet() {
+  # after [r] (run_step's "acted", seen here by bash's dynamic scope) a check that still fails: one line first
+  [[ -z "${BATCH_TTY:-}" && ${acted:-0} -eq 1 ]] && bad "Not done yet: ${NOW%%$'\n'*}"
+  return 0
+}
+p4_change_line() {
+  # $1 status before, $2 status now -> "name: old  ->  new" when both are "name = value", else "old  ->  new"
+  local a=$1 b=$2
+  if [[ "$a" == *" = "* && "$b" == *" = "* && "${a%% = *}" == "${b%% = *}" ]]; then printf '%s: %s  ->  %s' "${a%% = *}" "${a#* = }" "${b#* = }"
+  else printf '%s  ->  %s' "$a" "$b"; fi
+}
+p4_track() {
+  # $1 step, $2 its check: run it; remember the status line the first time commands are shown (kept across runs
+  # in primary_before), and when the check passes later, say and record what changed
+  local id=$1 rc=0 f first old
+  "$2" || rc=$?
+  [[ "$MODE" == run && -n "${STATE_DIR:-}" ]] || return $rc
+  f=$(p4_before_file); first=${NOW%%$'\n'*}; first=${first//|/;}
+  old=$(grep -m1 "^$id|" "$f" 2>/dev/null | cut -d'|' -f2-)
+  if [[ $rc -eq 1 && -n "$PLAN" ]]; then
+    if [[ -z "$old" && -n "$first" ]]; then install -d -m 700 "$STATE_DIR"; printf '%s|%s\n' "$id" "$first" >> "$f"; chmod 600 "$f" 2>/dev/null; fi
+    not_done_yet
+  elif [[ $rc -eq 0 && -n "$old" && -z "${BATCH_TTY:-}" && $CHECK_WAITS -eq 0 ]]; then
+    P4_CHANGE[$id]=$(p4_change_line "$old" "$first")
+    NOW+=$'\n'"Changed on the primary: ${P4_CHANGE[$id]}"
+    { grep -v "^$id|" "$f" 2>/dev/null > "$f.n"; mv -f -- "$f.n" "$f"; } 2>/dev/null
+    _log CHANGE "[$id] on the primary (done by you, checked): ${P4_CHANGE[$id]}"
+    [[ -n "${ACTIONS_FILE:-}" ]] && printf '\n# ===== %s | step %s | result: done by you, checked: %s\n' "$(ts)" "$id" "${P4_CHANGE[$id]}" | mask_pw >> "$ACTIONS_FILE" 2>/dev/null
+  fi
+  return $rc
+}
+c_4_1()  { p4_track 4.1 p4c_4_1; }
+c_4_2()  { p4_track 4.2 p4c_4_2; }
+c_4_3()  { p4_track 4.3 p4c_4_3; }
+c_4_4()  { p4_track 4.4 p4c_4_4; }
+c_4_5()  { p4_track 4.5 p4c_4_5; }
+c_4_6()  { p4_track 4.6 p4c_4_6; }
+c_4_7()  { p4_track 4.7 p4c_4_7; }
+c_4_8()  { p4_track 4.8 p4c_4_8; }
+c_4_9()  { p4_track 4.9 p4c_4_9; }
+c_4_10() { p4_track 4.10 p4c_4_10; }
+c_4_11() { p4_track 4.11 p4c_4_11; }
+p4_extras() {
+  # the primary commands of steps outside phase 4, shown in the same visit (PRIMARY_BATCH_EXTRA of the engine):
+  # 2.7 (/etc/hosts, as root) when phase 4 runs before phase 2 (otherwise 2.7 adds it itself), the copy of the
+  # password file out of ASM for 6.1 (as grid)
+  [[ "$MODE" == run && "${PRIMARY_RUN:-no}" != yes ]] || return 0
+  # (also when 2.7 is not part of this run, for example after a stop in phase 4 and --from 4.1, and its last result
+  # is not OK: its line then still comes with this visit)
+  local r27=${LAST_RESULT[2.7]:-}
+  if [[ $P27_DEFERRED -eq 0 && -z "${STEP_RESULT[2.7]:-}" && "$r27" != OK && "$r27" != DONE && "$r27" != DONE_BY_YOU ]] \
+     && { [[ ${PHASE4_FIRST:-0} -eq 1 ]] || ! step_in_range 2.7; }; then
+    local rc=0 e; local -a keep=()
+    NOW=""; PLAN=""; PLAN_UNDO=""; PRIMARY_HOW_STEP=""; CHECK_WAITS=0
+    c_2_7_check >/dev/null 2>&1 || rc=$?
+    if [[ $rc -eq 1 && -n "$PLAN" ]]; then
+      for e in ${PRIMARY_BATCH_EXTRA[@]+"${PRIMARY_BATCH_EXTRA[@]}"}; do [[ "$e" == 2.7\|* ]] || keep+=("$e"); done
+      PRIMARY_BATCH_EXTRA=(${keep[@]+"${keep[@]}"} "2.7|root|$PLAN${PLAN_UNDO:+$'\n'-- Undo, if ever needed: $PLAN_UNDO}")
+      primary_pending_add 2.7 "$PLAN_UNDO"
+    fi
+    NOW=""; PLAN=""; PLAN_UNDO=""; PRIMARY_HOW_STEP=""
+  fi
+  pw_prep_extra
+  return 0
+}
 phase_4() {
   phase_header 4 "Prepare the primary"
   say "The script only reads the primary. You run the changes it shows."
   STEP_TITLE_HINT=([4.1]="ARCHIVELOG and FORCE LOGGING" [4.2]="Standby redo logs" [4.3]="Data Guard names (log_archive_config)" [4.4]="Redo transport to the standby (log_archive_dest_N)" [4.5]="Automatic standby files (standby_file_management)" [4.6]="Archive destination and recovery area" [4.7]="Password file and SYS" [4.8]="fal_server (optional, for switchover)" [4.9]="Standby alias in the primary tnsnames.ora" [4.11]="Environment of $ORACLE_USER on the primary")
+  p4_extras
   batch_primary_steps 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.11
+  # 2.7 waited for this visit (its /etc/hosts line was in the block above): checked now
+  if [[ $P27_DEFERRED -eq 1 ]]; then
+    P27_RECHECK=1; run_step 2.7 primary "Primary resolves the standby host name" c_2_7; P27_RECHECK=0; P27_DEFERRED=0
+  fi
   run_step 4.1  primary "ARCHIVELOG and FORCE LOGGING" c_4_1
   run_step 4.2  primary "Standby redo logs on the primary" c_4_2
   run_step 4.3  primary "Data Guard names (log_archive_config)" c_4_3

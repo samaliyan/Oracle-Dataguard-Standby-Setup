@@ -7,7 +7,8 @@
 #                /dir    a folder here (OMF names)
 #              empty = automatic: the data disk group when this server has ASM, else "same"
 #   FRA_DEST   the recovery area (also the archived logs): +DG, same, /dir, or empty = automatic
-#   FRA_SIZE   its size, for example 60G (empty = estimated from the redo of the primary)
+#   FRA_SIZE   its size, for example 60G (empty = the primary's db_recovery_file_dest_size; an estimate from
+#              the redo of the primary only when the primary has no recovery area)
 #   PRIMARY_CHANNELS / AUX_CHANNELS   RMAN channels on the primary and on this server
 #
 # These functions are the one place for the rules: the RMAN script of the copy, the space checks, the
@@ -117,20 +118,38 @@ fra_estimate_mb() {
   [[ -n "$full" && $mb -lt $(( full * 2 )) ]] && mb=$(( full * 2 ))
   printf '%s' $(( (mb + 1023) / 1024 * 1024 ))
 }
+fra_src() {
+  # where the size of the standby's recovery area comes from: set (FRA_SIZE) | primary (its db_recovery_file_dest_size:
+  # after a switchover the standby must hold the same archived logs) | estimate (the primary has no recovery area)
+  if [[ -n "${FRA_SIZE:-}" ]]; then printf 'set'
+  elif num "${FRA_MB:-}" && [[ ${FRA_MB:-0} -gt 0 ]]; then printf 'primary'
+  else printf 'estimate'; fi
+}
+fra_src_short() {
+  # for the summary and the plan: "as the primary" / "set in the settings" / "estimate"
+  case "$(fra_src)" in set) printf 'set in the settings' ;; primary) printf 'as the primary' ;; *) printf 'estimate' ;; esac
+}
 fra_size_mb() {
-  # FRA_SIZE when set; but never less than twice the size a copy already filled (ORA-19809): the copy would fail again
-  if [[ -n "${FRA_SIZE:-}" ]]; then
-    local v=$(( 10#${FRA_SIZE%G} * 1024 )) full; full=$(fra_full_mb)
-    [[ -n "$full" && $v -lt $(( full * 2 )) ]] && v=$(( (full * 2 + 1023) / 1024 * 1024 ))
-    printf '%s' "$v"; return 0
-  fi
-  fra_estimate_mb
+  # FRA_SIZE when set, else the primary's size (else an estimate); never less than twice the size a copy already
+  # filled (ORA-19809): the copy would fail again
+  local v full; full=$(fra_full_mb)
+  case "$(fra_src)" in
+    set)     v=$(( 10#${FRA_SIZE%G} * 1024 )) ;;
+    primary) v=$(( (FRA_MB + 1023) / 1024 * 1024 )) ;;
+    *)       fra_estimate_mb; return 0 ;;
+  esac
+  [[ -n "$full" && $v -lt $(( full * 2 )) ]] && v=$(( (full * 2 + 1023) / 1024 * 1024 ))
+  printf '%s' "$v"
 }
 fra_size_why() {
+  local full; full=$(fra_full_mb)
   if [[ -n "${FRA_SIZE:-}" ]]; then
     printf 'set by you (FRA_SIZE=%s)' "$FRA_SIZE"
-    local full; full=$(fra_full_mb)
     [[ -n "$full" && $(( 10#${FRA_SIZE%G} * 1024 )) -lt $(( full * 2 )) ]] && printf ', raised: a copy filled %s, so at least twice that' "$(human_mb "$full")"
+    return 0
+  elif [[ "$(fra_src)" == primary ]]; then
+    printf 'as the primary (its db_recovery_file_dest_size: %s; the standby holds the same archived logs after a switchover)' "$(human_mb "$FRA_MB")"
+    [[ -n "$full" && $(( (FRA_MB + 1023) / 1024 * 1024 )) -lt $(( full * 2 )) ]] && printf ', raised: a copy filled %s, so at least twice that' "$(human_mb "$full")"
     return 0
   elif num "${REDO_DAY_MB:-}" && [[ ${REDO_DAY_MB:-0} -gt 0 ]]; then
     printf 'redo of the copy time and one day (%s a day on the primary), plus 30 %%' "$(human_mb "$REDO_DAY_MB")"
@@ -157,6 +176,30 @@ chan_suggest() {
   [[ $p -gt $a ]] && p=$a
   printf '%s %s' "$p" "$a"
 }
+# the channel counts are "set" when the settings or the summary gave them (PRIMARY_CHANNELS, or an AUX_CHANNELS other
+# than the default 4); else the copy uses the suggestion from the CPUs, and step 8.2 asks once (chan_apply, ask_channels)
+CHAN_ASK=""         # "" = not decided yet in this run, 1 = the counts are the suggestion (asked at 8.2), 0 = set
+chan_user_set() { [[ -n "${PRIMARY_CHANNELS:-}" ]] || [[ "$(chan_n "${AUX_CHANNELS:-}" 4)" != 4 ]]; }
+chan_effective() {
+  # "P A": the counts the copy will use (for the summary: the same numbers step 8.2 shows); nothing is changed
+  if [[ -z "$CHAN_ASK" ]] && ! chan_user_set; then chan_suggest
+  else printf '%s %s' "$(prim_channels)" "$(chan_n "${AUX_CHANNELS:-}" 4)"; fi
+}
+chan_apply() {
+  # once per run, before the RMAN script is made: counts that are not set become the suggestion (in memory; saved
+  # when the admin keeps them at 8.2)
+  [[ -n "$CHAN_ASK" ]] && return 0
+  if chan_user_set; then CHAN_ASK=0; return 0; fi
+  cpus_read
+  local sp sa; read -r sp sa <<< "$(chan_suggest)"
+  PRIMARY_CHANNELS=$sp; AUX_CHANNELS=$sa; CHAN_ASK=1
+  _log SETTINGS "RMAN channels not set: the suggestion is used ($sp on the primary, $sa here; CPUs ${CPU_PRIMARY:-?} / ${CPU_HERE:-?})"
+}
+chan_src_text() {
+  # where the counts come from, for the plan of 8.2
+  if [[ "$CHAN_ASK" == 1 ]]; then printf 'suggested for the CPUs: %s on the primary, %s here; asked before the start' "${CPU_PRIMARY:-not known}" "${CPU_HERE:-not known}"
+  else printf 'from the settings'; fi
+}
 # a channel count as a plain number: a value that is not 1..64 (08, abc, empty) gives $2 instead. The summary
 # and the copy plan use the counts before the settings are checked; raw "08" would be a bash error there.
 chan_n() { if [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 64 )); then printf '%s' $((10#$1)); else printf '%s' "$2"; fi; }
@@ -182,16 +225,36 @@ place_newname_lines() {
     *)   printf '%s' "${NEWNAMES:-}" ;;
   esac
 }
+PRIMARY_LOG_MEMBERS=1   # members per online log group on the primary (8.1 reads it; 2 or more: the standby multiplexes too)
+second_dest() {
+  # the second place for copies of the control file and of the logs: the recovery area, when it is another place
+  # of the same kind as the data place (two disk groups, or two folders); "" = none
+  local d f; d=$(data_dest); f=$(fra_dest)
+  [[ -n "$f" && "$f" != same && "${f%/}" != "${d%/}" ]] || return 0
+  if [[ "$d" == +* && "$f" == +* ]] || [[ "$d" == /* && "$f" == /* ]]; then printf '%s' "${f%/}"; fi
+  return 0
+}
+log_dests() {
+  # the OMF destinations of the online and standby logs: the data place, and the second place when the primary
+  # keeps two or more members per log group
+  local d s; d=$(data_dest); s=$(second_dest)
+  printf '%s\n' "$d"
+  [[ -n "$s" && ${PRIMARY_LOG_MEMBERS:-1} -ge 2 ]] && printf '%s\n' "$s"
+  return 0
+}
 place_spfile_sets() {
   # the "set" lines of the spfile clause that place the files (control files, OMF destinations, recovery area)
-  local d f; d=$(data_dest); f=$(fra_dest)
+  # Two control files (the data place and the recovery area, when that is another place of the same kind); the logs
+  # in one or two places like the primary (log_dests)
+  local d f s; d=$(data_dest); f=$(fra_dest); s=$(second_dest)
   case "$(place_mode)" in
     asm|dir)
-      if [[ "$d" == +* ]]; then printf "      set control_files='%s'\n" "$d"
-      else printf "      set control_files='%s/control01.ctl'\n" "$d"; fi
+      if [[ "$d" == +* ]]; then printf "      set control_files='%s'%s\n" "$d" "${s:+,'$s'}"
+      else printf "      set control_files='%s/control01.ctl'%s\n" "${d%/}" "${s:+,'$s/control02.ctl'}"; fi
       printf "      set db_create_file_dest='%s'\n" "$d"
-      printf "      set db_create_online_log_dest_1='%s'\n" "$d"
-      local n; for n in 2 3 4 5; do [[ " ${PRIMARY_OLD_DESTS:-} " == *" $n "* ]] && printf "      set db_create_online_log_dest_%s=''\n" "$n"; done ;;
+      local n=0 l used=" "
+      while IFS= read -r l; do [[ -n "$l" ]] || continue; n=$((n + 1)); used+="$n "; printf "      set db_create_online_log_dest_%s='%s'\n" "$n" "$l"; done < <(log_dests)
+      for n in 2 3 4 5; do [[ " ${PRIMARY_OLD_DESTS:-} " == *" $n "* && "$used" != *" $n "* ]] && printf "      set db_create_online_log_dest_%s=''\n" "$n"; done ;;
     *) printf '      set control_files=%s\n' "${CF_LIST:-}" ;;
   esac
   if [[ -n "$f" ]]; then
@@ -201,8 +264,11 @@ place_spfile_sets() {
   return 0
 }
 ask_channels() {
-  # before the copy: the RMAN channels on both servers, with the CPUs of both and a suggestion. The answer is saved
-  # as the default. 1 = do not copy now.
+  # before the copy: counts set in the settings or the summary are used as they are (shown in the plan, no
+  # question). Counts not set are the suggestion from the CPUs (chan_apply): asked once, the answer is saved as the
+  # default. 1 = do not copy now.
+  chan_apply
+  [[ "$CHAN_ASK" == 1 ]] || return 0
   cpus_read
   local sp sa p a; read -r sp sa <<< "$(chan_suggest)"
   while true; do
@@ -211,7 +277,7 @@ ask_channels() {
     [[ $YES_MODE -eq 1 ]] && return 0
     ask_choice "[k] Keep these   [c] Change   [s] Do not copy now" "kcs"
     case "$ANSWER" in
-      k) return 0 ;;
+      k) CHAN_ASK=0; save_settings; _log SETTINGS "RMAN channels kept: primary $PRIMARY_CHANNELS, auxiliary $AUX_CHANNELS"; return 0 ;;
       s) return 1 ;;
       c) ask_default "Channels on the primary (1-64)" "$sp"; p=$ANSWER
          # checked before any arithmetic: 08, 1.5 or a word would stop bash itself
@@ -219,9 +285,10 @@ ask_channels() {
          p=$((10#$p))
          ask_default "Channels on this server ($p-64, not fewer than on the primary)" "$(( sa > p ? sa : p ))"; a=$ANSWER
          if [[ "$p" =~ ^[0-9]{1,2}$ && "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$p >= 1 && 10#$p <= 64 && 10#$a >= 10#$p && 10#$a <= 64 )); then
-           PRIMARY_CHANNELS=$((10#$p)); AUX_CHANNELS=$((10#$a)); save_settings
+           PRIMARY_CHANNELS=$((10#$p)); AUX_CHANNELS=$((10#$a)); CHAN_ASK=0; save_settings
            _log SETTINGS "RMAN channels: primary $PRIMARY_CHANNELS, auxiliary $AUX_CHANNELS"
-         else say "Use numbers from 1 to 64, and not fewer on this server than on the primary."; fi ;;
+         else say "Use numbers from 1 to 64, and not fewer on this server than on the primary."; continue; fi
+         return 0 ;;
     esac
   done
 }

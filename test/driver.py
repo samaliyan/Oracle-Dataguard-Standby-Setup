@@ -43,6 +43,8 @@ def fix_primary(text):
     if "db_recovery_file_dest='" in text: p["db_recovery_file_dest"] = "+FRA"
     if "remote_login_passwordfile=exclusive" in text: p["remote_login_passwordfile"] = "EXCLUSIVE"
     if "alter user sys identified" in text: pri["sys_in_pwfile"] = True
+    # step 9.9: the key line added to ~/.ssh/authorized_keys of the ssh user on the primary
+    if "authorized_keys" in text and "dg_standby_setup health" in text: pri["root_key"] = 1
     m = re.search(r"fal_server=('[^;]*') scope", text)
     if m: p["fal_server"] = m.group(1).replace("'", "")
     if "tnsnames.ora" in text and ("cat >>" in text or "entry must be" in text): pri["tns_stby"] = 1; pri.pop("tns_stby_host", None)
@@ -200,7 +202,10 @@ def main():
             if step in lst("DG_TEST_HELP_AT") and step not in helped and "[h] Help" in bt:
                 helped.add(step); send("h"); continue
         if bt.endswith("'s password:"): send(E("DG_TEST_OSPW", "Oracle_os1")); continue
-        if bt == "Choice [1]": send(menu_answers.pop(0) if menu_answers else ""); continue
+        # (the default item is 1, or 9 on a finished server: without DG_TEST_MENU the full setup is chosen)
+        if bt.startswith("Choice [") and bt.endswith("]"): send(menu_answers.pop(0) if menu_answers else "1"); continue
+        # an installer prerequisite failure: [r] run it again after a fix, [i] ignore them (then IGNORE), [q]
+        if bt.startswith("[r] I fixed them, run it again"): send(E("DG_TEST_PREREQ", "i")); continue
         if bt.startswith("Steps to run, for example"): send(menu_steps.pop(0) if menu_steps else ""); continue
         if bt.startswith("Answer y automatically for this server"): send(E("DG_TEST_MENU_YES", "n")); continue
         if bt.startswith("[c] Changes made, with undo commands   [u] Undo a step"): send(E("DG_TEST_MENU_REC", "b")); continue

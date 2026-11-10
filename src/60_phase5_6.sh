@@ -67,8 +67,9 @@ nf_app_add() {
 nf_inst_cmd() {
   # $1 user, $2 group, $3 mode, $4 private copy of root, $5 target: written by the user itself (temporary file and
   # rename in the target folder, as install_as: root never writes, chmods or chowns a path in that user's folder)
-  printf "runuser -u %s -- sh -c 'umask 077; t=\$(mktemp %s/.dgtmp.XXXXXX) && cat > \"\$t\" && chgrp %s \"\$t\" && chmod %s \"\$t\" && mv -fT -- \"\$t\" %s || { rm -f -- \"\$t\"; exit 1; }' < %s" \
-    "$1" "$(dirname -- "$5")" "$2" "$3" "$5" "$(nf_q "$4")"
+  # (runuser -g: the new file gets the group at once, no chgrp)
+  printf "runuser -u %s -g %s -- sh -c 'umask 077; t=\$(mktemp %s/.dgtmp.XXXXXX) && cat > \"\$t\" && chmod %s \"\$t\" && mv -fT -- \"\$t\" %s || { rm -f -- \"\$t\"; exit 1; }' < %s" \
+    "$1" "$2" "$(dirname -- "$5")" "$3" "$5" "$(nf_q "$4")"
 }
 nf_scp_to() { if [[ ${OS_MAJOR:-0} -ge 9 ]]; then printf '1200'; else printf '600'; fi; }
 nf_scp_cmd() {
@@ -77,9 +78,16 @@ nf_scp_cmd() {
   local o s
   o="-o ControlMaster=no -o ControlPath=$(nf_q "$SSH_CTL") -o BatchMode=yes -o StrictHostKeyChecking=yes -o CheckHostIP=no -o $(nf_q "UserKnownHostsFile=$ROOT_KH $KH_FILE")"
   s=$(nf_q "$PRIMARY_SSH_USER@$PRIMARY_IP:$1")
-  printf 'rm -f -- %s; umask 077; { scp -q %s %s %s' "$(nf_q "$2")" "$o" "$s" "$(nf_q "$2")"
+  # (umask 077: the copy is made with mode 600; nf_fetch_add removes an old copy first, as an entry of its own)
+  printf 'umask 077; scp -q %s %s %s' "$o" "$s" "$(nf_q "$2")"
   [[ ${OS_MAJOR:-0} -ge 9 ]] && printf ' || scp -O -q %s %s %s' "$o" "$s" "$(nf_q "$2")"
-  printf '; } && chmod 600 %s' "$(nf_q "$2")"
+  return 0
+}
+nf_fetch_add() {
+  # $1 file on the primary, $2 private copy here: two shown entries, the clean-up of an old copy and the scp
+  # (the scp line is then only the copy itself; its md5 is checked after it, tag fetch)
+  nf_add "" root "rm -f -- $(nf_q "$2")"
+  nf_add "fetch:$1|$2" root "$(nf_scp_cmd "$1" "$2")" "" "$(nf_scp_to)"
 }
 nf_fetch_ok() {
   # $1 file on the primary, $2 the copy here: 0 only when the copy is byte-identical (md5)
@@ -114,6 +122,9 @@ nf_mkdir_add() {
     if [[ $made -eq 1 || ( ! -e "$p" && ! -L "$p" ) ]]; then
       made=1
       if [[ $held -eq 1 ]]; then nf_add "dir:$p|$owner" root "install -d -o $owner -g $INSTALL_GROUP -m 775 $(nf_q "$p")"
+      elif [[ "$(id -gn "$owner" 2>/dev/null)" == "$INSTALL_GROUP" && ! -g "$par" ]]; then
+        # made as $owner, whose own group is $INSTALL_GROUP (the folder above is not setgid): it has the group at once
+        nf_add "dir:$p|$owner" "$role" "mkdir -m 775 -- $(nf_q "$p")"
       else
         nf_add "" "$role" "mkdir -m 775 -- $(nf_q "$p")"
         # a folder with the wrong group is taken back at once (it is empty and new)
@@ -676,6 +687,35 @@ phase_5() {
 pw_dest() { printf '%s/dbs/orapw%s' "$DB_HOME" "$STANDBY_SID"; }
 pw_tmp_remote() { printf '/tmp/orapw_for_standby_%s' "$STANDBY_SID"; }
 
+pw_prep_extra() {
+  # One visit to the primary: when the primary keeps its password file in ASM, the readable copy that step 6.1
+  # needs (asmcmd pwcopy to /tmp, as $GRID_USER) is shown in the combined primary block of phase 4. It only prints
+  # the commands: step 6.1 checks the copy at its own time (and asks again if it is missing or older than a day),
+  # step 6.2 asks you to remove it after the copy. Nothing here when a copy is there already.
+  [[ "$MODE" == run && "${PRIMARY_RUN:-no}" != yes ]] || return 0
+  step_in_range 6.1 || return 0
+  pwfile_ok 2>/dev/null && return 0
+  ssh_alive || return 0
+  local pfile t
+  prim_sql "select file_name from v\$passwordfile_info;" >/dev/null 2>&1 || return 0
+  pfile=$(first_line); [[ "$pfile" =~ ^\+[A-Za-z0-9_./+-]+$ ]] || return 0
+  t=$(pw_tmp_remote)
+  # only when there is no copy at all (a clear "not there"): a copy that is there (usable, too old, of another
+  # owner, readable by others) is judged by step 6.1 itself, with its reason
+  prim_probe exists "$t" >/dev/null 2>&1 && [[ "$(head -n 1 <<< "$RUN_OUT")" == NO ]] || return 0
+  local -a keep=(); local e
+  for e in ${PRIMARY_BATCH_EXTRA[@]+"${PRIMARY_BATCH_EXTRA[@]}"}; do [[ "$e" == 6.1\|* ]] || keep+=("$e"); done
+  PRIMARY_BATCH_EXTRA=(${keep[@]+"${keep[@]}"} "6.1|$GRID_USER|-- The password file of the primary is in ASM. A readable copy for step 6.1 (it copies it with scp):
+export ORACLE_HOME=$GRID_HOME ORACLE_SID=+ASM PATH=$GRID_HOME/bin:\$PATH
+rm -f $t && test ! -e $t && (umask 077; asmcmd pwcopy '$pfile' $t)
+chgrp $INSTALL_GROUP $t
+chmod 640 $t
+-- Step 6.2 asks you to remove it after the copy:  rm -f $t")
+  # (as shown: when 6.1 then finds the copy, its own run records it; the undo is the rm of step 6.2)
+  local PRIMARY_HOW_STEP; PRIMARY_HOW_STEP=$(prim_grid_how)
+  primary_pending_add 6.1 "rm -f $t   (step 6.2 reminds you after the copy)"
+  return 0
+}
 pwfile_ok() {
   local d; d=$(pw_dest)
   [[ -f "$d" && ! -L "$d" ]] || return 1
@@ -696,7 +736,7 @@ pw_list() {
   # 1 when a path is not plain (it goes into a command line)
   local d tmp; d=$(pw_dest); tmp=$(pw_incoming)
   v_path "$PW_SRC" && v_path "$d" || { NOW+=$'\n'"A path is not plain, so no command is built with it: $PW_SRC $d"; return 1; }
-  nf_add "fetch:$PW_SRC|$tmp" root "$(nf_scp_cmd "$PW_SRC" "$tmp")" "" "$(nf_scp_to)"
+  nf_fetch_add "$PW_SRC" "$tmp"
   nf_bak_add oracle "$d"
   nf_add "inst:$d" root "$(nf_inst_cmd "$ORACLE_USER" "$INSTALL_GROUP" 640 "$tmp" "$d")"
   nf_add rmtmp root "rm -f -- $(nf_q "$tmp")"
@@ -827,6 +867,7 @@ c_6_2() {
   pwfile_ok || { NOW="Keep $t for now: the password file is not installed yet (step 6.1)"; return 2; }
   NOW="The temporary copy $t is still on the primary"
   PLAN="rm -f $t"
+  not_done_yet
   return 1
 }
 
@@ -922,7 +963,7 @@ tde_list() {
       nf_mkdir_add "$d" oracle || { NOW+=$'\n'"$NF_ERR"; return 1; }
       nf_add chmodq oracle "chmod 700 -- $(nf_q "$d")"
     fi
-    nf_add "fetch:$f|$tmp" root "$(nf_scp_cmd "$f" "$tmp")" "" "$(nf_scp_to)"
+    nf_fetch_add "$f" "$tmp"
     nf_bak_add oracle "$f"
     nf_add "inst:$f" root "$(nf_inst_cmd "$ORACLE_USER" "$INSTALL_GROUP" 600 "$tmp" "$f")"
     nf_add rmtmp root "rm -f -- $(nf_q "$tmp")"
