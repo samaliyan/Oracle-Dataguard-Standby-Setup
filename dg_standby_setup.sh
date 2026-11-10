@@ -2483,7 +2483,7 @@ ui_fold() {
       else if (t ~ /^    Will run/) { box = 0; cmd = 1 }
       else if (t ~ /^      How /) { box = 0; cmd = 1; print s; next }
       else if (t != "" && lead < 13 && !box) cmd = 0
-      if ((box && lead >= 4) || (cmd && lead >= 15) || lead >= nf || vis(s) <= w) { print s; next }
+      if (box || (cmd && lead >= 15) || lead >= nf || vis(s) <= w) { print s; next }
       # the continued part: under the text of the line (a log line "hh:mm:ss  tag  text": under the text)
       ci = length(ind); if (lead > ci) ci = lead
       if (match(t, /^  [0-9][0-9]:[0-9][0-9]:[0-9][0-9]  [a-z:]+ +/)) ci = RLENGTH

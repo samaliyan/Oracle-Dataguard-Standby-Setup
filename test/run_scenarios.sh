@@ -581,7 +581,7 @@ combo s121 DGT_VER=12.1.0.2.0 DGT_MEDIA=staged DGT_OS=7
 check "12.1 staged OL7: complete" "full_ok $T/r_s121.txt"
 check "12.1 OL7: patch 18370031 asked for before the Grid root.sh" "grep -q 'needs patch 18370031 before root.sh' $T/r_s121.txt"
 check "12.1: yum and the 12cR1 preinstall package" "grep -q \"yum user=root args=\\['install', '-y', 'oracle-rdbms-server-12cR1-preinstall'\" $T/state/calls.log"
-check "12.1: both zip files of each product used" "grep -q 'linuxamd64_12102_database_1of2.zip + /tmp/dgt/stage/linuxamd64_12102_database_2of2.zip' $T/r_s121.txt"
+check "12.1: both zip files of each product used" "grep -q 'Database: .*linuxamd64_12102_database_1of2.zip .*linuxamd64_12102_database_2of2.zip' $T/r_s121.txt && grep -q 'DB_MEDIA=.*database_1of2.zip,.*database_2of2.zip' $T/r_s121.txt"
 check "12.1: installers with -waitforcompletion, configToolAllCommands" "grep -q \"runInstaller user=grid .*'-waitforcompletion'\" $T/state/calls.log && grep -q 'configToolAllCommands' $T/state/calls.log"
 check "12.1: 12.1 response keys (DBA_GROUP, DECLINE_SECURITY_UPDATES) set" "grep -q 'oracle.install.db.DBA_GROUP=dba' $T/log/run_*.log && grep -q 'DECLINE_SECURITY_UPDATES=true' $T/log/run_*.log"
 check "12.1: no read-only-home step needed" "grep -q 'Not needed (read-only homes exist only from 18c)' $T/r_s121.txt && ! grep -q 'roohctl' $T/state/calls.log"
@@ -2149,7 +2149,7 @@ check "screen 80x24: step 9.1 keeps its title, the Will run heading, the srvctl 
 rm -rf $SN/s1b; built523; jset $P "d['static']=0"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/s1b DG_TEST_SNAP=4.10 DG_TEST_KEYS=4.10:d DG_TEST_QUIT_AT=4.10 DG_TEST_TIMEOUT=300 run $T/w2.txt --only 4.10)
 f=$(ls $SN/s1b/*step_4.10.txt 2>/dev/null | head -1); g=$(ls $SN/s1b/*alt_4.10_d.txt 2>/dev/null | head -1)
-check "screen 80x24: a cut primary step keeps 'Run on the PRIMARY (host), as grid' above its commands; d shows the whole text" "[[ -n '$f' && -n '$g' ]] && grep -q 'more lines: d shows all' $f && grep -q 'Run on the PRIMARY (prim01), as grid' $f && grep -q 'lsnrctl reload' $f && grep -q 'Step 4.10  (the whole text)' $g && grep -q 'Edit this file' $g"
+check "screen 80x24: a cut primary step keeps 'Run on the PRIMARY (host), as grid' above its commands, box lines never split by the script; d shows the whole text" "[[ -n '$f' && -n '$g' ]] && grep -q 'more lines: d shows all' $f && grep -q 'Run on the PRIMARY (prim01), as grid' $f && grep -q 'bin/lsnrctl reload LISTENER' $T/w2.txt && ! grep -q '^ (SID_LIST' $T/w2.txt && grep -q 'Step 4.10  (the whole text)' $g && grep -q 'Edit this file' $g"
 
 
 # ---- item 7: a primary with files in folders and in ASM; this server has ASM -> everything into +DATA ----
