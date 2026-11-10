@@ -219,3 +219,16 @@ Failures show the step's manual commands. rc 2 = cannot continue automatically (
 or "waits for step X" when the message names an earlier step. Check mode: TODO / WAITS / PROBLEM.
 Settings: primary values are read at every run; only standby values can be edited; the accepted
 values are kept in settings.accepted and differences are shown. One run at a time (flock).
+
+## 5.27 notes
+
+- Plain output, not --verbose: run_step keeps the title of a step in PT_PENDING. The output functions of the main
+  shell (say, _mark, warn, ask, print_commands, record) print it first (pt_flush); right after the check, run_step
+  prints it unless the step is plainly already correct, in which case it prints one line instead. block and hint
+  also flush, but they usually run in a pipe, so the flush after the check is the one that counts.
+- srl_statements: with two or more db_create_online_log_dest_n, the ADD STANDBY LOGFILE statements name the first
+  destination (a disk group, or a file name in the folder): one member per standby log.
+- space_check: NEED_LOG = one member of every online log (v$log), in the place of second_dest, when the standby
+  multiplexes its logs (PRIMARY_LOG_MEMBERS >= 2).
+- log_block: one SQL echo line is folded into the title; the SQL_MARK line is dropped; a block with exit code 0, no
+  ORA-/SP2- and at most one line of answer is written as one line "title  ->  answer".

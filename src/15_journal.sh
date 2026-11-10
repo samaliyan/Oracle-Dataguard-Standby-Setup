@@ -197,22 +197,63 @@ undo_text() {
 }
 
 show_changes_cli() {
-  # $1 step or empty
-  local l seq t run step kind obj det n=0 last_step=""
+  # $1 step or empty. Overview first (counts, runs, what --undo does by itself), one line per step, then every
+  # change on one line with its undo; a note that repeats in a group of the same kind is printed once under it.
+  local l seq t run step kind obj det n=0 last_step="" last_kind="" note="" pnote="" u cmd na=0 nh=0 np=0
   [[ -s "$JOURNAL_FILE" ]] || { printf '\n  No change is recorded yet (%s).\n' "$JOURNAL_FILE"; return 0; }
   journal_load_undone
-  printf '\n  %sChanges made by this script%s\n' "$C_W" "$C_N"
-  printf '  Journal         %s\n' "$JOURNAL_FILE"
-  printf '  undo auto       %s --undo STEP does it for you\n' "$(basename "$SELF")"
-  printf '  undo by hand    you run the command shown\n'
-  while IFS= read -r l; do
+  # (by step number, each step's changes oldest first: the primary visit makes 2.7 and phase 4 later than phase 3)
+  local -a E=(); mapfile -t E < <(journal_entries "${1:-}" | sort -s -t'|' -k4,4V)
+  if [[ ${#E[@]} -eq 0 ]]; then [[ -n "${1:-}" ]] && printf '\n  No change is recorded for step %s.\n' "$1" || printf '\n  No change is recorded, or every change was undone.\n'; return 0; fi
+  # ---- overview ----
+  declare -A SN=() SA=() SH=() SP=() RT=(); local -a SO=() RO=()
+  for l in "${E[@]}"; do
     IFS='|' read -r seq t run step kind obj det <<< "$l"
-    [[ "$step" != "$last_step" ]] && { printf '\n  %sStep %s%s  %s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")"; last_step=$step; }
-    printf '    %4s  %s  %-10s %s\n' "$seq" "${t:0:16}" "$kind" "$obj"
-    printf '          %sundo %s%s\n' "$C_D" "$(undo_text "$kind" "$obj" "$det")" "$C_N"
+    [[ -n "${SN[$step]:-}" ]] || { SO+=("$step"); SN[$step]=0; SA[$step]=0; SH[$step]=0; SP[$step]=0; }
+    [[ -n "${RT[$run]:-}" ]] || { RO+=("$run"); RT[$run]=${t:0:16}; }
+    SN[$step]=$((SN[$step] + 1))
+    if [[ "$kind" == PRIMARY ]]; then SP[$step]=$((SP[$step] + 1)); np=$((np + 1))
+    elif [[ "$(undo_text "$kind" "$obj" "$det")" == auto:* ]]; then SA[$step]=$((SA[$step] + 1)); na=$((na + 1))
+    else SH[$step]=$((SH[$step] + 1)); nh=$((nh + 1)); fi
+  done
+  printf '\n  %sChanges made by this script%s%s\n' "$C_W" "$C_N" "${1:+  (step $1)}"
+  printf '    On this server  %s   (%s undone by --undo, %s by hand)\n' "$((na + nh))" "$na" "$nh"
+  [[ $np -gt 0 ]] && printf '    On the primary  %s   (commands you ran there; undo them there, by hand)\n' "$np"
+  printf '    Runs            '; local r first=1
+  for r in "${RO[@]}"; do [[ $first -eq 1 ]] || printf '\n                    '; printf '%s  (%s)' "$r" "${RT[$r]}"; first=0; done; printf '\n'
+  printf '    Journal         %s\n' "$JOURNAL_FILE"
+  printf '    Undo a step     %s --undo STEP   (the auto ones; it shows the by-hand ones; newest step first)\n' "$SELF"
+  if [[ -z "${1:-}" && ${#SO[@]} -gt 1 ]]; then
+    printf '\n    %-6s %-44s %7s  %s\n' "Step" "" "changes" "undo"
+    for step in "${SO[@]}"; do
+      local how=""
+      [[ ${SA[$step]} -gt 0 ]] && how+="${SA[$step]} auto, "
+      [[ ${SH[$step]} -gt 0 ]] && how+="${SH[$step]} by hand, "
+      [[ ${SP[$step]} -gt 0 ]] && how+="${SP[$step]} on the primary, "
+      local tt; tt=$(step_title_of "$step"); [[ ${#tt} -gt 44 ]] && tt="${tt:0:43}…"
+      printf '    %-6s %-44s %7s  %s\n' "$step" "$tt" "${SN[$step]}" "${how%, }"
+    done
+  fi
+  # ---- every change ----
+  _sc_note() { [[ -n "$pnote" ]] && printf '            %s(%s)%s\n' "$C_D" "$pnote" "$C_N"; pnote=""; }
+  for l in "${E[@]}"; do
+    IFS='|' read -r seq t run step kind obj det <<< "$l"
+    u=$(undo_text "$kind" "$obj" "$det")
+    # a trailing "   (note)" that the next entries of the same kind share: printed once, after them
+    note=""; cmd=$u
+    if [[ "$u" =~ ^(.*[^ ])\ \ \ \((.*)\)$ ]]; then cmd=${BASH_REMATCH[1]}; note=${BASH_REMATCH[2]}; fi
+    if [[ "$step" != "$last_step" || "$kind" != "$last_kind" || "$note" != "$pnote" ]]; then _sc_note; fi
+    if [[ "$step" != "$last_step" ]]; then
+      printf '\n  %sStep %s%s  %s   %s%s%s\n' "$C_B" "$step" "$C_N" "$(step_title_of "$step")" "$C_D" "${t:0:16}" "$C_N"
+      last_step=$step
+    fi
+    last_kind=$kind
+    printf '    %4s  %-10s %s\n' "$seq" "$kind" "$obj"
+    printf '            %sundo %s%s\n' "$C_D" "$cmd" "$C_N"
+    pnote=$note
     n=$((n + 1))
-  done < <(journal_entries "${1:-}")
-  if [[ $n -eq 0 ]]; then [[ -n "${1:-}" ]] && printf '\n  No change is recorded for step %s.\n' "$1" || printf '\n  No change is recorded, or every change was undone.\n'; fi
+  done
+  _sc_note
   return 0
 }
 change_word() {

@@ -3,6 +3,29 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.27
+
+The five open points of the 5.26 review.
+
+- Standby redo logs have one member each (Oracle MAA: a second member only slows down the writing of the redo
+  that arrives). With two or more OMF log destinations (the multiplexed logs of 5.26) the statements name the
+  first one, for example `alter database add standby logfile thread 1 ('+DATA') size 200M;`. The same rule is
+  used for the standby logs of the primary (step 4.2).
+- Space check before the copy (8.1): the second member of every online log, which goes to the recovery area's
+  place when the logs are multiplexed, is counted there ("second log members"). The standby logs are counted
+  once (one member).
+- A second run is short: a step that is already correct is one line (`✔ 2.1  Groups ...  All 10 groups
+  exist ...`). A step that asks, does something or finds a problem shows its full text as before.
+  `--verbose` shows every step in full.
+- `--show-changes`: an overview first (changes on this server, how many `--undo` takes back by itself and how
+  many are by hand, the commands you ran on the primary, the runs), one line per step, then every change with
+  its undo, by step number; a note shared by a group (for example "only if no file and no user uses it") is
+  printed once under it.
+- Run log: a SQL query that succeeds with a one-line answer is one line (`query  ->  answer`); in the other
+  blocks the query is written once and the internal output marker is left out. Errors and longer answers keep
+  their block. A full run's log is about half as long.
+- Tests: the multiplexed-log path is tested (the mock answers the members query and the online log size).
+
 ## 5.26
 
 Before the first real use: four independent reviews of real runs (the work flow, the screen layout, the logs and

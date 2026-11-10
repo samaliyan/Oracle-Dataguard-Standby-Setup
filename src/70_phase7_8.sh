@@ -996,22 +996,22 @@ CF_LIST=""
 srl_plan_space() {
   # Standby logs that step 9.3 still has to create (missing or smaller than the online logs), which are not in the
   # sizes read from the primary: SRL_MB, and SRL_LOC = where 9.3 puts them (the same rule as srl_statements:
-  # the OMF destination, else the first online-log folder outside the recovery area). Multiplexed OMF logs count twice.
+  # the OMF destination, else the first online-log folder outside the recovery area). One member each (srl_statements).
   SRL_MB=0; SRL_LOC=""
   prim_sql "select (select count(*)+count(distinct thread#) from v\$log)||'|'||(select count(*) from v\$standby_log where bytes>=(select max(bytes) from v\$log))||'|'||(select max(bytes) from v\$log)||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select nvl(max(value),'-') from v\$parameter where name in ('db_create_file_dest','db_create_online_log_dest_1') and value is not null)||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 0
-  local need have b copies omf dir; IFS='|' read -r need have b copies omf dir <<< "$(first_line)"
+  local need have b omf dir; IFS='|' read -r need have b _ omf dir <<< "$(first_line)"
   num "$need" && num "$have" && num "$b" || return 0
-  num "$copies" && [[ $copies -ge 1 ]] || copies=1
   [[ $need -gt $have ]] || return 0
   SRL_MB=$(( (need - have) * ((b + 1048575) / 1048576) ))
-  if [[ -n "$omf" && "$omf" != "-" ]]; then SRL_LOC=$omf; SRL_MB=$((SRL_MB * copies)); else SRL_LOC=$dir; fi
+  if [[ -n "$omf" && "$omf" != "-" ]]; then SRL_LOC=$omf; else SRL_LOC=$dir; fi
 }
 space_check() {
   # appends to PRE_INFO; sets PRE_FIX and returns 1 when a place here lacks space. Each place (a disk group, or the
   # file system of a folder) must hold what goes there TOGETHER: the database files (+10 %), the standby logs of
-  # step 9.3 and the recovery area (its full size, set as db_recovery_file_dest_size).
+  # step 9.3, the second member of each online log (multiplexed: in the recovery area's place) and the recovery
+  # area (its full size, set as db_recovery_file_dest_size).
   local l d mb key mnt f ff free need short="" sz
-  declare -A NEED_DB=() NEED_SRL=() NEED_FRA=() FREE=() THERE=() LABEL=()
+  declare -A NEED_DB=() NEED_SRL=() NEED_LOG=() NEED_FRA=() FREE=() THERE=() LABEL=()
   srl_plan_space
   [[ "$(place_mode)" != same && $SRL_MB -gt 0 ]] && SRL_LOC=$(data_dest)
   _sk() {
@@ -1029,11 +1029,19 @@ space_check() {
     NEED_DB[$KEY]=$(( ${NEED_DB[$KEY]:-0} + mb ))
   done < <(sb_loc_list)
   if [[ -n "$SRL_LOC" && $SRL_MB -gt 0 ]]; then _sk "$SRL_LOC" || return 1; NEED_SRL[$KEY]=$(( ${NEED_SRL[$KEY]:-0} + SRL_MB )); fi
+  # multiplexed logs (log_dests): the second member of every online log group goes to the second place. The
+  # first members are in the database files (read from the primary, all its members: more than needed there).
+  local sd; sd=$(second_dest)
+  if [[ "$(place_mode)" != same && -n "$sd" && ${PRIMARY_LOG_MEMBERS:-1} -ge 2 ]]; then
+    if prim_sql "select round(sum(bytes)/1048576) from v\$log;" && num "$(first_line)"; then
+      _sk "$sd" || return 1; NEED_LOG[$KEY]=$(first_line)
+    else PRE_FIX="Cannot read the size of the online logs of the primary (their second members go to $sd)"; return 1; fi
+  fi
   f=$(fra_dest)
   if [[ -n "$f" ]]; then _sk "$f" || return 1; NEED_FRA[$KEY]=$(fra_size_mb); fi
   # ASM: usable_file_mb, the space after mirroring. Files of an earlier copy in ASM are NOT counted as free (a new copy
   # creates new OMF files next to them).
-  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_FRA[@]}"; do
+  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_LOG[@]}" "${!NEED_FRA[@]}"; do
     [[ "$key" == +* && -z "${FREE[$key]:-}" ]] || continue
     free=0; sql_asm "select usable_file_mb from v\$asm_diskgroup where name=upper('${key#+}');" && free=$(first_line)
     num "$free" || free=0
@@ -1051,13 +1059,14 @@ space_check() {
     done <<< "$FS_FILENAMES"
   fi
   local seen=" "
-  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_FRA[@]}"; do
+  for key in "${!NEED_DB[@]}" "${!NEED_SRL[@]}" "${!NEED_LOG[@]}" "${!NEED_FRA[@]}"; do
     [[ "$seen" == *" $key "* ]] && continue; seen+="$key "
-    local ndb=${NEED_DB[$key]:-0} nsrl=${NEED_SRL[$key]:-0} nfra=${NEED_FRA[$key]:-0} parts=""
-    need=$(( (ndb + nsrl) * 110 / 100 + nfra ))
+    local ndb=${NEED_DB[$key]:-0} nsrl=${NEED_SRL[$key]:-0} nlog=${NEED_LOG[$key]:-0} nfra=${NEED_FRA[$key]:-0} parts=""
+    need=$(( (ndb + nsrl + nlog) * 110 / 100 + nfra ))
     free=$(( ${FREE[$key]:-0} + ${THERE[$key]:-0} ))
     [[ $ndb -gt 0 ]] && parts+="database files $(human_mb "$ndb"), "
     [[ $nsrl -gt 0 ]] && parts+="standby logs $(human_mb "$nsrl"), "
+    [[ $nlog -gt 0 ]] && parts+="second log members $(human_mb "$nlog"), "
     [[ $nfra -gt 0 ]] && parts+="recovery area $(human_mb "$nfra"), "
     parts=${parts%, }
     if [[ $free -lt $need ]]; then

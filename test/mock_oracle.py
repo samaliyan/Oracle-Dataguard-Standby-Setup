@@ -123,6 +123,13 @@ def primary_sql(q, pri):
         return "\n".join(pri.get("controlfiles", ["+DATA/PRODDB/CONTROLFILE/current.261.1", "+FRA/PRODDB/CONTROLFILE/current.256.1"]))
     if "from v$log group by thread# order by thread#" in l:
         return "\n".join(f"{t}|{pri['orl']}|{pri['orl_bytes']}" for t in range(1, pri.get("threads", 1) + 1))
+    if l.strip() == "select count(*) from v$standby_log;":
+        return str(pri["srl"] * pri.get("threads", 1) if pri["srl"] else 0)
+    # members per online log group, and the size of one member of every group
+    if "select nvl(max(count(*)),1) from v$logfile where type='online' group by group#;" in l:
+        return str(pri.get("log_members", 1))
+    if l.strip() == "select round(sum(bytes)/1048576) from v$log;":
+        return str(round(pri["orl"] * pri.get("threads", 1) * pri["orl_bytes"] / 1048576))
     if "count(*)+count(distinct thread#) from v$log" in l:
         th = pri.get("threads", 1); need = (pri["orl"] + 1) * th
         have = pri["srl"] * th if (pri["srl"] and pri["srl_bytes"] >= pri["orl_bytes"]) else 0
@@ -132,9 +139,9 @@ def primary_sql(q, pri):
         if pri["srl"] and pri["srl_bytes"] >= pri["orl_bytes"]:
             return "\n".join(f"{t}|{pri['srl']}" for t in range(1, pri.get("threads", 1) + 1))
         return ""
-    if "name in ('db_create_file_dest','db_create_online_log_dest_1')" in l:
-        omf = pri["params"].get("db_create_file_dest", "+DATA") or "-"
-        return f"{omf}|{pri['orl'] * pri.get('threads', 1) + pri['srl']}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
+    if "name='db_create_online_log_dest_1' and value is not null)" in l:
+        omf = pri["params"].get("db_create_online_log_dest_1") or pri["params"].get("db_create_file_dest", "+DATA") or "-"
+        return f"{omf}|{pri.get('online_log_dests', 0)}|{pri['orl'] * pri.get('threads', 1) + pri['srl']}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
     if l.strip() == "select 1 from dual;": return "1"
     if "select db_unique_name||' '||database_role from v$database" in l: return f"{pri['unique']} {pri['role']}"
     if "from v$tempfile" in l: return f"{pri['data_mb']}|{pri['temp_mb']}"
@@ -288,9 +295,10 @@ def local_sql(q, st, sid):
         return "\n".join(f"{t}|{n}" for t in range(1, pri.get("threads", 1) + 1)) if n else ""
     if "max(blocksize)" in l:
         return "512|0"
-    if "name in ('db_create_file_dest','db_create_online_log_dest_1')" in l:
-        pri = load(PRI); omf = pri["params"].get("db_create_file_dest", "+DATA") or "-"
-        return f"{omf}|{pri['orl'] * pri.get('threads', 1) + inst.get('srl', 0)}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
+    if "name='db_create_online_log_dest_1' and value is not null)" in l:
+        pri = load(PRI); dests = inst.get("log_dests", [])
+        omf = (dests[0] if dests else pri["params"].get("db_create_file_dest", "+DATA")) or "-"
+        return f"{omf}|{len(dests)}|{pri['orl'] * pri.get('threads', 1) + inst.get('srl', 0)}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
     if "thread#||' '||max(sequence#)" in l and "applied in" in l:
         pri = load(PRI); seqs = pri.get("applied_t", pri.get("seq_t", {"1": pri["seq"]}))
         return "\n".join(f"{t} {q}" for t, q in sorted(seqs.items()))
@@ -316,6 +324,9 @@ def local_sql(q, st, sid):
         for stmt in [x for x in l.split("\n") if "add standby logfile" in x]:
             if (not omf or omf == "-") and "(" not in stmt: return "ORA-02236: invalid file name"
         threads = pri.get("threads", 1)
+        # members per new standby log: an empty file spec makes one in each OMF log destination (as Oracle does)
+        for stmt in [x for x in l.split("\n") if "add standby logfile" in x]:
+            inst.setdefault("srl_members", []).append(1 if "(" in stmt else max(1, len(inst.get("log_dests", []))))
         inst["srl"] = inst.get("srl", 0) + l.count("add standby logfile") // threads; st["instances"][sid] = inst
         return ""
     if "recover managed standby database cancel" in l:
@@ -629,6 +640,9 @@ def rman():
     # a value a test set itself is kept
     m = re.search(r"set db_recovery_file_dest='([^']+)'", data)
     if m and "fra_param" not in inst: inst["fra_param"] = m.group(1)
+    # the OMF log destinations of the standby: those the duplicate set, else the primary's (same paths)
+    inst["log_dests"] = re.findall(r"set db_create_online_log_dest_\d='([^']+)'", data) or \
+        [v for k, v in sorted(load(PRI)["params"].items()) if re.fullmatch(r"db_create_online_log_dest_\d", k) and v and v != "-"]
     if st.pop("fra_full_errs", None): inst["df_errors"] = 0
     st["instances"][cfg["sid"]] = inst
     spf = os.path.join(cfg["db_home"], "dbs", "spfile" + cfg["sid"] + ".ora")
