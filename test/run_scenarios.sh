@@ -2223,8 +2223,10 @@ check "PRIMARY_RUN=yes: ARCHIVELOG (needs a restart of the primary) is never off
 DBH=$T/u01/app/oracle/product/19.0.0/dbhome_1
 fresh; jset $S "d['lsnr_check']=1"; grep -vw "$(hostname -s)" /etc/hosts > /tmp/dgt_hosts && cat /tmp/dgt_hosts > /etc/hosts
 rc=$(DG_TEST_QUIT_AT=3.10 run $T/r1.txt --only 3.9)
-if [[ -n "$(timeout 10 getent -s dns ahostsv4 "$(hostname -s)" 2>/dev/null)" ]]; then
-# (a machine whose DNS knows its own name, as the GitHub runners: /etc/hosts is not the cause, and the script must not say it is)
+dnsip=$(timeout 10 getent -s dns ahostsv4 "$(hostname -s)" 2>/dev/null | awk '{print $1; exit}')
+if [[ -n "$dnsip" && " $(hostname -I 2>/dev/null) " == *" $dnsip "* ]]; then
+# (a machine whose DNS gives its own address for its name, as some GitHub runners: /etc/hosts is not the cause,
+# and the script must not say it is. When DNS gives another address, that is the cause, as below.)
 check "3.9: listener INTERMEDIATE, host name only in DNS (this machine) -> /etc/hosts not blamed, the commands to compare shown" "grep -q 'INTERMEDIATE (Not All Endpoints Registered)' $T/r1.txt && ! grep -q 'Cause: ' $T/r1.txt && grep -q 'the cause is not known' $T/r1.txt && grep -q 'srvctl stop listener -listener LISTENER' $T/r1.txt"
 else
 check "3.9: listener INTERMEDIATE because the host name is not in /etc/hosts -> cause named, [y] adds it, srvctl stop + start, then ONLINE" "grep -q 'INTERMEDIATE (Not All Endpoints Registered)' $T/r1.txt && grep -q 'Cause: ' $T/r1.txt && grep -qE \"^[0-9.]+ +.*$(hostname -s)\" /etc/hosts && grep -q 'srvctl stop listener -listener LISTENER' $T/r1.txt && [[ \$(res 3.9 $T/r1.txt) == DONE ]]"
