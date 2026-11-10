@@ -363,9 +363,10 @@ This script asks questions. Run it in an interactive terminal, for example:  ssh
                   elif [[ -n "$CUR_STEP" ]]; then show_help "$CUR_STEP" || true
                   else say "No help for this question. All options:  $SELF --help"; fi ;;
       # the step text was cut to fit the screen ("N more lines: d shows all"): d shows it here too
-      d) if [[ $UI -eq 1 && -n "$CUR_STEP" ]] && [[ ${UI_CUT:-0} -eq 1 || -s "$UI_BUF_FILE.cut" ]]; then
-           # the whole text of the step, uncut (the details from the log: l, then the step number)
-           if [[ -s "$UI_BUF_FILE.cut" ]]; then ui_page "$UI_BUF_FILE.cut" "Step $CUR_STEP  (the whole text)"; else ui_details "$CUR_STEP"; fi
+      # (not cut: d is the details of the step from the log, as the caller handles it)
+      d) if [[ $UI -eq 1 && -n "$CUR_STEP" && ${UI_CUT:-0} -eq 1 && -s "$UI_BUF_FILE.cut" ]]; then
+           # the whole text of the step, uncut; command lines (15 columns or more) are not split
+           ui_page "$UI_BUF_FILE.cut" "Step $CUR_STEP  (the whole text)" "" 0 15
          else return 0; fi ;;
       *) return 0 ;;
     esac

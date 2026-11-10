@@ -955,7 +955,7 @@ check "Standard Edition -> stop at discovery, before any install" "[[ $rc -ne 0 
 # X17 patched primary + base media: told at 3.1, before installing
 fresh empty
 rc=$(DG_TEST_QUIT_AT=3.2 run $T/x17.txt)
-check "3.1 says the primary has patches and how to avoid patching by hand" "grep -q 'The primary has patches' $T/x17.txt && grep -q 'set the value "Release Update"' $T/x17.txt && grep -q 'RU_DIR and OPATCH_ZIP' $T/x17.txt"
+check "3.1 says the primary has patches and how to avoid patching by hand" "grep -q 'The primary has patches' $T/x17.txt && grep -q 'set the value .Release Update.' $T/x17.txt && grep -q 'RU_DIR and OPATCH_ZIP' $T/x17.txt"
 # X18 a home in the inventory without a finished installer -> not 'installed'
 fresh; chown oracle $T/u01/app/oracle/product/19.0.0/dbhome_1/bin/oradism; rm -f $T/varlib/db_install.done
 rc=$(DG_TEST_NOFIX=3.6 DG_TEST_QUIT_AT=3.7 run $T/x18.txt --from 3.6)
@@ -2038,7 +2038,7 @@ fresh empty
 # (48 rows: step 3.2 shows its job command lines and the response file; on a smaller screen the step is cut and d shows all of it)
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=48x100 DG_TEST_SNAPDIR=$SN/a DG_TEST_SNAP=3.2,4.1 DG_TEST_KEYS=3.2:l,3.2:d,3.2:h DG_TEST_TIMEOUT=500 run $T/z500.txt)
 check "screen: a full setup runs to the end in the screen layout" "[[ $rc -eq 0 ]] && grep -q 'Standby setup is complete' $SN/a/*_end.txt"
-check "screen: the map on top (every phase, done/total, totals, keys), the step below with this phase so far" "grep -qE 'Data Guard standby setup [0-9]+\.[0-9]+ ' $SN/a/*_step_3.2.txt && grep -qE '✔ +2 This server +16/16' $SN/a/*_step_3.2.txt && grep -qE '▶ +3 Software +1/11' $SN/a/*_step_3.2.txt && grep -q 'need attention' $SN/a/*_step_3.2.txt && grep -q 'l: all steps   d: details   h: help' $SN/a/*_step_3.2.txt && grep -qE '✔ 3.1 +Installer files +done' $SN/a/*_step_3.2.txt && grep -q '  Step 3.2  Grid Infrastructure' $SN/a/*_step_3.2.txt"
+check "screen: the map on top (every phase, done/total, totals, keys; 2.7 waits for the primary visit), the step below with this phase so far" "grep -qE 'Data Guard standby setup [0-9]+\.[0-9]+ ' $SN/a/*_step_3.2.txt && grep -qE '! +2 This server +15/16' $SN/a/*_step_3.2.txt && grep -qE '▶ +3 Software +1/11' $SN/a/*_step_3.2.txt && grep -q 'need attention' $SN/a/*_step_3.2.txt && grep -q 'l: all steps   d: details   h: help' $SN/a/*_step_3.2.txt && grep -qE '✔ 3.1 +Installer files +done' $SN/a/*_step_3.2.txt && grep -q '  Step 3.2  Grid Infrastructure' $SN/a/*_step_3.2.txt"
 check "screen: the next phase starts on a clean area (phase 3 done, 4 is current)" "grep -qE '✔ +3 Software +11/11' $SN/a/*_step_4.1.txt && grep -qE '▶ +4 Primary' $SN/a/*_step_4.1.txt && ! grep -q 'Step 3\.' $SN/a/*_step_4.1.txt"
 check "screen: l lists every step on a separate screen, opened at the current phase (a step number for its details)" "grep -q 'Phase 3  Install the Oracle software   1 of 11 done' $SN/a/*_alt_3.2_l.txt && grep -qE '▶ 3.2 +Grid Infrastructure software' $SN/a/*_alt_3.2_l.txt && grep -q 'a step number: its details' $SN/a/*_alt_3.2_l.txt"
 check "screen: d shows the details of the current step (from the log), h its help, both on a separate screen" "grep -q 'Result   in progress (the current step)' $SN/a/*_alt_3.2_d.txt && grep -q 'status Grid is not installed yet' $SN/a/*_alt_3.2_d.txt && grep -q 'Help  ·  step 3.2' $SN/a/*_alt_3.2_h.txt && grep -q 'Where' $SN/a/*_alt_3.2_h.txt"
@@ -2046,8 +2046,8 @@ check "screen: the installer output is not on the screen (in its file only), its
 # a failed install and "try again" in an 80 x 24 terminal: attempt 2 starts on a clean area
 # (3.2 fails here because the two ASM passwords typed differ; a prerequisite failure has its own [r]/[i] question)
 fresh empty
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/b DG_TEST_SNAP=3.2#6 DG_TEST_ASMPW2=Other_999x DG_TEST_RETRY=3.2 DG_TEST_QUIT_AT=3.3 DG_TEST_TIMEOUT=400 run $T/z501.txt)
-check "screen: try again -> 'attempt 2' on a clean area (the earlier attempt is not mixed in), short keys in 80 columns" "grep -q 'Step 3.2  Grid Infrastructure software (Oracle Restart)   attempt 2' $SN/b/*_try6.txt && ! grep -q 'Grid installer failed' $SN/b/*_try6.txt && grep -q 'l: steps  d: details  h: help' $SN/b/*_try6.txt"
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/b DG_TEST_SNAP=3.2#9 DG_TEST_ASMPW2=Other_999x DG_TEST_RETRY=3.2 DG_TEST_QUIT_AT=3.3 DG_TEST_TIMEOUT=400 run $T/z501.txt)
+check "screen: try again -> 'attempt 2' on a clean area (the earlier attempt is not mixed in), short keys in 80 columns" "grep -q 'Step 3.2  Grid Infrastructure software (Oracle Restart)   attempt 2' $SN/b/*_try9.txt && ! grep -q 'Grid installer failed' $SN/b/*_try9.txt && grep -q 'l: steps  d: details  h: help' $SN/b/*_try9.txt"
 # a long job: one live line; d shows its output so far; an install with warnings (exit code 6) before root.sh
 fresh empty; jset $S "d['installer_sleep']=4; d['grid_warn']=1"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=30x100 DG_TEST_SNAPDIR=$SN/c DG_TEST_SNAP=3.3 DG_TEST_JOBKEYS="Grid installer:d" DG_TEST_QUIT_AT=3.4 DG_TEST_TIMEOUT=400 run $T/z502.txt)
@@ -2223,7 +2223,12 @@ check "PRIMARY_RUN=yes: ARCHIVELOG (needs a restart of the primary) is never off
 DBH=$T/u01/app/oracle/product/19.0.0/dbhome_1
 fresh; jset $S "d['lsnr_check']=1"; grep -vw "$(hostname -s)" /etc/hosts > /tmp/dgt_hosts && cat /tmp/dgt_hosts > /etc/hosts
 rc=$(DG_TEST_QUIT_AT=3.10 run $T/r1.txt --only 3.9)
+if [[ -n "$(timeout 10 getent -s dns ahostsv4 "$(hostname -s)" 2>/dev/null)" ]]; then
+# (a machine whose DNS knows its own name, as the GitHub runners: /etc/hosts is not the cause, and the script must not say it is)
+check "3.9: listener INTERMEDIATE, host name only in DNS (this machine) -> /etc/hosts not blamed, the commands to compare shown" "grep -q 'INTERMEDIATE (Not All Endpoints Registered)' $T/r1.txt && ! grep -q 'Cause: ' $T/r1.txt && grep -q 'the cause is not known' $T/r1.txt && grep -q 'srvctl stop listener -listener LISTENER' $T/r1.txt"
+else
 check "3.9: listener INTERMEDIATE because the host name is not in /etc/hosts -> cause named, [y] adds it, srvctl stop + start, then ONLINE" "grep -q 'INTERMEDIATE (Not All Endpoints Registered)' $T/r1.txt && grep -q 'Cause: ' $T/r1.txt && grep -qE \"^[0-9.]+ +.*$(hostname -s)\" /etc/hosts && grep -q 'srvctl stop listener -listener LISTENER' $T/r1.txt && [[ \$(res 3.9 $T/r1.txt) == DONE ]]"
+fi
 fresh; jset $S "d['lsnr_check']=1"
 runuser -u oracle -- perl -e 'use Socket; socket(S, PF_INET, SOCK_STREAM, 0); setsockopt(S, SOL_SOCKET, SO_REUSEADDR, 1); bind(S, sockaddr_in(1521, inet_aton("'"$(hostname -I | tr ' ' '\n' | grep -v '^127' | grep -E '^[0-9.]+$' | head -n 1)"'"))) or exit 1; listen(S, 5); $0 = "'"$DBH"'/bin/tnslsnr LISTENER -inherit"; sleep 300' >/dev/null 2>&1 &
 sleep 1; fpid=$(pgrep -f "^$DBH/bin/tnslsnr LISTENER" | head -n 1); jset $S "d['fake_lsnr_pid']=$fpid"
