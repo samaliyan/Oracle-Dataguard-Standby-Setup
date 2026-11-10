@@ -14,6 +14,31 @@ run_cmds() {
   return 0
 }
 
+# ---- the commands of a step: filled in the check (cp_add, shown under "Will run"), run from that list ----
+# P2_META[i]: what the action does around entry i (journal, waits); P2_SNAP: the files the shown content was made
+# from, with their md5 at the check (written only while they are still the same)
+declare -a P2_META=()
+P2_SNAP=""
+p2q() { printf '%q' "$1"; }
+p2_add() { P2_META[${#CP_CMD[@]}]=$1; shift; cp_add "$@"; }    # $1 tag, then as cp_add
+p2_exec() {
+  # entry $1 runs; a failure is said (like cp_run). $2 = "alone": the entries after it are not affected
+  cp_exec "$1" && return 0
+  bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$1]}" | mask_pw)"$'\n'"$(tail -n 4 <<< "$RUN_OUT" | mask_pw)"
+  [[ "${2:-}" != alone && $(( $1 + 1 )) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+  return 1
+}
+p2_md5() { if [[ -e "$1" || -L "$1" ]]; then md5sum -- "$1" 2>/dev/null | cut -d' ' -f1; else printf 'none'; fi; }
+p2_snap() { local f; for f in "$@"; do P2_SNAP+="$f|$(p2_md5 "$f")"$'\n'; done; }
+p2_unchanged() {
+  local l f
+  while IFS= read -r l; do
+    [[ -n "$l" ]] || continue; f=${l%|*}
+    [[ "$(p2_md5 "$f")" == "${l##*|}" ]] || { bad "$f was changed after the check. Nothing was written. Answer r to check again."; return 1; }
+  done <<< "$P2_SNAP"
+  return 0
+}
+
 # ---- 2.1 groups ----
 G_TODO=""
 c_2_1() {
@@ -44,17 +69,19 @@ c_2_1() {
   if [[ -z "$miss" ]]; then NOW="All ${#_ge[@]} groups exist with the same ids as on the primary"; return 0; fi
   G_TODO=${miss%$'\n'}
   NOW="Missing groups: $(grep -oE '[^ ]+$' <<< "$G_TODO" | paste -sd' ' -)"
-  PLAN="$G_TODO"
+  PLAN="Create the missing groups, with the same ids as on the primary."
   USING="Group names and ids from the primary"
+  local c; while IFS= read -r c; do [[ -n "$c" ]] && cp_add root "$c"; done <<< "$G_TODO"
   return 1
 }
 d_2_1() {
   # each command is journaled as soon as it worked (a later failure does not hide an earlier change)
-  local c; while IFS= read -r c; do
-    [[ -n "$c" ]] || continue
-    run_cmds <<< "$c" || return 1
+  local i c
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    c=${CP_CMD[$i]}
+    p2_exec "$i" || return 1
     [[ "$c" =~ ^groupadd\ -g\ ([0-9]+)\ ([A-Za-z0-9_.-]+)$ ]] && journal GROUP "${BASH_REMATCH[2]}" "gid ${BASH_REMATCH[1]}"
-  done <<< "$G_TODO"
+  done
   return 0
 }
 
@@ -99,17 +126,19 @@ c_2_2() {
   fi
   U_TODO=${todo%$'\n'}
   NOW="${why%$'\n'}"
-  PLAN="$U_TODO"
+  PLAN="Create the users, or give them the primary group and other groups they have on the primary."
   USING="Id, primary group and other groups of each user, from the primary"
+  local c; while IFS= read -r c; do [[ -n "$c" ]] && cp_add root "$c"; done <<< "$U_TODO"
   return 1
 }
 d_2_2() {
-  local c; while IFS= read -r c; do
-    [[ -n "$c" ]] || continue
-    run_cmds <<< "$c" || return 1
+  local i c
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    c=${CP_CMD[$i]}
+    p2_exec "$i" || return 1
     [[ "$c" =~ ^useradd\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal USER "${BASH_REMATCH[1]}" "$c"
     [[ "$c" =~ ^usermod\ .*\ ([A-Za-z0-9_.-]+)$ ]] && journal USERMOD "${BASH_REMATCH[1]}" "$c"
-  done <<< "$U_TODO"
+  done
   return 0
 }
 
@@ -131,9 +160,17 @@ need_pkgs() {
   return 0
 }
 P_MISS=()
+p2_proxy_vars() {
+  # the proxy variables set in the environment of this script (names only): the commands of the list get them
+  local v out=""
+  for v in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+    [[ -n "${!v:-}" ]] && out+="${out:+, }$v"
+  done
+  printf '%s' "$out"
+}
 c_2_3() {
   command -v rpm >/dev/null 2>&1 || { NOW="rpm is not found. This server is not Oracle Linux or RHEL."; return 2; }
-  local p; P_MISS=()
+  local p pe; P_MISS=()
   while IFS= read -r p; do rpm -q "$p" >/dev/null 2>&1 || P_MISS+=("$p"); done < <(need_pkgs)
   if [[ ${#P_MISS[@]} -eq 0 ]]; then NOW="Required packages are installed"; return 0; fi
   NOW="Missing packages: ${P_MISS[*]}"
@@ -142,12 +179,20 @@ c_2_3() {
   USING="Oracle Linux $OS_MAJOR, database $DB_MAJOR
 $(preinstall_pkg) sets kernel parameters and limits for the user oracle.
 It does not change existing users."
+  pe=$(p2_proxy_vars)
+  # (proxy values may hold a password: they reach yum / dnf through the environment, never on a command line)
+  [[ -n "$pe" ]] && USING+=$'\n'"The proxy settings of this environment are used ($pe)."
+  for p in "${P_MISS[@]}"; do cp_add root "$PKG install -y $p" "" 3600; done
   return 1
 }
 d_2_3() {
-  local p failed=()
-  for p in "${P_MISS[@]}"; do
-    if run_logged "$PKG install -y $p" "$PKG" install -y "$p" && rpm -q "$p" >/dev/null 2>&1; then say "Installed: $p"; journal PKG "$p"
+  local p failed=() i ok
+  # one entry per package: a package that fails does not stop the others
+  for ((i = 0; i < ${#P_MISS[@]}; i++)); do
+    p=${P_MISS[$i]}; ok=0
+    [[ "${CP_CMD[$i]:-}" == *" install -y $p" ]] || { bad "Internal error: the command for $p was not shown before, so it is not run."; return 1; }
+    cp_exec "$i" && ok=1
+    if [[ $ok -eq 1 ]] && rpm -q "$p" >/dev/null 2>&1; then say "Installed: $p"; journal PKG "$p"
     else failed+=("$p"); bad "Not installed: $p ($(grep -iE 'no package|unable to find|error' <<< "$RUN_OUT" | head -n 1))"; fi
   done
   [[ ${#failed[@]} -eq 0 ]] && return 0
@@ -269,16 +314,18 @@ The preinstall package sets limits only for the user named oracle."
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
   [[ "$ORACLE_USER" != "oracle" ]] && ! id oracle >/dev/null 2>&1 && \
     PLAN+=$'\n'"The preinstall package may create a user named oracle (uid 54321). This standby does not use it."
+  # the whole new file: the lines it has (limits of other users on a shared server stay), then the new block
+  [[ -L "$LIMITS_FILE" ]] && { NOW+=$'\n'"$LIMITS_FILE is a symbolic link, so the script does not change it."; return 2; }
+  local old="" add=""
+  [[ -f "$LIMITS_FILE" ]] && { old=$(cat -- "$LIMITS_FILE") || { NOW="Cannot read $LIMITS_FILE"; return 2; }; }
+  for it in "${LIM_TODO[@]}"; do add+=$(lim_line ${it})$'\n'; done
+  P2_SNAP=""; p2_snap "$LIMITS_FILE"
+  cp_add_file "$LIMITS_FILE" 644 "${old:+$old$'\n'}# added by dg_standby_setup.sh $RUN_ID"$'\n'"${add%$'\n'}"
   return 1
 }
 d_2_4() {
-  backup_file "$LIMITS_FILE" || return 1
-  local it txt=""
-  for it in "${LIM_TODO[@]}"; do txt+=$(lim_line ${it})$'\n'; done
-  # other lines in the file (limits of other users on a shared server) stay
-  printf '# added by dg_standby_setup.sh %s\n%s' "$RUN_ID" "$txt" | append_as root "$LIMITS_FILE" || return 1
-  chmod 644 "$LIMITS_FILE"
-  printf '%s' "$txt" | log_block "added to $LIMITS_FILE"
+  p2_unchanged || return 1
+  cp_run
 }
 
 # ---- 2.5 folders ----
@@ -336,6 +383,85 @@ make_dir() {
     else chown -h "$owner:$INSTALL_GROUP" "$path" && runuser -u "$owner" -- chmod 775 -- "$path"; fi
   fi
 }
+# make_dir as a list (steps 2.5 and 2.14): the same rules, worked out in the check, so the exact commands are shown
+# before [y]. The action works the list out again and runs it only when it is still the same.
+#   P2_MDOUT  one line per command: "DIR|<folder>|<owner>|<command>" (makes a folder) or "CMD|||<command>"
+#   P2_MADE   the folders the list makes so far ("<folder>=<owner>" lines); P2_MDWHY why a folder is refused
+P2_MDOUT=""; P2_MADE=""; P2_MDWHY=""
+p2_planned() { local l; while IFS= read -r l; do [[ -n "$l" && "${l%=*}" == "$1" ]] && { printf '%s' "${l##*=}"; return 0; }; done <<< "$P2_MADE"; return 1; }
+p2_planned_child() { local l; while IFS= read -r l; do [[ -n "$l" && "${l%=*}" == "$1"/* ]] && return 0; done <<< "$P2_MADE"; return 1; }
+make_dir_plan() {
+  # $1 path, $2 owner: the commands make_dir would run, added to P2_MDOUT. 1 (P2_MDWHY) where make_dir refuses
+  local path=$1 owner=$2 p="" par="/" comp held=1 grp=$INSTALL_GROUP po qp lo cmd
+  local -a parts=()
+  [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { P2_MDWHY="$path is not a plain absolute path. It is not created or changed."; return 1; }
+  case "$path" in /etc/ORACLE|/etc/ORACLE/*) ;;
+    /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/tmp)
+    P2_MDWHY="$path is a system folder. It is not created or changed."; return 1 ;; esac
+  IFS='/' read -ra parts <<< "${path#/}"
+  for comp in "${parts[@]}"; do
+    [[ -n "$comp" ]] || continue
+    p+="/$comp"; qp=$(p2q "$p")
+    # made by an earlier command of this list: a folder of its owner (not held by root)
+    if p2_planned "$p" >/dev/null; then held=0; par=$p; continue; fi
+    if [[ -L "$p" ]]; then
+      lo=$(stat -c '%U' "$p")
+      [[ "$lo" == "root" ]] || { P2_MDWHY="$p is a symbolic link owned by $lo. It is not used."; return 1; }
+    fi
+    [[ $held -eq 1 ]] && ! root_holds "$par" "$p" && held=0
+    if [[ ! -e "$p" && ! -L "$p" ]]; then
+      if [[ $held -eq 1 ]]; then cmd="install -d -o $owner -g $grp -m 775 $qp"
+      else
+        # below a folder another user can change: made as $owner; a folder that cannot get the group is taken back
+        cmd="runuser -u $owner -- mkdir -m 775 -- $qp && { runuser -u $owner -- chgrp -h $grp -- $qp || { runuser -u $owner -- rmdir -- $qp; echo '$owner is not a member of the group $grp (step 2.2)'; exit 1; }; }"
+      fi
+      P2_MDOUT+="DIR|$p|$owner|$cmd"$'\n'; P2_MADE+="$p=$owner"$'\n'
+    elif [[ ! -d "$p" ]]; then P2_MDWHY="$p exists, but it is not a folder. It is not changed."; return 1; fi
+    par=$p
+  done
+  [[ -L "$path" ]] && return 0      # (its owner is not changed)
+  # an empty folder gets the owner, the group and the mode (a folder this list makes has them already)
+  qp=$(p2q "$path")
+  if po=$(p2_planned "$path"); then
+    # made by this list: empty unless the list makes something in it
+    [[ "$po" != "$owner" ]] && ! p2_planned_child "$path" || return 0
+  else
+    dir_empty "$path" && ! p2_planned_child "$path" || return 0
+    [[ "$(stat -c '%U:%G:%a' -- "$path" 2>/dev/null)" == "$owner:$grp:775" ]] && return 0
+  fi
+  if [[ $held -eq 1 ]]; then cmd="chown -h $owner:$grp $qp && chmod 775 $qp"
+  else cmd="chown -h $owner:$grp $qp && runuser -u $owner -- chmod 775 -- $qp"; fi
+  P2_MDOUT+="CMD|||$cmd"$'\n'
+  return 0
+}
+dir_plan_all() {
+  # stdin: "folder:owner" lines -> P2_MDOUT for all of them, in order. 1 with P2_MDWHY
+  local d own
+  P2_MDOUT=""; P2_MADE=""; P2_MDWHY=""
+  while IFS=: read -r d own; do [[ -n "$d" ]] || continue; make_dir_plan "$d" "$own" || return 1; done
+  return 0
+}
+p2_dirs_add() {
+  # P2_MDOUT into the shown list
+  local k d o c
+  P2_META=()
+  while IFS='|' read -r k d o c; do
+    [[ -n "$k" ]] || continue
+    if [[ "$k" == DIR ]]; then p2_add "DIR|$d|$o" root "$c"; else p2_add "" root "$c"; fi
+  done <<< "$P2_MDOUT"
+}
+p2_dirs_run() {
+  # $1 the list shown before [y]; stdin the "folder:owner" lines: worked out again now, run only when the same
+  local shown=$1 i m d o
+  dir_plan_all || { bad "$P2_MDWHY"; return 1; }
+  [[ "$P2_MDOUT" == "$shown" ]] || { bad "The folders were changed after the check. Nothing was done. Answer r to check again."; return 1; }
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    p2_exec "$i" || return 1
+    m=${P2_META[$i]:-}
+    if [[ "$m" == DIR\|* ]]; then IFS='|' read -r _ d o <<< "$m"; say "Created $d"; journal DIR "$d" "owner $o"; fi
+  done
+  return 0
+}
 dir_specs() {
   if use_grid; then printf '%s\n' "$GRID_BASE:$GRID_USER" "$GRID_HOME:$GRID_USER"; fi
   printf '%s\n' "$INVENTORY_DIR:$GRID_USER" "$ORACLE_BASE:$ORACLE_USER" "$DB_HOME:$ORACLE_USER"
@@ -373,13 +499,16 @@ ${fixw%$'\n'}"
   [[ -n "$short" ]] && warn "Little free space for the software:"$'\n'"${short%$'\n'}"
   if [[ -z "$miss" ]]; then NOW="The folders exist and have the right owners"; return 0; fi
   NOW="Some folders are missing, or an empty folder has the wrong owner"
+  dir_plan_all < <(dir_specs) || { NOW+=$'\n'"$P2_MDWHY"; return 2; }
   PLAN="Create these folders, or set their owner (group $INSTALL_GROUP, mode 775):
 ${miss%$'\n'}
 Folders that are not empty keep their owner."
   USING="Same paths as on the primary"
+  P25_SHOWN=$P2_MDOUT; p2_dirs_add
   return 1
 }
-d_2_5() { local d own; while IFS=: read -r d own; do make_dir "$d" "$own" || return 1; done < <(dir_specs); }
+P25_SHOWN=""
+d_2_5() { p2_dirs_run "$P25_SHOWN" < <(dir_specs); }
 
 # ---- 2.6 /etc/hosts on standby ----
 # The script fixes /etc/hosts itself (a backup is kept, --undo puts it back):
@@ -501,19 +630,26 @@ c_2_6() {
     NOW="The host names do not resolve on this server"
     PLAN="Add these lines to /etc/hosts (a backup is kept):"$'\n'"$H_TODO"
   fi
+  # the whole new file, shown and written as it is: in place (it keeps its owner, mode and SELinux label, and a
+  # bind-mounted /etc/hosts of a container can be written too)
+  local new
+  new=$(hosts_new_text) || { NOW+=$'\n'"Cannot read /etc/hosts."; return 2; }
+  # a file that had lines never becomes empty
+  [[ ! -s /etc/hosts || -n "$new" ]] || { NOW+=$'\n'"The new /etc/hosts would be empty. Nothing is changed."; return 2; }
+  P2_SNAP=""; p2_snap /etc/hosts
+  cp_add root "cat > /etc/hosts" "$new"
   return 1
 }
-d_2_6() {
-  backup_file /etc/hosts || return 1
-  local tmp h want fq
-  tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-  # a missing /etc/hosts starts empty; one that cannot be copied (a full /tmp) stops here: never written short
-  if [[ -e /etc/hosts ]]; then cp -- /etc/hosts "$tmp" || { bad "Cannot copy /etc/hosts to $tmp. Nothing was changed."; return 1; }; fi
-  # take each name (and this server's full name) off every line whose address is not the right one
+hosts_new_text() {
+  # /etc/hosts as step 2.6 writes it: each name of H_FIX (and this server's full name) taken off every line whose
+  # address is not the right one; then the lines of H_TODO that are not there yet
+  local txt="" h want fq l
+  # a missing /etc/hosts starts empty
+  if [[ -e /etc/hosts ]]; then txt=$(cat -- /etc/hosts) || return 1; fi
   while IFS='|' read -r h want; do
     [[ -n "$h" ]] || continue
     fq=""; [[ "$h" == "$STANDBY_HOST" ]] && fq=$(host_fq)
-    awk -v n="$h" -v f="$fq" -v w="$want" '
+    txt=$(awk -v n="$h" -v f="$fq" -v w="$want" '
       /^[[:space:]]*(#|$)/ { print; next }
       {
         if ($1 == w || index($1, ":")) { print; next }      # the right line, and IPv6 lines, stay as they are
@@ -524,19 +660,24 @@ d_2_6() {
           out = out " " $i; kept++
         }
         if (kept > 0 || NF == 1) print out
-      }' "$tmp" > "$tmp.n" && mv -f -- "$tmp.n" "$tmp" || return 1
+      }' <<< "$txt") || return 1
   done <<< "$H_FIX"
-  # a last line without its newline gets one first (else the new line would be glued to it)
-  [[ -s "$tmp" && -n "$(tail -c 1 -- "$tmp")" ]] && printf '\n' >> "$tmp"
-  local l; while IFS= read -r l; do
-    [[ -n "$l" ]] && ! grep -qxF -- "$l" "$tmp" && { printf '%s\n' "$l" >> "$tmp" || { bad "Cannot write $tmp. Nothing was changed."; return 1; }; }
+  while IFS= read -r l; do
+    [[ -n "$l" ]] && ! grep -qxF -- "$l" <<< "$txt" && txt+="${txt:+$'\n'}$l"
   done <<< "$H_TODO"
-  # a file that had lines never becomes empty
-  [[ ! -s /etc/hosts || -s "$tmp" ]] || { bad "The new /etc/hosts would be empty. Nothing was changed."; return 1; }
-  # written in place: the file keeps its owner, mode and SELinux label; a failed write puts the backup back
-  cat -- "$tmp" > /etc/hosts || { [[ -f "/etc/hosts.bak_$RUN_ID" ]] && cat -- "/etc/hosts.bak_$RUN_ID" > /etc/hosts; bad "/etc/hosts could not be written. The old content was put back."; return 1; }
-  rm -f -- "$tmp"
-  journal_file_written /etc/hosts 1
+  printf '%s' "$txt"
+}
+d_2_6() {
+  local existed=0; [[ -e /etc/hosts ]] && existed=1
+  p2_unchanged || return 1
+  [[ -L /etc/hosts ]] && { bad "/etc/hosts is a symbolic link. It is not changed."; return 1; }
+  backup_file /etc/hosts || return 1
+  if ! p2_exec 0; then
+    # a failed write puts the backup back
+    [[ -f "/etc/hosts.bak_$RUN_ID" ]] && cat -- "/etc/hosts.bak_$RUN_ID" > /etc/hosts
+    bad "/etc/hosts could not be written. The old content was put back."; return 1
+  fi
+  journal_file_written /etc/hosts "$existed"
   say "Corrected /etc/hosts."
   return 0
 }
@@ -680,23 +821,25 @@ c_2_9() {
   elif [[ $pm -eq 1 ]]; then NOW="Port $PORT/tcp is saved as open, but the running firewall does not have it yet (zone $FW_ZONE)"
   else NOW="Port $PORT/tcp is closed in firewalld (zone $FW_ZONE${ifc:+, interface $ifc})"; fi
   # no --reload: it would also drop other rules that are only in the running firewall
-  PLAN=""
-  [[ $pm -eq 1 ]] || PLAN="firewall-cmd --permanent --zone=$FW_ZONE --add-port=$PORT/tcp"$'\n'
-  [[ $rt -eq 1 ]] || PLAN+="firewall-cmd --zone=$FW_ZONE --add-port=$PORT/tcp"
-  PLAN=${PLAN%$'\n'}
+  if [[ $pm -eq 1 ]]; then PLAN="Open port $PORT/tcp in the running firewall (zone $FW_ZONE)."
+  elif [[ $rt -eq 1 ]]; then PLAN="Save port $PORT/tcp as open (zone $FW_ZONE), so it stays open after a reboot."
+  else PLAN="Open port $PORT/tcp in firewalld (zone $FW_ZONE), now and after a reboot."; fi
+  PLAN+=$'\n'"No reload: rules that are only in the running firewall stay."
+  [[ $pm -eq 1 ]] || cp_add root "firewall-cmd --permanent --zone=$FW_ZONE --add-port=$PORT/tcp"
+  [[ $rt -eq 1 ]] || cp_add root "firewall-cmd --zone=$FW_ZONE --add-port=$PORT/tcp"
   return 1
 }
 d_2_9() {
   # the journal names only the rules this step added (a rule that was there before, saved or running, is not
   # removed by the undo: it may belong to something else)
-  local c perm=0 run=0 obj=""
-  while IFS= read -r c; do
-    [[ -n "$c" ]] || continue
-    run_cmds <<< "$c" || { [[ -n "$obj" ]] && journal FWPORT "$obj" "permanent=$perm runtime=$run"; return 1; }
+  local c i perm=0 run=0 obj=""
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    c=${CP_CMD[$i]}
+    p2_exec "$i" || { [[ -n "$obj" ]] && journal FWPORT "$obj" "permanent=$perm runtime=$run"; return 1; }
     [[ "$c" =~ --zone=([A-Za-z0-9_-]+)\ --add-port=([0-9]+/tcp) ]] || continue
     obj="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
     if [[ "$c" == *--permanent* ]]; then perm=1; else run=1; fi
-  done <<< "$PLAN"
+  done
   [[ -n "$obj" ]] && journal FWPORT "$obj" "permanent=$perm runtime=$run"
   return 0
 }
@@ -733,10 +876,11 @@ c_2_10() {
     return 0
   fi
   NOW="No time sync is running (neither chronyd nor ntpd)"
-  PLAN="systemctl enable --now chronyd"
+  PLAN="Start the time service chronyd, also at every boot."
+  cp_add root "systemctl enable --now chronyd"
   return 1
 }
-d_2_10() { run_cmds <<< "systemctl enable --now chronyd" && journal SERVICE chronyd; }
+d_2_10() { cp_run && journal SERVICE chronyd; }
 
 # ---- 2.11 profiles ----
 PROF_TODO=()
@@ -787,18 +931,36 @@ After this, the default ORACLE_SID of $ORACLE_USER is $STANDBY_SID."
     PLAN+=$'\n'"    ORACLE_SID=$sid"$'\n'"    PATH=\$ORACLE_HOME/bin:\$PATH"
   done
   PLAN+=$'\n'"Existing lines stay; the new lines come last, so they win."
+  # added at the end, by the user itself (its own file in its own folder); a backup is kept
+  local prof lead blk
+  P2_META=(); P2_SNAP=""
+  for entry in "${todo[@]}"; do
+    IFS='|' read -r usr base home sid <<< "$entry"
+    prof="$(home_of "$usr")/.bash_profile"
+    [[ -L "$prof" ]] && { NOW+=$'\n'"$prof is a symbolic link. It is not changed."; return 2; }
+    # a last line without its newline gets one first (else the first new line would be glued to it)
+    lead=0; [[ -s "$prof" && -n "$(tail -c 1 -- "$prof" 2>/dev/null)" ]] && lead=1
+    blk=$(profile_block "$usr" "$base" "$home" "$sid"); [[ $lead -eq 1 ]] && blk=$'\n'"$blk"
+    p2_snap "$prof"
+    p2_add "PROF|$usr|$lead|$prof" root "runuser -u $usr -- tee -a -- $(p2q "$prof") > /dev/null" "$blk"
+  done
   return 1
 }
 d_2_11() {
-  local entry usr base home sid prof
-  for entry in "${PROF_TODO[@]}"; do
-    IFS='|' read -r usr base home sid <<< "$entry"
-    prof="$(home_of "$usr")/.bash_profile"
+  local i m usr lead prof before after
+  p2_unchanged || return 1
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    m=${P2_META[$i]:-}; IFS='|' read -r _ usr lead prof <<< "$m"
+    [[ -n "$prof" ]] || { p2_exec "$i" || return 1; continue; }
     [[ -L "$prof" ]] && { bad "$prof is a symbolic link. It is not changed."; return 1; }
     backup_file "$prof" "$usr" || return 1
-    profile_block "$usr" "$base" "$home" "$sid" | append_as "$usr" "$prof" || { bad "Cannot write $prof"; return 1; }
-    profile_block "$usr" "$base" "$home" "$sid" | log_block "added to $prof"
+    before=0; [[ -f "$prof" ]] && before=$(stat -c '%s' -- "$prof")
+    p2_exec "$i" || { bad "Cannot write $prof"; return 1; }
+    after=$(stat -c '%s' -- "$prof" 2>/dev/null); num "$after" || after=$before
+    # journaled as an added block (--undo cuts exactly these bytes off again)
+    journal_file_appended "$prof" "$before" "${CP_IN[$i]}"$'\n' "$((after - before))" "$lead"
   done
+  return 0
 }
 
 # ---- 2.12 ASM disk method ----
@@ -821,7 +983,8 @@ c_2_12() {
     # the rules are applied by systemd-udevd: without it /dev/oraasm stays empty
     if ! systemctl is-active --quiet systemd-udevd 2>/dev/null; then
       NOW="ASM disks use udev rules, but systemd-udevd is not running. The rules would not be applied."
-      A212_MODE=udevd; PLAN="systemctl start systemd-udevd"
+      A212_MODE=udevd; PLAN="Start systemd-udevd, the udev service of the system."
+      cp_add root "systemctl start systemd-udevd"
       return 1
     fi
     NOW="ASM disks use udev rules, with devices in /dev/oraasm
@@ -854,8 +1017,12 @@ To use ASMLib instead: answer s, install oracleasm-support (step 2.3), then run 
     [[ "$need" == *"systemctl enable"* ]] && nl+="${nl:+; }does not start at boot"
     NOW="ASMLib (oracleasm): $nl"
   fi
-  PLAN="${need%$'\n'}"
-  [[ -n "$PLAN" ]] || PLAN="Use ASMLib for the ASM disks"
+  if [[ -n "$need" ]]; then
+    PLAN="Make ASMLib ready for the ASM disks ($GRID_USER:$ag, loaded, started at boot), then use it."
+    PLAN+=$'\n'"If a command fails (ASMLib does not work on this kernel), these run instead and udev rules are used:"
+    PLAN+=$'\n'"  oracleasm configure -d"$'\n'"  systemctl disable oracleasm"
+    local c; while IFS= read -r c; do [[ -n "$c" ]] && cp_add root "$c"; done <<< "$need"
+  else PLAN="Use ASMLib for the ASM disks"; fi
   A212_MODE=asmlib
   return 1
 }
@@ -864,13 +1031,13 @@ d_2_12() {
     to_udev|save) ASM_METHOD=udev; save_settings; return 0 ;;
     udevd)
       # the udev service of the system: started (nothing else changes); a part of every Linux system
-      run_cmds <<< "systemctl start systemd-udevd" || { bad "systemd-udevd did not start. To see why:  systemctl status systemd-udevd"; return 1; }
+      cp_run || { bad "systemd-udevd did not start. To see why:  systemctl status systemd-udevd"; return 1; }
       systemctl is-active --quiet systemd-udevd 2>/dev/null || { bad "systemd-udevd is still not running. To see why:  systemctl status systemd-udevd"; return 1; }
       return 0 ;;
   esac
-  if [[ -n "$PLAN" && "$PLAN" != "Use ASMLib"* ]]; then
-    journal ASMCFG oracleasm "$(tr '\n' ';' <<< "$PLAN")"
-    if ! run_cmds <<< "$PLAN"; then
+  if cp_any; then
+    journal ASMCFG oracleasm "$(printf '%s;' "${CP_CMD[@]}")"
+    if ! cp_run; then
       warn "ASMLib does not work on this kernel ($(uname -r)). udev rules are used instead."
       run_logged "oracleasm configure -d" oracleasm configure -d || true
       run_logged "systemctl disable oracleasm" systemctl disable oracleasm || true
@@ -1035,7 +1202,7 @@ Each chosen disk gets a GPT label and one partition"
     if [[ "$(asm_method)" == "asmlib" ]]; then PLAN+=$'\n'"Then: oracleasm createdisk <DG>_1, <DG>_2 ..."
     else PLAN+=$'\n'"Then a udev rule makes /dev/oraasm/<DG>_1, owner $GRID_USER:$(asm_owner_group), mode 0660"; fi
     PLAN+=$'\n'"All chosen disks are checked first. Disks with any data are refused."
-    PLAN+=$'\n'"You type each disk name to confirm it."
+    PLAN+=$'\n'"The exact commands are shown once the disks are chosen. You type each disk name to confirm it."
   fi
   PLAN=${PLAN#$'\n'}
   USING="Size needed (database files of the primary + 10%, plus the recovery area):"
@@ -1059,51 +1226,95 @@ udev_uuid() {
   printf '%s' "$u"
 }
 
-make_asm_disk() {
-  # $1 label, $2 disk (already validated and confirmed)
-  local label=$1 disk=$2 part
-  part=$(part_name "$disk")
-  disk_is_free "$disk" || { bad "$disk can no longer be used: $DISK_WHY. Nothing was erased."; return 1; }
-  journal PART "$disk" "GPT with one partition for ASM disk $label"
-  run_cmds <<< "parted -s $disk mklabel gpt mkpart primary 1MiB 100%
-partprobe $disk" || return 1
-  command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null
-  local n=0
-  until [[ "$(lsblk -dn -o TYPE "$part" 2>/dev/null)" == "part" ]]; do
-    n=$((n + 1)); [[ $n -gt 10 ]] && { bad "Partition $part did not appear"; return 1; }; nap 1
-  done
+asm_udev_rule() {
+  # $1 partition UUID, $2 label: the udev rule of one ASM disk
+  printf 'ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_PART_ENTRY_UUID}=="%s", SYMLINK+="oraasm/%s", OWNER="%s", GROUP="%s", MODE="0660"' \
+    "$1" "$2" "$GRID_USER" "$(asm_owner_group)"
+}
+asm_uuid_mark() { printf '<the partition UUID of %s>' "$1"; }   # in the shown rule: read once the partition exists
+P213_RULESDIR=0
+asm_disk_cmds() {
+  # $1 label, $2 disk (validated): its commands into the shown list. P2_META tags what the action does around them:
+  #   PART (checked free again, journaled first)  PROBE (waits for the partition)  RULE (the partition UUID is put in)
+  #   CREATE (ASMLib)  FIN (the last one of the disk: the ASM disk is checked and recorded)
+  local label=$1 disk=$2 part; part=$(part_name "$disk")
+  p2_add "PART|$label|$disk" root "parted -s $disk mklabel gpt mkpart primary 1MiB 100%"
+  p2_add "PROBE|$label|$part" root "partprobe $disk"
   if [[ "$(asm_method)" == "asmlib" ]]; then
-    if ! run_cmds <<< "oracleasm createdisk $label $part
-oracleasm scandisks"; then
-      printf 'The disk now has an empty GPT partition, with no data on it.\nTo try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
-      return 1
-    fi
-  else
-    local uuid; uuid=$(udev_uuid "$part")
-    if ! [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-      bad "Cannot read the partition UUID of $part"
-      printf 'The disk now has an empty GPT partition, with no data on it.\nTo try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$part" "$disk" | hint
-      return 1
-    fi
-    install -d -m 755 "$(dirname "$UDEV_RULES")" || return 1
-    backup_file "$UDEV_RULES" || return 1
-    # a retry after a slow udev must not add the same rule twice
-    if ! grep -qsF -- "ENV{ID_PART_ENTRY_UUID}==\"$uuid\"" "$UDEV_RULES"; then
-      printf 'ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_PART_ENTRY_UUID}=="%s", SYMLINK+="oraasm/%s", OWNER="%s", GROUP="%s", MODE="0660"\n' \
-        "$uuid" "$label" "$GRID_USER" "$(asm_owner_group)" | append_as root "$UDEV_RULES" || return 1
-    fi
-    chmod 644 "$UDEV_RULES"
-    run_cmds <<< "udevadm control --reload-rules
-udevadm trigger --action=change --sysname-match=${part#/dev/}
-udevadm settle" || return 1
-    n=0; until [[ -e "/dev/oraasm/$label" ]]; do n=$((n + 1)); [[ $n -gt 10 ]] && break; nap 1; done
-    local perm; perm=$(stat -L -c '%U:%G:%a' "/dev/oraasm/$label" 2>/dev/null)
-    [[ "$perm" == "$GRID_USER:$(asm_owner_group):660" ]] || { bad "/dev/oraasm/$label has owner and mode '$perm', but needs $GRID_USER:$(asm_owner_group):660"; return 1; }
+    p2_add "CREATE|$label|$part" root "oracleasm createdisk $label $part"
+    p2_add "FIN|$label|$part" root "oracleasm scandisks"
+    return 0
   fi
-  asm_label_exists "$label" || { bad "ASM disk $label was created, but it is not visible"; return 1; }
-  record_label "$label" "$part"
-  journal ASMLABEL "$label" "on $part"
-  say "Created ASM disk $label on $part"
+  if [[ $P213_RULESDIR -eq 0 && ! -d "$(dirname "$UDEV_RULES")" ]]; then
+    p2_add "" root "install -d -m 755 $(dirname "$UDEV_RULES")"
+  fi
+  P213_RULESDIR=1
+  # a retry after a slow udev does not add the same rule twice (the action looks for the UUID first)
+  p2_add "RULE|$label|$part" root "cat >> $UDEV_RULES" "$(asm_udev_rule "$(asm_uuid_mark "$part")" "$label")"
+  p2_add "" root "chmod 644 $UDEV_RULES"
+  p2_add "" root "udevadm control --reload-rules"
+  p2_add "" root "udevadm trigger --action=change --sysname-match=${part#/dev/}"
+  p2_add "FIN|$label|$part" root "udevadm settle"
+}
+asm_wipe_hint() {
+  # $1 the partition (part_name of its disk)
+  local d=${1%1}; [[ "$d" =~ [0-9]p$ ]] && d=${d%p}
+  printf 'The disk now has an empty GPT partition, with no data on it.\nTo try again later, clear it first:\n  wipefs -a %s ; wipefs -a %s\n' "$1" "$d" | hint
+}
+asm_disks_run() {
+  # runs the shown list of asm_disk_cmds, entry by entry
+  local i m k lab x uuid lead before after n perm
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    m=${P2_META[$i]:-}; k=""; lab=""; x=""
+    [[ -n "$m" ]] && IFS='|' read -r k lab x <<< "$m"
+    case "$k" in
+      PART)
+        disk_is_free "$x" || { bad "$x can no longer be used: $DISK_WHY. Nothing was erased."; return 1; }
+        journal PART "$x" "GPT with one partition for ASM disk $lab" ;;
+      RULE)
+        uuid=$(udev_uuid "$x")
+        if ! [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+          bad "Cannot read the partition UUID of $x"; asm_wipe_hint "$x"; return 1
+        fi
+        # the rule as shown, with the UUID that was not known before the partition was made
+        CP_IN[$i]=${CP_IN[$i]//"$(asm_uuid_mark "$x")"/$uuid}
+        if grep -qsF -- "ENV{ID_PART_ENTRY_UUID}==\"$uuid\"" "$UDEV_RULES"; then
+          say "The udev rule for $x (UUID $uuid) is in $UDEV_RULES already."; continue
+        fi
+        [[ -L "$UDEV_RULES" ]] && { bad "Not changed: $UDEV_RULES is a symbolic link."; return 1; }
+        dir_root_only "$UDEV_RULES" || { bad "Not changed: $(dirname -- "$UDEV_RULES") must be a folder that only root can write to."; return 1; }
+        backup_file "$UDEV_RULES" || return 1
+        lead=0; [[ -s "$UDEV_RULES" && -n "$(tail -c 1 -- "$UDEV_RULES")" ]] && { lead=1; CP_IN[$i]=$'\n'"${CP_IN[$i]}"; }
+        before=0; [[ -f "$UDEV_RULES" ]] && before=$(stat -c '%s' -- "$UDEV_RULES") ;;
+    esac
+    if ! p2_exec "$i"; then
+      [[ "$(asm_method)" == "asmlib" && ( "$k" == CREATE || "$k" == FIN ) ]] && asm_wipe_hint "$x"
+      return 1
+    fi
+    case "$k" in
+      PROBE)
+        command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null
+        n=0
+        until [[ "$(lsblk -dn -o TYPE "$x" 2>/dev/null)" == "part" ]]; do
+          n=$((n + 1)); [[ $n -gt 10 ]] && { bad "Partition $x did not appear"; return 1; }; nap 1
+        done ;;
+      RULE)
+        # journaled as an added block (the undo keeps the rule of a disk that a disk group still uses)
+        after=$(stat -c '%s' -- "$UDEV_RULES" 2>/dev/null); num "$after" || after=$before
+        journal_file_appended "$UDEV_RULES" "$before" "${CP_IN[$i]}"$'\n' "$((after - before))" "$lead" ;;
+      FIN)
+        if [[ "$(asm_method)" != "asmlib" ]]; then
+          n=0; until [[ -e "/dev/oraasm/$lab" ]]; do n=$((n + 1)); [[ $n -gt 10 ]] && break; nap 1; done
+          perm=$(stat -L -c '%U:%G:%a' "/dev/oraasm/$lab" 2>/dev/null)
+          [[ "$perm" == "$GRID_USER:$(asm_owner_group):660" ]] || { bad "/dev/oraasm/$lab has owner and mode '$perm', but needs $GRID_USER:$(asm_owner_group):660"; return 1; }
+        fi
+        asm_label_exists "$lab" || { bad "ASM disk $lab was created, but it is not visible"; return 1; }
+        record_label "$lab" "$x"
+        journal ASMLABEL "$lab" "on $x"
+        say "Created ASM disk $lab on $x" ;;
+    esac
+  done
+  return 0
 }
 
 next_label() {
@@ -1241,12 +1452,16 @@ d_2_13() {
     disk_is_free "$d" || { bad "$d cannot be used: $DISK_WHY. Nothing was erased."; return 1; }
     disk_sector_ok "$d" || { bad "$SECTOR_WHY"$'\n'"Nothing was erased."; return 1; }
   done
+  # the exact commands for all chosen disks, before anything is asked or erased
+  cp_reset; P2_META=(); P213_RULESDIR=0
+  for p in "${sel[@]}"; do asm_disk_cmds "${p%%|*}" "${p#*|}"; done
+  cp_show
   for p in "${sel[@]}"; do
     d=${p#*|}
     confirm_word "ALL data on $d ($(lsblk -dn -o SIZE "$d" | tr -d ' ')) will be erased to make ASM disk ${p%%|*}." "$d" \
       || { say "Not confirmed. Nothing was erased."; return 3; }
   done
-  for p in "${sel[@]}"; do make_asm_disk "${p%%|*}" "${p#*|}" || return 1; done
+  asm_disks_run
 }
 
 # ---- 2.14 database folders (file system storage) ----
@@ -1322,11 +1537,15 @@ mount <mount point>
   if [[ ${#missing[@]} -eq 0 ]]; then NOW="${report%$'\n'}"; return 0; fi
   FS_TODO=("${missing[@]}")
   NOW="${report%$'\n'}"
+  dir_plan_all < <(fs_todo_specs) || { NOW+=$'\n'"$P2_MDWHY"; return 2; }
   PLAN="Create these folders (owner $ORACLE_USER:$INSTALL_GROUP, mode 775):"
   for d in "${missing[@]}"; do PLAN+=$'\n'"  $d"; done
+  P214_SHOWN=$P2_MDOUT; p2_dirs_add
   return 1
 }
-d_2_14() { local d; for d in "${FS_TODO[@]}"; do make_dir "$d" "$ORACLE_USER" || return 1; done; }
+P214_SHOWN=""
+fs_todo_specs() { local d; for d in "${FS_TODO[@]+"${FS_TODO[@]}"}"; do printf '%s:%s\n' "$d" "$ORACLE_USER"; done; }
+d_2_14() { p2_dirs_run "$P214_SHOWN" < <(fs_todo_specs); }
 
 # ---- 2.15 storage is not shared with the primary ----
 STORAGE_SHARED=""; STORAGE_KEYS=()
@@ -1690,9 +1909,17 @@ c_2_16() {
       PLAN="-- $SHM_UNIT_WIN sets /dev/shm at boot. The drop-in that would set the size over it is a link:"$'\n'"--   $(shm_dropin)"$'\n'"-- Remove the link (rm $(shm_dropin)), then answer r: the script writes the drop-in then."
       return 1
     fi
+    if [[ $SHM_BOOT_RO -eq 0 && -n "$SHM_UNIT_WIN" ]] && ! grep -qE '^[[:space:]]*Options[[:space:]]*=' "$SHM_UNIT_WIN"; then
+      KIND_NOW=manual; MANUAL_HOW="root"; MANUAL_WHERE="To do on this server ($(hostname -s))"
+      PLAN="-- $SHM_UNIT_WIN sets /dev/shm at boot, but has no Options line to set the size in."$'\n'"-- Add size=${MEM_SHM_MB}m to its mount options (Options=...,size=${MEM_SHM_MB}m), and to the /dev/shm line in $FSTAB_FILE, then:"$'\n'"systemctl daemon-reload"
+      [[ $cur -lt $MEM_SHM_MB ]] && PLAN+=$'\n'"mount -o remount,size=${MEM_SHM_MB}m /dev/shm"
+      PLAN+=$'\n'"-- Then answer r."
+      return 1
+    fi
     if [[ $SHM_BOOT_RO -eq 1 ]]; then PLAN+=$'\n'"$SHM_UNIT_WIN sets /dev/shm at boot. It is not changed; this drop-in sets size=${MEM_SHM_MB}m and wins over it:"$'\n'"  $(shm_dropin)"
     elif [[ -n "$SHM_UNIT_WIN" ]]; then PLAN+=$'\n'"$SHM_UNIT_WIN sets /dev/shm at boot: its Options line gets size=${MEM_SHM_MB}m too (a backup is kept)"; fi
     PLAN+=$'\n'"Then the size for the next boot is read again from these files."
+    shm_cmds "$cur" || { NOW+=$'\n'"Cannot read $FSTAB_FILE${SHM_UNIT_WIN:+ or $SHM_UNIT_WIN}."; return 2; }
   else
     KIND_NOW=manual
     MANUAL_HOW="root"; MANUAL_WHERE="To do for this server ($(hostname -s))"
@@ -1703,63 +1930,64 @@ c_2_16() {
   return 1
 }
 
-d_2_16() {
-  [[ $MEM_SHM_MB -gt 0 ]] || return 1
-  local cur old; cur=$(df -m --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' '); num "$cur" || cur=0
+shm_cmds() {
+  # $1 the size of /dev/shm now (MB): the commands and the whole new files of step 2.16 into the shown list
+  local cur=$1 uf=$SHM_UNIT_WIN reload=0 txt
+  P2_META=(); P2_SNAP=""
   if [[ $cur -lt $MEM_SHM_MB ]]; then
-    [[ $cur -gt 0 ]] && old="${cur}m" || old="-"
-    run_cmds <<< "mount -o remount,size=${MEM_SHM_MB}m /dev/shm" || return 1
-    journal SHM /dev/shm "old=$old new=${MEM_SHM_MB}m"
+    local old="-"; [[ $cur -gt 0 ]] && old="${cur}m"
+    p2_add "SHM|$old" root "mount -o remount,size=${MEM_SHM_MB}m /dev/shm"
   fi
   # a systemd mount unit for /dev/shm (or a drop-in of it) wins over fstab at boot: the size is set in the file
   # that wins, too
-  shm_boot_calc; local uf=$SHM_UNIT_WIN
   if [[ $SHM_BOOT_RO -eq 1 ]]; then
     # the winning file is outside /etc (a package or /run owns it): a drop-in in /etc sets the size over it
     local dn dopts="" x ol=(); dn=$(shm_dropin)
-    [[ -L "$dn" ]] && { bad "$dn is a symbolic link. It is not written through."; printf 'Remove the link (as root):  rm %s   Then run this step again.\n' "$dn" | hint; return 1; }
     IFS=',' read -ra ol <<< "$SHM_BOOT_OPTS"
-    for x in "${ol[@]}"; do [[ -z "$x" || "$x" == size=* ]] || dopts+="${dopts:+,}$x"; done
-    install -d -m 755 "$(dirname "$dn")" || return 1
-    [[ -f "$dn" ]] && { backup_file "$dn" || return 1; }
-    printf '# Written by dg_standby_setup.sh: the size of /dev/shm for the Oracle SGA (wins over %s)\n[Mount]\nOptions=%s\n' "$SHM_UNIT_WIN" "${dopts:+$dopts,}size=${MEM_SHM_MB}m" | write_as root "$dn" 644 || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    uf=""
+    for x in "${ol[@]+"${ol[@]}"}"; do [[ -z "$x" || "$x" == size=* ]] || dopts+="${dopts:+,}$x"; done
+    p2_snap "$dn"
+    cp_add_file "$dn" 644 "# Written by dg_standby_setup.sh: the size of /dev/shm for the Oracle SGA (wins over $SHM_UNIT_WIN)"$'\n'"[Mount]"$'\n'"Options=${dopts:+$dopts,}size=${MEM_SHM_MB}m"
+    reload=1; uf=""
   fi
   if [[ -n "$uf" ]]; then
-    if ! grep -qE '^[[:space:]]*Options[[:space:]]*=' "$uf"; then
-      bad "$uf sets /dev/shm at boot, but has no Options line to set the size in."
-      printf 'Add size=%sm to its mount options by hand (Options=...,size=%sm), then: systemctl daemon-reload
-' "$MEM_SHM_MB" "$MEM_SHM_MB" | hint
-      return 1
-    fi
-    local ut; ut=$(mktemp) || return 1; CLEANUP_FILES+=("$ut")
-    awk -v sz="size=${MEM_SHM_MB}m" '
+    txt=$(awk -v sz="size=${MEM_SHM_MB}m" '
       /^[[:space:]]*Options[[:space:]]*=/ { v = $0; sub(/^[[:space:]]*Options[[:space:]]*=[[:space:]]*/, "", v)
         n = split(v, o, ","); opts = ""
         for (i = 1; i <= n; i++) if (o[i] !~ /^size=/ && o[i] != "") opts = opts (opts ? "," : "") o[i]
         print "Options=" (opts ? opts "," : "") sz; next }
-      { print }' "$uf" > "$ut" || return 1
-    backup_file "$uf" || return 1
-    write_as root "$uf" 644 < "$ut" || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || true
+      { print }' "$uf") || return 1
+    p2_snap "$uf"
+    cp_add_file "$uf" 644 "$txt"
+    reload=1
   fi
   # a new fstab line keeps the protections /dev/shm has now (nosuid, nodev, noexec): "defaults" would drop them
   local keep="" o; for o in $(findmnt -n -o OPTIONS /dev/shm 2>/dev/null | tr ',' ' '); do
     case "$o" in nosuid|nodev|noexec) keep+=",$o" ;; esac; done
   # /etc/fstab: the size option of the /dev/shm line is set (other options stay), or such a line is added
-  local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-  awk -v sz="size=${MEM_SHM_MB}m" -v keep="$keep" '
+  txt=$(awk -v sz="size=${MEM_SHM_MB}m" -v keep="$keep" '
     !/^[[:space:]]*#/ && $2 == "/dev/shm" && NF >= 4 {
       n = split($4, o, ","); opts = ""
       for (i = 1; i <= n; i++) if (o[i] !~ /^size=/) opts = opts (opts ? "," : "") o[i]
       $4 = (opts ? opts "," : "") sz; done = 1 }
     { print }
-    END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE" > "$tmp" || return 1
-  backup_file "$FSTAB_FILE" || return 1
-  write_as root "$FSTAB_FILE" 644 < "$tmp" || return 1
-  # systemd makes its unit from fstab only at a daemon-reload (or the next boot)
-  [[ -d "$SYSTEMD_RUN_DIR" ]] && { systemctl daemon-reload >/dev/null 2>&1 || true; }
+    END { if (!done) print "tmpfs   /dev/shm   tmpfs   defaults" keep "," sz "   0 0" }' "$FSTAB_FILE") || return 1
+  [[ -n "$txt" ]] || return 1
+  p2_snap "$FSTAB_FILE"
+  cp_add_file "$FSTAB_FILE" 644 "$txt"
+  # systemd makes its unit from fstab (and reads the unit files) only at a daemon-reload, or the next boot
+  [[ -d "$SYSTEMD_RUN_DIR" ]] && reload=1
+  [[ $reload -eq 1 ]] && cp_add root "systemctl daemon-reload || true"
+  return 0
+}
+d_2_16() {
+  [[ $MEM_SHM_MB -gt 0 ]] || return 1
+  local i m
+  p2_unchanged || return 1
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    p2_exec "$i" || return 1
+    m=${P2_META[$i]:-}
+    [[ "$m" == SHM\|* ]] && journal SHM /dev/shm "old=${m#SHM|} new=${MEM_SHM_MB}m"
+  done
   # what the next boot gets is read again from the files just written
   shm_boot_calc; local boot=$SHM_BOOT_MB
   if ! num "$boot" || [[ $boot -lt $MEM_SHM_NEED ]]; then

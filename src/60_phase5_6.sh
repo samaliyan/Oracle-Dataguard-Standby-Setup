@@ -4,6 +4,193 @@
 lsnr_file() { printf '%s/network/admin/listener.ora' "$(lsnr_home)"; }
 tns_file()  { printf '%s/network/admin/tnsnames.ora' "$DB_HOME"; }
 
+#---- the commands of phases 5 and 6 ("Will run": what is shown is what runs) -----------------
+# The check functions build the list with nf_add (cp_add plus a tag); the do functions run it with nf_run.
+# The tag says what is done after an entry ran (journal, backup record, md5 check of a copy) or how its
+# failure counts. Files of oracle / grid are written by that user (owner, group and mode stay as they are).
+declare -a NF_TAG=()
+NF_SUMS=""            # md5|file of the files whose new content was worked out in the check
+nf_reset() { NF_TAG=(); NF_SUMS=""; }
+nf_add() { NF_TAG[${#CP_CMD[@]}]=$1; shift; cp_add "$@"; }      # $1 tag (may be empty), then as cp_add
+nf_q() {
+  # one word of a shell command line: as it is when plain, else in single quotes
+  if [[ "$1" =~ ^[A-Za-z0-9_./,:+=@%-]+$ ]]; then printf '%s' "$1"; else printf "'%s'" "${1//\'/\'\\\'\'}"; fi
+}
+nf_lsnr_role() { if use_grid; then printf 'grid'; else printf 'oracle'; fi; }
+nf_role_user() { case "$1" in grid) printf '%s' "$GRID_USER" ;; oracle) printf '%s' "$ORACLE_USER" ;; *) printf 'root' ;; esac; }
+nf_sum() { if [[ -e "$1" || -L "$1" ]]; then md5sum -- "$1" 2>/dev/null | cut -d' ' -f1; else printf 'none'; fi; }
+nf_sum_add() { NF_SUMS+="$(nf_sum "$1")|$1"$'\n'; }
+nf_sums_ok() {
+  # the files are as they were when the new content was worked out (else nothing is written)
+  local s f
+  while IFS='|' read -r s f; do
+    [[ -n "$f" ]] || continue
+    [[ "$(nf_sum "$f")" == "$s" ]] || { bad "$f was changed after the check. Nothing was changed. Answer r to check it again."; return 1; }
+  done <<< "$NF_SUMS"
+  return 0
+}
+nf_bak_add() {
+  # $1 role, $2 file: "keep a backup" (once per run; as backup_file: as the owner, never readable by everyone)
+  local f=$2 b="$2.bak_$RUN_ID"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  [[ ( -e "$b" || -L "$b" ) && -n "${BACKUPS_MADE[$b]:-}" ]] && return 0      # made earlier in this run
+  nf_add "bak:$f" "$1" "cp -p -- $(nf_q "$f") $(nf_q "$b") && chmod o-rwx -- $(nf_q "$b")"
+}
+nf_baks_ok() {
+  # before anything is changed: a backup name that exists but was not made by this run is never overwritten
+  local i t b
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    t=${NF_TAG[$i]:-}; [[ "$t" == bak:* ]] || continue
+    b="${t#bak:}.bak_$RUN_ID"
+    [[ -e "$b" || -L "$b" ]] && { bad "$b exists already, but this run did not make it. Nothing is changed in ${t#bak:}."; return 1; }
+  done
+  return 0
+}
+nf_write_cmd() {
+  # $1 file, $2 mode, $3 user that writes it: the whole new content (on the input) through a temporary file in the
+  # same folder and a rename (a crash never leaves half a file); the group of the old file is kept
+  local f=$1 d g gc=""; d=$(dirname -- "$f")
+  if [[ -e "$f" ]]; then
+    g=$(stat -c '%G' -- "$f" 2>/dev/null)
+    [[ -n "$g" ]] && id -nG "$3" 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$g" && gc=" && chgrp $(nf_q "$g") \"\$t\""
+  fi
+  # (in braces: the text given on the input is for the whole command)
+  printf '{ t=$(mktemp %s/.dgtmp.XXXXXX) && cat > "$t" && chmod %s "$t"%s && mv -fT -- "$t" %s || { rm -f -- "$t"; exit 1; }; }' \
+    "$(nf_q "$d")" "$2" "$gc" "$(nf_q "$f")"
+}
+nf_app_add() {
+  # $1 role, $2 file, $3 text: added at the end (a missing final newline of the file is added first, as append_as)
+  local lead=0 nl=""
+  [[ -s "$2" && -n "$(tail -c 1 -- "$2")" ]] && { lead=1; nl=$'\n'; }
+  nf_add "app:$2|$lead" "$1" "cat >> $(nf_q "$2")" "$nl$3"
+}
+nf_inst_cmd() {
+  # $1 user, $2 group, $3 mode, $4 private copy of root, $5 target: written by the user itself (temporary file and
+  # rename in the target folder, as install_as: root never writes, chmods or chowns a path in that user's folder)
+  printf "runuser -u %s -- sh -c 'umask 077; t=\$(mktemp %s/.dgtmp.XXXXXX) && cat > \"\$t\" && chgrp %s \"\$t\" && chmod %s \"\$t\" && mv -fT -- \"\$t\" %s || { rm -f -- \"\$t\"; exit 1; }' < %s" \
+    "$1" "$(dirname -- "$5")" "$2" "$3" "$5" "$(nf_q "$4")"
+}
+nf_scp_to() { if [[ ${OS_MAJOR:-0} -ge 9 ]]; then printf '1200'; else printf '600'; fi; }
+nf_scp_cmd() {
+  # $1 file on the primary, $2 private copy here: the scp of prim_scp (over the open ssh connection, read-only
+  # on the primary). On OL9 scp uses SFTP; a primary without the sftp subsystem needs the old protocol (-O).
+  local o s
+  o="-o ControlMaster=no -o ControlPath=$(nf_q "$SSH_CTL") -o BatchMode=yes -o StrictHostKeyChecking=yes -o CheckHostIP=no -o $(nf_q "UserKnownHostsFile=$ROOT_KH $KH_FILE")"
+  s=$(nf_q "$PRIMARY_SSH_USER@$PRIMARY_IP:$1")
+  printf 'rm -f -- %s; umask 077; { scp -q %s %s %s' "$(nf_q "$2")" "$o" "$s" "$(nf_q "$2")"
+  [[ ${OS_MAJOR:-0} -ge 9 ]] && printf ' || scp -O -q %s %s %s' "$o" "$s" "$(nf_q "$2")"
+  printf '; } && chmod 600 %s' "$(nf_q "$2")"
+}
+nf_fetch_ok() {
+  # $1 file on the primary, $2 the copy here: 0 only when the copy is byte-identical (md5)
+  local src=$1 tmp=$2 rmd lmd
+  [[ -s "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || { bad "The copy of $src is empty"; return 1; }
+  prim_probe md5 "$src" || { bad "Cannot get the md5sum of $src on the primary. The copy is not used."; return 1; }
+  rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT"); lmd=$(md5sum "$tmp" | awk '{print $1}')
+  [[ "$rmd" =~ ^[0-9a-f]{32}$ && "$rmd" == "$lmd" ]] || { bad "The copy differs from $src on the primary (md5 here $lmd, there $rmd)"; return 1; }
+  say "Checksum (md5) is the same as the file on the primary."
+}
+nf_mkdir_add() {
+  # $1 folder, $2 role of its owner: the commands of make_dir for it (made with the same rules; NF_ERR when
+  # make_dir would refuse). Nothing when the folder is there and not empty.
+  local path=$1 role=$2 owner p="" par="/" comp held=1 lo
+  local -a parts=()
+  owner=$(nf_role_user "$role"); NF_ERR=""
+  [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { NF_ERR="$path is not a plain absolute path. It is not created or changed."; return 1; }
+  case "$path" in /etc/ORACLE|/etc/ORACLE/*) ;;
+    /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/tmp)
+    NF_ERR="$path is a system folder. It is not created or changed."; return 1 ;; esac
+  IFS='/' read -ra parts <<< "${path#/}"
+  local made=0
+  for comp in "${parts[@]}"; do
+    [[ -n "$comp" ]] || continue
+    p+="/$comp"
+    if [[ -L "$p" ]]; then
+      lo=$(stat -c '%U' "$p")
+      [[ "$lo" == "root" ]] || { NF_ERR="$p is a symbolic link owned by $lo. It is not used."; return 1; }
+    fi
+    # (a folder made by this list belongs to the owner: root does not hold the ones below it, as in make_dir)
+    [[ $held -eq 1 ]] && ! root_holds "$par" "$p" && held=0
+    if [[ $made -eq 1 || ( ! -e "$p" && ! -L "$p" ) ]]; then
+      made=1
+      if [[ $held -eq 1 ]]; then nf_add "dir:$p|$owner" root "install -d -o $owner -g $INSTALL_GROUP -m 775 $(nf_q "$p")"
+      else
+        nf_add "" "$role" "mkdir -m 775 -- $(nf_q "$p")"
+        # a folder with the wrong group is taken back at once (it is empty and new)
+        nf_add "dirgrp:$p|$owner" "$role" "chgrp -h $INSTALL_GROUP -- $(nf_q "$p") || { rmdir -- $(nf_q "$p"); exit 1; }"
+      fi
+    else
+      [[ -d "$p" ]] || { NF_ERR="$p exists, but it is not a folder. It is not changed."; return 1; }
+    fi
+    par=$p
+  done
+  [[ -L "$path" ]] && return 0
+  if [[ $made -eq 1 ]] || dir_empty "$path"; then
+    nf_add "" root "chown -h $owner:$INSTALL_GROUP $(nf_q "$path")"
+    if [[ $held -eq 1 ]]; then nf_add "" root "chmod 775 $(nf_q "$path")"
+    else nf_add "" "$role" "chmod 775 -- $(nf_q "$path")"; fi
+  fi
+  return 0
+}
+NF_ERR=""
+nf_exec() {
+  # entry $1 of the list, then what its tag says. 0 = go on
+  local i=$1 t=${NF_TAG[$1]:-} f="" rc=0 before=0 existed=0 lead after
+  case "$t" in
+    write:*|inst:*)
+      f=${t#*:}
+      [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
+      [[ -d "$f" ]] && { bad "Not changed: $f is a folder, not a file."; return 1; }
+      [[ -e "$f" ]] && existed=1 ;;
+    app:*)
+      f=${t#app:}; f=${f%|*}
+      [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
+      [[ -f "$f" ]] && before=$(stat -c '%s' -- "$f") ;;
+  esac
+  cp_exec "$i" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    case "$t" in
+      chmodq|rmtmp|sso1:*|gp_stop) return 0 ;;          # as before: these never stopped the step
+      fetch:*)
+        f=${t#fetch:}; f=${f%|*}
+        bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"
+        [[ $rc -eq 124 ]] && say "No answer from the primary within ${CP_TO[$i]} s."
+        printf 'The ssh user %s must be able to read %s on the primary.\n' "$PRIMARY_SSH_USER" "$f" | hint
+        return 1 ;;
+      dirgrp:*)
+        f=${t#dirgrp:}
+        bad "${f#*|} cannot give ${f%|*} the group $INSTALL_GROUP (${f#*|} is not a member of it). Step 2.2 adds the users to the groups."; return 1 ;;
+      *)
+        bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}" | mask_pw)"$'\n'"$(tail -n 4 <<< "$RUN_OUT" | mask_pw)"; return 1 ;;
+    esac
+  fi
+  case "$t" in
+    bak:*)   BACKUPS_MADE["${t#bak:}.bak_$RUN_ID"]=1 ;;
+    write:*) journal_file_written "$f" "$existed" ;;
+    inst:*)  say "Installed $f"; journal_file_written "$f" "$existed" ;;
+    app:*)
+      lead=${t##*|}; after=$(stat -c '%s' -- "$f" 2>/dev/null)
+      journal_file_appended "$f" "$before" "${CP_IN[$i]}"$'\n' "$((after - before))" "$lead" ;;
+    fetch:*) f=${t#fetch:}; nf_fetch_ok "${f%|*}" "${f#*|}" || return 1 ;;
+    dir:*|dirgrp:*) f=${t#*:}; say "Created ${f%|*}"; journal DIR "${f%|*}" "owner ${f#*|}" ;;
+    sso1:*)  journal RENAME "${t#sso1:}/cwallet.sso" "to=${t#sso1:}/cwallet.sso.old_$RUN_ID"
+             say "The old auto-login file of ${t#sso1:} is kept as cwallet.sso.old_$RUN_ID. It is made again." ;;
+    sso2:*)  journal RENAME "${t#sso2:}/cwallet.sso" "to=${t#sso2:}/cwallet.sso.old_$RUN_ID"
+             say "The auto-login file of ${t#sso2:} that is not usable here is kept as cwallet.sso.old_$RUN_ID. It is made again." ;;
+    lsnrstart) journal LSNRSTART "$SB_LSNR" "started from $(lsnr_home)" ;;
+    gp_modify) journal LSNRPORT "$SB_LSNR" "old=${L310_CUR:-unknown} new=$PORT" ;;
+  esac
+  return 0
+}
+nf_run() {
+  # the entries $1 (default 0) up to before $2 (default: all), in order; the first that fails stops
+  local i from=${1:-0} to=${2:-${#CP_CMD[@]}}
+  for ((i = from; i < to; i++)); do
+    nf_exec "$i" || { [[ $((i + 1)) -lt $to ]] && say "The commands after it were not run."; return 1; }
+  done
+  return 0
+}
+
 net_dir_note() {
   # $1 a network file: its folder may be a link to a TNS_ADMIN shared with other homes or servers. Said in the
   # plan, and asked also with --yes
@@ -130,7 +317,27 @@ port_owner_pid() {
   # iproute 3.10 of OL7 < 7.5 prints users:(("tnslsnr",1234,8)); newer ones users:(("tnslsnr",pid=1234,fd=8))
   ss -ltnp "( sport = :$1 )" 2>/dev/null | grep -oE 'users:\(\("[^"]*",(pid=)?[0-9]+' | head -n 1 | grep -oE '[0-9]+$'
 }
+l51_list() {
+  # the commands of 5.1 for L51_MODE, worked out from listener.ora as it is now (the do function writes only
+  # while the file is still the same)
+  local f u r new mode txt; f=$(lsnr_file); u=$(lsnr_user); r=$(nf_lsnr_role)
+  txt="# Added by dg_standby_setup.sh $RUN_ID"
+  nf_sum_add "$f"
+  nf_bak_add "$r" "$f"
+  case "$L51_MODE" in
+    insert|insert_desc|replace|replace_desc)
+      if [[ "$L51_MODE" == insert* ]]; then new=$(sidlist_insert "$f") || return 1; else new=$(sidlist_replace "$f") || return 1; fi
+      [[ "$L51_MODE" == *_desc ]] && new+=$'\n'"$txt"$'\n'"$(lsnr_desc_block)"
+      mode=$(stat -c '%a' -- "$f")
+      nf_add "write:$f" "$r" "$(nf_write_cmd "$f" "$mode" "$u")" "$new" ;;
+    both)   nf_app_add "$r" "$f" "$txt"$'\n'"$(lsnr_desc_block)"$'\n'"$(static_block)" ;;
+    desc)   nf_app_add "$r" "$f" "$txt"$'\n'"$(lsnr_desc_block)" ;;
+    *)      nf_app_add "$r" "$f" "$txt"$'\n'"$(static_block)" ;;
+  esac
+  return 0
+}
 c_5_1() {
+  nf_reset
   lsnr_sw_ok || { NOW="The listener software is not installed yet (phase 3)"; return 2; }
   local st=0 f; f=$(lsnr_file)
   # on a server that already runs something else: port $PORT must be free or ours
@@ -170,27 +377,26 @@ ORACLE_HOME (database home, not Grid):
       # no Grid: the listener lives in the database home and must be defined completely
       L51_MODE=both
       NOW="No listener is defined in listener.ora. There is no Grid on this server."$'\n'"  $f"
-      PLAN="Write this to listener.ora (owner $ORACLE_USER; a backup is kept):
-$(lsnr_desc_block)
-$(static_block)"
+      PLAN="Write the listener address and the static entry to listener.ora (owner $ORACLE_USER; a backup is kept)."
       net_dir_note "$f"
+      l51_list
       return 1
     fi
     if [[ $st -eq 0 ]]; then
       L51_MODE=desc
       NOW="listener.ora has the static entry, but no address for the listener $SB_LSNR:"$'\n'"  $f"
-      PLAN="Add this to listener.ora (a backup is kept):
-$(lsnr_desc_block)"
+      PLAN="Add the address of the listener $SB_LSNR to listener.ora (a backup is kept)."
       net_dir_note "$f"
+      l51_list
       return 1
     fi
   fi
   if [[ $st -eq 1 ]] && ! lsnr_has_sidlist; then
     L51_MODE=static
     NOW="listener.ora has no static entry for $STANDBY_SID:"$'\n'"  $f"
-    PLAN="Add this to listener.ora (owner $(lsnr_user); a backup is kept):
-$(static_block)"
+    PLAN="Add the static entry SID_LIST_$SB_LSNR to listener.ora (owner $(lsnr_user); a backup is kept)."
     net_dir_note "$f"
+    l51_list
     return 1
   fi
   # the block is there, without this SID: the entry is put inside it (one block of that name, written the usual
@@ -201,7 +407,9 @@ $(static_block)"
     PLAN="Add this entry inside SID_LIST_$SB_LSNR (owner $(lsnr_user); a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == insert_desc ]] && PLAN+=$'\n'"and this listener address:"$'\n'"$(lsnr_desc_block)"
+    PLAN+=$'\n'"listener.ora is written whole with this change (below)."
     net_dir_note "$f"
+    l51_list
     return 1
   fi
   # the entry of this SID is there but not right: it is replaced (one block, one entry of this SID, on lines of
@@ -213,8 +421,9 @@ $(sid_desc_block)"
     PLAN="Replace the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR with this (a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == replace_desc ]] && PLAN+=$'\n'"and add this listener address:"$'\n'"$(lsnr_desc_block)"
-    PLAN+=$'\n'"A running listener reads it at the next reload (step 5.2)."
+    PLAN+=$'\n'"listener.ora is written whole with this change (below). A running listener reads it at the next reload (step 5.2)."
     net_dir_note "$f"
+    l51_list
     return 1
   fi
   # the wrong entry of this SID serves another service (the broker's _DGMGRL): it stays, the entry of
@@ -226,7 +435,9 @@ $(sid_desc_block)"
     PLAN="Add this entry inside SID_LIST_$SB_LSNR (a backup is kept; the other entry stays, it may be used by the broker):
 $(sid_desc_block)"
     [[ "$L51_MODE" == insert_desc ]] && PLAN+=$'\n'"and this listener address:"$'\n'"$(lsnr_desc_block)"
+    PLAN+=$'\n'"listener.ora is written whole with this change (below)."
     net_dir_note "$f"
+    l51_list
     return 1
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
@@ -251,38 +462,19 @@ $(sid_desc_block)"
 lsnr_reload_flag() { printf '%s/listener_reload_due' "$STATE_DIR"; }
 lsnr_changed() { install -d -m 700 "$STATE_DIR" 2>/dev/null; : > "$(lsnr_reload_flag)"; }
 d_5_1() {
-  local f u txt; f=$(lsnr_file); u=$(lsnr_user)
-  backup_file "$f" "$u" || return 1
-  # whatever is changed below, a running listener reads it only at a reload (step 5.2 does it): the flag is set
-  # only after the file was really changed (lsnr_changed)
-  txt="# Added by dg_standby_setup.sh $RUN_ID"$'\n'
-  case "$L51_MODE" in
-    insert|insert_desc)
-      local new; new=$(sidlist_insert "$f") || { bad "The entry could not be put into SID_LIST_$SB_LSNR of $f. Add it by hand."; return 1; }
-      printf '%s\n' "$new" | write_as "$u" "$f" "$(stat -c '%a' -- "$f")" || return 1
-      lsnr_changed
-      sid_desc_block | log_block "added inside SID_LIST_$SB_LSNR of $f"
-      [[ "$L51_MODE" == insert ]] && return 0
-      txt+="$(lsnr_desc_block)" ;;
-    replace|replace_desc)
-      local new; new=$(sidlist_replace "$f") || { bad "The entry of $STANDBY_SID in SID_LIST_$SB_LSNR of $f could not be replaced. Correct it by hand."; return 1; }
-      printf '%s\n' "$new" | write_as "$u" "$f" "$(stat -c '%a' -- "$f")" || return 1
-      lsnr_changed
-      sid_desc_block | log_block "replaced the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR of $f"
-      [[ "$L51_MODE" == replace ]] && return 0
-      txt+="$(lsnr_desc_block)" ;;
-    both)   txt+="$(lsnr_desc_block)"$'\n'"$(static_block)" ;;
-    desc)   txt+="$(lsnr_desc_block)" ;;
-    *)      txt+="$(static_block)" ;;
-  esac
-  printf '%s\n' "$txt" | append_as "$u" "$f" || return 1
+  # the commands shown: the backup, then listener.ora written whole (by its owner) or the block added at its end
+  nf_sums_ok || return 1
+  nf_baks_ok || return 1
+  nf_run || return 1
+  # a running listener reads the change only at a reload (step 5.2 does it): the flag is set only now
   lsnr_changed
-  printf '%s\n' "$txt" | log_block "added to $f"
+  return 0
 }
 
 # ---- 5.2 ----
 L52_START=0
 c_5_2() {
+  nf_reset
   lsnr_sw_ok || { NOW="The listener software is not installed yet (phase 3)"; return 2; }
   static_entry_state || { NOW="The static entry is not correct yet (step 5.1)"; return 2; }
   L52_START=0; L52_GRIDPORT=0
@@ -291,6 +483,7 @@ c_5_2() {
     L52_START=1
     NOW="Listener $SB_LSNR is not running"
     PLAN="Start it:  lsnrctl start $SB_LSNR   (as $ORACLE_USER, from $DB_HOME)"
+    nf_add lsnrstart "$(nf_lsnr_role)" "$(lsnr_home)/bin/lsnrctl start $SB_LSNR" "" 120
     return 1
   fi
   # an address the primary can reach: not only 127.x / localhost
@@ -305,10 +498,11 @@ $(lsnr_home)/bin/lsnrctl stop $SB_LSNR ; $(lsnr_home)/bin/lsnrctl start $SB_LSNR
       # an Oracle Restart listener: the same change as step 3.10 (asked first, also with --yes: it restarts the listener)
       KIND_NOW=""; L52_GRIDPORT=1; YES_HOLD=1
       L310_CUR=$(as_grid timeout 600 "$GRID_HOME/bin/srvctl" config listener -listener "$SB_LSNR" 2>/dev/null | sed -n 's/.*End points:[[:space:]]*TCP:\([0-9]*\).*/\1/Ip' | head -n 1)
-      PLAN="As $GRID_USER (the listener restarts; connections to it are cut for a moment):
-srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT
-srvctl stop listener -listener $SB_LSNR
-srvctl start listener -listener $SB_LSNR"
+      PLAN="Set port $PORT for the Oracle Restart listener $SB_LSNR (as step 3.10 does), as $GRID_USER."
+      PLAN+=$'\n'"The listener restarts; connections to it are cut for a moment."
+      nf_add gp_modify grid "srvctl modify listener -listener $SB_LSNR -endpoints TCP:$PORT"
+      nf_add gp_stop grid "srvctl stop listener -listener $SB_LSNR"
+      nf_add "" grid "srvctl start listener -listener $SB_LSNR"
     fi
     net_dir_note "$(lsnr_file)"
     return 1
@@ -318,20 +512,21 @@ srvctl start listener -listener $SB_LSNR"
   if [[ -f "$(lsnr_reload_flag)" ]]; then
     NOW="Step 5.1 changed listener.ora. The running listener $SB_LSNR still has the old entries."
     PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
+    nf_add "" "$(nf_lsnr_role)" "$(lsnr_home)/bin/lsnrctl reload $SB_LSNR" "" 120
     return 1
   fi
   if grep -qF "Instance \"$STANDBY_SID\", status UNKNOWN" <<< "$RUN_OUT"; then NOW="The listener shows Instance \"$STANDBY_SID\", status UNKNOWN (port $PORT)"; return 0; fi
   NOW="The listener does not show the static instance $STANDBY_SID yet"
   PLAN="Reload it:  lsnrctl reload $SB_LSNR   (as $(lsnr_user); open connections stay)"
+  nf_add "" "$(nf_lsnr_role)" "$(lsnr_home)/bin/lsnrctl reload $SB_LSNR" "" 120
   return 1
 }
 L52_GRIDPORT=0
 d_5_2() {
-  # the port change restarts the listener: it reads listener.ora then, no reload is due any more
-  [[ $L52_GRIDPORT -eq 1 ]] && { d_3_10 || return 1; rm -f -- "$(lsnr_reload_flag)"; return 0; }
-  local a=reload; [[ $L52_START -eq 1 ]] && a=start
-  run_logged "lsnrctl $a" as_lsnr timeout 120 "$(lsnr_home)/bin/lsnrctl" "$a" "$SB_LSNR" || { bad "$(tail -n 3 <<< "$RUN_OUT")"; return 1; }
-  [[ "$a" == "start" ]] && journal LSNRSTART "$SB_LSNR" "started from $(lsnr_home)"
+  # the shown commands: lsnrctl start or reload, or (Oracle Restart, wrong port) srvctl modify / stop / start as
+  # in step 3.10 (a failed stop does not stop the step). A started or restarted listener reads listener.ora:
+  # no reload is due any more
+  nf_run || return 1
   rm -f -- "$(lsnr_reload_flag)"
   return 0
 }
@@ -369,8 +564,21 @@ tns_replace() {
     END { if (!done || bad) exit 1 }' "$1"
 }
 TNS_MODE=""
+tns_list() {
+  # the commands of 5.3 / 5.4 for TNS_MODE, worked out from tnsnames.ora as it is now (written only while the
+  # file is still the same): the entry replaced (the whole file written by its owner), or added at its end
+  local f new; f=$(tns_file)
+  nf_sum_add "$f"
+  nf_bak_add oracle "$f"
+  if [[ "$TNS_MODE" == replace ]]; then
+    new=$(tns_replace "$f" "$T_ALIAS") || return 1
+    nf_add "write:$f" oracle "$(nf_write_cmd "$f" "$(stat -c '%a' -- "$f")" "$ORACLE_USER")" "$new"
+  else
+    nf_app_add oracle "$f" "$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+  fi
+}
 c_tns() {
-  TNS_MODE=""
+  TNS_MODE=""; nf_reset
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
   local f; f=$(tns_file)
@@ -384,7 +592,9 @@ c_tns() {
       TNS_MODE=replace; YES_HOLD=1
       PLAN="Replace the entry $T_ALIAS in tnsnames.ora with this (a backup is kept; other entries stay):
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+      PLAN+=$'\n'"tnsnames.ora is written whole with this change (below)."
       net_dir_note "$f"
+      tns_list
       return 1
     fi
     KIND_NOW=manual; MANUAL_HOW="$ORACLE_USER  ->  shell"
@@ -414,7 +624,9 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
       TNS_MODE=replace; YES_HOLD=1
       PLAN="Replace the entry $T_ALIAS in tnsnames.ora with this (a backup is kept; other entries stay):
 $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+      PLAN+=$'\n'"tnsnames.ora is written whole with this change (below)."
       net_dir_note "$f"
+      tns_list
       return 1
     fi
     NOW="The alias $T_ALIAS is in tnsnames.ora, but tnsping fails: $(grep -E 'TNS-[0-9]+' <<< "$RUN_OUT" | head -n 1)"
@@ -435,22 +647,17 @@ $(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
     net_dir_note "$f"
     return 1
   fi
-  PLAN="Add this to tnsnames.ora (a backup is kept):
-$(tns_block "$T_ALIAS" "$T_HOST" "$T_SVC")"
+  PLAN="Add the entry $T_ALIAS to the end of tnsnames.ora (a backup is kept)."
   net_dir_note "$f"
+  tns_list
   return 1
 }
 d_tns() {
-  local f; f=$(tns_file)
-  backup_file "$f" "$ORACLE_USER" || return 1
-  if [[ "$TNS_MODE" == replace ]]; then
-    local new; new=$(tns_replace "$f" "$T_ALIAS") || { bad "The entry $T_ALIAS in $f could not be replaced. Correct it by hand."; return 1; }
-    printf '%s\n' "$new" | write_as "$ORACLE_USER" "$f" "$(stat -c '%a' -- "$f")" || return 1
-    tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | log_block "replaced the entry $T_ALIAS in $f"
-    return 0
-  fi
-  tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | append_as "$ORACLE_USER" "$f" || return 1
-  tns_block "$T_ALIAS" "$T_HOST" "$T_SVC" | log_block "added to $f"
+  # the commands shown: the backup, then the entry added at the end of tnsnames.ora, or the file written whole
+  # with the entry replaced (as $ORACLE_USER)
+  nf_sums_ok || return 1
+  nf_baks_ok || return 1
+  nf_run
 }
 c_5_3() { T_ALIAS=$PRIMARY_TNS; T_HOST=$PRIMARY_HOST; T_SVC=$PRIMARY_SERVICE; c_tns; }
 c_5_4() { T_ALIAS=$STANDBY_TNS; T_HOST=$STANDBY_HOST; T_SVC=$STANDBY_SERVICE; c_tns; }
@@ -482,7 +689,20 @@ pwfile_ok() {
 }
 
 PW_SRC=""
+pw_incoming() { printf '%s/orapw_incoming.%s' "$STATE_DIR" "$$"; }
+pw_list() {
+  # the commands of 6.1: copy PW_SRC from the primary into a private file here (then checked with md5sum),
+  # keep the old file, install the copy as $ORACLE_USER (mode 640), remove the private copy.
+  # 1 when a path is not plain (it goes into a command line)
+  local d tmp; d=$(pw_dest); tmp=$(pw_incoming)
+  v_path "$PW_SRC" && v_path "$d" || { NOW+=$'\n'"A path is not plain, so no command is built with it: $PW_SRC $d"; return 1; }
+  nf_add "fetch:$PW_SRC|$tmp" root "$(nf_scp_cmd "$PW_SRC" "$tmp")" "" "$(nf_scp_to)"
+  nf_bak_add oracle "$d"
+  nf_add "inst:$d" root "$(nf_inst_cmd "$ORACLE_USER" "$INSTALL_GROUP" 640 "$tmp" "$d")"
+  nf_add rmtmp root "rm -f -- $(nf_q "$tmp")"
+}
 c_6_1() {
+  nf_reset
   db_sw_ok || { NOW="The database software is not installed yet (phase 3)"; return 2; }
   rw_home_ok || { NOW="The Oracle home is read-only (step 3.8)"; return 2; }
   local d; d=$(pw_dest)
@@ -549,6 +769,7 @@ Install it here (owner $ORACLE_USER:$INSTALL_GROUP, mode 640):
   $d"
       [[ -f "$d" ]] && PLAN+=$'\n'"Keep the old file as ${d##*/}.bak_$RUN_ID (same folder)"
       USING="Fresh copy of $pfile on the primary (owner $towner)"
+      pw_list || return 2
       return 1
     fi
     NOW+=$'\n'"The primary password file is in ASM: $pfile"
@@ -578,33 +799,17 @@ chmod g+r $pfile"
 Install it here (owner $ORACLE_USER:$INSTALL_GROUP, mode 640):
   $d"
   [[ -f "$d" ]] && PLAN+=$'\n'"Keep the old file as ${d##*/}.bak_$RUN_ID (same folder)"
+  pw_list || return 2
   return 1
 }
-fetch_primary_file() {
-  # $1 file on primary, $2 private local copy. 0 only when the copy is byte-identical (md5).
-  local src=$1 tmp=$2 rmd lmd
-  rm -f -- "$tmp"
-  # the copy is private from the first byte (password file, wallet): scp creates it under umask 077
-  local um rc=0; um=$(umask); umask 077; prim_scp "$src" "$tmp" || rc=1; umask "$um"
-  chmod 600 -- "$tmp" 2>/dev/null
-  [[ $rc -eq 0 ]] || { bad "scp failed: $(tail -n 2 <<< "$RUN_OUT")"; printf 'The ssh user %s must be able to read %s on the primary.\n' "$PRIMARY_SSH_USER" "$src" | hint; return 1; }
-  [[ -s "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || { bad "The copy of $src is empty"; return 1; }
-  prim_probe md5 "$src" || { bad "Cannot get the md5sum of $src on the primary. The copy is not used."; return 1; }
-  rmd=$(awk '{print $1; exit}' <<< "$RUN_OUT"); lmd=$(md5sum "$tmp" | awk '{print $1}')
-  [[ "$rmd" =~ ^[0-9a-f]{32}$ && "$rmd" == "$lmd" ]] || { bad "The copy differs from $src on the primary (md5 here $lmd, there $rmd)"; return 1; }
-  say "Checksum (md5) is the same as the file on the primary."
-}
 d_6_1() {
-  local d tmp; d=$(pw_dest)
+  # the commands shown: scp into a private file of root (its md5sum is compared with the primary's before it is
+  # used), the backup, the install as $ORACLE_USER, the private copy removed
   install -d -m 700 "$STATE_DIR"
-  tmp="$STATE_DIR/orapw_incoming.$$"; CLEANUP_FILES+=("$tmp")
-  fetch_primary_file "$PW_SRC" "$tmp" || return 1
-  local existed=0; [[ -e "$d" ]] && existed=1
-  backup_file "$d" "$ORACLE_USER" || return 1
-  install_as "$ORACLE_USER" "$INSTALL_GROUP" 640 "$tmp" "$d" || { bad "Cannot install $d"; return 1; }
-  rm -f "$tmp"
-  journal_file_written "$d" "$existed"
-  DONE_MSG="The primary password file is installed here:"$'\n'"  $d"
+  CLEANUP_FILES+=("$(pw_incoming)")
+  nf_baks_ok || return 1
+  nf_run || return 1
+  DONE_MSG="The primary password file is installed here:"$'\n'"  $(pw_dest)"
 }
 
 # ---- 6.2 temporary copy on primary ----
@@ -699,7 +904,66 @@ sqlnet_has_wallet() {
   local f d=${1%/}; f=$(sqlnet_file); [[ -f "$f" ]] || return 1
   norm "$(sed 's/#.*//' "$f")" | grep -qE "\(DIRECTORY=\"?$(sed 's/[][\.*^$+?(){}|]/\\&/g' <<< "${d^^}")/?\"?\)"
 }
+TDE_CW_PRED=()      # the folders where orapki makes cwallet.sso after the copy (as the check after the copy will find)
+TDE_PW_NOTE="(the keystore password: you type it when this runs; it is not shown, logged or kept)"
+tde_incoming() { printf '%s/tde_incoming.%s' "$STATE_DIR" "$$"; }
+tde_in_todo() { local x; for x in "${TDE_TODO[@]+"${TDE_TODO[@]}"}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+tde_list() {
+  # the commands of 6.3: per wallet folder (made as make_dir does when missing) the files of TDE_TODO copied from
+  # the primary (scp into a private file of root, md5sum compared, backup, installed as $ORACLE_USER mode 600),
+  # sqlnet.ora (TDE_SQLNET), then the auto-login keystore made with orapki where it will be missing.
+  # 1 (with the reason in NOW) when a folder could not be made the way make_dir makes it.
+  local f d tmp s txt seen=" " opt x
+  tmp=$(tde_incoming)
+  for f in "${TDE_TODO[@]+"${TDE_TODO[@]}"}"; do
+    d=$(dirname "$f")
+    if [[ "$seen" != *" $d "* ]]; then
+      seen+="$d "
+      nf_mkdir_add "$d" oracle || { NOW+=$'\n'"$NF_ERR"; return 1; }
+      nf_add chmodq oracle "chmod 700 -- $(nf_q "$d")"
+    fi
+    nf_add "fetch:$f|$tmp" root "$(nf_scp_cmd "$f" "$tmp")" "" "$(nf_scp_to)"
+    nf_bak_add oracle "$f"
+    nf_add "inst:$f" root "$(nf_inst_cmd "$ORACLE_USER" "$INSTALL_GROUP" 600 "$tmp" "$f")"
+    nf_add rmtmp root "rm -f -- $(nf_q "$tmp")"
+    # a new ewallet.p12 (for example after a new master key) makes an auto-login file that was made HERE outdated
+    # (ORA-28374): it is moved aside and made again. One that comes from the primary is copied anyway.
+    if [[ "$f" == */ewallet.p12 && -f "$d/cwallet.sso" ]] && ! tde_in_todo "$d/cwallet.sso"; then
+      nf_add "sso1:$d" oracle "mv -f -- $(nf_q "$d/cwallet.sso") $(nf_q "$d/cwallet.sso.old_$RUN_ID")"
+    fi
+  done
+  s=$(sqlnet_file)
+  if [[ $TDE_SQLNET -eq 1 ]]; then
+    nf_sum_add "$s"; nf_bak_add oracle "$s"
+    nf_app_add oracle "$s" "# Added by dg_standby_setup.sh $RUN_ID (TDE wallet of the standby)"$'\n'"ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = ${TDE_DIRS[0]})))"
+  elif [[ $TDE_SQLNET -eq 2 ]]; then
+    nf_sum_add "$s"
+    txt=$(sqlnet_wallet_replaced "$s" "${TDE_DIRS[0]}") || { NOW+=$'\n'"The ENCRYPTION_WALLET_LOCATION entry of $s cannot be changed. Edit it by hand."; return 1; }
+    nf_bak_add oracle "$s"
+    nf_add "write:$s" oracle "$(nf_write_cmd "$s" "$(stat -c '%a' -- "$s")" "$ORACLE_USER")" "$txt"
+  fi
+  # the auto-login keystore: missing now, or moved aside above (outdated by a new ewallet.p12)
+  TDE_CW_PRED=("${TDE_CW_TODO[@]+"${TDE_CW_TODO[@]}"}")
+  for f in "${TDE_TODO[@]+"${TDE_TODO[@]}"}"; do
+    [[ "$f" == */ewallet.p12 ]] || continue
+    d=$(dirname "$f")
+    [[ -n "$WALLET_ROOT" && "$d" == "$WALLET_ROOT/tde_seps" ]] && continue
+    [[ -f "$d/cwallet.sso" ]] && ! tde_in_todo "$d/cwallet.sso" || continue
+    [[ " ${TDE_CW_PRED[*]+"${TDE_CW_PRED[*]}"} " == *" $d "* ]] || TDE_CW_PRED+=("$d")
+  done
+  # a cwallet.sso that does not open here (LOCAL, made on another host or outdated) is kept aside first
+  for d in "${TDE_CW_PRED[@]+"${TDE_CW_PRED[@]}"}"; do
+    [[ -f "$d/cwallet.sso" ]] && ! tde_in_todo "$d/ewallet.p12" || continue
+    nf_add "sso2:$d" oracle "mv -f -- $(nf_q "$d/cwallet.sso") $(nf_q "$d/cwallet.sso.old_$RUN_ID")"
+  done
+  for d in "${TDE_CW_PRED[@]+"${TDE_CW_PRED[@]}"}"; do
+    opt=$(tde_local_autologin "$d" && printf -- '-auto_login_local' || printf -- '-auto_login')
+    nf_add "orapki:$d" oracle "$DB_HOME/bin/orapki wallet create -wallet $(nf_q "$d") $opt" "$TDE_PW_NOTE" 300
+  done
+  return 0
+}
 c_6_3() {
+  nf_reset
   # the wallet query of the discovery failed: asked again now; still failing = not known (never "no wallet")
   if [[ ${TDE_UNREAD:-0} -eq 1 ]]; then
     need_ssh || return 2
@@ -816,6 +1080,7 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
     [[ -n "$stale" ]] && NOW+=$'\n'"Not usable here:$stale"
     PLAN="Make cwallet.sso here with orapki, as $ORACLE_USER, in:"$'\n'"$(printf '  %s\n' "${nocw[@]}")"$'\n'"You type the keystore (wallet) password once. It is passed to orapki and not kept anywhere."
     [[ -n "$stale" ]] && PLAN+=$'\n'"A cwallet.sso that is not usable is kept first as cwallet.sso.old_$RUN_ID (same folder)."
+    tde_list || return 2
     return 1
   fi
   if [[ -z "$miss$diff" && $TDE_SQLNET -eq 0 ]]; then
@@ -835,79 +1100,81 @@ ENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY 
     [[ $nport -eq 1 ]] && PLAN+="The primary has no auto-login keystore (cwallet.sso)$([[ $nloc -eq 1 ]] && printf ' in the other folders')."$'\n'"Without one here, the RMAN copy and redo apply on the standby stop with ORA-28365."$'\n'
     [[ -n "$stale" ]] && PLAN+="Not usable here, kept as cwallet.sso.old_$RUN_ID:$stale"$'\n'
     PLAN+="After the copy, cwallet.sso is made on this server with orapki (you type the keystore password once)."$'\n'
+    PLAN+="The wallet is checked again after the copy: if a folder other than shown needs one, nothing more is done."$'\n'
   fi
   PLAN=${PLAN%$'\n'}
+  tde_list || return 2
   return 1
 }
 d_6_3() {
-  local f tmp d
-  for f in "${TDE_TODO[@]+"${TDE_TODO[@]}"}"; do
-    d=$(dirname "$f")
-    make_dir "$d" "$ORACLE_USER" || return 1
-    runuser -u "$ORACLE_USER" -- chmod 700 "$d" 2>/dev/null || true
-    tmp="$STATE_DIR/tde_incoming.$$"; CLEANUP_FILES+=("$tmp")
-    fetch_primary_file "$f" "$tmp" || return 1
-    local existed=0; [[ -e "$f" ]] && existed=1
-    backup_file "$f" "$ORACLE_USER" || return 1
-    install_as "$ORACLE_USER" "$INSTALL_GROUP" 600 "$tmp" "$f" || return 1
-    rm -f "$tmp"; say "Installed $f"; journal_file_written "$f" "$existed"
-    # a new ewallet.p12 (for example after a new master key) makes an auto-login file that was made HERE
-    # outdated (ORA-28374): it is moved aside and made again. One that comes from the primary is copied anyway.
-    if [[ "$f" == */ewallet.p12 && -f "$d/cwallet.sso" && " ${TDE_TODO[*]} " != *" $d/cwallet.sso "* ]]; then
-      runuser -u "$ORACLE_USER" -- mv -f -- "$d/cwallet.sso" "$d/cwallet.sso.old_$RUN_ID" \
-        && { journal RENAME "$d/cwallet.sso" "to=$d/cwallet.sso.old_$RUN_ID"; say "The old auto-login file of $d is kept as cwallet.sso.old_$RUN_ID. It is made again."; }
-    fi
-  done
-  if [[ $TDE_SQLNET -eq 1 ]]; then
-    local s; s=$(sqlnet_file)
-    backup_file "$s" "$ORACLE_USER" || return 1
-    printf '# Added by dg_standby_setup.sh %s (TDE wallet of the standby)\nENCRYPTION_WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = %s)))\n' "$RUN_ID" "${TDE_DIRS[0]}" \
-      | append_as "$ORACLE_USER" "$s" || return 1
-    say "Added ENCRYPTION_WALLET_LOCATION to $s"
-  elif [[ $TDE_SQLNET -eq 2 ]]; then
-    local s txt; s=$(sqlnet_file)
-    txt=$(sqlnet_wallet_replaced "$s" "${TDE_DIRS[0]}") || { bad "The ENCRYPTION_WALLET_LOCATION entry of $s could not be changed. Edit it by hand."; return 1; }
-    backup_file "$s" "$ORACLE_USER" || return 1
-    printf '%s\n' "$txt" | write_as "$ORACLE_USER" "$s" "$(stat -c '%a' -- "$s")" || return 1
-    say "Changed ENCRYPTION_WALLET_LOCATION in $s"
-  fi
+  # the commands shown, in their order. The ones of the auto-login keystore (mv aside, orapki) run only when the
+  # check after the copy finds the same folders without a usable cwallet.sso as shown before
+  nf_sums_ok || return 1
+  nf_baks_ok || return 1
+  install -d -m 700 "$STATE_DIR"; CLEANUP_FILES+=("$(tde_incoming)")
+  local i n=${#CP_CMD[@]} first t d
+  first=$n
+  for ((i = 0; i < n; i++)); do t=${NF_TAG[$i]:-}; [[ "$t" == sso2:* || "$t" == orapki:* ]] && { first=$i; break; }; done
+  nf_run 0 "$first" || return 1
   # the auto-login keystore: worked out again after the copy (the copied files may have brought one)
   need_ssh || return 1            # a lost connection is opened again on the screen, not in the quiet check
-  local rc=0; TDE_CW_TODO=(); c_6_3 >/dev/null 2>&1 || rc=$?
+  # (the check builds a list of its own: the shown list is kept aside meanwhile)
+  local -a s_role=("${CP_ROLE[@]+"${CP_ROLE[@]}"}") s_cmd=("${CP_CMD[@]+"${CP_CMD[@]}"}") s_in=("${CP_IN[@]+"${CP_IN[@]}"}") s_to=("${CP_TO[@]+"${CP_TO[@]}"}")
+  local -a s_tag=() s_pred=("${TDE_CW_PRED[@]+"${TDE_CW_PRED[@]}"}") got=()
+  for ((i = 0; i < n; i++)); do s_tag[i]=${NF_TAG[$i]:-}; done
+  local rc=0; cp_reset; TDE_CW_TODO=(); c_6_3 >/dev/null 2>&1 || rc=$?
+  got=("${TDE_CW_TODO[@]+"${TDE_CW_TODO[@]}"}")
+  CP_ROLE=("${s_role[@]+"${s_role[@]}"}"); CP_CMD=("${s_cmd[@]+"${s_cmd[@]}"}"); CP_IN=("${s_in[@]+"${s_in[@]}"}"); CP_TO=("${s_to[@]+"${s_to[@]}"}")
+  NF_TAG=(); for ((i = 0; i < n; i++)); do NF_TAG[i]=${s_tag[$i]}; done
+  TDE_CW_PRED=("${s_pred[@]+"${s_pred[@]}"}")
   [[ $rc -eq 0 ]] && return 0
   # only a missing auto-login file is left for orapki; anything else the re-check finds is reported, not hidden
   [[ $rc -eq 2 ]] && { bad "The TDE wallet could not be checked again after the copy: $NOW"; return 1; }
-  if [[ ${#TDE_CW_TODO[@]} -eq 0 || ${#TDE_TODO[@]} -gt 0 || $TDE_SQLNET -ne 0 ]]; then bad "The TDE wallet is still not right after the copy: $NOW"; return 1; fi
+  if [[ ${#got[@]} -eq 0 || ${#TDE_TODO[@]} -gt 0 || $TDE_SQLNET -ne 0 ]]; then bad "The TDE wallet is still not right after the copy: $NOW"; return 1; fi
+  if [[ "$(printf '%s\n' "${got[@]}" | sort -u)" != "$(printf '%s\n' "${TDE_CW_PRED[@]+"${TDE_CW_PRED[@]}"}" | sort -u)" ]]; then
+    bad "After the copy, these folders have no usable auto-login keystore (cwallet.sso):"$'\n'"$(printf '  %s\n' "${got[@]}")"$'\n'"That is not what was shown before, so nothing more is done. Answer r to check again."
+    return 1
+  fi
   # a cwallet.sso that does not open here (LOCAL, made on another host or outdated) is kept aside, then made again
-  for d in "${TDE_CW_TODO[@]}"; do
-    [[ -f "$d/cwallet.sso" ]] || continue
-    runuser -u "$ORACLE_USER" -- mv -f -- "$d/cwallet.sso" "$d/cwallet.sso.old_$RUN_ID" || { bad "Cannot move $d/cwallet.sso aside"; return 1; }
-    journal RENAME "$d/cwallet.sso" "to=$d/cwallet.sso.old_$RUN_ID"; say "The auto-login file of $d that is not usable here is kept as cwallet.sso.old_$RUN_ID. It is made again."
+  for ((i = first; i < n; i++)); do
+    t=${NF_TAG[$i]:-}; [[ "$t" == sso2:* ]] || continue
+    [[ -f "${t#sso2:}/cwallet.sso" ]] || continue
+    nf_exec "$i" || return 1
   done
   tde_make_autologin
 }
+tde_orapki_exec() {
+  # entry $1 of the shown list (orapki wallet create, as $ORACLE_USER), the password $2 on its input: never in an
+  # argument, a file, the log or on the screen ($3: another password to hide in its output). Output in RUN_OUT.
+  local i=$1 rc=0
+  say "${C_D}Running as $(cp_user "${CP_ROLE[$i]}"):${C_N} ${CP_CMD[$i]}  ->  (the keystore password)"
+  RUN_OUT=$(printf '%s\n' "$2" | cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" 2>&1) || rc=$?
+  RUN_OUT=${RUN_OUT//"$2"/*****}; [[ -n "${3:-}" ]] && RUN_OUT=${RUN_OUT//"$3"/*****}
+  { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
+  return "$rc"
+}
 TDE_CW_TODO=()
 tde_make_autologin() {
-  # cwallet.sso for every keystore folder in TDE_CW_TODO. The password goes to orapki on its input
-  # (never on its command line, never in a file or the log). If orapki does not take it, the command is shown.
-  # every folder is tried (one failure does not stop the others); the result is the files that exist at the end
-  local d out failed=0 opt
-  ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${TDE_CW_TODO[*]})"
+  # the orapki entries of the shown list: cwallet.sso for each folder. One password question for all of them;
+  # if orapki does not take it, the command is shown. Every folder is tried (one failure does not stop the
+  # others); the result is the files that exist at the end
+  local i d out failed=0 dirs=() idx=()
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    [[ "${NF_TAG[$i]:-}" == orapki:* ]] && { idx+=("$i"); dirs+=("${NF_TAG[$i]#orapki:}"); }
+  done
+  [[ ${#idx[@]} -gt 0 ]] || return 0
+  ask_secret "TDE keystore password (the wallet password of the primary; one password for: ${dirs[*]})"
   local pw=$SECRET; SECRET=""
-  for d in "${TDE_CW_TODO[@]}"; do
-    opt=$(tde_local_autologin "$d" && printf -- '-auto_login_local' || printf -- '-auto_login')
-    out=$(printf '%s\n' "$pw" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
-    out=${out//"$pw"/*****}
-    printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt"
+  for i in "${idx[@]}"; do
+    d=${NF_TAG[$i]#orapki:}
+    tde_orapki_exec "$i" "$pw" || true; out=$RUN_OUT
     # a folder whose keystore has another password (a PDB keystore in isolated mode): asked once more, for it only
     # only a wrong password (PKI-02002 / "incorrect"), not a missing or unreadable wallet, earns a second question
     if [[ ! -f "$d/cwallet.sso" ]] && runuser -u "$ORACLE_USER" -- test -r "$d/ewallet.p12" && grep -qiE 'PKI-02002|incorrect' <<< "$out" && ! grep -qiE 'PKI-0200[3-9]|not found|no such|permission' <<< "$out"; then
       warn "The password did not open the keystore in $d. It may have its own password."
       ask_secret "TDE keystore password for $d only"
       local pw2=$SECRET; SECRET=""
-      out=$(printf '%s\n' "$pw2" | timeout 300 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet create -wallet "$d" "$opt" 2>&1 9>&-) || true
-      out=${out//"$pw2"/*****}; out=${out//"$pw"/*****}; pw2=""
-      printf '%s\n' "$out" | log_block "orapki wallet create -wallet $d $opt (its own password)"
+      tde_orapki_exec "$i" "$pw2" "$pw" || true; out=$RUN_OUT; pw2=""
     fi
     if [[ -f "$d/cwallet.sso" ]]; then
       say "Made $d/cwallet.sso"; journal_file_written "$d/cwallet.sso" 0

@@ -291,12 +291,91 @@ c_7_1() {
   NOW="Missing, or not writable by $ORACLE_USER:"$'\n'"$(printf '  %s\n' "${I71[@]}")"
   [[ -n "$out" ]] && NOW+=$'\n'"Also $out (audit_file_dest of the spfile, outside $ORACLE_BASE): the check after this action shows how to make it."
   PLAN="Create them with owner $ORACLE_USER:$INSTALL_GROUP"$'\n'"The audit folder is the one the standby uses (the copy in step 8.2 sets audit_file_dest to it;"$'\n'"a standby that exists already uses the audit_file_dest of its spfile, also checked);"$'\n'"the diagnostic folder is diagnostic_dest of the primary."
+  l71_build "${I71[@]}"
+  [[ -n "$L71_ERR" ]] && PLAN+=$'\n'"Not made (the action stops there): $L71_ERR"
   return 1
 }
+# ---- the commands of 7.1: what make_dir does, as a list that is shown before [y] and run as shown ----
+# Root makes a folder only while no one but root can change the folders on the way (root_holds, from / down);
+# below a folder another user can change, the oracle user makes the rest itself. An existing empty folder gets
+# the owner; one that is not empty keeps its owner (the check after the action names it).
+L71_DIRS=(); L71_FROM=(); L71_TO=(); L71_NEW=(); L71_ERR=""
+l71_dir_cmds() {
+  # $1 folder: adds its commands; 1 = it is not made (L71_ERR says why, in the words of make_dir)
+  local path=$1 owner=$ORACLE_USER p="" par="/" comp held=1 made=0 lo
+  local -a parts=()
+  [[ "$path" == /* && ! "$path" =~ (^|/)\.\.?(/|$) && "$path" != *//* ]] || { L71_ERR="$path is not a plain absolute path. It is not created or changed."; return 1; }
+  # (a path that is not plain for a command line, e.g. a space, is never put into one)
+  v_path "$path" || { L71_ERR="$path is not a plain absolute path. It is not created or changed."; return 1; }
+  case "$path" in /etc/ORACLE|/etc/ORACLE/*) ;;
+    /|/usr|/usr/*|/etc|/etc/*|/var|/bin|/sbin|/lib|/lib64|/boot|/boot/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/tmp)
+    L71_ERR="$path is a system folder. It is not created or changed."; return 1 ;; esac
+  IFS='/' read -ra parts <<< "${path#/}"
+  for comp in "${parts[@]}"; do
+    [[ -n "$comp" ]] || continue
+    p+="/$comp"
+    if [[ -L "$p" ]]; then
+      lo=$(stat -c '%U' -- "$p" 2>/dev/null)
+      [[ "$lo" == "root" ]] || { L71_ERR="$p is a symbolic link owned by $lo. It is not used."; return 1; }
+    fi
+    # (a folder still to be made is not there now: root_holds fails for what lies below it, as it does when the
+    # folder is made, owned by the oracle user)
+    [[ $held -eq 1 ]] && ! root_holds "$par" "$p" && held=0
+    if [[ ! -e "$p" && ! -L "$p" ]]; then
+      L71_NEW[${#CP_CMD[@]}]=$p
+      if [[ $held -eq 1 ]]; then cp_add root "install -d -o $owner -g $INSTALL_GROUP -m 775 $p"
+      # a new folder with the wrong group is taken back at once (it is empty and new)
+      else cp_add oracle "mkdir -m 775 $p && { chgrp -h $INSTALL_GROUP $p || { rmdir $p; exit 1; }; }"; fi
+      made=1
+    elif [[ ! -d "$p" ]]; then
+      L71_ERR="$p exists, but it is not a folder. It is not changed."; return 1
+    fi
+    par=$p
+  done
+  # an existing empty folder gets the owner (a link keeps its owner: said when the action runs); a folder made
+  # just now has it already
+  if [[ $made -eq 0 && ! -L "$path" ]] && dir_empty "$path"; then
+    # the mode is set as the new owner when a user other than root can change the folder above
+    if [[ $held -eq 1 ]]; then cp_add root "chown -h $owner:$INSTALL_GROUP $path && chmod 775 $path"
+    else cp_add root "chown -h $owner:$INSTALL_GROUP $path"; cp_add oracle "chmod 775 $path"; fi
+  fi
+  return 0
+}
+l71_build() {
+  # the list for the folders $@, in order; a folder that is not made ends the list (L71_ERR)
+  local d
+  cp_reset; L71_DIRS=(); L71_FROM=(); L71_TO=(); L71_NEW=(); L71_ERR=""
+  for d in "$@"; do
+    L71_DIRS+=("$d"); L71_FROM+=("${#CP_CMD[@]}")
+    if ! l71_dir_cmds "$d"; then L71_TO+=("${#CP_CMD[@]}"); break; fi
+    L71_TO+=("${#CP_CMD[@]}")
+  done
+}
 d_7_1() {
-  local d o
-  for d in "${I71_TODO[@]}"; do
-    make_dir "$d" "$ORACLE_USER" || return 1
+  local d o k i shown
+  # made again from the folders as they are now: what runs is what was shown, or nothing runs
+  shown=$(cp_text)
+  l71_build "${I71_TODO[@]}"
+  if [[ "$(cp_text)" != "$shown" ]]; then
+    bad "The folders changed after the commands were shown. Nothing was run."$'\n'"Answer r: the new commands are shown first."
+    return 1
+  fi
+  for ((k = 0; k < ${#L71_DIRS[@]}; k++)); do
+    d=${L71_DIRS[$k]}
+    for ((i = L71_FROM[k]; i < L71_TO[k]; i++)); do
+      if ! cp_exec "$i"; then
+        bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}")"$'\n'"$(tail -n 4 <<< "$RUN_OUT")"
+        [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+        case "${CP_CMD[$i]}" in
+          "mkdir "*) printf '%s must be able to make it (the folder above can be changed by users other than root, so root does not make it),\nand %s must be in the group %s (step 2.2 adds the users to the groups).\n' "$ORACLE_USER" "$ORACLE_USER" "$INSTALL_GROUP" | hint ;;
+        esac
+        return 1
+      fi
+      # each folder made is journaled after it was made (--undo removes it again if it is empty)
+      [[ -n "${L71_NEW[$i]:-}" ]] && { say "Created ${L71_NEW[$i]}"; journal DIR "${L71_NEW[$i]}" "owner $ORACLE_USER"; }
+    done
+    if [[ $k -eq $((${#L71_DIRS[@]} - 1)) && -n "$L71_ERR" ]]; then bad "$L71_ERR"; return 1; fi
+    [[ -L "$d" ]] && warn "$d is a symbolic link. Its owner is not changed."
     # an existing folder that is not empty keeps its owner (nothing in it is changed): said here, by name
     if ! runuser -u "$ORACLE_USER" -- test -w "$d"; then
       o=$(stat -c '%U:%G %a' -- "$d" 2>/dev/null)
@@ -318,16 +397,49 @@ c_7_7() {
     NOW="/etc/oratab has another home for $STANDBY_SID:"$'\n'"  $cur"
     PLAN="Change that line in /etc/oratab to (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:$yn"
     oratab_link_plan
+    [[ "$KIND_NOW" == manual ]] || l77_build
     return 1
   fi
   NOW="/etc/oratab has no line for $STANDBY_SID. oraenv and dbstart need it."
   PLAN="Add this line to /etc/oratab (a backup is kept):"$'\n'"  $STANDBY_SID:$DB_HOME:N"
   oratab_link_plan
+  [[ "$KIND_NOW" == manual ]] || l77_build
   return 1
+}
+# ---- the commands of 7.7 (made from the file as it is now; d_7_7 makes them again and runs them only if equal) ----
+L77_FILE=""; L77_LEAD=0; L77_LINE=""
+l77_build() {
+  # the file: /etc/oratab, or the file a safe link points to. A line of this SID: the whole file is written again
+  # in place (owner, mode and SELinux label stay), only that line changed (its Y/N kept). No such line: the line
+  # is added at the end (a new file gets root:<install group> 664).
+  local f b; f=$(oratab_file); L77_FILE=$f; L77_LEAD=0; L77_LINE=""
+  [[ -n "$f" ]] || return 0
+  b="$f.bak_$RUN_ID"
+  if [[ -f "$f" ]] && grep -qE "^${STANDBY_SID}:" "$f"; then
+    local txt; txt=$(awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' "$f")
+    # the backup once per run (a backup this run made already is kept: it holds the content before the run)
+    [[ -e "$b" || -L "$b" ]] || cp_add root "cp -p --remove-destination $f $b && chmod o-rwx $b"
+    # written in place; a write that fails puts the old content back from the backup
+    cp_add root "cat > $f || { cat $b > $f; echo 'The old content was put back.'; exit 1; }" "$txt"
+    return 0
+  fi
+  L77_LINE="$STANDBY_SID:$DB_HOME:N"
+  if [[ -f "$f" ]]; then
+    [[ -e "$b" || -L "$b" ]] || cp_add root "cp -p --remove-destination $f $b && chmod o-rwx $b"
+    # a last line without its newline gets one first
+    [[ -s "$f" && -n "$(tail -c 1 -- "$f")" ]] && L77_LEAD=1
+  fi
+  if [[ $L77_LEAD -eq 1 ]]; then cp_add root "printf '\\n%s\\n' '$L77_LINE' >> $f"
+  else cp_add root "printf '%s\\n' '$L77_LINE' >> $f"; fi
+  # a new file gets the usual owner; an existing one (Grid makes it) keeps its owner
+  [[ -e "$f" ]] || { cp_add root "chown root:$INSTALL_GROUP $f"; cp_add root "chmod 664 $f"; }
+  return 0
 }
 oratab_file() {
   # the file to write: /etc/oratab, or the file a safe link points to (empty: a link that is not safe)
-  if [[ -L /etc/oratab ]]; then safe_link_target /etc/oratab || true; else printf '/etc/oratab'; fi
+  # (a target path that is not plain is not written through either: it is put into shown command lines)
+  if [[ -L /etc/oratab ]]; then local t; t=$(safe_link_target /etc/oratab) && v_path "$t" && printf '%s' "$t"; return 0
+  else printf '/etc/oratab'; fi
 }
 oratab_link_plan() {
   # a link is written through only when it is safe (safe_link_target); else the line is set by hand
@@ -340,20 +452,34 @@ oratab_link_plan() {
 }
 d_7_7() {
   local f; f=$(oratab_file); [[ -n "$f" ]] || { bad "/etc/oratab is a link that is not safe to write through."; return 1; }
-  local new=0; [[ -f "$f" ]] || new=1
-  backup_file "$f" || return 1
-  if [[ $new -eq 0 ]] && grep -qE "^${STANDBY_SID}:" "$f"; then
-    # only the line of this SID changes (its Y/N stays); written in place, so owner, mode and label stay
-    local tmp; tmp=$(mktemp) || return 1; CLEANUP_FILES+=("$tmp")
-    awk -F: -v sid="$STANDBY_SID" -v home="$DB_HOME" 'BEGIN { OFS = ":" } $1 == sid && !done { $2 = home; if ($3 !~ /^[YNyn]$/) $3 = "N"; done = 1 } { print }' "$f" > "$tmp" || return 1
-    cat -- "$tmp" > "$f" || { [[ -f "$f.bak_$RUN_ID" ]] && cat -- "$f.bak_$RUN_ID" > "$f"; bad "$f could not be written. The old content was put back."; return 1; }
-    rm -f -- "$tmp"
-    journal_file_written "$f" 1
-    return 0
+  # made again from the file as it is now: what runs is what was shown, or nothing runs
+  local shown; shown=$(cp_text)
+  cp_reset; l77_build
+  if [[ "$(cp_text)" != "$shown" || "$L77_FILE" != "$f" ]]; then
+    bad "$f changed after the commands were shown. Nothing was run."$'\n'"Answer r: the new commands are shown first."
+    return 1
   fi
-  printf '%s:%s:N' "$STANDBY_SID" "$DB_HOME" | append_as root "$f" || return 1
-  # a new file gets the usual owner; an existing one (Grid makes it) keeps its owner
-  [[ $new -eq 1 ]] && { chown root:"$INSTALL_GROUP" "$f"; chmod 664 "$f"; }
+  [[ -L "$f" ]] && { bad "Not changed: $f is a symbolic link."; return 1; }
+  # root adds a line only in a folder that only root can change (else the file could be swapped for a link)
+  if [[ -n "$L77_LINE" ]] && ! dir_root_only "$f"; then bad "Not changed: $(dirname -- "$f") must be a folder that only root can write to."; return 1; fi
+  local i before after txt
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    before=$(stat -c '%s' -- "$f" 2>/dev/null); num "$before" || before=0
+    if ! cp_exec "$i"; then
+      bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}")"$'\n'"$(tail -n 4 <<< "$RUN_OUT")"
+      [[ $((i + 1)) -lt ${#CP_CMD[@]} ]] && say "The commands after it were not run."
+      return 1
+    fi
+    # journaled after each success, as before: the backup, the whole file written again, or the line added
+    case "${CP_CMD[$i]}" in
+      "cp -p "*) BACKUPS_MADE["$f.bak_$RUN_ID"]=1 ;;
+      "cat > "*) journal_file_written "$f" 1 ;;
+      "printf "*)
+        after=$(stat -c '%s' -- "$f" 2>/dev/null); num "$after" || after=$before
+        txt=$L77_LINE; [[ $L77_LEAD -eq 1 ]] && txt=$'\n'"$txt"
+        journal_file_appended "$f" "$before" "$txt"$'\n' "$((after - before))" "$L77_LEAD" ;;
+    esac
+  done
   return 0
 }
 
@@ -427,12 +553,9 @@ c_7_2() {
         cleanup_cannot; return 2
       fi
       NOW="Instance $STANDBY_SID is not started"
-      PLAN="Write this pfile:
-  $(pfile_path)
-with these lines:
-$(pfile_text | sed 's/^/  /')
-Start the instance as $ORACLE_USER:
-  startup nomount pfile='$(pfile_path)'"
+      l72_start_list
+      if cp_find oracle "cat > " >/dev/null; then PLAN="Write the pfile $(pfile_path) (db_name and db_unique_name only),"$'\n'"then start the instance $STANDBY_SID in NOMOUNT with it, as $ORACLE_USER."
+      else PLAN="Start the instance $STANDBY_SID in NOMOUNT with the pfile $(pfile_path), as $ORACLE_USER."; fi
       return 1 ;;
     HUNG) NOW="$(hung_text)"$'\n'"Run step 9.2 to stop it (shutdown abort):  $SELF --from 9.2"; return 2 ;;
     *) NOW="Cannot read the state of the instance on this server ($(ora_errors "$SQL_OUT"))"; return 2 ;;
@@ -630,6 +753,8 @@ d_7_2_cleanup() {
          case "$ANSWER" in r) L72_CLEAN=""; return 4 ;; s) L72_CLEAN=""; return 3 ;; q) user_stop "Stopped by you" ;; esac ;;
       y) cleanup_proof || return 1
          printf '%s\n' "${CL_TEXT%$'\n'}" | block "Removed now:"
+         # the exact commands, right before the word: they run in this order, each shown again while it runs
+         cp_show
          confirm_word "Remove these files of the unfinished copy on THIS server ($(hostname -s))." "CLEAN" || { L72_CLEAN=""; return 3; }
          # each change is journaled after it was done (a command that failed, and those after it, leave no entry)
          local i nf=0
@@ -681,14 +806,54 @@ d_7_2() {
     [[ $crc -eq 0 ]] || return $crc
     local_state
     [[ "$LSTATE" == "IDLE" ]] || return 0          # NOMOUNT from the pfile already: nothing more to start
+    # the start after the clean-up: its exact commands are shown before they run
+    cp_reset; l72_start_list; cp_show
   fi
-  local p; p=$(pfile_path)
-  if [[ -f "$p" && "$(cat "$p")" != "$(pfile_text)" ]]; then backup_file "$p" "$ORACLE_USER" || return 1; fi
-  [[ -f "$p" && "$(cat "$p")" == "$(pfile_text)" ]] || { pfile_text | write_as "$ORACLE_USER" "$p" 644 || return 1; }
-  pfile_text | log_block "pfile $p"
-  # journaled first: a run that stops during the startup still lists the instance for --undo
-  journal INSTANCE "$STANDBY_SID" "started NOMOUNT with $p"
-  sql_local_long "startup nomount pfile='$p'" || { bad "Startup nomount failed ($(ora_errors "$SQL_OUT"))"; printf '%s\n' "$SQL_OUT" | tail -n 5 | hint; return 1; }
+  l72_start_run
+}
+l72_start_list() {
+  # the commands that start the instance in NOMOUNT from the text pfile; the pfile is written first (as the
+  # oracle user) when it is missing or differs, after a backup of the old one (once per run)
+  local p b; p=$(pfile_path); b="$p.bak_$RUN_ID"
+  if ! [[ -f "$p" && "$(cat -- "$p")" == "$(pfile_text)" ]]; then
+    [[ -f "$p" && ! -L "$p" && ! -e "$b" && ! -L "$b" ]] && cp_add oracle "cp -p $p $b && chmod o-rwx $b"
+    # (written through the open standard input: a non-root user cannot open /dev/stdin when root made the pipe)
+    cp_add oracle "cat > $p && chmod 644 $p" "$(pfile_text)"
+  fi
+  cp_add oracle "sqlplus -S / as sysdba" "startup nomount pfile='$p'" 1800
+}
+l72_start_run() {
+  # runs the list of l72_start_list as shown, journaled as before
+  local p b i existed; p=$(pfile_path); b="$p.bak_$RUN_ID"
+  if cp_find oracle "cat > $p" >/dev/null; then
+    [[ -L "$p" ]] && { bad "Not changed: $p is a symbolic link."; return 1; }
+    [[ -d "$p" ]] && { bad "Not changed: $p is a folder, not a file."; return 1; }
+    # no backup in the list: one of this run is there already, or a file of that name this run did not make
+    # (the oracle user could have put it there): then nothing is changed
+    if [[ -f "$p" ]] && ! cp_find oracle "cp -p $p " >/dev/null && [[ -z "${BACKUPS_MADE[$b]:-}" ]]; then
+      bad "$b exists already, but this run did not make it. Nothing is changed in $p."; return 1
+    fi
+  fi
+  for ((i = 0; i < ${#CP_CMD[@]}; i++)); do
+    existed=0; [[ -e "$p" ]] && existed=1
+    if [[ "${CP_CMD[$i]}" == "sqlplus "* ]]; then
+      pfile_text | log_block "pfile $p"
+      # journaled first: a run that stops during the startup still lists the instance for --undo
+      journal INSTANCE "$STANDBY_SID" "started NOMOUNT with $p"
+      cp_exec "$i" || { bad "Startup nomount failed ($(ora_errors "$RUN_OUT"))"; printf '%s\n' "$RUN_OUT" | tail -n 5 | hint; return 1; }
+      continue
+    fi
+    if ! cp_exec "$i"; then
+      bad "This command failed:  $(head -n 1 <<< "${CP_CMD[$i]}")"$'\n'"$(tail -n 4 <<< "$RUN_OUT")"
+      say "The commands after it were not run."
+      return 1
+    fi
+    case "${CP_CMD[$i]}" in
+      "cp -p "*) BACKUPS_MADE[$b]=1 ;;
+      "cat > "*) journal_file_written "$p" "$existed" ;;
+    esac
+  done
+  return 0
 }
 
 # ---- 7.3 - 7.6 golden connections ----
@@ -1245,14 +1410,15 @@ c_8_1() {
   if [[ -n "$PRE_ASMGID_OLD" ]]; then
     # the one pre-check the script fixes itself: the group of the oracle program
     NOW="$DB_HOME/bin/oracle has group $PRE_ASMGID_OLD. It must be $PRE_ASMGID_WANT, the group of the ASM disks (ORA-15025)."
-    PLAN="As root:  $GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"$'\n'"Then all pre-checks run again."
+    PLAN="Give $DB_HOME/bin/oracle the group of the ASM disks with setasmgidwrap of the Grid home, as root."$'\n'"Then all pre-checks run again."
+    cp_add root "$GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle"
     KIND_NOW=auto; return 1
   fi
   PLAN="$PRE_FIX"; return 1
 }
 d_8_1() {
   root_prog_ok "$GRID_HOME/bin/setasmgidwrap" || return 1
-  run_logged "setasmgidwrap" "$GRID_HOME/bin/setasmgidwrap" "o=$DB_HOME/bin/oracle" || { bad "setasmgidwrap failed: ${RUN_OUT%%$'\n'*}"; return 1; }
+  cp_run_one root "$GRID_HOME/bin/setasmgidwrap o=$DB_HOME/bin/oracle" || { bad "setasmgidwrap failed: ${RUN_OUT%%$'\n'*}"; return 1; }
   journal ASMGID "$DB_HOME/bin/oracle" "by hand, only if wanted, as root: chgrp $PRE_ASMGID_OLD $DB_HOME/bin/oracle ; chmod 6751 $DB_HOME/bin/oracle  (the group it had before)"
   say "$DB_HOME/bin/oracle now has group $(stat -c '%G' "$DB_HOME/bin/oracle" 2>/dev/null)."
   return 0
@@ -1299,8 +1465,10 @@ c_8_2() {
   # the network limits the whole copy: about 100 MB/s on 1 Gbit/s, up to about 1000 MB/s on 10 Gbit/s
   net_speed_read || true
   local est_lo est_hi; est_lo=$(copy_minutes lo); est_hi=$(copy_minutes hi)
-  PLAN="Copy the database from the primary with RMAN (active duplicate), as $ORACLE_USER:
-  rman target sys@$PRIMARY_TNS auxiliary sys@$STANDBY_TNS
+  dup_job_add
+  PLAN="Copy the database from the primary with RMAN (active duplicate), as $ORACLE_USER.
+It runs as a job in its own session: $DB_HOME/bin/rman with the input under \"Will run\"
+(the passwords travel on its standard input only). Output: $(dup_rman_log)$([[ -f "$(pfile_path)" ]] && printf '\nAfter a finished copy, as %s:  mv -f %s %s.pre_duplicate_%s  (the instance uses its spfile then)' "$ORACLE_USER" "$(pfile_path)" "$(pfile_path)" "$RUN_ID")
 Size to copy: about $(human_mb "$PRIMARY_DB_MB"), with $(prim_channels) channels on the primary and $AUX_CHANNELS on this server
 Rough time: $(human_min "$est_lo") to $(human_min "$est_hi") ($(copy_speed_text))
 The primary database is only read: nothing is created, dropped or changed in it.
@@ -1313,8 +1481,8 @@ Run the copy when the load is low, for example at night."
 Database files go to: $(place_text "$(data_dest)")
 Recovery area: $(place_text "$fd")${fd:+, $(human_mb "$(fra_size_mb)")}
 Settings written to the standby spfile:
-$(sed -n 's/^      set /  /p' <<< "$(rman_script)")
-The full RMAN script is saved first to $LOG_DIR/duplicate_<date>.rman"
+$(sed -n 's/^      set /  /p' <<< "$DUP_SCRIPT")
+The RMAN script (the input without the two connect lines) is saved first as $(dup_rman_file)"
   [[ -z "${TMUX:-}${STY:-}" ]] && USING+=$'\n'"The copy runs in its own session: closing the terminal does not stop it."$'\n'"Run the script again to watch it."
   # Grid is here, but files would go to a file system: said before the copy (the confirmation asks)
   if use_grid && grid_sw_ok && [[ -n "$(fs_dirs)" ]]; then
@@ -1323,27 +1491,50 @@ The full RMAN script is saved first to $LOG_DIR/duplicate_<date>.rman"
   return 1
 }
 
+dup_rman_file() { printf '%s/duplicate_%s.rman' "$LOG_DIR" "$RUN_ID"; }
+dup_rman_log() { printf '%s/duplicate_%s.log' "$LOG_DIR" "$RUN_ID"; }
+DUP_SCRIPT=""
+dup_job_add() {
+  # the RMAN copy as one entry of the shown list ("Will run"): the program and its whole standard input (the two
+  # logins, the RMAN script, exit). It runs as a job (run_long), never through cp_run, from this same entry, so
+  # what is shown is what runs. The passwords are in the input only: ***** on the screen and in the log.
+  DUP_SCRIPT=$(rman_script)
+  cp_add oracle "$DB_HOME/bin/rman" "$(printf 'connect target sys/"%s"@%s\nconnect auxiliary sys/"%s"@%s\n%s\nexit' "$SYS_PW" "$PRIMARY_TNS" "$SYS_PW" "$STANDBY_TNS" "$DUP_SCRIPT")"
+}
 d_8_2() {
-  local pc0 ac0; pc0=$(prim_channels); ac0=$AUX_CHANNELS
+  local pc0 ac0 shown; pc0=$(prim_channels); ac0=$AUX_CHANNELS
+  shown=$(cp_text)
   ask_channels || return 3
   # changed now: said again right before the start (the RMAN script is written from the values below)
-  [[ "$(prim_channels)/$AUX_CHANNELS" != "$pc0/$ac0" ]] && say "The copy uses $(prim_channels) channels on the primary and $AUX_CHANNELS here (rough time now $(human_min "$(copy_minutes lo)") to $(human_min "$(copy_minutes hi)"))."
+  if [[ "$(prim_channels)/$AUX_CHANNELS" != "$pc0/$ac0" ]]; then
+    say "The copy uses $(prim_channels) channels on the primary and $AUX_CHANNELS here (rough time now $(human_min "$(copy_minutes lo)") to $(human_min "$(copy_minutes hi)"))."
+    # the input with the new channels (the pre-checks set the sections from them), shown before the question
+    dup_prechecks || { bad "The pre-checks no longer pass: $PRE_FIX"; return 1; }
+    cp_reset; dup_job_add; cp_show; shown=$(cp_text)
+  fi
   confirm_word "Start the RMAN copy now." "DUPLICATE" || { say "The copy was not started."; return 3; }
   # the checks again, right before the start (tnsnames.ora or the instance may have changed meanwhile)
   dup_prechecks || { bad "The pre-checks no longer pass: $PRE_FIX"; return 1; }
-  local rmanfile="$LOG_DIR/duplicate_$RUN_ID.rman" rlog="$LOG_DIR/duplicate_$RUN_ID.log"
+  # what runs is what was shown: an input that the new pre-checks changed is shown, and not run now
+  cp_reset; dup_job_add
+  if [[ "$(cp_text)" != "$shown" ]]; then
+    cp_show
+    bad "The RMAN input changed after it was shown (the pre-checks read new values, see above). The copy was not started."$'\n'"Answer r to check again and confirm this input."
+    return 1
+  fi
+  local rmanfile rlog; rmanfile=$(dup_rman_file); rlog=$(dup_rman_log)
   [[ -e "$(dup_marker)" ]] && rm -f -- "$(dup_marker)"
-  rman_script | write_as root "$rmanfile" 640 || return 1
+  printf '%s\n' "$DUP_SCRIPT" | write_as root "$rmanfile" 640 || return 1
   say "RMAN script:  $rmanfile"
   DUP_RAN=1
   install -d -m 700 "$STATE_DIR"; : > "$STATE_DIR/dup_attempt"
   journal DUPLICATE "$STANDBY_UNIQUE" "RMAN duplicate started: files of the standby are created in $(all_locs | cut -d: -f1 | paste -sd' ' -)"
-  local rc=0
-  run_long "RMAN duplicate" "$rlog" 'Starting|Finished|ORA-|RMAN-|copy complete|output file name|restoring|backup set complete' oracle "$DB_HOME/bin/rman" < <(
-    printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$PRIMARY_TNS"
-    printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"
-    cat "$rmanfile"
-    printf 'exit\n') || rc=$?
+  local rc=0 nl
+  # shown while it starts, as cp_exec does; the whole input (masked) is in the log
+  nl=$(grep -c '' <<< "${CP_IN[0]}")
+  say "${C_D}Running as $ORACLE_USER (a job):${C_N} $(mask_pw <<< "${CP_CMD[0]}  ->  $(head -n 1 <<< "${CP_IN[0]}")  (and $((nl - 1)) more lines)")"
+  { printf 'as %s (a job, output %s): ' "$ORACLE_USER" "$rlog"; cp_entry_text 0; } | mask_pw | log_block "RUN"
+  run_long "RMAN duplicate" "$rlog" 'Starting|Finished|ORA-|RMAN-|copy complete|output file name|restoring|backup set complete' oracle "${CP_CMD[0]}" < <(printf '%s\n' "${CP_IN[0]}") || rc=$?
   if dup_log_ok "$rlog" "$rc"; then
     # "Finished" in the RMAN output is not the whole proof: the standby itself is looked at first. Only a
     # verified copy gets the "duplicate" marker (otherwise later steps would take the standby as built)

@@ -77,7 +77,13 @@ cp_role_run() {
     grid) as_grid "$@" ;;
     oracle) as_oracle "$@" ;;
     # root: the PATH of root that runs this script (its system tools), a clean environment otherwise
-    *) ( cd / && env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" "$@" 9>&- ) ;;
+    # The proxy settings of this environment are passed on (yum / dnf need them); their values are never on a
+    # command line or in the log.
+    *) local -a pv=(); local v
+       for v in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+         [[ -n "${!v:-}" ]] && pv+=("$v=${!v}")
+       done
+       ( cd / && env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" 9>&- ) ;;
   esac
 }
 cp_exec() {
