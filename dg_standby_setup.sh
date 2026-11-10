@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.27"
+readonly SCRIPT_VERSION="5.28"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -157,6 +157,15 @@ log_block() {
     [[ "${t#*: }" == "${q:0:20}"* ]] && { t="${t%%: *}: $q${e:+ (exit code 0, $e in output)}"; body=$(grep -v '^SQL> ' <<< "$body"); }
   fi
   body=$(grep -vx '__DG_SQL_OUTPUT__' <<< "$body")
+  # --verbose: a read-only query or command also goes to the list shown under the step
+  if [[ -n "$VQ_FILE" ]]; then
+    local vrc vres; vrc=$(sed -n 's/^(exit code \([0-9]*\).*/\1/p' <<< "$body" | tail -n 1); vres=$(grep -vE '^\(exit code [0-9]+' <<< "$body")
+    if [[ "$t" =~ ^(STANDBY|ASM|PRIMARY)[^:]*:\ +[Ss][Ee][Ll][Ee][Cc][Tt]\  ]]; then vq_line "$t" "$vres" "${vrc:-0}" "$e"
+    elif [[ "$body" == "command (as "* ]]; then
+      local c1; c1=$(head -n 1 <<< "$body"); c1=${c1#*: }
+      cmd_reads_only "$c1" && vq_line "${c1}" "$(sed 1d <<< "$vres")" "${vrc:-0}" ""
+    fi
+  fi
   # a short answer without an error: one line, "title  ->  answer"
   if [[ -z "$e" && $nq -le 1 ]] && grep -qx '(exit code 0)' <<< "$body"; then
     local res; res=$(grep -vx '(exit code 0)' <<< "$body" | sed '/^[[:space:]]*$/d')
@@ -176,6 +185,32 @@ log_block() {
 # Plain output, not --verbose: the title of a step waits (PT_PENDING) until the step prints something. A step that
 # is already correct prints one line instead (run_step: pt_ok_line); anything else prints the title first (pt_flush).
 PT_PENDING=""
+# --verbose: every read-only query and command (SQL select, a probe on the primary, a local read like crsctl stat) is
+# also shown, one line each ("query  ->  answer"), under the step that ran it (in --health: under its check). They
+# are collected in VQ_FILE (a file: many of them run in a subshell) and shown by vq_dump / health_report.
+VQ_FILE=""
+# (DG_TEST_NO_QUERIES=1: the test suite, which runs with DG_VERBOSE=1, keeps its outputs without these lines)
+vq_init() { [[ ${VERBOSE:-0} -eq 1 && -z "$VQ_FILE" && "${DG_TEST_NO_QUERIES:-0}" != 1 ]] || return 0; VQ_FILE=$(mktemp /tmp/dg_vq.XXXXXXXX 2>/dev/null) || VQ_FILE=""; [[ -z "$VQ_FILE" ]] || CLEANUP_FILES+=("$VQ_FILE"); }
+vq_add() { [[ -n "$VQ_FILE" ]] || return 0; printf '%s\n' "$1" | sed -e 's/\x1b\[[0-9;]*m//g' | mask_pw >> "$VQ_FILE"; }
+vq_take() { [[ -n "$VQ_FILE" && -s "$VQ_FILE" ]] || return 0; cat -- "$VQ_FILE"; : > "$VQ_FILE"; }
+vq_dump() {
+  # the queries collected so far, on the screen under the current step (dimmed, "· query  ->  answer")
+  [[ -n "$VQ_FILE" && -s "$VQ_FILE" && ${HEALTH:-0} -ne 1 ]] || return 0
+  local l
+  while IFS= read -r l; do
+    if [[ $UI -eq 1 ]]; then ui_out 8 "      ${C_D}· $l${C_N}"; else pt_flush; printf '      %s· %s%s\n' "$C_D" "$l" "$C_N"; fi
+  done < <(vq_take)
+}
+vq_line() {
+  # $1 title ("STANDBY sqlplus: select ..."), $2 answer lines, $3 rc, $4 error flag -> one line for VQ_FILE
+  local a n; n=$(grep -c . <<< "$2")
+  if [[ -n "$4" || "$3" != 0 ]]; then a=$(grep -m1 -oE '(ORA|SP2|TNS|RMAN|PRCD|PRCR|CRS)-[0-9]+[^|]{0,80}' <<< "$2"); a="error: ${a:-exit code $3}"
+  elif [[ $n -eq 0 ]]; then a="(no rows)"
+  elif [[ $n -eq 1 ]]; then a=$(grep . <<< "$2"); [[ ${#a} -gt 100 ]] && a="${a:0:99}…"
+  else a="$(grep -m1 . <<< "$2" | cut -c1-60)  (and $((n - 1)) more lines)"; fi
+  local t=$1; [[ ${#t} -gt 120 ]] && t="${t:0:119}…"
+  vq_add "$t  ->  $a"
+}
 pt_flush() { [[ -n "$PT_PENDING" ]] || return 0; printf '\n  %sStep %s%s  %s%s%s\n' "$C_B" "${PT_PENDING%%$'\t'*}" "$C_N" "$C_W" "${PT_PENDING#*$'\t'}" "$C_N"; PT_PENDING=""; }
 say()  { if [[ $UI -eq 1 ]]; then ui_out 6 "      $*"; else pt_flush; printf '      %s\n' "$*"; fi; _log INFO "$*"; }
 _mark() { # $1 color $2 symbol $3 log tag, rest = text (first line after the symbol, other lines under it)
@@ -368,6 +403,7 @@ ask() {
   # $1 = question. Result in ANSWER.  Typing h shows the help of the current step.
   [[ ${HEALTH:-0} -eq 1 ]] && health_no_question "$1"
   while true; do
+    vq_dump
     if [[ $UI -eq 1 ]]; then ui_live_clear; ui_flush; ui_header; printf '\n'; else pt_flush; fi
     printf '    %s%s %s%s %s ' "$C_C" "$S_ASK" "$1" "$C_N" "$S_END"
     if ! IFS= read -r ANSWER < "$PROMPT_IN"; then
@@ -1633,6 +1669,7 @@ run_step() {
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
     ui_live_clear
+    vq_dump
     # (plain output: the title waits only for a step that is already correct; block and hint often run in a pipe,
     # where clearing PT_PENDING would not reach this shell)
     if [[ -n "$PT_PENDING" ]] && ! [[ $rc -eq 0 && $CHECK_WAITS -eq 0 && $PRIM_RAN -eq 0 && $acted -eq 0 && -z "$(primary_pending_get "$id")" ]]; then pt_flush; fi
@@ -1788,7 +1825,7 @@ run_step() {
     # where the log is now: the first error the action logs is found after this point (step_error)
     local logpos=0; [[ -n "$LOG_FILE" ]] && logpos=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || printf 0)
     DO_T0[$id]=$SECONDS
-    ui_flush; drc=0; IN_DO=1; "$dofn" || drc=$?; IN_DO=0
+    ui_flush; drc=0; IN_DO=1; "$dofn" || drc=$?; IN_DO=0; vq_dump
     _log DO "[$id] end, exit code $drc, after $(ui_dur $((SECONDS - DO_T0[$id])))"
     if [[ $drc -eq 3 ]]; then skip_record "$id" "Not started. To run it later:  $(on_demand "$id" && printf '%s --roll-forward' "$SELF" || printf '%s --from %s' "$SELF" "$id")"; return 0; fi
     if [[ $drc -eq 0 ]]; then
@@ -4800,6 +4837,7 @@ probe_log() {
   [[ -s "$5" ]] && e=$(sed 's/^/stderr: /' -- "$5")
   [[ -n "$e" ]] && o+="${o:+$'\n'}$e"
   n=$(grep -c . <<< "$o")
+  [[ -n "$VQ_FILE" ]] && vq_line "PRIMARY $1: $2" "$o" "$3" ""
   if [[ $n -eq 0 ]]; then _log PROBE "PRIMARY $1 (rc $3, no output): $2"
   elif [[ $n -eq 1 && ${#o} -le 160 ]]; then _log PROBE "PRIMARY $1 (rc $3): $2  ->  $(grep . <<< "$o")"
   else
@@ -14520,7 +14558,10 @@ phase_8() {
 #------------------------------------------------------------------------------
 DG_DEAD_NOTE=""; REG_MODE=""; REG_OLD_OPT=""; REG_OLD_HOME=""; REG_OLD_PW=""; REG_MOD_ARGS=(); REG_OLD_DG=""; REG_NEW_DG=""; REG_OLD_DOM=""
 
+HEALTH_BUILT_OK=0
 need_built() {
+  # (--health found the standby built and mounted at its start: the checks do not read that again)
+  [[ ${HEALTH:-0} -eq 1 && $HEALTH_BUILT_OK -eq 1 ]] && return 0
   db_sw_ok || { NOW="Database software is not installed (phase 3)"; return 1; }
   detect_built
   if [[ $STANDBY_BUILT -eq 1 && "$LSTATE" == "IDLE" && "${CUR_STEP%%.*}" == "10" ]]; then
@@ -16712,7 +16753,9 @@ health_run_check() {
   NOW=""; PLAN=""; USING=""; DONE_MSG=""; QUIET_PLAN=0; PRIMARY_HOW_STEP=""; MANUAL_HOW=""; MANUAL_WHERE=""; KIND_NOW=""; NEED_SYS=0; PLAN_UNDO=""; CHECK_WAITS=0
   CUR_STEP=$id
   { printf '\n==== %s  %s ====\n' "$id" "$title"; } >> "$HEALTH_LOG"
+  vq_take > /dev/null      # (--verbose: the list of this check starts empty)
   rc=0; "$fn" >> "$HEALTH_LOG" 2>&1 || rc=$?
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[$id]=$(vq_take)
   if [[ $rc -eq 0 && $CHECK_WAITS -eq 0 ]]; then st=OK
   elif [[ $rc -eq 0 && $CHECK_WAITS -ge 2 ]]; then st=SKIPPED
   elif [[ $rc -eq 0 ]]; then st=WARNING
@@ -16784,8 +16827,11 @@ health_main() {
   fi
   detect_built >> "$HEALTH_LOG" 2>&1
   [[ $STANDBY_BUILT -eq 1 ]] || health_exit UNKNOWN "The standby database is not recorded as built here (phase 8). $SC_INFO"
+  # the checks below do not read the instance state, the role and the datafile headers again (need_built)
+  HEALTH_BUILT_OK=1
 
   health_ssh || _log WARN "health: $HEALTH_SSH_ERR"
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[0.0]=$(vq_take)
   local -a checks=("10.1|Transport and apply lag|c_10_1" "10.2|No archive gap|c_10_2_once" "10.3|Last log: primary and standby|c_10_3_once"
                    "10.4|Redo apply is running|c_10_4" "10.5|No unrecoverable (NOLOGGING) changes|c_10_5" "10.6|Patch level: primary and standby|c_10_6"
                    "10.8|Archived logs: space and nightly clean-up|c_10_8")
@@ -16814,18 +16860,27 @@ health_main() {
   # the state of Data Guard on this standby (role, protection mode, last applied log): a line of its own, and
   # kept for --status
   dg_state_read >> "$HEALTH_LOG" 2>&1
+  [[ -n "$VQ_FILE" ]] && HEALTH_VQ[dg]=$(vq_take)
   health_report
   health_exit
 }
 
+declare -A HEALTH_VQ=()
+health_vq() {
+  # --verbose: the queries of check $1, under its line
+  local l; [[ -n "${HEALTH_VQ[$1]:-}" ]] || return 0
+  while IFS= read -r l; do [[ -n "$l" ]] && health_out "                  · $l"; done <<< "${HEALTH_VQ[$1]}"
+  return 0
+}
 health_report() {
   local id
   HEALTH_REPORTED=1
   [[ -n "$HEALTH_LOG" ]] && printf '\n==== Summary ====\n' >> "$HEALTH_LOG"
   for id in "${HEALTH_ORDER[@]}"; do
     health_out "$(printf '  %-9s %-5s %s' "${HEALTH_STATE[$id]}" "$([[ "$id" == 0.0 ]] || printf '%s' "$id")" "${HEALTH_TEXT[$id]}")"
+    health_vq "$id"
   done
-  [[ -n "${DGS_ROLE:-}" ]] && health_out "  Data Guard: $(dg_state_oneline)"
+  [[ -n "${DGS_ROLE:-}" ]] && { health_out "  Data Guard: $(dg_state_oneline)"; health_vq dg; }
   if [[ $HEALTH_SSH_NOKEY -eq 1 ]]; then
     health_out "  Note: $HEALTH_SSH_ERR (set it up with step 9.9:  $SELF --only 9.9; see --help-step 9.9 / README). 10.3 and 10.5: standby side only; 10.6 skipped."
   elif [[ -n "$HEALTH_SSH_ERR" ]]; then
@@ -18346,9 +18401,10 @@ Setup
                          dg_standby_setup.sh --user oracle
   --plain              Plain scrolling output instead of the screen layout
                          dg_standby_setup.sh --plain
-  --verbose            The end summary lists every step (else a phase where every step is OK
-                       is one line; the log always has every step)
-                         dg_standby_setup.sh --verbose
+  --verbose            Every step in full, with each read-only query or command it runs and its
+                       answer ("· query  ->  answer"); the end summary lists every step.
+                       With --health: the queries of each check under its line.
+                         dg_standby_setup.sh --verbose      dg_standby_setup.sh --health --verbose
 After setup
   --only 10            Health check, with the screen and questions
                          dg_standby_setup.sh --only 10
@@ -18744,6 +18800,7 @@ main() {
   # a wrong command line is exit 2, but 3 (unknown) with --health: 2 means "critical" to a monitoring system
   local a; PX=2; for a in "$@"; do [[ "$a" == "--health" ]] && PX=3; done
   parse_args "$@"
+  vq_init
   if [[ -n "$HELP_STEP" ]]; then help_cli "$HELP_STEP"; exit 0; fi
   # a failure to start is "unknown" (3) for --health, as for a monitoring system (fd 7: its output, see health_out)
   local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }

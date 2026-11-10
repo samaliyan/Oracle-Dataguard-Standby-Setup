@@ -98,7 +98,7 @@ None of them changes the primary.
 | `--settings` | Review or edit the saved values, then stop |
 | `--status` | Data Guard state, then the result of every phase and step so far, with the runs and their logs |
 | `--plain` | Plain scrolling output instead of the screen layout |
-| `--verbose` | At the end, the full table of every step (also `DG_VERBOSE=1`) |
+| `--verbose` | Every step in full with the read-only queries it runs and their answers; the full table at the end; with `--health`, the queries under each check (also `DG_VERBOSE=1`) |
 | `--show-changes [step]` | Every change made on this server, with its undo |
 | `--undo <step>` | Undo the changes of one step |
 | `--help-step <step>` | The manual way of a step (`all` for every step, `health` for --health) |
@@ -179,8 +179,17 @@ Plain scrolling output, as in earlier versions: every message stays on the scree
 when the terminal is smaller than 80 x 24 or is not a terminal.
 
 ### `--verbose`
-At the end of a run, the full table of every step and its result (by default only the steps that need
-attention are listed). `DG_VERBOSE=1` in the environment does the same.
+Shows what the checks read. Every step is shown in full (by default a step that is already correct is one
+line), and under it each read-only query or command it ran, with its answer:
+```
+  Step 9.4  Redo apply (MRP)
+      · STANDBY sqlplus: select count(*) from v$managed_standby where process like 'MRP%';  ->  1
+    ✔ Redo apply (MRP) is running
+```
+Commands that change something are always shown (under "Will run" before `[y]`, and "Running as ..." while
+they run). At the end, the full table of every step. With `--health --verbose`, the queries of each check
+are listed under its line (the first line, the status, stays the same for monitoring). The run log always
+has every query with its answer. `DG_VERBOSE=1` in the environment does the same.
 
 ### `--show-changes [step]`
 Lists every change the script made on this server (files written, settings, users, disks, services,

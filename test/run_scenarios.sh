@@ -20,7 +20,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_TEST_NO_QUERIES=${DG_TEST_NO_QUERIES:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -119,7 +119,7 @@ PARTS=(
   [7]="W X Z6 Z20"
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14"
-  [10]="Z12 Z13"
+  [10]="Z12 Z13 5.28"
   [11]="5.23"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
@@ -2379,6 +2379,22 @@ check "--show-changes: a note shared by a group is printed once, the steps in nu
 # ---- the run log: one line for a short SQL answer, no marker ----
 f=$(ls -t $T/log/run_*.log | head -1)
 check "run log: a short SQL answer is one line (query -> answer), the output marker is never written" "grep -qE 'OUT +\\| STANDBY sqlplus: select status from v\\\$instance;  ->  MOUNTED' $f && ! grep -q '__DG_SQL_OUTPUT__' $T/log/run_*.log"
+fi
+if part 5.28; then
+CUR=5.28; echo "== 5.28  --verbose shows the read-only queries and their answers; --health reads the instance state once"
+fresh empty; rc=$(run $T/r28a.txt)
+check "a standby built from an empty server (base for the 5.28 tests)" "grep -q 'Standby setup is complete' $T/r28a.txt"
+# ---- --health --verbose: the queries of each check under its line; the first line unchanged ----
+rc=$(DG_TEST_NO_QUERIES=0 run $T/r28b.txt --health --verbose)
+check "--health --verbose: exit 0, the first line is the status, each check's queries under its line with the answer" "[[ $rc -eq 0 ]] && grep -v '^Note: DG_TEST' $T/r28b.txt | grep -m1 . | grep -q '^OK - standby PRODDB_STBY' && grep -A3 -E '^  OK +10\\.2 ' $T/r28b.txt | grep -q '· STANDBY sqlplus: select count(\\*) from v\\\$archive_gap;  ->  0' && grep -A6 -E '^  OK +10\\.5 ' $T/r28b.txt | grep -q '· PRIMARY (read-only): select force_logging from v\\\$database;  ->  YES'"
+rc=$(DG_TEST_NO_QUERIES=0 DG_VERBOSE=0 run $T/r28c.txt --health)
+f=$(ls -t $T/log/health_*.log | head -1)
+check "--health without --verbose: no query lines on the screen; the instance state is read a few times, not before every check" "[[ $rc -eq 0 ]] && ! grep -q '· ' $T/r28c.txt && [[ \$(grep -c 'OUT    | STANDBY sqlplus: select status from v\\\$instance' $f) -le 5 ]]"
+# ---- a setup step with --verbose: its queries between its title and its result ----
+rc=$(DG_TEST_NO_QUERIES=0 run $T/r28d.txt --only 9.4 --verbose)
+check "--only 9.4 --verbose: the MRP query and its answer under 'Step 9.4', before the result" "sed -n '/^  Step 9\\.4 /,/Redo apply (MRP) is running/p' $T/r28d.txt | grep -q \"· STANDBY sqlplus: select count(\\*) from v\\\$managed_standby where process like 'MRP%';  ->  1\""
+rc=$(DG_TEST_NO_QUERIES=0 DG_VERBOSE=0 run $T/r28e.txt --only 9.4)
+check "--only 9.4 without --verbose: no query lines" "grep -q 'Redo apply (MRP) is running' $T/r28e.txt && ! grep -q '· STANDBY sqlplus' $T/r28e.txt"
 fi
 parts_done
 echo

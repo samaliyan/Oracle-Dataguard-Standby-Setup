@@ -119,6 +119,7 @@ probe_log() {
   [[ -s "$5" ]] && e=$(sed 's/^/stderr: /' -- "$5")
   [[ -n "$e" ]] && o+="${o:+$'\n'}$e"
   n=$(grep -c . <<< "$o")
+  [[ -n "$VQ_FILE" ]] && vq_line "PRIMARY $1: $2" "$o" "$3" ""
   if [[ $n -eq 0 ]]; then _log PROBE "PRIMARY $1 (rc $3, no output): $2"
   elif [[ $n -eq 1 && ${#o} -le 160 ]]; then _log PROBE "PRIMARY $1 (rc $3): $2  ->  $(grep . <<< "$o")"
   else
