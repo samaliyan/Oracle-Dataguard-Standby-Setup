@@ -3,6 +3,48 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.26
+
+Before the first real use: four independent reviews of real runs (the work flow, the screen layout, the logs and
+errors, and a senior DBA's view), then these changes.
+
+Safer to copy and to read:
+- Commands for you are copy-safe: the lines in the boxes start at column 0 (a heredoc's `EOF`, tnsnames and
+  listener entries work when pasted), shell blocks use `#` comments, and `commands_<step>_*.txt` and the actions
+  file are scripts you can run as they are. Help texts follow the same rule.
+- Screen layout: command lines are never broken by the script (the terminal wraps them, so a copy is one line);
+  a step that does not fit keeps its title, status, the start of the plan, the "Will run" heading with the
+  first and last commands, warnings and the question; the result of the previous step stays while there is
+  room; the log path is in the map; a compact map on small screens.
+- A failed step ends the run: "Stopped: step X failed (error)", exit code 4 (1 = stopped by you), no extra
+  question. The end summary is one line per finished phase (`--verbose` for every step), with a
+  "Data Guard now" block after a full run. The run log has an END line, the time of each step, the values of
+  the run; job files have a header and a footer, and a retry does not overwrite the first one.
+
+Errors you can act on:
+- Installer prerequisites: the failed checks (with their PRVF/PRVG ids) are read from the installer's own log
+  and shown before the question: fix and run again, or run again ignoring them (type IGNORE). root.sh errors
+  are taken from its log.
+- RMAN copy: progress while it runs (datafiles, GB, time left); on failure the whole error stack, the likely
+  cause, the standby alert log, and what is left on this server.
+
+Data Guard (agreed with the owner):
+- Two control files on the standby, and redo log members as on the primary (multiplexed).
+- The standby's recovery area is as large as the primary's: 8.1 stops when the space is not there; a smaller
+  size only when set on purpose, with a warning.
+- New step 9.9: an ssh key so that `--health` can check the primary too (a restricted authorized_keys line).
+  Without it, `--health` checks the standby side and marks the primary checks SKIPPED (not UNKNOWN).
+- One visit to the primary: the commands of 2.7 (/etc/hosts) and the 6.1 preparation join the phase-4 block,
+  per OS user; the restart of 4.1 is a separate DOWNTIME box (srvctl under Oracle Restart).
+
+Smaller:
+- `--health`: the first line is the status (Nagios form, with lag perfdata); protection mode shown.
+  `--status` starts with the Data Guard state.
+- Summary (1.4): problems first, a names table (primary | standby), the installer files found, Release Update
+  and channels as values (8.2 does not ask the channels again). 3.1 records the installer files without a
+  question. `--check` plans the same ASMLib group as the real run.
+- Primary changes are journaled with their old and new value. The run log shows read-only probes as one line.
+
 ## 5.25
 
 What is shown is what runs, in every step. The notes of 5.23 said that every automatic step shows its exact

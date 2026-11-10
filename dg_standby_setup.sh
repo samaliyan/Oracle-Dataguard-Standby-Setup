@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.25"
+readonly SCRIPT_VERSION="5.26"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -14109,8 +14109,8 @@ c_8_2() {
   PLAN="Copy the database from the primary with RMAN (active duplicate), as $ORACLE_USER: about $(human_mb "$PRIMARY_DB_MB").
 Rough time: $(human_min "$est_lo") to $(human_min "$est_hi") ($(copy_speed_text))
 Channels: $(prim_channels) on the primary, $AUX_CHANNELS on this server ($(chan_src_text))
-The primary is only read (nothing in it is created, dropped or changed), but it gets extra disk and network
-load, log switches, a snapshot control file in its \$ORACLE_HOME/dbs and an audit file per login. Run it when the load is low.
+The primary is only read (nothing in it is created, dropped or changed). Load on it: disk and network,
+log switches, a snapshot control file in \$ORACLE_HOME/dbs, an audit file per login. Run it when the load is low.
 RMAN: duplicate target database for standby from active database$([[ -n "${DUP_SECTION:-}" ]] && printf ' section size %s' "$DUP_SECTION")
   dorecover, spfile with $nset settings (the \"set\" lines under \"Will run\"), nofilenamecheck
 It runs as a job in its own session, with the input under \"Will run\" (the passwords only on its standard input).
@@ -14202,7 +14202,8 @@ d_8_2() {
   if [[ "$(dup_cause)" == FRA_FULL ]]; then
     bad "The copy did not finish: the recovery area on this server is full ($(fra_dest), $(human_mb "$(fra_full_mb)"))."
   else
-    bad "The copy did not finish (exit code $rc)."
+    # (the first error in the ✘ line: the end of the run names it: "Stopped: step 8.2 failed (...)")
+    bad "The copy did not finish (exit code $rc)${fe:+: ${fe%%$'\n'*}}"
   fi
   local causes; causes=$(dup_cause_lines "$fe"$'\n'"$stk")
   {
