@@ -212,7 +212,7 @@ net_dir_note() {
   return 0
 }
 static_entry_state() {
-  # 0 = correct, 1 = missing, 2 = present with another ORACLE_HOME
+  # 0 = correct, 1 = missing, 2 = present but not right (ORACLE_HOME, GLOBAL_DBNAME, ENVS)
   local f; f=$(lsnr_file)
   [[ -f "$f" ]] || return 1
   local flat seg found=1 sidn homen
@@ -225,10 +225,15 @@ static_entry_state() {
       local hok=0 gok=0
       [[ "$seg" == *"$homen"* || "$seg" == *"(ORACLE_HOME=${DB_HOME^^}/)"* ]] && hok=1
       [[ "$seg" == *"(GLOBAL_DBNAME=${STANDBY_SERVICE^^})"* ]] && gok=1
-      [[ $hok -eq 1 && $gok -eq 1 ]] && return 0
+      # a listener of the Grid home: the entry must also give the server processes the TNS_ADMIN of the database
+      # home (sid_envs_line)
+      local eok=1
+      [[ -n "$(sid_envs_line)" && "$seg" != *"(ENVS="*"TNS_ADMIN=${DB_HOME^^}/NETWORK/ADMIN"* ]] && eok=0
+      [[ $hok -eq 1 && $gok -eq 1 && $eok -eq 1 ]] && return 0
       STATIC_WHY=""
       [[ $hok -eq 1 ]] || STATIC_WHY+="ORACLE_HOME is not $DB_HOME"$'\n'
       [[ $gok -eq 1 ]] || STATIC_WHY+="GLOBAL_DBNAME is missing or not $STANDBY_SERVICE"$'\n'
+      [[ $eok -eq 1 ]] || STATIC_WHY+="ENVS with TNS_ADMIN=$DB_HOME/network/admin is missing (the listener runs from the Grid home; the copy needs it to find the primary)"$'\n'
       found=2
     fi
   done < <(sidlist_of "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
@@ -245,13 +250,23 @@ sidlist_of() {
     print out }' <<< "$1"
 }
 lsnr_has_sidlist() { local f; f=$(lsnr_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$f"; }
+sid_envs_line() {
+  # A listener of the Grid home runs with TNS_ADMIN of the Grid home, and the server processes it starts inherit
+  # that. During the copy those processes connect to the primary by its alias (RMAN "from service"), which is
+  # only in the tnsnames.ora of the database home: without this line the copy ends with ORA-17629 / ORA-12154.
+  # (A listener of the database home is started by this script with the right TNS_ADMIN.)
+  [[ "$(lsnr_home)" != "$DB_HOME" ]] && printf '      (ENVS = "TNS_ADMIN=%s/network/admin")\n' "$DB_HOME"
+  return 0
+}
 static_block() {
-  printf 'SID_LIST_%s =\n  (SID_LIST =\n    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n    )\n  )\n' \
-    "$SB_LSNR" "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
+  local e; e=$(sid_envs_line); [[ -n "$e" ]] && e+=$'\n'
+  printf 'SID_LIST_%s =\n  (SID_LIST =\n    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n%s    )\n  )\n' \
+    "$SB_LSNR" "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME" "$e"
 }
 
 sid_desc_block() {
-  printf '    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n    )\n' "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
+  local e; e=$(sid_envs_line); [[ -n "$e" ]] && e+=$'\n'
+  printf '    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n%s    )\n' "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME" "$e"
 }
 sidlist_insert() {
   # $1 listener.ora -> the file with the SID_DESC of this standby put just before the closing parenthesis of

@@ -1,17 +1,14 @@
-# Automatic release: whenever the files of the script reach the main branch (git push, or "Upload files" on
-# the GitHub web page) with a version that has no release yet, this makes the release v<version> by itself,
-# with the script attached as dg_standby_setup-<version>.sh, its SHA-256 checksum, and the notes of that version
-# from CHANGELOG.md. A version that already has a release is left alone (nothing is replaced).
+# Automatic release: when the CI workflow has passed on the main branch for a commit whose version has no release
+# yet, this makes the release v<version> by itself, with the script attached as dg_standby_setup-<version>.sh,
+# its SHA-256 checksum, and the notes of that version from CHANGELOG.md. A version that already has a release is
+# left alone (nothing is replaced). A commit whose tests fail is never released.
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main, master]
-    paths:
-      - 'src/**'
-      - 'build.sh'
-      - 'dg_standby_setup.sh'
-      - 'CHANGELOG.md'
   workflow_dispatch:
 
 permissions:
@@ -23,14 +20,28 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # after CI: only a successful run for a push to main / master. By hand: only from main / master (CI is then
+    # not waited for: check it yourself first).
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push')
+      || (github.event_name == 'workflow_dispatch' && (github.ref_name == 'main' || github.ref_name == 'master'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Build from src/ and read the version
         run: |
           bash ./build.sh
           bash -n dg_standby_setup.sh
+          if ! git -c core.fileMode=false diff --quiet -- dg_standby_setup.sh; then
+            echo "::error file=dg_standby_setup.sh::dg_standby_setup.sh differs from the build of src/ (run bash build.sh and commit it)"; exit 1
+          fi
           v=$(sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/\1/p' dg_standby_setup.sh)
           if [ -z "$v" ]; then echo "SCRIPT_VERSION not found in dg_standby_setup.sh" >&2; exit 1; fi
           echo "VER=$v" >> "$GITHUB_ENV"
@@ -43,11 +54,10 @@ jobs:
             echo "Release v$VER exists already: nothing to do."
             exit 0
           fi
+          # the notes: the section "## <version>" of CHANGELOG.md, up to the next "## " (a version without notes is not released)
+          awk -v v="## $VER" '$0 == v {on = 1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then echo "::error file=CHANGELOG.md::CHANGELOG.md has no section '## $VER'"; exit 1; fi
           f="dg_standby_setup-$VER.sh"
           cp dg_standby_setup.sh "$f"
-          chmod 750 "$f"
           sha256sum "$f" > "$f.sha256"
-          # the notes: the section "## <version>" of CHANGELOG.md, up to the next "## "
-          awk -v v="## $VER" '$0 == v {on = 1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md 2>/dev/null || true
-          [ -s notes.md ] || echo "dg_standby_setup.sh version $VER" > notes.md
-          gh release create "v$VER" "$f" "$f.sha256" --title "$VER" --notes-file notes.md --target "$GITHUB_SHA"
+          gh release create "v$VER" "$f" "$f.sha256" --title "$VER" --notes-file notes.md --target "$SHA"

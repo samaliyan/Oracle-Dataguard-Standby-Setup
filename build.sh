@@ -1,11 +1,18 @@
 #!/bin/bash
-set -e
+# Joins src/*.sh (in the order of their numbers) into dg_standby_setup.sh. The result replaces the old file only
+# when it parses.
+set -eu
 cd "$(dirname "$0")"
+export LC_ALL=C
 out=dg_standby_setup.sh
-cat src/00_core.sh > $out
-for f in src/10_engine.sh src/11_plan.sh src/12_screen.sh src/15_journal.sh src/20_settings.sh src/22_storage.sh src/30_primary.sh src/32_discover.sh src/35_sql.sh src/40_phase1.sh src/41_summary.sh src/45_phase2.sh src/50_phase3.sh src/55_phase4.sh src/60_phase5_6.sh src/70_phase7_8.sh src/80_phase9_10.sh src/85_health.sh src/90_help.sh src/99_main.sh; do
-  printf '\n' >> $out; cat "$f" >> $out
+tmp=$out.build.$$
+trap 'rm -f -- "$tmp"' EXIT
+first=1
+for f in src/[0-9][0-9]_*.sh; do
+  [ "$first" = 1 ] || printf '\n' >> "$tmp"
+  cat "$f" >> "$tmp"; first=0
 done
-chmod 755 $out
-bash -n $out
-echo "built $(wc -l < $out) lines"
+bash -n "$tmp"
+chmod 755 "$tmp"
+mv -f -- "$tmp" "$out"
+echo "built $(wc -l < "$out") lines"

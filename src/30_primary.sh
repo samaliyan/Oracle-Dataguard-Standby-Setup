@@ -402,6 +402,7 @@ open_ssh() {
   if ssh -E "$elog" -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=12h \
          -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
          -o ServerAliveInterval=60 -o ConnectTimeout=15 -o NumberOfPasswordPrompts=3 \
+         -o ForwardAgent=no -o ClearAllForwardings=yes \
          -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < "$PROMPT_IN" 9>&-; then
     SSH_OPEN=1
   else

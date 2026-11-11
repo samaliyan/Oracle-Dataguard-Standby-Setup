@@ -21,11 +21,24 @@ deletion, a password change or a file.
 | Primary storage | ASM, file system, or both |
 | Grid Infrastructure | Oracle Restart on the standby when the primary uses ASM. Owned by a separate `grid` user or by `oracle` |
 
+Not every release runs on every Oracle Linux (step 1.6 checks this before anything is installed):
+
+| Release | Oracle Linux for the standby |
+|---|---|
+| 12.1 (12.1.0.2), 12.2, 18c | 7 only |
+| 19c | 7, 8; 9 only together with Release Update 19.19 or newer (`RU_DIR`) |
+| 21c | 8; 9 only together with Release Update 21.12 or newer (`RU_DIR`) |
+| 23ai | 8, 9 |
+
+Releases newer than 23 and Oracle Linux 10 are refused. 21c and 23ai use a read-only Oracle home that cannot
+be made read/write; step 3.8 stops there, so treat these two releases as **not supported yet** (see
+"Known limits").
+
 ## Download
 
 Take `dg_standby_setup-<version>.sh` from the latest release on the
-[Releases](../../releases) page (each release also has a `.sha256` checksum), and rename it to
-`dg_standby_setup.sh` if you like. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+[Releases](../../releases) page. Each release also has a `.sha256` checksum: check it with
+`sha256sum -c dg_standby_setup-<version>.sh.sha256` before you rename the file to `dg_standby_setup.sh`. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
@@ -58,7 +71,7 @@ step of that part. The same parts work from the command line:
 Before each step the script shows what it found and what it will do, and asks:
 
 ```
-[y] Yes, do it   [s] Skip   [h] Help   [q] Quit
+[y] Yes, do it   [a] Yes to all   [s] Skip   [h] Help   [q] Quit
 ```
 
 ## Phases
@@ -264,8 +277,10 @@ manual way.
   the copy, with the CPUs of both servers and a suggestion).
 - `DATA_DEST`: where the database files of the standby go: `+DG` (a disk group, Oracle-managed names), `same`
   (the paths of the primary), or a folder. Empty = automatic: the data disk group when this server has ASM.
-- `FRA_DEST`, `FRA_SIZE`: the recovery area of the standby and its size (empty = estimated from the redo of
-  the primary: the archived logs of the copy time and one day, plus 30 %; at least 10 GB).
+- `FRA_DEST`, `FRA_SIZE`: the recovery area of the standby and its size (empty = as large as the
+  primary's `db_recovery_file_dest_size`; step 8.1 stops when that space is not there. Only when the primary
+  has no recovery area is it estimated from the redo of the primary: the archived logs of the copy time and
+  one day, plus 30 %, at least 10 GB. A smaller value on purpose gives a warning at step 8.1).
 - `ARCH_CLEANUP`: how applied archived logs are deleted here: `timer` (systemd, default), `crontab` (a line
   in the crontab of oracle), `oracle` (only the recovery area itself), `none`. `ARCH_CLEANUP_TIME` (HH:MM,
   04:30), `ARCH_CLEANUP_DAYS` (0-30, 1).
@@ -387,8 +402,11 @@ docs/DESIGN.md        design notes
 ssh and the installers. These include ASM and file system storage, interrupted jobs, a wrong password,
 a disk that is not empty, a failed duplicate, undo, and a check that no changing command ever reaches the primary.
 
-> The tests need root and change `/etc/hosts`. Run them **only in a throw-away container or VM**, never on
-> a real server.
+> The tests need root and are destructive: they **kill the processes of the users `oracle` and `grid`, delete
+> these users with their home folders and the Oracle groups**, remove `/etc/oraInst.loc`, `/etc/oracle`,
+> `/etc/oratab` entries and Oracle limits files, and rewrite `/etc/hosts`. Run them **only in a throw-away
+> container or VM**, never on a server that has (or will have) Oracle on it. The suite refuses to start on a
+> machine that looks like a real Oracle server.
 
 ```bash
 ./build.sh
@@ -402,6 +420,20 @@ sections A and Q on Oracle Linux 7 (bash 4.2) in a container.
 
 The mocks are not real Oracle. Before using the script in production, run `--check` on the real servers
 and read what it reports.
+
+## Known limits
+
+- The script was tested against mocks only (see above), not yet end to end on real servers. Use `--check` first.
+- 21c and 23ai: the Oracle home is read-only there and `roohctl -disable` is no longer possible; the script
+  still expects a read/write home (step 3.8), so a standby of these releases cannot be finished with it yet.
+- The key for `--health` (step 9.9) lets root of the standby log in as the Oracle owner of the primary without
+  a password. Its `authorized_keys` line limits where it may come from and forbids forwarding and a terminal,
+  but not the commands. Protect root on the standby accordingly.
+- After a switchover (this server becomes the primary): the nightly clean-up of archived logs deletes nothing
+  any more. Without Grid, the boot unit still starts the database only to MOUNT; open it yourself and review
+  the unit.
+- The installer zips are not verified against Oracle's checksums. Compare them yourself (`sha256sum`) with the
+  values on the download page before step 3.1.
 
 ## Disclaimer
 

@@ -120,7 +120,7 @@ PARTS=(
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
-  [11]="5.23"
+  [11]="5.23 5.30"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -140,6 +140,25 @@ fi
 if [[ -n "$SEL_PART" ]] && { [[ "$SEL_PART" == *[!0-9]* ]] || [[ -z "${PARTS[$SEL_PART]:-}" ]]; }; then
   echo "no part '$SEL_PART' (parts: ${!PARTS[*]})" >&2; exit 2
 fi
+# These tests kill the processes of oracle and grid, delete these users (with their home folders) and the Oracle
+# groups, and remove or rewrite Oracle's files in /etc. They must never run on a machine with a real Oracle on it:
+# the first run on a machine looks for one and refuses; DGT_FORCE=1 runs anyway. A machine that has run the tests
+# is marked (/etc/dgt_test_machine) and is not asked again.
+if [[ $(id -u) -ne 0 ]]; then echo "The tests need root (in a throw-away container or VM only)." >&2; exit 2; fi
+if [[ ! -e /etc/dgt_test_machine && "${DGT_FORCE:-0}" != 1 ]]; then
+  real=""
+  pgrep -f '^(ora|db|asm)_pmon_' >/dev/null 2>&1 && real+="an Oracle instance runs here; "
+  [[ -e /etc/oraInst.loc ]] && real+="/etc/oraInst.loc exists; "
+  grep -qE '^[^#[:space:]]' /etc/oratab 2>/dev/null && real+="/etc/oratab has entries; "
+  for u in oracle grid; do id "$u" >/dev/null 2>&1 && real+="the user $u exists; "; done
+  if [[ -n "$real" ]]; then
+    echo "Refused: this machine looks like a real Oracle server (${real%; })." >&2
+    echo "The tests delete the users oracle and grid, their home folders, the Oracle groups and Oracle's files in /etc." >&2
+    echo "Run them only in a throw-away container or VM. To run here anyway:  DGT_FORCE=1 $0 ..." >&2
+    exit 2
+  fi
+fi
+: > /etc/dgt_test_machine
 CUR=-; RAN_SECTIONS=""; PART_STARTED=""
 part() { # $1 = section key; true when the section runs in this run
   local k=$1 p hit=""
@@ -230,6 +249,7 @@ check "FRA created with the compatible attributes of DATA" "python3 -c \"import 
 check "roohctl -disable ran" "grep -q 'roohctl user=oracle' $T/state/calls.log"
 check "password file is primary copy, mode 640" "grep -q ORAPW-PRIMARY $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwPRODDB_STBY && [[ \$(stat -c %a $T/u01/app/oracle/product/19.0.0/dbhome_1/dbs/orapwPRODDB_STBY) == 640 ]]"
 check "static entry uses DB home" "grep -q 'ORACLE_HOME = $T/u01/app/oracle/product/19.0.0/dbhome_1' $T/u01/app/19.0.0/grid/network/admin/listener.ora"
+check "static entry of a Grid listener gives the server processes the TNS_ADMIN of the database home (ENVS): the copy finds the primary alias" "grep -q 'ENVS = \"TNS_ADMIN=$T/u01/app/oracle/product/19.0.0/dbhome_1/network/admin\"' $T/u01/app/19.0.0/grid/network/admin/listener.ora"
 check "9.8: archivelog deletion policy set on the standby" "grep -qE '^    9\.8 +done' $T/b.txt && grep -q 'rman_adp' $S"
 check "rman duplicate ran once (plus the syntax check, the login test and the 9.8 policy)" "python3 -c \"import json;assert json.load(open('$S')).get('duplicated')==1\" && [[ \$(grep -c '^rman ' $T/state/calls.log) -eq 4 ]]"
 check "srvctl -instance is the SID" "python3 -c \"import json;assert json.load(open('$S'))['srvctl']['instance']=='PRODDB_STBY'\""
@@ -911,7 +931,7 @@ rm -f "$R"
 # X8 standby redo log size is rounded UP to whole MB (else the primary would get more and more logs)
 fresh; jset $P "d['orl_bytes']=100000000; d['srl']=0"
 rc=$(DG_TEST_QUIT_AT=4.3 run $T/x8.txt --only 4)
-check "SRL size 100000000 bytes -> size 96M (rounded up)" "grep -q 'add standby logfile thread 1 size 96M' $T/x8.txt"
+check "SRL size 100000000 bytes -> size 96M (rounded up)" "grep -q 'add standby logfile thread 1 ('+DATA') size 96M' $T/x8.txt"
 # X9 log_archive_config keeps other members; 4.7 pending restart
 fresh; jset $P "d['params']['log_archive_config']='DG_CONFIG=(PRODDB,OTHERSB)'; d['params']['remote_login_passwordfile']='NONE'; d['spparams']={'remote_login_passwordfile':'EXCLUSIVE'}"
 rc=$(DG_TEST_NOFIX=4.7 run $T/x9.txt --only 4)
@@ -2331,6 +2351,8 @@ if grep -q 'show archivelog deletion policy' <<< "\$in"; then
 else echo "DELETE RAN as \$(id -un): \$in" >> $d/del.log; echo 'deleted archived log'; fi
 EOF
   chmod 755 $d/bin/rman
+  printf '#!/bin/bash\ncat > /dev/null\ncat %s/role 2>/dev/null || echo "PHYSICAL STANDBY"\n' "$d" > $d/bin/sqlplus; chmod 755 $d/bin/sqlplus
+  [[ -n "${2:-}" ]] && printf '%s\n' "$2" > $d/role
   bash -c "source <(sed -n '/^arch_days()/p; /^arch_script_text()/,/^}/p' $T/dg_standby_setup.sh); STANDBY_UNIQUE=PRODDB_STBY STANDBY_SID=PRODDB_STBY ORACLE_USER=oracle DB_HOME=$d ARCH_CLEANUP_DAYS=1; arch_script_text" > $d/s.sh
   chmod 755 $d/s.sh
   local out rc=0; out=$($d/s.sh 2>&1) || rc=$?
@@ -2342,6 +2364,12 @@ check "clean-up script: policy '... APPLIED ON ALL STANDBY BACKED UP 1 TIMES ...
 o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;')
 printf '%s\n' "$o" > $T/ut524b.txt
 check "clean-up script: policy '... TO APPLIED ON ALL STANDBY;' -> the delete runs (as oracle), exit 0" "[[ \$(head -n 1 $T/ut524b.txt) == 0 ]] && grep -q 'DELETE RAN as oracle:' $T/ut524arch/del.log && grep -q \"delete noprompt archivelog all completed before 'sysdate-1'\" $T/ut524arch/del.log && grep -q '=== end (exit code 0) ===' $T/ut524b.txt"
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;' PRIMARY)
+printf '%s\n' "$o" > $T/ut524c.txt
+check "clean-up script: the database is now the PRIMARY (after a switchover) -> nothing deleted, said so, exit 0" "[[ \$(head -n 1 $T/ut524c.txt) == 0 ]] && grep -q 'The database role is not PHYSICAL STANDBY (PRIMARY): nothing deleted' $T/ut524c.txt && [[ ! -s $T/ut524arch/del.log ]]"
+o=$(ut_524_arch 'CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;' 'ORA-01034: ORACLE not available')
+printf '%s\n' "$o" > $T/ut524d.txt
+check "clean-up script: the role cannot be read (instance down) -> nothing deleted, exit 1" "[[ \$(head -n 1 $T/ut524d.txt) == 1 ]] && grep -q 'the database role cannot be read: nothing deleted' $T/ut524d.txt && [[ ! -s $T/ut524arch/del.log ]]"
 rm -rf $T/ut524arch
 
 # ---- 10.8 on a built standby: no clean-up chosen; the free space of the recovery area's disk group unreadable ----
@@ -2417,6 +2445,57 @@ fresh empty; mv $T/stage/*.zip /var/dgt_hold/; out=$T/r29c.txt
     timeout 600 python3 $DRV $SW/dg_standby_setup.sh >/dev/null 2>&1 )
 check "no zips anywhere: the summary says to copy them next to the script ($SW) or to /stage" "grep -q 'No Grid installer zip found  ->  copy it next to this script ($SW) or to /stage' $out"
 rm -rf $SW /var/dgt_hold
+fi
+if part 5.30; then
+CUR=5.30; echo "== 5.30  Fixes of the strict review (unit tests of the changed functions)"
+fresh
+cat > $T/ut530.sh <<'EOF'
+#!/bin/bash
+# unit tests of 5.30: each prints one line "name=result"
+S=$1; T=$2
+fn() { sed -n "/^$1()/,/^}/p" "$S"; }
+# 1) save_settings: a write that fails must leave the old file and return 1
+( source <(fn save_settings; fn all_setting_keys; fn is_standby_key; sed -n '/^readonly SETTING_SPECS="/,/^readonly STANDBY_KEYS=/p' "$S")
+  ts() { date '+%F %T'; }; bad() { echo "BAD: $*" >&2; }; save_accepted() { :; }
+  MODE=run; SCRIPT_VERSION=x; STATE_DIR=$T/ut530; SETTINGS_FILE=$STATE_DIR/settings.conf; SETTINGS_ACCEPTED=0; LSNR_ASSUMED=0
+  rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"; PRIMARY_IP=10.1.1.1; PRIMARY_SSH_USER=oracle
+  save_settings 2>/dev/null; a=$?; n1=$(grep -c '' "$SETTINGS_FILE"); g=$(grep -c '^PRIMARY_IP=10.1.1.1$' "$SETTINGS_FILE")
+  cp "$SETTINGS_FILE" "$STATE_DIR/good"
+  # a file size limit of 1 block: the write of the new file fails as on a full disk
+  ( trap '' XFSZ; ulimit -f 1; PRIMARY_IP=10.9.9.9; save_settings 2>/dev/null ); b=$?
+  cmp -s "$SETTINGS_FILE" "$STATE_DIR/good" && same=1 || same=0
+  left=$(ls "$STATE_DIR" | grep -c 'settings.conf.tmp')
+  echo "save=$a/$g/$([[ $n1 -gt 20 ]] && echo long)/$b/$same/$left" )
+# 2) grp_or: a group counts only when the database owner is in it
+( source <(fn grp_or); ORACLE_USER=oracle; INSTALL_GROUP=oinstall
+  getent() { case "$2" in dba|oper|backupdba|oinstall) return 0 ;; *) return 1 ;; esac; }
+  id() { if [[ "$1" == -nG ]]; then echo "oinstall dba"; else [[ "$1" == oracle ]]; fi; }
+  r1=$(grp_or oper dba); r2=$(grp_or dba); r3=$(grp_or racdba)
+  id() { if [[ "$1" == -nG ]]; then echo "oinstall dba backupdba"; else [[ "$1" == oracle ]]; fi; }
+  r4=$(grp_or backupdba dba)
+  id() { return 1; }; r5=$(grp_or oper dba)
+  echo "grp=$r1/$r2/$r3/$r4/$r5" )
+# 3) log_block: ORA- in a long output with exit code 0 is still marked
+( source <(fn log_block); LOG_FILE=$T/ut530.log; VQ_FILE=""; : > "$LOG_FILE"; ts() { echo t; }; mask_pw() { cat; }
+  set -o pipefail
+  { echo "ORA-01034: ORACLE not available"; for ((i = 0; i < 20000; i++)); do echo "line $i of a long output, padded padded padded"; done; echo "(exit code 0)"; } | log_block "RUN test" 2>/dev/null
+  echo "logblock=$(grep -c 'exit code 0, ORA- in output' "$LOG_FILE" | sed 's/^[1-9][0-9]*$/marked/')" )
+# 4) the pmon pattern knows the process names of 23ai (db_pmon_<SID>)
+( source <(fn pmon_running); ORACLE_USER=u; STANDBY_SID=S1
+  pgrep() { local re=${@: -1}; printf '%s\n' "$PS" | grep -qE "$re"; }
+  PS="ora_pmon_S1"; pmon_running && a=1 || a=0; PS="db_pmon_S1"; pmon_running && b=1 || b=0; PS="db_pmon_S12"; pmon_running && c=1 || c=0
+  echo "pmon=$a$b$c" )
+EOF
+bash $T/ut530.sh $T/dg_standby_setup.sh $T > $T/ut530.txt 2>&1
+check "unit: save_settings writes the file; a failed write (as on a full disk) returns 1, keeps the old file and leaves no temporary file" "grep -qx 'save=0/1/long/1/1/0' $T/ut530.txt"
+check "unit: response-file groups: only a group the database owner is in (oper -> dba, racdba -> the install group); before the user exists, the first that exists" "grep -qx 'grp=dba/dba/oinstall/backupdba/oper' $T/ut530.txt"
+check "unit: log_block marks ORA- in a long output that ended with exit code 0 (no SIGPIPE miss)" "grep -qx 'logblock=marked' $T/ut530.txt"
+check "unit: the instance's processes are found by ora_pmon_<SID> and by db_pmon_<SID> (23ai), not by another SID" "grep -qx 'pmon=110' $T/ut530.txt"
+# the test file of the shared-storage check is never written through a link
+d=$T/ut530d; rm -rf $d; mkdir -p $d; echo keep > $d/victim; ln -s $d/victim $d/link
+( umask 077; set -C; : > "$d/link" ) 2>/dev/null; r=$?
+check "noclobber (as used for the storage test file): a link of that name is not written through" "[[ $r -ne 0 && \$(cat $d/victim) == keep ]]"
+rm -rf $d $T/ut530 $T/ut530.log
 fi
 parts_done
 echo

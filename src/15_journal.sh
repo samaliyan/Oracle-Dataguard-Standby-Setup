@@ -327,7 +327,7 @@ _undo_obj_ok() {
       case "$obj" in /|/etc|/usr|/usr/*bin|/bin|/sbin|/lib*|/var|/opt|/home|/root|/boot|/dev|/proc|/sys|/tmp|/u0[0-9]) bad "Not undone: $obj is a system folder."; return 1 ;; esac
       [[ "$kind" != DIR && -d "$obj" && ! -L "$obj" ]] && { bad "Not undone: $obj is a folder, but the journal line is for a file."; return 1; }
       if [[ "$kind" == EDIT ]]; then x=$(detail_field "$det" bak); [[ "$x" == "-" || ( "$x" == "$obj".bak_* && "${x#"$obj".bak_}" =~ ^[0-9]{8}_?[0-9]{6}(_[0-9]+)?$ ) ]] || { bad "Not undone: the backup $x does not belong to $obj."; return 1; }; fi
-      if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
+      if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".old_* && "${x#"$obj".old_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
     FWPORT) [[ "$obj" =~ ^[A-Za-z0-9_-]+:[0-9]+/tcp$ ]] || { bad "Not undone: invalid firewall entry $obj"; return 1; } ;;
     UNIT)   [[ "$obj" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || { bad "Not undone: invalid unit name $obj"; return 1; } ;;
     CRONLINE) v_name "$obj" && [[ "$(detail_field "$det" tag)" =~ ^#~dg_standby_setup~[a-z0-9_]+$ ]] || { bad "Not undone: unusual crontab entry ($obj, $det)"; return 1; } ;;

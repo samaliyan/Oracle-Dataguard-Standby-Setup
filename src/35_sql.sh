@@ -8,7 +8,7 @@ _sql_exec() {
   if [[ ${IN_DO:-0} -eq 1 && ! "${sql,,}" =~ ^[[:space:]]*select[[:space:]] ]]; then
     local who=$ORACLE_USER; [[ "$runner" == as_grid ]] && who=$GRID_USER
     local first; first=$(head -n 1 <<< "$sql"); local nl; nl=$(grep -c '' <<< "$sql")
-    say "${C_D}Running as $who:${C_N} $(mask_pw <<< "sqlplus ${connect#connect }  ->  $first")$([[ $nl -gt 1 ]] && printf '  (and %s more lines)' $((nl - 1)))"
+    say "${C_D}Running as $who:${C_N} $(printf '%s\n' "sqlplus ${connect#connect }  ->  $first" | mask_pw)$([[ $nl -gt 1 ]] && printf '  (and %s more lines)' $((nl - 1)))"
   fi
   # output through a file: background processes of a started instance must not keep a pipe open
   tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) || { SQL_OUT="SP2-0000: cannot create a temporary file"; return 1; }
@@ -36,7 +36,7 @@ sql_primary_tns() {
   _sql_exec "connect sys/\"$SYS_PW\"@$PRIMARY_TNS as sysdba" "$1" "PRIMARY via $PRIMARY_TNS (read-only): ${1:0:150}" as_oracle "$DB_HOME"
 }
 
-pmon_running() { pgrep -u "$ORACLE_USER" -f "^ora_pmon_${STANDBY_SID}( |\$)" >/dev/null 2>&1; }   # the processes of the standby instance run
+pmon_running() { pgrep -u "$ORACLE_USER" -f "^(ora|db)_pmon_${STANDBY_SID}( |\$)" >/dev/null 2>&1; }   # the processes of the standby instance run
 STATE_TMO=$((FAST_WAITS == 1 ? 5 : 120))     # a login that hangs longer than this is a hung instance, not a slow one
 local_state() {
   # LSTATE = IDLE | STARTED | MOUNTED | OPEN | HUNG | ERROR | NOSW

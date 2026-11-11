@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.29"
+readonly SCRIPT_VERSION="5.30"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -98,7 +98,7 @@ OS_ID=""; OS_MAJOR=""; PKG=""
 #------------------------------------------------------------------------------
 # Output and logging
 #------------------------------------------------------------------------------
-if [[ -t 1 ]]; then
+if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then
   C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1;34m'; C_C=$'\e[36m'; C_M=$'\e[35m'; C_D=$'\e[2m'; C_W=$'\e[1m'; C_N=$'\e[0m'
 else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_M=""; C_D=""; C_W=""; C_N=""
@@ -144,8 +144,10 @@ log_block() {
   local body t=$1 e=""
   body=$(cat)
   if grep -qx '(exit code 0)' <<< "$body"; then
-    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])ORA-[0-9]{4,5}' && e="ORA-"
-    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])SP2-[0-9]{4}' && e+="${e:+/}SP2-"
+    # (one awk each, no "grep | grep -q": with pipefail a long output would end the first grep with SIGPIPE and
+    # the match would count as none)
+    awk '!/^SQL> / && /(^|[[:space:]])ORA-[0-9][0-9][0-9][0-9]/ {f=1} END {exit !f}' <<< "$body" && e="ORA-"
+    awk '!/^SQL> / && /(^|[[:space:]])SP2-[0-9][0-9][0-9][0-9]/ {f=1} END {exit !f}' <<< "$body" && e+="${e:+/}SP2-"
     if [[ -n "$e" ]]; then body=$(sed "s#^(exit code 0)\$#(exit code 0, $e in output)#" <<< "$body"); t+=" (exit code 0, $e in output)"; fi
   fi
   # SQL: the query is in the title once (not again as "SQL> ..."), the output marker of the probes is left out
@@ -380,7 +382,7 @@ cleanup() {
     # (once the job's command has ended, its .rc file exists: the response file is no longer needed and goes now)
     [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && [[ ! -f "${JOB_OUT:-/nonexistent}.rc" ]] && continue
     rm -f -- "$f"
-    [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
+    [[ "$(dirname "$f")" == /tmp/dg_rsp.* || "$(dirname "$f")" == /tmp/dg_screen.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
   if [[ ( $SSH_OPEN -eq 1 || ${HEALTH_SSH_OPEN:-0} -eq 1 ) && -n "$SSH_CTL" ]]; then
     ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
@@ -841,14 +843,17 @@ run_long() {
   { ( umask 077; { printf '#| %s %s, run %s, step %s: %s\n' "${SELF##*/}" "$SCRIPT_VERSION" "$RUN_ID" "${CUR_STEP:--}" "$title"
                    printf '#| as %s, started %s: %s\n' "$(cp_user "$who" 2>/dev/null || printf '%s' "$who")" "$(ts)" "$hcmd"
                    printf '#| ---- output ----\n'; } | mask_pw > "$out" ); } 2>/dev/null || { bad "Cannot write $out."; JOB_PROGRESS_FN=""; return 1; }
-  # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
+  # Ctrl+C from here on asks (the job is about to exist: a plain stop would leave it without a job file)
+  RL_INT=0; trap 'RL_INT=1' INT
+  # fd 9 (the lock of this script) is closed for the job; so are the screen and stderr of the script (the job writes
+  # to its file: a "| tee" behind the script must end with the script, not with the job): a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
   # .pid and .rc are written to a temp name and moved: a reader never sees a half-written file
   setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid.t" && mv -f -- "$1.pid.t" "$1.pid"; f=$1; k=$2; sp=$3; shift 3
     "$@" >> "$f" 2>&1; r=$?; d=$SECONDS
     printf "#| ---- end %s, exit code %s, after %s min %s s ----\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$r" $((d / 60)) $((d % 60)) >> "$f"
     echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
-    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 9>&- &
+    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 > /dev/null 2>&1 9>&- &
   local bg=$! n=0 jpid=""
   while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
@@ -873,7 +878,6 @@ If this run stops, the next run will not know that $title is still running."
     say "To stop the job itself:  pkill -s $jpid"
     [[ "${title:-}" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
   fi
-  RL_INT=0; trap 'RL_INT=1' INT
   local t0=$SECONDS hb=0 ui_on=$UI pg_t=$SECONDS pg_said="" pg_said_t=$SECONDS
   # how often the progress is read: every 15 s for the live line, every 60 s in plain mode (shown when it changed,
   # at least every 5 minutes); with the test timing every 2 s
@@ -946,7 +950,10 @@ If this run stops, the next run will not know that $title is still running."
     fi
   done
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
-  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"; job_running "$jpid" || rm -f -- "$JOB_FILE"; JOB_PID=""
+  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"
+  # the result is read here: the job file goes also when programs the job left behind still run (with the exit
+  # code file gone, the next run would take the job itself for running)
+  { num "$rc" || ! job_running "$jpid"; } && rm -f -- "$JOB_FILE"; JOB_PID=""
   num "$rc" || { rc=1; bad "$title was stopped before it finished."; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
   JOB_KEEP=""

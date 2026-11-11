@@ -111,7 +111,7 @@ srl_statements() {
   [[ -n "$bclause" ]] && SRL_INFO_EXTRA="The online logs use 4096-byte blocks."$'\n'"The standby disks must support 4K sectors, or you get ORA-01378." || SRL_INFO_EXTRA=""
   # standby logs without a thread (thread 0) can serve any thread
   local pool0; pool0=$(awk -F'|' '$1==0 {print $2}' <<< "$good"); num "$pool0" || pool0=0
-  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
+  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select decode(a.c,0,b.c,a.c) from (select count(*) c from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null) a, (select count(*) c from v\$parameter where name in ('db_recovery_file_dest','db_create_file_dest') and value is not null) b)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
   local ndest; IFS='|' read -r omf ndest maxg dir <<< "$(first_line)"; num "$ndest" || ndest=0
   num "$maxg" || return 2
   maxb=$(awk -F'|' '{if ($3 > m) m = $3} END {print m+0}' <<< "$threads")
@@ -126,6 +126,8 @@ srl_statements() {
     while [[ $have -lt $((c + 1)) ]]; do
       # one member per standby log (MAA: a second member only slows the writes of the redo that arrives). With two
       # or more OMF log destinations an empty spec would make one member in each: the first destination is named.
+      # (The destinations are db_create_online_log_dest_n or, when none of them is set, db_create_file_dest and
+      # the recovery area: Oracle puts a member into each of those two as well.)
       if [[ "$omf" != "-" && -n "$omf" && $ndest -lt 2 ]]; then spec=""
       elif [[ "$omf" == +* ]]; then spec=" ('${omf%%/*}')"
       elif [[ "$omf" != "-" && -n "$omf" ]]; then g=$((g + 1)); spec=" group $g ('${omf%/}/srl_t${t}_g${g}.log')"

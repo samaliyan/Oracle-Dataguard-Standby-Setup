@@ -578,6 +578,18 @@ arch_script_text() {
   printf '[ "$(id -un)" = root ] && exec runuser -u %s -- "$0" "$@"\n' "$ORACLE_USER"
   printf 'echo "=== dg_arch_cleanup $(date '"'"'+%%Y-%%m-%%d %%H:%%M:%%S'"'"') ==="\n'
   printf 'export ORACLE_HOME=%s ORACLE_SID=%s LANG=C\n' "$DB_HOME" "$STANDBY_SID"
+  # the role first: after a switchover or failover this server is the primary, and the logs of a primary are
+  # deleted by its backup, not by "applied on the standby and a day old"
+  cat <<'EOS'
+# only while this database is a physical standby (after a switchover it is the primary: its archived logs then
+# belong to its backups, and nothing is deleted here)
+role=$(printf 'set heading off feedback off pagesize 0\nselect database_role from v$database;\nexit\n' | "$ORACLE_HOME/bin/sqlplus" -S -L / as sysdba 2>&1)
+case "$role" in
+  *"PHYSICAL STANDBY"*) ;;
+  *PRIMARY*|*"SNAPSHOT STANDBY"*|*"LOGICAL STANDBY"*) echo "The database role is not PHYSICAL STANDBY ($(echo $role)): nothing deleted"; echo "=== end (exit code 0) ==="; exit 0 ;;
+  *) echo "RMAN-00000: the database role cannot be read: nothing deleted"; printf '%s\n' "$role" | head -n 5; echo "=== end (exit code 1) ==="; exit 1 ;;
+esac
+EOS
   printf '# the deletion policy first: without TO APPLIED ON STANDBY a log that is not applied could be deleted\n'
   printf '# (the same rule as step 9.8: "... BACKED UP n TIMES ..." is not enough on a standby)\n'
   printf 'pol=$(printf "show archivelog deletion policy;\\nexit\\n" | "$ORACLE_HOME/bin/rman" target / 2>&1)\n'
@@ -1250,7 +1262,7 @@ c_10_1() {
   # and "no destination" is said only when the query itself worked)
   if ssh_alive; then
     local prc=0 dl did dst der
-    prim_sql "select distinct 'DEST:'||dest_id||'|'||status||'|'||nvl(error,'-') from gv\$archive_dest where upper(db_unique_name)=upper('$STANDBY_UNIQUE') and target='STANDBY';" || prc=1
+    prim_sql "select distinct 'DEST:'||dest_id||'|'||status||'|'||nvl(error,'-') from gv\$archive_dest where upper(db_unique_name)=upper('$STANDBY_UNIQUE') and target in ('STANDBY','REMOTE');" || prc=1
     # a RAC primary gives one line per instance: a line with an error first
     dl=$(sed -n 's/^[[:space:]]*DEST://p' <<< "$SQL_OUT" | awk -F'|' '{print ($3 == "-" ? 1 : 0) "\t" $0}' | sort -k1,1n | cut -f2- | head -n 1)
     if [[ "$dl" =~ ^[0-9]+\|[A-Z_\ ]+\| ]]; then

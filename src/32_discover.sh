@@ -174,8 +174,8 @@ Fix the time synchronization: step 2.10 here, chronyd on the primary.")
   ASM_PMON_PID=""
   local pid user args
   while read -r pid user args; do
-    if [[ "$args" =~ ^ora_pmon_([A-Za-z][A-Za-z0-9_]*)$ ]]; then
-      local psid=${BASH_REMATCH[1]}
+    if [[ "$args" =~ ^(ora|db)_pmon_([A-Za-z][A-Za-z0-9_]*)$ ]]; then
+      local psid=${BASH_REMATCH[2]}
       num "$pid" && v_name "$user" && pm+=("$psid:$pid:$user")
     fi
     [[ "$args" =~ ^asm_pmon_\+ASM[0-9]*$ ]] && num "$pid" && ASM_PMON_PID=$pid

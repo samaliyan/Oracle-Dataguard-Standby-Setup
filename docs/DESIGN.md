@@ -1,4 +1,4 @@
-# dg_standby_setup.sh 5.20 - design
+# dg_standby_setup.sh - design (kept up to date with each version; the notes name the version they came with)
 
 Runs as root on the future STANDBY. Builds a physical standby of one primary database.
 Never changes the primary on its own: primary work is printed, then re-checked read-only.

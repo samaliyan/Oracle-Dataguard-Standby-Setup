@@ -93,7 +93,7 @@ health_ssh() {
   local -a idf=(); local kf; kf=$(health_key_file); [[ -f "$kf" ]] && idf=(-o IdentityFile="$kf")
   if timeout 30 ssh -E "$elog" "${idf[@]+"${idf[@]}"}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=300 \
        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
-       -o ConnectTimeout=15 -o ServerAliveInterval=30 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null 9>&- \
+       -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null 9>&- \
      && ssh_alive; then
     HEALTH_SSH_OPEN=1; return 0
   fi
@@ -379,7 +379,7 @@ health_key_test() {
   rm -f -- "$ctl"
   if timeout 30 ssh "${idf[@]+"${idf[@]}"}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$ctl" -o ControlPersist=10 \
        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
-       -o ConnectTimeout=15 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null > /dev/null 2>&1 9>&-; then rc=0; fi
+       -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null > /dev/null 2>&1 9>&-; then rc=0; fi
   [[ -e "$ctl" ]] && timeout 10 ssh -o ControlPath="$ctl" -O exit "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
   rm -f -- "$ctl"
   return $rc
