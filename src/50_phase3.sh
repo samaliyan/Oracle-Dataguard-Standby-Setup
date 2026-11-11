@@ -26,7 +26,10 @@ grp_or() {
 #------------------------------------------------------------------------------
 # Media (installer zip files)
 #------------------------------------------------------------------------------
-ZIP_DIRS=(/stage /software /install /tmp /root /home /opt /u01 /mnt /media)
+# the folder of this script first (the zips are often put next to it), then the usual places; three levels deep.
+# (not when the script lies in /: that would search the whole server)
+ZIP_DIRS=(); [[ "$SCRIPT_DIR" != / ]] && ZIP_DIRS+=("$SCRIPT_DIR")
+ZIP_DIRS+=(/stage /software /install /tmp /root /home /opt /u01 /mnt /media)
 media_kind() {
   # $1 zip -> grid_image | grid_staged | db_image | db_staged | db_staged_part | grid_staged_part | other
   local l; l=$(unzip -Z1 "$1" 2>/dev/null)

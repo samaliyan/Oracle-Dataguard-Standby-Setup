@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.28"
+readonly SCRIPT_VERSION="5.29"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -6176,8 +6176,11 @@ summary_problems() {
   [[ "${SUM_FORCELOG^^}" == NO ]] && printf 'Force logging is off on the primary  ->  phase 4 shows the command (no restart)\n'
   [[ "${STEP_RESULT[1.6]:-OK}" != OK ]] && printf 'Version or OS: %s  ->  see step 1.6\n' "${STEP_NOW[1.6]:-check step 1.6}"
   # (the zips are searched as step 3.1 does, in ${ZIP_DIRS[*]})
-  if ! grid_sw_ok 2>/dev/null && use_grid && [[ -z "$GRID_MEDIA$SUM_GRID_FOUND" ]]; then printf 'No Grid installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
-  if ! db_sw_ok 2>/dev/null && [[ -z "$DB_MEDIA$SUM_DB_FOUND" ]]; then printf 'No database installer zip found  ->  copy it to /stage on this server (step 3.1 shows how)\n'; fi
+  if ! grid_sw_ok 2>/dev/null && use_grid && [[ -z "$GRID_MEDIA$SUM_GRID_FOUND" ]]; then printf 'No Grid installer zip found  ->  copy it next to this script (%s) or to /stage (step 3.1 shows how)\n' "$SCRIPT_DIR"; fi
+  if ! db_sw_ok 2>/dev/null && [[ -z "$DB_MEDIA$SUM_DB_FOUND" ]]; then printf 'No database installer zip found  ->  copy it next to this script (%s) or to /stage (step 3.1 shows how)\n' "$SCRIPT_DIR"; fi
+  # a zip of the settings (an earlier run) that is gone or no longer usable: said now, not only at step 3.1
+  if ! grid_sw_ok 2>/dev/null && use_grid && [[ -n "$GRID_MEDIA" ]] && ! media_ok "$GRID_MEDIA"; then printf 'The Grid installer zip of the settings is missing or not usable: %s  ->  copy it back, or change the value "Installer zips"\n' "${GRID_MEDIA//,/ }"; fi
+  if ! db_sw_ok 2>/dev/null && [[ -n "$DB_MEDIA" ]] && ! media_ok "$DB_MEDIA"; then printf 'The database installer zip of the settings is missing or not usable: %s  ->  copy it back, or change the value "Installer zips"\n' "${DB_MEDIA//,/ }"; fi
   # base media and a patched primary: said now, not after the installs (step 3.11 would ask for opatchauto by hand)
   if ! db_sw_ok 2>/dev/null && [[ -n "$SUM_PATCHES" && -z "$RU_DIR" ]]; then
     local mf=${DB_MEDIA:-$SUM_DB_FOUND}; mf=${mf%%,*}
@@ -6284,8 +6287,8 @@ fra_why_short() {
 }
 sum_media_text() {
   local g=${GRID_MEDIA:-$SUM_GRID_FOUND} d=${DB_MEDIA:-$SUM_DB_FOUND} t=""
-  if use_grid && ! grid_sw_ok 2>/dev/null; then t="Grid $( [[ -n "$g" ]] && basename "${g%%,*}" || printf 'not found'); "; fi
-  if ! db_sw_ok 2>/dev/null; then t+="database $( [[ -n "$d" ]] && basename "${d%%,*}" || printf 'not found')"; else t=${t%; }; fi
+  if use_grid && ! grid_sw_ok 2>/dev/null; then t="Grid $( [[ -n "$g" ]] && { printf %s "$(basename "${g%%,*}")"; [[ -n "$GRID_MEDIA" ]] && ! media_ok "$GRID_MEDIA" && printf ' (missing)'; true; } || printf 'not found'); "; fi
+  if ! db_sw_ok 2>/dev/null; then t+="database $( [[ -n "$d" ]] && { printf %s "$(basename "${d%%,*}")"; [[ -n "$DB_MEDIA" ]] && ! media_ok "$DB_MEDIA" && printf ' (missing)'; true; } || printf 'not found')"; else t=${t%; }; fi
   [[ -z "$GRID_MEDIA$DB_MEDIA" && -n "$SUM_GRID_FOUND$SUM_DB_FOUND" ]] && t+="   (found; step 3.1 uses them)"
   printf '%s' "$t"
 }
@@ -8585,7 +8588,10 @@ grp_or() {
 #------------------------------------------------------------------------------
 # Media (installer zip files)
 #------------------------------------------------------------------------------
-ZIP_DIRS=(/stage /software /install /tmp /root /home /opt /u01 /mnt /media)
+# the folder of this script first (the zips are often put next to it), then the usual places; three levels deep.
+# (not when the script lies in /: that would search the whole server)
+ZIP_DIRS=(); [[ "$SCRIPT_DIR" != / ]] && ZIP_DIRS+=("$SCRIPT_DIR")
+ZIP_DIRS+=(/stage /software /install /tmp /root /home /opt /u01 /mnt /media)
 media_kind() {
   # $1 zip -> grid_image | grid_staged | db_image | db_staged | db_staged_part | grid_staged_part | other
   local l; l=$(unzip -Z1 "$1" 2>/dev/null)

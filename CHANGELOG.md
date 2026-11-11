@@ -3,6 +3,16 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.29
+
+- The installer zips are also searched for in the folder of the script itself (first, three levels deep), so
+  the script and the zips can be put together in any folder. The messages for missing zips name that folder.
+- Summary (step 1.4): an installer zip saved in the settings by an earlier run that is gone or no longer
+  usable is named under "Problems found now" and marked "(missing)" on its value line (before, only step 3.1
+  said so).
+- README: where to put the installer files, how the release is found (file name or the inside of the zip),
+  the owner and mode they need, 12.1 pairs, and the Release Update.
+
 ## 5.28
 
 - `--verbose` shows what the checks read: every step in full, and under it each read-only query or command it
