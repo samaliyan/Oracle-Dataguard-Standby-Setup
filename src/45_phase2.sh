@@ -1648,7 +1648,8 @@ storage_not_shared() {
     if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, same source $lsrc on both servers) "; continue; fi
     # 2) a test file written here (as the database owner) must not be visible on the primary
     if [[ "$ans" == "YES" ]]; then
-      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$"
+      # (a new name at every call: a file an earlier call could not remove must not be in the way)
+      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$_$RANDOM"
       CLEANUP_FILES+=("$m")
       # (made with noclobber, also by root: a name that is already there, for example a link put there by a member of
       # the Oracle groups, is never written through)
@@ -1662,7 +1663,7 @@ storage_not_shared() {
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
-      rm -f -- "$m"
+      runuser -u "$ORACLE_USER" -- rm -f -- "$m" 2>/dev/null; rm -f -- "$m"     # as its maker first (root may not remove it on NFS)
       case "$ans" in
         YES) STORAGE_SHARED+="$d ($fst, the test file is seen on the primary) "; continue ;;
         NO)  ans=SEEN_NO ;;

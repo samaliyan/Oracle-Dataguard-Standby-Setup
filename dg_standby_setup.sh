@@ -4228,7 +4228,7 @@ save_settings() {
       [[ ${LSNR_ASSUMED:-0} -eq 1 && ( "$k" == PORT || "$k" == LISTENER_NAME || "$k" == PRIMARY_SERVICE ) ]] && continue
       printf '%s=%s\n' "$k" "${!k}"
     done
-  )
+  ) || text=""       # (a text that was not built to its end is not written)
   [[ "$text" == *"PRIMARY_IP="* ]] && ( umask 077; printf '%s\n' "$text" > "$tmp" ) 2>/dev/null && [[ -s "$tmp" ]] && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
   # values the script itself sets after you accepted (ASM method, installer files) stay accepted
   [[ ${SETTINGS_ACCEPTED:-0} -eq 1 ]] && save_accepted
@@ -8176,7 +8176,8 @@ storage_not_shared() {
     if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, same source $lsrc on both servers) "; continue; fi
     # 2) a test file written here (as the database owner) must not be visible on the primary
     if [[ "$ans" == "YES" ]]; then
-      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$"
+      # (a new name at every call: a file an earlier call could not remove must not be in the way)
+      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$_$RANDOM"
       CLEANUP_FILES+=("$m")
       # (made with noclobber, also by root: a name that is already there, for example a link put there by a member of
       # the Oracle groups, is never written through)
@@ -8190,7 +8191,7 @@ storage_not_shared() {
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
-      rm -f -- "$m"
+      runuser -u "$ORACLE_USER" -- rm -f -- "$m" 2>/dev/null; rm -f -- "$m"     # as its maker first (root may not remove it on NFS)
       case "$ans" in
         YES) STORAGE_SHARED+="$d ($fst, the test file is seen on the primary) "; continue ;;
         NO)  ans=SEEN_NO ;;
@@ -8611,8 +8612,9 @@ grp_or() {
   # first group of the list that exists on this server AND that the database owner is in (the installer stops
   # with INS-35341 for a group the user is not a member of; the preinstall package creates oper, backupdba ...
   # but adds no existing user to them). Before the user exists: the first group that exists.
-  local g mine=""
-  id "$ORACLE_USER" >/dev/null 2>&1 && mine=" $(id -nG "$ORACLE_USER" 2>/dev/null) "
+  # GRP_USER=<user> asks for another owner (the Grid owner for the groups of ASM).
+  local g mine="" u=${GRP_USER:-$ORACLE_USER}
+  id "$u" >/dev/null 2>&1 && mine=" $(id -nG "$u" 2>/dev/null) "
   for g in "$@"; do
     [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 || continue
     [[ -z "$mine" || "$mine" == *" $g "* ]] && { printf '%s' "$g"; return 0; }
@@ -9818,7 +9820,7 @@ grid_rsp_keys() {
   rsp_set  "$f" "$GRID_HOME" ORACLE_HOME oracleHome || true                 # staged (12.1) installer only
   rsp_set  "$f" "$INSTALL_GROUP" UNIX_GROUP_NAME unixGroupName || true
   rsp_set  "$f" "en" SELECTED_LANGUAGES || true
-  rsp_need "$f" "$(grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
+  rsp_need "$f" "$(GRP_USER=$GRID_USER grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
   rsp_set  "$f" "$(getent group asmoper >/dev/null 2>&1 && printf asmoper)" oracle.install.asm.OSOPER OSOPER || true
   rsp_need "$f" "$(asm_owner_group)" oracle.install.asm.OSASM OSASM
   rsp_need "$f" "$ASM_PW" oracle.install.asm.SYSASMPassword sysasmPassword
@@ -11749,6 +11751,11 @@ net_dir_note() {
   YES_HOLD=1
   return 0
 }
+static_why_effect() {
+  # what a wrong entry leads to (after static_entry_state said why)
+  if [[ "$STATIC_WHY" == *"ORACLE_HOME is not"* || "$STATIC_WHY" == *"GLOBAL_DBNAME is"* ]]; then printf 'Logins through the listener would fail (ORA-01017 or ORA-12514).'
+  else printf 'Logins work, but the copy (step 8.2) would not find the primary (ORA-17629, ORA-12154).'; fi
+}
 static_entry_state() {
   # 0 = correct, 1 = missing, 2 = present but not right (ORACLE_HOME, GLOBAL_DBNAME, ENVS)
   local f; f=$(lsnr_file)
@@ -11981,7 +11988,7 @@ $(sid_desc_block)"
   if [[ $st -eq 2 ]] && sidlist_replace "$f" >/dev/null 2>&1; then
     # an existing entry is changed: asked also with --yes (another database may have set it up)
     L51_MODE=replace; YES_HOLD=1; ! use_grid && ! lsnr_has_desc && L51_MODE=replace_desc
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."$'\n'"  $f"
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"$'\n'"  $f"
     PLAN="Replace the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR with this (a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == replace_desc ]] && PLAN+=$'\n'"and add this listener address:"$'\n'"$(lsnr_desc_block)"
@@ -12006,7 +12013,7 @@ $(sid_desc_block)"
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"
     NOW+=$'\n'"It is written in a form the script does not change (more than one entry or block, or other text"$'\n'"on its lines). Please correct this entry by hand."
   else
     NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID, written in a form the script does not change"$'\n'"(more than one such block, or its parentheses do not close). Please add the entry by hand."
@@ -17135,7 +17142,7 @@ help_text() {
   local PTA=${PRIMARY_TNS_ADMIN:-\$ORACLE_HOME/network/admin} PLH=${PRIMARY_LISTENER_HOME:-<listener home on primary>}
   local G=0 SO=0; [[ "${USE_GRID:-}" == "yes" ]] && G=1; [[ "$OU" == "$GU" ]] && SO=1
   local LH LU; if [[ $G -eq 1 ]]; then LH=$GH; LU=$GU; else LH=$DBH; LU=$OU; fi
-  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
+  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && GRP_USER=${GRID_USER:-} grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
   local DGS; DGS=$( [[ -n "${LOCS:-}" ]] && asm_dgs 2>/dev/null | paste -sd' ' - ); DGS=${DGS:-DATA FRA}
   # SQL on the primary by hand: the exact home and SID, so the environment of the user there does not matter
   # (three lines: who, then two complete commands, each one copyable on its own)

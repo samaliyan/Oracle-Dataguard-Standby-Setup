@@ -211,6 +211,11 @@ net_dir_note() {
   YES_HOLD=1
   return 0
 }
+static_why_effect() {
+  # what a wrong entry leads to (after static_entry_state said why)
+  if [[ "$STATIC_WHY" == *"ORACLE_HOME is not"* || "$STATIC_WHY" == *"GLOBAL_DBNAME is"* ]]; then printf 'Logins through the listener would fail (ORA-01017 or ORA-12514).'
+  else printf 'Logins work, but the copy (step 8.2) would not find the primary (ORA-17629, ORA-12154).'; fi
+}
 static_entry_state() {
   # 0 = correct, 1 = missing, 2 = present but not right (ORACLE_HOME, GLOBAL_DBNAME, ENVS)
   local f; f=$(lsnr_file)
@@ -443,7 +448,7 @@ $(sid_desc_block)"
   if [[ $st -eq 2 ]] && sidlist_replace "$f" >/dev/null 2>&1; then
     # an existing entry is changed: asked also with --yes (another database may have set it up)
     L51_MODE=replace; YES_HOLD=1; ! use_grid && ! lsnr_has_desc && L51_MODE=replace_desc
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."$'\n'"  $f"
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"$'\n'"  $f"
     PLAN="Replace the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR with this (a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == replace_desc ]] && PLAN+=$'\n'"and add this listener address:"$'\n'"$(lsnr_desc_block)"
@@ -468,7 +473,7 @@ $(sid_desc_block)"
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"
     NOW+=$'\n'"It is written in a form the script does not change (more than one entry or block, or other text"$'\n'"on its lines). Please correct this entry by hand."
   else
     NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID, written in a form the script does not change"$'\n'"(more than one such block, or its parentheses do not close). Please add the entry by hand."

@@ -20,8 +20,9 @@ grp_or() {
   # first group of the list that exists on this server AND that the database owner is in (the installer stops
   # with INS-35341 for a group the user is not a member of; the preinstall package creates oper, backupdba ...
   # but adds no existing user to them). Before the user exists: the first group that exists.
-  local g mine=""
-  id "$ORACLE_USER" >/dev/null 2>&1 && mine=" $(id -nG "$ORACLE_USER" 2>/dev/null) "
+  # GRP_USER=<user> asks for another owner (the Grid owner for the groups of ASM).
+  local g mine="" u=${GRP_USER:-$ORACLE_USER}
+  id "$u" >/dev/null 2>&1 && mine=" $(id -nG "$u" 2>/dev/null) "
   for g in "$@"; do
     [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 || continue
     [[ -z "$mine" || "$mine" == *" $g "* ]] && { printf '%s' "$g"; return 0; }
@@ -1227,7 +1228,7 @@ grid_rsp_keys() {
   rsp_set  "$f" "$GRID_HOME" ORACLE_HOME oracleHome || true                 # staged (12.1) installer only
   rsp_set  "$f" "$INSTALL_GROUP" UNIX_GROUP_NAME unixGroupName || true
   rsp_set  "$f" "en" SELECTED_LANGUAGES || true
-  rsp_need "$f" "$(grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
+  rsp_need "$f" "$(GRP_USER=$GRID_USER grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
   rsp_set  "$f" "$(getent group asmoper >/dev/null 2>&1 && printf asmoper)" oracle.install.asm.OSOPER OSOPER || true
   rsp_need "$f" "$(asm_owner_group)" oracle.install.asm.OSASM OSASM
   rsp_need "$f" "$ASM_PW" oracle.install.asm.SYSASMPassword sysasmPassword
