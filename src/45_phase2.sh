@@ -155,7 +155,11 @@ preinstall_pkg() {
   esac
 }
 need_pkgs() {
-  printf '%s\n' "$(preinstall_pkg)" unzip chrony parted bc
+  printf '%s\n' "$(preinstall_pkg)" unzip
+  # chrony only when ntpd does not keep the time here: installed next to a working ntpd, chronyd would be enabled
+  # and take over at the next boot (step 2.10 accepts either)
+  systemctl is-active --quiet ntpd 2>/dev/null || printf 'chrony\n'
+  printf '%s\n' parted bc
   use_grid && [[ "$(asm_method)" == "asmlib" ]] && printf '%s\n' oracleasm-support
   return 0
 }
@@ -1506,7 +1510,7 @@ fs_need_lines() {
   local d mb
   while IFS= read -r d; do
     mb=$(loc_mb "$d")
-    [[ "$d" == "$FRA_LOC" ]] && mb=$((mb + $(fra_need_mb)))
+    [[ "$d" == "$(fra_dest)" ]] && mb=$((mb + $(fra_need_mb)))     # where it goes HERE (not the primary's place)
     printf '%s|%s\n' "$d" "$mb"
   done < <(fs_dirs)
 }
@@ -1644,9 +1648,12 @@ storage_not_shared() {
     if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, same source $lsrc on both servers) "; continue; fi
     # 2) a test file written here (as the database owner) must not be visible on the primary
     if [[ "$ans" == "YES" ]]; then
-      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$"
+      # (a new name at every call: a file an earlier call could not remove must not be in the way)
+      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$_$RANDOM"
       CLEANUP_FILES+=("$m")
-      runuser -u "$ORACLE_USER" -- sh -c 'umask 077; : > "$1"' sh "$m" 2>/dev/null || ( umask 077; : > "$m" ) 2>/dev/null \
+      # (made with noclobber, also by root: a name that is already there, for example a link put there by a member of
+      # the Oracle groups, is never written through)
+      runuser -u "$ORACLE_USER" -- sh -c 'umask 077; set -C; : > "$1"' sh "$m" 2>/dev/null || { [[ ! -e "$m" && ! -L "$m" ]] && ( umask 077; set -C; : > "$m" ) 2>/dev/null; } \
         || { [[ -z "$info2" ]] && info2="Cannot write a test file in $d"; np=1; continue; }
       ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
       if [[ "$ans" == "NO" && $net -eq 1 && "$STORAGE_NET_DONE" != *" $d|$lsrc "* ]]; then
@@ -1656,7 +1663,7 @@ storage_not_shared() {
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
-      rm -f -- "$m"
+      runuser -u "$ORACLE_USER" -- rm -f -- "$m" 2>/dev/null; rm -f -- "$m"     # as its maker first (root may not remove it on NFS)
       case "$ans" in
         YES) STORAGE_SHARED+="$d ($fst, the test file is seen on the primary) "; continue ;;
         NO)  ans=SEEN_NO ;;

@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.29"
+readonly SCRIPT_VERSION="5.30"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -98,7 +98,7 @@ OS_ID=""; OS_MAJOR=""; PKG=""
 #------------------------------------------------------------------------------
 # Output and logging
 #------------------------------------------------------------------------------
-if [[ -t 1 ]]; then
+if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then
   C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1;34m'; C_C=$'\e[36m'; C_M=$'\e[35m'; C_D=$'\e[2m'; C_W=$'\e[1m'; C_N=$'\e[0m'
 else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_M=""; C_D=""; C_W=""; C_N=""
@@ -144,8 +144,10 @@ log_block() {
   local body t=$1 e=""
   body=$(cat)
   if grep -qx '(exit code 0)' <<< "$body"; then
-    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])ORA-[0-9]{4,5}' && e="ORA-"
-    grep -vE '^SQL> ' <<< "$body" | grep -qE '(^|[[:space:]])SP2-[0-9]{4}' && e+="${e:+/}SP2-"
+    # (one awk each, no "grep | grep -q": with pipefail a long output would end the first grep with SIGPIPE and
+    # the match would count as none)
+    awk '!/^SQL> / && /(^|[[:space:]])ORA-[0-9][0-9][0-9][0-9]/ {f=1} END {exit !f}' <<< "$body" && e="ORA-"
+    awk '!/^SQL> / && /(^|[[:space:]])SP2-[0-9][0-9][0-9][0-9]/ {f=1} END {exit !f}' <<< "$body" && e+="${e:+/}SP2-"
     if [[ -n "$e" ]]; then body=$(sed "s#^(exit code 0)\$#(exit code 0, $e in output)#" <<< "$body"); t+=" (exit code 0, $e in output)"; fi
   fi
   # SQL: the query is in the title once (not again as "SQL> ..."), the output marker of the probes is left out
@@ -380,7 +382,7 @@ cleanup() {
     # (once the job's command has ended, its .rc file exists: the response file is no longer needed and goes now)
     [[ -n "$JOB_KEEP" && ",$JOB_KEEP," == *",$f,"* ]] && job_running "$JOB_PID" && [[ ! -f "${JOB_OUT:-/nonexistent}.rc" ]] && continue
     rm -f -- "$f"
-    [[ "$(dirname "$f")" == /tmp/dg_rsp.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
+    [[ "$(dirname "$f")" == /tmp/dg_rsp.* || "$(dirname "$f")" == /tmp/dg_screen.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
   if [[ ( $SSH_OPEN -eq 1 || ${HEALTH_SSH_OPEN:-0} -eq 1 ) && -n "$SSH_CTL" ]]; then
     ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
@@ -841,14 +843,17 @@ run_long() {
   { ( umask 077; { printf '#| %s %s, run %s, step %s: %s\n' "${SELF##*/}" "$SCRIPT_VERSION" "$RUN_ID" "${CUR_STEP:--}" "$title"
                    printf '#| as %s, started %s: %s\n' "$(cp_user "$who" 2>/dev/null || printf '%s' "$who")" "$(ts)" "$hcmd"
                    printf '#| ---- output ----\n'; } | mask_pw > "$out" ); } 2>/dev/null || { bad "Cannot write $out."; JOB_PROGRESS_FN=""; return 1; }
-  # fd 9 (the lock of this script) is closed for the job: a job that outlives the script must not block the next run
+  # Ctrl+C from here on asks (the job is about to exist: a plain stop would leave it without a job file)
+  RL_INT=0; trap 'RL_INT=1' INT
+  # fd 9 (the lock of this script) is closed for the job; so are the screen and stderr of the script (the job writes
+  # to its file: a "| tee" behind the script must end with the script, not with the job): a job that outlives the script must not block the next run
   # the job removes its JOB_KEEP files only when the script is gone (else the script still needs them, e.g. for a retry)
   # .pid and .rc are written to a temp name and moved: a reader never sees a half-written file
   setsid bash -c 'cd / || exit 1; echo $$ > "$1.pid.t" && mv -f -- "$1.pid.t" "$1.pid"; f=$1; k=$2; sp=$3; shift 3
     "$@" >> "$f" 2>&1; r=$?; d=$SECONDS
     printf "#| ---- end %s, exit code %s, after %s min %s s ----\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$r" $((d / 60)) $((d % 60)) >> "$f"
     echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
-    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 9>&- &
+    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 > /dev/null 2>&1 9>&- &
   local bg=$! n=0 jpid=""
   while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
@@ -873,7 +878,6 @@ If this run stops, the next run will not know that $title is still running."
     say "To stop the job itself:  pkill -s $jpid"
     [[ "${title:-}" == RMAN* ]] || say "A stopped installer or root script leaves a half-configured home."
   fi
-  RL_INT=0; trap 'RL_INT=1' INT
   local t0=$SECONDS hb=0 ui_on=$UI pg_t=$SECONDS pg_said="" pg_said_t=$SECONDS
   # how often the progress is read: every 15 s for the live line, every 60 s in plain mode (shown when it changed,
   # at least every 5 minutes); with the test timing every 2 s
@@ -946,7 +950,10 @@ If this run stops, the next run will not know that $title is still running."
     fi
   done
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
-  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"; job_running "$jpid" || rm -f -- "$JOB_FILE"; JOB_PID=""
+  local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"
+  # the result is read here: the job file goes also when programs the job left behind still run (with the exit
+  # code file gone, the next run would take the job itself for running)
+  { num "$rc" || ! job_running "$jpid"; } && rm -f -- "$JOB_FILE"; JOB_PID=""
   num "$rc" || { rc=1; bad "$title was stopped before it finished."; }
   trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
   JOB_KEEP=""
@@ -1269,7 +1276,8 @@ record() {
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
-  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
+  local gr=0
+  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null || gr=$?; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }" && [[ $gr -le 1 || ! -e "$PROGRESS_FILE" ]]; } > "$PROGRESS_FILE.n" 2>/dev/null \
     && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"; }; then
     # the next run would show an old result for this step: said once
     [[ ${PROGRESS_WARNED:-0} -eq 1 ]] || { PROGRESS_WARNED=1; warn "The progress file $PROGRESS_FILE cannot be written. The next run may show old results."; }
@@ -1379,6 +1387,7 @@ next_cmd() {
   [[ -n "$nx" ]] || return 0
   # the step on demand (10.7) goes on only with its own option
   on_demand "$nx" && { printf '%s --roll-forward' "$SELF"; return 0; }
+  [[ ${ROLL_FORWARD:-0} -eq 1 && "$nx" == 10.* ]] && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
   # a range (--only 2.1-2.4, grid, db): the same range again, from the step that is not done
   if [[ -n "$TO_STEP" && "$nx" == *.* ]] && [[ $(step_num "$nx") -ge $(step_num "$FROM_STEP") && $(step_num "$nx") -le $(step_num "$TO_STEP") ]]; then
@@ -2030,7 +2039,9 @@ primary_pending_add() {
   if [[ -n "$old" && "$old" != "-" ]]; then
     if [[ -z "$u" || "$old" == *"$u"* ]]; then u=$old; else u="$old ; $u"; fi
   fi
-  { grep -v "^$1|" "$f" 2>/dev/null; printf '%s|%s|%s\n' "$1" "${u:--}" "$how"; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; chmod 600 "$f" 2>/dev/null
+  # (grep: 0 or 1 = written, with or without lines; 2 = it could not read or write: the old file stays)
+  local gr=0
+  { grep -v "^$1|" "$f" 2>/dev/null || gr=$?; printf '%s|%s|%s\n' "$1" "${u:--}" "$how" && [[ $gr -le 1 || ! -e "$f" ]]; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; chmod 600 "$f" 2>/dev/null
   return 0
 }
 primary_pending_get() { [[ -n "$STATE_DIR" ]] || return 0; grep -m1 "^$1|" "$(primary_pending_file)" 2>/dev/null | cut -d'|' -f2; return 0; }
@@ -2038,7 +2049,9 @@ primary_pending_how() { [[ -n "$STATE_DIR" ]] || return 0; grep -m1 "^$1|" "$(pr
 primary_pending_del() {
   [[ "$MODE" == "run" ]] || return 0
   local f; f=$(primary_pending_file); [[ -f "$f" ]] || return 0
-  grep -v "^$1|" "$f" > "$f.n" 2>/dev/null; mv -f -- "$f.n" "$f"; return 0
+  local gr=0; grep -v "^$1|" "$f" > "$f.n" 2>/dev/null || gr=$?
+  if [[ $gr -le 1 ]]; then mv -f -- "$f.n" "$f"; else rm -f -- "$f.n"; fi
+  return 0
 }
 batch_primary_steps() {
   # $@ step ids of kind primary that follow each other. Their checks are run first (read-only) and every
@@ -2190,13 +2203,13 @@ cp_entry_text() {
   local i=$1 l
   if [[ "${CP_ROLE[$i]}" == file ]]; then
     printf "write %s (mode %s; a backup of the old file is kept):\n" "${CP_CMD[$i]}" "${CP_TO[$i]}"
-    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done <<< "${CP_IN[$i]}"
+    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done < <(printf '%s\n' "${CP_IN[$i]}")
     return 0
   fi
   printf '%s' "${CP_CMD[$i]}"
   if [[ -n "${CP_IN[$i]}" ]]; then
     printf " <<'EOF'\n"
-    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done <<< "${CP_IN[$i]}"
+    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done < <(printf '%s\n' "${CP_IN[$i]}")
     printf 'EOF\n'
   else printf '\n'; fi
 }
@@ -2314,10 +2327,11 @@ cp_exec() {
   first=$(head -n 1 <<< "${CP_CMD[$i]}")
   # the input of sqlplus / rman / asmcmd is part of what runs: its first line is shown with the command
   if [[ -n "${CP_IN[$i]}" ]]; then
-    local nl; nl=$(grep -c '' <<< "${CP_IN[$i]}")
-    inp="  ->  $(head -n 1 <<< "${CP_IN[$i]}")"; [[ $nl -gt 1 ]] && inp+="  (and $((nl - 1)) more lines)"
+    # (no here-string for the input: on older bash that is a temporary file, and the input of the copy holds the password)
+    local nl; nl=$(printf '%s\n' "${CP_IN[$i]}" | grep -c '')
+    inp="  ->  ${CP_IN[$i]%%$'\n'*}"; [[ $nl -gt 1 ]] && inp+="  (and $((nl - 1)) more lines)"
   fi
-  say "${C_D}Running as $(cp_user "${CP_ROLE[$i]}"):${C_N} $(mask_pw <<< "$first$inp")"
+  say "${C_D}Running as $(cp_user "${CP_ROLE[$i]}"):${C_N} $(printf '%s\n' "$first$inp" | mask_pw)"
   tmp=$(mktemp /tmp/dg_out.XXXXXXXX) || { RUN_OUT="cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
   if [[ -n "${CP_IN[$i]}" ]]; then
@@ -2329,7 +2343,8 @@ cp_exec() {
   RUN_OUT=$(cat -- "$tmp"); rm -f -- "$tmp"
   # sqlplus ends with 0 also after an error: an ORA- or SP2- line in its output is a failure
   # (sqlplus by name or by a full path that ends in /sqlplus)
-  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
+  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] \
+    && awk '/^(ORA|SP2)-[0-9]+/ && !/^ORA-32004/ {f=1} END {exit !f}' <<< "$RUN_OUT" && rc=1   # (ORA-32004: a deprecated parameter in the spfile, the start itself worked)
   { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
   return "$rc"
 }
@@ -2693,7 +2708,10 @@ ui_buf_start() {
   # $1 = 1: a clean area first. Lines collected before (a phase intro) stay in the collection.
   [[ $UI -eq 1 ]] || return 0
   if [[ -z "$UI_BUF_FILE" ]]; then
-    UI_BUF_FILE=$(mktemp /tmp/dg_screen.XXXXXXXX 2>/dev/null) || { UI_BUF_FILE=""; return 0; }
+    # a folder of its own (mode 700): the .cut / .res / .used files beside the text are not for other users to
+    # read, and nobody can put a file of such a name there first
+    local sd; sd=$(mktemp -d /tmp/dg_screen.XXXXXXXX 2>/dev/null) || { UI_BUF_FILE=""; return 0; }
+    UI_BUF_FILE=$sd/text
     CLEANUP_FILES+=("$UI_BUF_FILE" "$UI_BUF_FILE.cut" "$UI_BUF_FILE.res" "$UI_BUF_FILE.used")
   fi
   if [[ "$1" == 1 ]]; then ui_area_clear; : > "$UI_BUF_FILE"; UI_REC_A=-1; UI_REC_B=-1; UI_RES_A=-1; UI_RES_B=-1
@@ -3697,7 +3715,7 @@ _undo_obj_ok() {
       case "$obj" in /|/etc|/usr|/usr/*bin|/bin|/sbin|/lib*|/var|/opt|/home|/root|/boot|/dev|/proc|/sys|/tmp|/u0[0-9]) bad "Not undone: $obj is a system folder."; return 1 ;; esac
       [[ "$kind" != DIR && -d "$obj" && ! -L "$obj" ]] && { bad "Not undone: $obj is a folder, but the journal line is for a file."; return 1; }
       if [[ "$kind" == EDIT ]]; then x=$(detail_field "$det" bak); [[ "$x" == "-" || ( "$x" == "$obj".bak_* && "${x#"$obj".bak_}" =~ ^[0-9]{8}_?[0-9]{6}(_[0-9]+)?$ ) ]] || { bad "Not undone: the backup $x does not belong to $obj."; return 1; }; fi
-      if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
+      if [[ "$kind" == RENAME ]]; then x=$(detail_field "$det" to); [[ ( "$x" == "$obj".pre_duplicate_* && "${x#"$obj".pre_duplicate_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".failed_* && "${x#"$obj".failed_}" =~ ^[0-9_]+$ ) || ( "$x" == "$obj".old_* && "${x#"$obj".old_}" =~ ^[0-9_]+$ ) ]] || { bad "Not undone: the renamed file $x does not belong to $obj."; return 1; }; fi ;;
     FWPORT) [[ "$obj" =~ ^[A-Za-z0-9_-]+:[0-9]+/tcp$ ]] || { bad "Not undone: invalid firewall entry $obj"; return 1; } ;;
     UNIT)   [[ "$obj" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || { bad "Not undone: invalid unit name $obj"; return 1; } ;;
     CRONLINE) v_name "$obj" && [[ "$(detail_field "$det" tag)" =~ ^#~dg_standby_setup~[a-z0-9_]+$ ]] || { bad "Not undone: unusual crontab entry ($obj, $det)"; return 1; } ;;
@@ -4166,7 +4184,10 @@ save_settings() {
   local k tmp
   install -d -m 700 "$STATE_DIR"
   tmp="$SETTINGS_FILE.tmp.$$"
-  {
+  # the text is built first and written with one command: a write that fails (disk full) is then seen, and the
+  # old file stays (a loop that ends with "continue" would hide the failed writes before it)
+  local text
+  text=$(
     printf '# dg_standby_setup.sh %s settings - written %s\n' "$SCRIPT_VERSION" "$(ts)"
     printf '# Format KEY=VALUE, no spaces, no quotes.\n\n'
     printf '# ---- Standby values. You may change these. ----\n'
@@ -4207,7 +4228,8 @@ save_settings() {
       [[ ${LSNR_ASSUMED:-0} -eq 1 && ( "$k" == PORT || "$k" == LISTENER_NAME || "$k" == PRIMARY_SERVICE ) ]] && continue
       printf '%s=%s\n' "$k" "${!k}"
     done
-  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
+  ) || text=""       # (a text that was not built to its end is not written)
+  [[ "$text" == *"PRIMARY_IP="* ]] && ( umask 077; printf '%s\n' "$text" > "$tmp" ) 2>/dev/null && [[ -s "$tmp" ]] && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
   # values the script itself sets after you accepted (ASM method, installer files) stay accepted
   [[ ${SETTINGS_ACCEPTED:-0} -eq 1 ]] && save_accepted
   return 0
@@ -5120,6 +5142,7 @@ open_ssh() {
   if ssh -E "$elog" -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=12h \
          -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
          -o ServerAliveInterval=60 -o ConnectTimeout=15 -o NumberOfPasswordPrompts=3 \
+         -o ForwardAgent=no -o ClearAllForwardings=yes \
          -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < "$PROMPT_IN" 9>&-; then
     SSH_OPEN=1
   else
@@ -5311,8 +5334,8 @@ Fix the time synchronization: step 2.10 here, chronyd on the primary.")
   ASM_PMON_PID=""
   local pid user args
   while read -r pid user args; do
-    if [[ "$args" =~ ^ora_pmon_([A-Za-z][A-Za-z0-9_]*)$ ]]; then
-      local psid=${BASH_REMATCH[1]}
+    if [[ "$args" =~ ^(ora|db)_pmon_([A-Za-z][A-Za-z0-9_]*)$ ]]; then
+      local psid=${BASH_REMATCH[2]}
       num "$pid" && v_name "$user" && pm+=("$psid:$pid:$user")
     fi
     [[ "$args" =~ ^asm_pmon_\+ASM[0-9]*$ ]] && num "$pid" && ASM_PMON_PID=$pid
@@ -5634,7 +5657,7 @@ _sql_exec() {
   if [[ ${IN_DO:-0} -eq 1 && ! "${sql,,}" =~ ^[[:space:]]*select[[:space:]] ]]; then
     local who=$ORACLE_USER; [[ "$runner" == as_grid ]] && who=$GRID_USER
     local first; first=$(head -n 1 <<< "$sql"); local nl; nl=$(grep -c '' <<< "$sql")
-    say "${C_D}Running as $who:${C_N} $(mask_pw <<< "sqlplus ${connect#connect }  ->  $first")$([[ $nl -gt 1 ]] && printf '  (and %s more lines)' $((nl - 1)))"
+    say "${C_D}Running as $who:${C_N} $(printf '%s\n' "sqlplus ${connect#connect }  ->  $first" | mask_pw)$([[ $nl -gt 1 ]] && printf '  (and %s more lines)' $((nl - 1)))"
   fi
   # output through a file: background processes of a started instance must not keep a pipe open
   tmp=$(mktemp /tmp/dg_sql.XXXXXXXX) || { SQL_OUT="SP2-0000: cannot create a temporary file"; return 1; }
@@ -5662,7 +5685,7 @@ sql_primary_tns() {
   _sql_exec "connect sys/\"$SYS_PW\"@$PRIMARY_TNS as sysdba" "$1" "PRIMARY via $PRIMARY_TNS (read-only): ${1:0:150}" as_oracle "$DB_HOME"
 }
 
-pmon_running() { pgrep -u "$ORACLE_USER" -f "^ora_pmon_${STANDBY_SID}( |\$)" >/dev/null 2>&1; }   # the processes of the standby instance run
+pmon_running() { pgrep -u "$ORACLE_USER" -f "^(ora|db)_pmon_${STANDBY_SID}( |\$)" >/dev/null 2>&1; }   # the processes of the standby instance run
 STATE_TMO=$((FAST_WAITS == 1 ? 5 : 120))     # a login that hangs longer than this is a hung instance, not a slow one
 local_state() {
   # LSTATE = IDLE | STARTED | MOUNTED | OPEN | HUNG | ERROR | NOSW
@@ -6660,7 +6683,11 @@ preinstall_pkg() {
   esac
 }
 need_pkgs() {
-  printf '%s\n' "$(preinstall_pkg)" unzip chrony parted bc
+  printf '%s\n' "$(preinstall_pkg)" unzip
+  # chrony only when ntpd does not keep the time here: installed next to a working ntpd, chronyd would be enabled
+  # and take over at the next boot (step 2.10 accepts either)
+  systemctl is-active --quiet ntpd 2>/dev/null || printf 'chrony\n'
+  printf '%s\n' parted bc
   use_grid && [[ "$(asm_method)" == "asmlib" ]] && printf '%s\n' oracleasm-support
   return 0
 }
@@ -8011,7 +8038,7 @@ fs_need_lines() {
   local d mb
   while IFS= read -r d; do
     mb=$(loc_mb "$d")
-    [[ "$d" == "$FRA_LOC" ]] && mb=$((mb + $(fra_need_mb)))
+    [[ "$d" == "$(fra_dest)" ]] && mb=$((mb + $(fra_need_mb)))     # where it goes HERE (not the primary's place)
     printf '%s|%s\n' "$d" "$mb"
   done < <(fs_dirs)
 }
@@ -8149,9 +8176,12 @@ storage_not_shared() {
     if [[ $net -eq 1 && -n "$lsrc" && "$lsrc" != /dev/* && "$lsrc" == "$psrc" ]]; then STORAGE_SHARED+="$d ($fst, same source $lsrc on both servers) "; continue; fi
     # 2) a test file written here (as the database owner) must not be visible on the primary
     if [[ "$ans" == "YES" ]]; then
-      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$"
+      # (a new name at every call: a file an earlier call could not remove must not be in the way)
+      m="$d/.dg_standby_test_$(hostname -s)_${RUN_ID}_$$_$RANDOM"
       CLEANUP_FILES+=("$m")
-      runuser -u "$ORACLE_USER" -- sh -c 'umask 077; : > "$1"' sh "$m" 2>/dev/null || ( umask 077; : > "$m" ) 2>/dev/null \
+      # (made with noclobber, also by root: a name that is already there, for example a link put there by a member of
+      # the Oracle groups, is never written through)
+      runuser -u "$ORACLE_USER" -- sh -c 'umask 077; set -C; : > "$1"' sh "$m" 2>/dev/null || { [[ ! -e "$m" && ! -L "$m" ]] && ( umask 077; set -C; : > "$m" ) 2>/dev/null; } \
         || { [[ -z "$info2" ]] && info2="Cannot write a test file in $d"; np=1; continue; }
       ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
       if [[ "$ans" == "NO" && $net -eq 1 && "$STORAGE_NET_DONE" != *" $d|$lsrc "* ]]; then
@@ -8161,7 +8191,7 @@ storage_not_shared() {
         ans=""; prim_probe exists "$m" && ans=$(head -n 1 <<< "$RUN_OUT")
         [[ "$ans" == "NO" ]] && STORAGE_NET_DONE+="$d|$lsrc "
       fi
-      rm -f -- "$m"
+      runuser -u "$ORACLE_USER" -- rm -f -- "$m" 2>/dev/null; rm -f -- "$m"     # as its maker first (root may not remove it on NFS)
       case "$ans" in
         YES) STORAGE_SHARED+="$d ($fst, the test file is seen on the primary) "; continue ;;
         NO)  ans=SEEN_NO ;;
@@ -8579,9 +8609,16 @@ in_inventory() {
   [[ -f "$inv" ]] && grep -q "LOC=\"$1\"" "$inv" && ! grep -q "LOC=\"$1\"[^>]*REMOVED=\"T\"" "$inv"
 }
 grp_or() {
-  # first group of the list that exists on this server
-  local g
-  for g in "$@"; do [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 && { printf '%s' "$g"; return 0; }; done
+  # first group of the list that exists on this server AND that the database owner is in (the installer stops
+  # with INS-35341 for a group the user is not a member of; the preinstall package creates oper, backupdba ...
+  # but adds no existing user to them). Before the user exists: the first group that exists.
+  # GRP_USER=<user> asks for another owner (the Grid owner for the groups of ASM).
+  local g mine="" u=${GRP_USER:-$ORACLE_USER}
+  id "$u" >/dev/null 2>&1 && mine=" $(id -nG "$u" 2>/dev/null) "
+  for g in "$@"; do
+    [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 || continue
+    [[ -z "$mine" || "$mine" == *" $g "* ]] && { printf '%s' "$g"; return 0; }
+  done
   printf '%s' "$INSTALL_GROUP"
 }
 
@@ -9783,7 +9820,7 @@ grid_rsp_keys() {
   rsp_set  "$f" "$GRID_HOME" ORACLE_HOME oracleHome || true                 # staged (12.1) installer only
   rsp_set  "$f" "$INSTALL_GROUP" UNIX_GROUP_NAME unixGroupName || true
   rsp_set  "$f" "en" SELECTED_LANGUAGES || true
-  rsp_need "$f" "$(grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
+  rsp_need "$f" "$(GRP_USER=$GRID_USER grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
   rsp_set  "$f" "$(getent group asmoper >/dev/null 2>&1 && printf asmoper)" oracle.install.asm.OSOPER OSOPER || true
   rsp_need "$f" "$(asm_owner_group)" oracle.install.asm.OSASM OSASM
   rsp_need "$f" "$ASM_PW" oracle.install.asm.SYSASMPassword sysasmPassword
@@ -10440,7 +10477,7 @@ c_3_8() {
   OBH=$(printf '%s\n' "$RUN_OUT" | grep -E '^/' | head -n 1); OBH=${OBH%/}
   if [[ "$OBH" == "$DB_HOME" ]]; then NOW="The Oracle home is read/write (orabasehome prints the home itself)"; return 0; fi
   NOW="The Oracle home is read-only. orabasehome prints:"$'\n'"  $OBH"
-  if [[ -n "$(ls -A "$ORACLE_BASE/dbs" 2>/dev/null)" ]] || pgrep -f "^ora_pmon_" >/dev/null 2>&1; then
+  if [[ -n "$(ls -A "$ORACLE_BASE/dbs" 2>/dev/null)" ]] || pgrep -f "^(ora|db)_pmon_" >/dev/null 2>&1; then
     NOW+=$'\n'"A database already uses it: there are files in $ORACLE_BASE/dbs, or an instance runs."$'\n'"The script does not change such a home."
     return 2
   fi
@@ -10925,7 +10962,7 @@ srl_statements() {
   [[ -n "$bclause" ]] && SRL_INFO_EXTRA="The online logs use 4096-byte blocks."$'\n'"The standby disks must support 4K sectors, or you get ORA-01378." || SRL_INFO_EXTRA=""
   # standby logs without a thread (thread 0) can serve any thread
   local pool0; pool0=$(awk -F'|' '$1==0 {print $2}' <<< "$good"); num "$pool0" || pool0=0
-  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select count(*) from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
+  "$run" "select nvl((select max(value) from v\$parameter where name='db_create_online_log_dest_1' and value is not null),(select nvl(max(value),'-') from v\$parameter where name='db_create_file_dest' and value is not null))||'|'||(select decode(a.c,0,b.c,a.c) from (select count(*) c from v\$parameter where name like 'db_create_online_log_dest_%' and value is not null) a, (select count(*) c from v\$parameter where name in ('db_recovery_file_dest','db_create_file_dest') and value is not null) b)||'|'||(select max(group#) from (select group# from v\$log union all select group# from v\$standby_log))||'|'||nvl((select min(substr(member,1,instr(member,'/',-1)-1)) keep (dense_rank first order by group#, member) from v\$logfile where type='ONLINE' and upper(member) not like (select upper(nvl(max(value),'#none#'))||'%' from v\$parameter where name='db_recovery_file_dest')),(select max(substr(member,1,instr(member,'/',-1)-1)) from v\$logfile where type='ONLINE')) from dual;" || return 2
   local ndest; IFS='|' read -r omf ndest maxg dir <<< "$(first_line)"; num "$ndest" || ndest=0
   num "$maxg" || return 2
   maxb=$(awk -F'|' '{if ($3 > m) m = $3} END {print m+0}' <<< "$threads")
@@ -10940,6 +10977,8 @@ srl_statements() {
     while [[ $have -lt $((c + 1)) ]]; do
       # one member per standby log (MAA: a second member only slows the writes of the redo that arrives). With two
       # or more OMF log destinations an empty spec would make one member in each: the first destination is named.
+      # (The destinations are db_create_online_log_dest_n or, when none of them is set, db_create_file_dest and
+      # the recovery area: Oracle puts a member into each of those two as well.)
       if [[ "$omf" != "-" && -n "$omf" && $ndest -lt 2 ]]; then spec=""
       elif [[ "$omf" == +* ]]; then spec=" ('${omf%%/*}')"
       elif [[ "$omf" != "-" && -n "$omf" ]]; then g=$((g + 1)); spec=" group $g ('${omf%/}/srl_t${t}_g${g}.log')"
@@ -11712,8 +11751,13 @@ net_dir_note() {
   YES_HOLD=1
   return 0
 }
+static_why_effect() {
+  # what a wrong entry leads to (after static_entry_state said why)
+  if [[ "$STATIC_WHY" == *"ORACLE_HOME is not"* || "$STATIC_WHY" == *"GLOBAL_DBNAME is"* ]]; then printf 'Logins through the listener would fail (ORA-01017 or ORA-12514).'
+  else printf 'Logins work, but the copy (step 8.2) would not find the primary (ORA-17629, ORA-12154).'; fi
+}
 static_entry_state() {
-  # 0 = correct, 1 = missing, 2 = present with another ORACLE_HOME
+  # 0 = correct, 1 = missing, 2 = present but not right (ORACLE_HOME, GLOBAL_DBNAME, ENVS)
   local f; f=$(lsnr_file)
   [[ -f "$f" ]] || return 1
   local flat seg found=1 sidn homen
@@ -11726,10 +11770,15 @@ static_entry_state() {
       local hok=0 gok=0
       [[ "$seg" == *"$homen"* || "$seg" == *"(ORACLE_HOME=${DB_HOME^^}/)"* ]] && hok=1
       [[ "$seg" == *"(GLOBAL_DBNAME=${STANDBY_SERVICE^^})"* ]] && gok=1
-      [[ $hok -eq 1 && $gok -eq 1 ]] && return 0
+      # a listener of the Grid home: the entry must also give the server processes the TNS_ADMIN of the database
+      # home (sid_envs_line)
+      local eok=1
+      [[ -n "$(sid_envs_line)" && "$seg" != *"(ENVS="*"TNS_ADMIN=${DB_HOME^^}/NETWORK/ADMIN"* ]] && eok=0
+      [[ $hok -eq 1 && $gok -eq 1 && $eok -eq 1 ]] && return 0
       STATIC_WHY=""
       [[ $hok -eq 1 ]] || STATIC_WHY+="ORACLE_HOME is not $DB_HOME"$'\n'
       [[ $gok -eq 1 ]] || STATIC_WHY+="GLOBAL_DBNAME is missing or not $STANDBY_SERVICE"$'\n'
+      [[ $eok -eq 1 ]] || STATIC_WHY+="ENVS with TNS_ADMIN=$DB_HOME/network/admin is missing (the listener runs from the Grid home; the copy needs it to find the primary)"$'\n'
       found=2
     fi
   done < <(sidlist_of "$flat" | sed 's/(SID_DESC=/\n(SID_DESC=/g')
@@ -11746,13 +11795,23 @@ sidlist_of() {
     print out }' <<< "$1"
 }
 lsnr_has_sidlist() { local f; f=$(lsnr_file); [[ -f "$f" ]] && grep -qiE "^[[:space:]]*SID_LIST_${SB_LSNR}[[:space:]]*=" "$f"; }
+sid_envs_line() {
+  # A listener of the Grid home runs with TNS_ADMIN of the Grid home, and the server processes it starts inherit
+  # that. During the copy those processes connect to the primary by its alias (RMAN "from service"), which is
+  # only in the tnsnames.ora of the database home: without this line the copy ends with ORA-17629 / ORA-12154.
+  # (A listener of the database home is started by this script with the right TNS_ADMIN.)
+  [[ "$(lsnr_home)" != "$DB_HOME" ]] && printf '      (ENVS = "TNS_ADMIN=%s/network/admin")\n' "$DB_HOME"
+  return 0
+}
 static_block() {
-  printf 'SID_LIST_%s =\n  (SID_LIST =\n    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n    )\n  )\n' \
-    "$SB_LSNR" "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
+  local e; e=$(sid_envs_line); [[ -n "$e" ]] && e+=$'\n'
+  printf 'SID_LIST_%s =\n  (SID_LIST =\n    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n%s    )\n  )\n' \
+    "$SB_LSNR" "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME" "$e"
 }
 
 sid_desc_block() {
-  printf '    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n    )\n' "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME"
+  local e; e=$(sid_envs_line); [[ -n "$e" ]] && e+=$'\n'
+  printf '    (SID_DESC =\n      (GLOBAL_DBNAME = %s)\n      (SID_NAME = %s)\n      (ORACLE_HOME = %s)\n%s    )\n' "$STANDBY_SERVICE" "$STANDBY_SID" "$DB_HOME" "$e"
 }
 sidlist_insert() {
   # $1 listener.ora -> the file with the SID_DESC of this standby put just before the closing parenthesis of
@@ -11929,7 +11988,7 @@ $(sid_desc_block)"
   if [[ $st -eq 2 ]] && sidlist_replace "$f" >/dev/null 2>&1; then
     # an existing entry is changed: asked also with --yes (another database may have set it up)
     L51_MODE=replace; YES_HOLD=1; ! use_grid && ! lsnr_has_desc && L51_MODE=replace_desc
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."$'\n'"  $f"
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"$'\n'"  $f"
     PLAN="Replace the entry of $STANDBY_SID inside SID_LIST_$SB_LSNR with this (a backup is kept; the other entries stay):
 $(sid_desc_block)"
     [[ "$L51_MODE" == replace_desc ]] && PLAN+=$'\n'"and add this listener address:"$'\n'"$(lsnr_desc_block)"
@@ -11954,7 +12013,7 @@ $(sid_desc_block)"
   fi
   KIND_NOW=manual; MANUAL_HOW="$(lsnr_user)  ->  shell"
   if [[ $st -eq 2 ]]; then
-    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"Logins through the listener would fail (ORA-01017 or ORA-12514)."
+    NOW="The static entry for $STANDBY_SID is not right:"$'\n'"${STATIC_WHY%$'\n'}"$'\n'"$(static_why_effect)"
     NOW+=$'\n'"It is written in a form the script does not change (more than one entry or block, or other text"$'\n'"on its lines). Please correct this entry by hand."
   else
     NOW="listener.ora has a SID_LIST_$SB_LSNR block without $STANDBY_SID, written in a form the script does not change"$'\n'"(more than one such block, or its parentheses do not close). Please add the entry by hand."
@@ -15139,6 +15198,18 @@ arch_script_text() {
   printf '[ "$(id -un)" = root ] && exec runuser -u %s -- "$0" "$@"\n' "$ORACLE_USER"
   printf 'echo "=== dg_arch_cleanup $(date '"'"'+%%Y-%%m-%%d %%H:%%M:%%S'"'"') ==="\n'
   printf 'export ORACLE_HOME=%s ORACLE_SID=%s LANG=C\n' "$DB_HOME" "$STANDBY_SID"
+  # the role first: after a switchover or failover this server is the primary, and the logs of a primary are
+  # deleted by its backup, not by "applied on the standby and a day old"
+  cat <<'EOS'
+# only while this database is a physical standby (after a switchover it is the primary: its archived logs then
+# belong to its backups, and nothing is deleted here)
+role=$(printf 'set heading off feedback off pagesize 0\nselect database_role from v$database;\nexit\n' | "$ORACLE_HOME/bin/sqlplus" -S -L / as sysdba 2>&1)
+case "$role" in
+  *"PHYSICAL STANDBY"*) ;;
+  *PRIMARY*|*"SNAPSHOT STANDBY"*|*"LOGICAL STANDBY"*) echo "The database role is not PHYSICAL STANDBY ($(echo $role)): nothing deleted"; echo "=== end (exit code 0) ==="; exit 0 ;;
+  *) echo "RMAN-00000: the database role cannot be read: nothing deleted"; printf '%s\n' "$role" | head -n 5; echo "=== end (exit code 1) ==="; exit 1 ;;
+esac
+EOS
   printf '# the deletion policy first: without TO APPLIED ON STANDBY a log that is not applied could be deleted\n'
   printf '# (the same rule as step 9.8: "... BACKED UP n TIMES ..." is not enough on a standby)\n'
   printf 'pol=$(printf "show archivelog deletion policy;\\nexit\\n" | "$ORACLE_HOME/bin/rman" target / 2>&1)\n'
@@ -15811,7 +15882,7 @@ c_10_1() {
   # and "no destination" is said only when the query itself worked)
   if ssh_alive; then
     local prc=0 dl did dst der
-    prim_sql "select distinct 'DEST:'||dest_id||'|'||status||'|'||nvl(error,'-') from gv\$archive_dest where upper(db_unique_name)=upper('$STANDBY_UNIQUE') and target='STANDBY';" || prc=1
+    prim_sql "select distinct 'DEST:'||dest_id||'|'||status||'|'||nvl(error,'-') from gv\$archive_dest where upper(db_unique_name)=upper('$STANDBY_UNIQUE') and target in ('STANDBY','REMOTE');" || prc=1
     # a RAC primary gives one line per instance: a line with an error first
     dl=$(sed -n 's/^[[:space:]]*DEST://p' <<< "$SQL_OUT" | awk -F'|' '{print ($3 == "-" ? 1 : 0) "\t" $0}' | sort -k1,1n | cut -f2- | head -n 1)
     if [[ "$dl" =~ ^[0-9]+\|[A-Z_\ ]+\| ]]; then
@@ -16739,7 +16810,7 @@ health_ssh() {
   local -a idf=(); local kf; kf=$(health_key_file); [[ -f "$kf" ]] && idf=(-o IdentityFile="$kf")
   if timeout 30 ssh -E "$elog" "${idf[@]+"${idf[@]}"}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$SSH_CTL" -o ControlPersist=300 \
        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
-       -o ConnectTimeout=15 -o ServerAliveInterval=30 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null 9>&- \
+       -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null 9>&- \
      && ssh_alive; then
     HEALTH_SSH_OPEN=1; return 0
   fi
@@ -17025,7 +17096,7 @@ health_key_test() {
   rm -f -- "$ctl"
   if timeout 30 ssh "${idf[@]+"${idf[@]}"}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$ctl" -o ControlPersist=10 \
        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
-       -o ConnectTimeout=15 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null > /dev/null 2>&1 9>&-; then rc=0; fi
+       -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null > /dev/null 2>&1 9>&-; then rc=0; fi
   [[ -e "$ctl" ]] && timeout 10 ssh -o ControlPath="$ctl" -O exit "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
   rm -f -- "$ctl"
   return $rc
@@ -17071,7 +17142,7 @@ help_text() {
   local PTA=${PRIMARY_TNS_ADMIN:-\$ORACLE_HOME/network/admin} PLH=${PRIMARY_LISTENER_HOME:-<listener home on primary>}
   local G=0 SO=0; [[ "${USE_GRID:-}" == "yes" ]] && G=1; [[ "$OU" == "$GU" ]] && SO=1
   local LH LU; if [[ $G -eq 1 ]]; then LH=$GH; LU=$GU; else LH=$DBH; LU=$OU; fi
-  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
+  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && GRP_USER=${GRID_USER:-} grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
   local DGS; DGS=$( [[ -n "${LOCS:-}" ]] && asm_dgs 2>/dev/null | paste -sd' ' - ); DGS=${DGS:-DATA FRA}
   # SQL on the primary by hand: the exact home and SID, so the environment of the user there does not matter
   # (three lines: who, then two complete commands, each one copyable on its own)
@@ -17597,8 +17668,8 @@ RUN    $PSQL
        select thread#, count(*) from v\$standby_log group by thread#;
        -- per thread: online groups + 1; size = the largest online log;
        -- blocksize 4096 if the online logs use it
-       -- with OMF or ASM:
-       alter database add standby logfile thread 1 size <M>M;
+       -- with OMF or ASM (name the place: without it Oracle makes a second member in the recovery area):
+       alter database add standby logfile thread 1 ('<+DG or db_create_file_dest>') size <M>M;
        -- without OMF:
        alter database add standby logfile thread 1 group <n> ('<redo folder>/srl_t1_g<n>.log') size <M>M;
 EXPECT For every thread: standby logs = online groups + 1
@@ -17969,8 +18040,8 @@ WHERE  This server ($S), SQL*Plus as sysdba
 RUN    $SSQL
        alter database recover managed standby database cancel;
        alter system set standby_file_management=manual scope=memory;
-       alter database add standby logfile thread 1 size <same as primary>M;
-       (this form is for OMF or ASM; otherwise add a file name)
+       alter database add standby logfile thread 1 ('<+DG>') size <same as primary>M;
+       (this form is for OMF or ASM, the place named so that there is one member; otherwise add a file name)
        alter system set standby_file_management=auto scope=memory;
 EXPECT Per thread: online groups + 1
        If apply ran before, it is started again afterwards:
@@ -18420,7 +18491,7 @@ After setup
   --roll-forward       Bring a standby that cannot catch up up to date from the primary (18c+)
                          dg_standby_setup.sh --roll-forward
 Information
-  --status             The result of every phase and step (connects to nothing)
+  --status             The result of every phase and step (no connection to the primary)
                          dg_standby_setup.sh --status
   --show-changes [N.M] Changes made by the setup, and how to undo them
                          dg_standby_setup.sh --show-changes 6.1
@@ -18850,6 +18921,12 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   # every run asks questions: without a terminal (nohup, cron, ssh without -t) it would fail later at a confusing point
   if ! { : < /dev/tty; } 2>/dev/null; then
     printf 'This script asks questions. Run it in an interactive terminal, for example:  ssh -t root@%s\n' "$(hostname -s 2>/dev/null)"
+    exit 1
+  fi
+  # the questions are written to the standard output: sent to a file, they would not be seen and the run would
+  # seem to hang (a pipe such as "| tee file" is fine)
+  if [[ -f /dev/stdout ]]; then
+    printf 'This script asks questions on the screen, so its output cannot go to a file. To keep a copy:  %s ... | tee file\n(The run log in %s holds everything in any case.)\n' "$SELF" "$LOG_DIR" >&2
     exit 1
   fi
   # one run at a time (a second run would take over the ssh connection and the settings)

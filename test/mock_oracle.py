@@ -141,7 +141,8 @@ def primary_sql(q, pri):
         return ""
     if "name='db_create_online_log_dest_1' and value is not null)" in l:
         omf = pri["params"].get("db_create_online_log_dest_1") or pri["params"].get("db_create_file_dest", "+DATA") or "-"
-        return f"{omf}|{pri.get('online_log_dests', 0)}|{pri['orl'] * pri.get('threads', 1) + pri['srl']}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
+        nd = pri.get('online_log_dests', 0) or sum(1 for k in ("db_create_file_dest", "db_recovery_file_dest") if pri["params"].get(k, "+DATA" if k == "db_create_file_dest" else "") not in ("", "-", None))
+        return f"{omf}|{nd}|{pri['orl'] * pri.get('threads', 1) + pri['srl']}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
     if l.strip() == "select 1 from dual;": return "1"
     if "select db_unique_name||' '||database_role from v$database" in l: return f"{pri['unique']} {pri['role']}"
     if "from v$tempfile" in l: return f"{pri['data_mb']}|{pri['temp_mb']}"
@@ -298,7 +299,9 @@ def local_sql(q, st, sid):
     if "name='db_create_online_log_dest_1' and value is not null)" in l:
         pri = load(PRI); dests = inst.get("log_dests", [])
         omf = (dests[0] if dests else pri["params"].get("db_create_file_dest", "+DATA")) or "-"
-        return f"{omf}|{len(dests)}|{pri['orl'] * pri.get('threads', 1) + inst.get('srl', 0)}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
+        # no db_create_online_log_dest_n: Oracle uses db_create_file_dest and the recovery area (a member in each)
+        nd = len(dests) or sum(1 for v in (pri["params"].get("db_create_file_dest", "+DATA"), inst.get("fra_param") or pri["params"].get("db_recovery_file_dest", "")) if v not in ("", "-", None))
+        return f"{omf}|{nd}|{pri['orl'] * pri.get('threads', 1) + inst.get('srl', 0)}|{pri.get('redo_dir', '+DATA/PRODDB/ONLINELOG')}"
     if "thread#||' '||max(sequence#)" in l and "applied in" in l:
         pri = load(PRI); seqs = pri.get("applied_t", pri.get("seq_t", {"1": pri["seq"]}))
         return "\n".join(f"{t} {q}" for t, q in sorted(seqs.items()))
@@ -326,7 +329,7 @@ def local_sql(q, st, sid):
         threads = pri.get("threads", 1)
         # members per new standby log: an empty file spec makes one in each OMF log destination (as Oracle does)
         for stmt in [x for x in l.split("\n") if "add standby logfile" in x]:
-            inst.setdefault("srl_members", []).append(1 if "(" in stmt else max(1, len(inst.get("log_dests", []))))
+            inst.setdefault("srl_members", []).append(1 if "(" in stmt else max(1, len(inst.get("log_dests", [])) or 2))
         inst["srl"] = inst.get("srl", 0) + l.count("add standby logfile") // threads; st["instances"][sid] = inst
         return ""
     if "recover managed standby database cancel" in l:

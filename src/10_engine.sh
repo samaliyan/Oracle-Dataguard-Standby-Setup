@@ -133,7 +133,8 @@ record() {
   # check mode writes nothing but its log: the progress file keeps the results of the real runs
   [[ "$MODE" == "check" ]] && return 0
   install -d -m 700 "$STATE_DIR" 2>/dev/null
-  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }"; } > "$PROGRESS_FILE.n" 2>/dev/null \
+  local gr=0
+  if ! { { grep -v "^$1|" "$PROGRESS_FILE" 2>/dev/null || gr=$?; printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$(ts)" "$RUN_ID" "${STEP_NOW[$1]//|/ }" && [[ $gr -le 1 || ! -e "$PROGRESS_FILE" ]]; } > "$PROGRESS_FILE.n" 2>/dev/null \
     && mv -f -- "$PROGRESS_FILE.n" "$PROGRESS_FILE"; }; then
     # the next run would show an old result for this step: said once
     [[ ${PROGRESS_WARNED:-0} -eq 1 ]] || { PROGRESS_WARNED=1; warn "The progress file $PROGRESS_FILE cannot be written. The next run may show old results."; }
@@ -243,6 +244,7 @@ next_cmd() {
   [[ -n "$nx" ]] || return 0
   # the step on demand (10.7) goes on only with its own option
   on_demand "$nx" && { printf '%s --roll-forward' "$SELF"; return 0; }
+  [[ ${ROLL_FORWARD:-0} -eq 1 && "$nx" == 10.* ]] && { printf '%s --roll-forward' "$SELF"; return 0; }
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "1" ]]; then printf '%s --only %s' "$SELF" "${ONLY_TEXT:-$ONLY_PHASE}"; return 0; fi
   # a range (--only 2.1-2.4, grid, db): the same range again, from the step that is not done
   if [[ -n "$TO_STEP" && "$nx" == *.* ]] && [[ $(step_num "$nx") -ge $(step_num "$FROM_STEP") && $(step_num "$nx") -le $(step_num "$TO_STEP") ]]; then
@@ -894,7 +896,9 @@ primary_pending_add() {
   if [[ -n "$old" && "$old" != "-" ]]; then
     if [[ -z "$u" || "$old" == *"$u"* ]]; then u=$old; else u="$old ; $u"; fi
   fi
-  { grep -v "^$1|" "$f" 2>/dev/null; printf '%s|%s|%s\n' "$1" "${u:--}" "$how"; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; chmod 600 "$f" 2>/dev/null
+  # (grep: 0 or 1 = written, with or without lines; 2 = it could not read or write: the old file stays)
+  local gr=0
+  { grep -v "^$1|" "$f" 2>/dev/null || gr=$?; printf '%s|%s|%s\n' "$1" "${u:--}" "$how" && [[ $gr -le 1 || ! -e "$f" ]]; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; chmod 600 "$f" 2>/dev/null
   return 0
 }
 primary_pending_get() { [[ -n "$STATE_DIR" ]] || return 0; grep -m1 "^$1|" "$(primary_pending_file)" 2>/dev/null | cut -d'|' -f2; return 0; }
@@ -902,7 +906,9 @@ primary_pending_how() { [[ -n "$STATE_DIR" ]] || return 0; grep -m1 "^$1|" "$(pr
 primary_pending_del() {
   [[ "$MODE" == "run" ]] || return 0
   local f; f=$(primary_pending_file); [[ -f "$f" ]] || return 0
-  grep -v "^$1|" "$f" > "$f.n" 2>/dev/null; mv -f -- "$f.n" "$f"; return 0
+  local gr=0; grep -v "^$1|" "$f" > "$f.n" 2>/dev/null || gr=$?
+  if [[ $gr -le 1 ]]; then mv -f -- "$f.n" "$f"; else rm -f -- "$f.n"; fi
+  return 0
 }
 batch_primary_steps() {
   # $@ step ids of kind primary that follow each other. Their checks are run first (read-only) and every

@@ -46,7 +46,7 @@ After setup
   --roll-forward       Bring a standby that cannot catch up up to date from the primary (18c+)
                          dg_standby_setup.sh --roll-forward
 Information
-  --status             The result of every phase and step (connects to nothing)
+  --status             The result of every phase and step (no connection to the primary)
                          dg_standby_setup.sh --status
   --show-changes [N.M] Changes made by the setup, and how to undo them
                          dg_standby_setup.sh --show-changes 6.1
@@ -476,6 +476,12 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   # every run asks questions: without a terminal (nohup, cron, ssh without -t) it would fail later at a confusing point
   if ! { : < /dev/tty; } 2>/dev/null; then
     printf 'This script asks questions. Run it in an interactive terminal, for example:  ssh -t root@%s\n' "$(hostname -s 2>/dev/null)"
+    exit 1
+  fi
+  # the questions are written to the standard output: sent to a file, they would not be seen and the run would
+  # seem to hang (a pipe such as "| tee file" is fine)
+  if [[ -f /dev/stdout ]]; then
+    printf 'This script asks questions on the screen, so its output cannot go to a file. To keep a copy:  %s ... | tee file\n(The run log in %s holds everything in any case.)\n' "$SELF" "$LOG_DIR" >&2
     exit 1
   fi
   # one run at a time (a second run would take over the ssh connection and the settings)

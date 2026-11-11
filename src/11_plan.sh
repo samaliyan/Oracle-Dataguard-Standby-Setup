@@ -33,13 +33,13 @@ cp_entry_text() {
   local i=$1 l
   if [[ "${CP_ROLE[$i]}" == file ]]; then
     printf "write %s (mode %s; a backup of the old file is kept):\n" "${CP_CMD[$i]}" "${CP_TO[$i]}"
-    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done <<< "${CP_IN[$i]}"
+    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done < <(printf '%s\n' "${CP_IN[$i]}")
     return 0
   fi
   printf '%s' "${CP_CMD[$i]}"
   if [[ -n "${CP_IN[$i]}" ]]; then
     printf " <<'EOF'\n"
-    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done <<< "${CP_IN[$i]}"
+    while IFS= read -r l || [[ -n "$l" ]]; do printf '  %s\n' "$l"; done < <(printf '%s\n' "${CP_IN[$i]}")
     printf 'EOF\n'
   else printf '\n'; fi
 }
@@ -157,10 +157,11 @@ cp_exec() {
   first=$(head -n 1 <<< "${CP_CMD[$i]}")
   # the input of sqlplus / rman / asmcmd is part of what runs: its first line is shown with the command
   if [[ -n "${CP_IN[$i]}" ]]; then
-    local nl; nl=$(grep -c '' <<< "${CP_IN[$i]}")
-    inp="  ->  $(head -n 1 <<< "${CP_IN[$i]}")"; [[ $nl -gt 1 ]] && inp+="  (and $((nl - 1)) more lines)"
+    # (no here-string for the input: on older bash that is a temporary file, and the input of the copy holds the password)
+    local nl; nl=$(printf '%s\n' "${CP_IN[$i]}" | grep -c '')
+    inp="  ->  ${CP_IN[$i]%%$'\n'*}"; [[ $nl -gt 1 ]] && inp+="  (and $((nl - 1)) more lines)"
   fi
-  say "${C_D}Running as $(cp_user "${CP_ROLE[$i]}"):${C_N} $(mask_pw <<< "$first$inp")"
+  say "${C_D}Running as $(cp_user "${CP_ROLE[$i]}"):${C_N} $(printf '%s\n' "$first$inp" | mask_pw)"
   tmp=$(mktemp /tmp/dg_out.XXXXXXXX) || { RUN_OUT="cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
   if [[ -n "${CP_IN[$i]}" ]]; then
@@ -172,7 +173,8 @@ cp_exec() {
   RUN_OUT=$(cat -- "$tmp"); rm -f -- "$tmp"
   # sqlplus ends with 0 also after an error: an ORA- or SP2- line in its output is a failure
   # (sqlplus by name or by a full path that ends in /sqlplus)
-  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] && grep -qE '^(ORA|SP2)-[0-9]+' <<< "$RUN_OUT" && rc=1
+  [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] \
+    && awk '/^(ORA|SP2)-[0-9]+/ && !/^ORA-32004/ {f=1} END {exit !f}' <<< "$RUN_OUT" && rc=1   # (ORA-32004: a deprecated parameter in the spfile, the start itself worked)
   { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
   return "$rc"
 }

@@ -3,6 +3,54 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.30
+
+A strict review by five independent reviewers (Oracle, installation, the engine, security, documents and tests).
+Every finding was checked in the code before it was changed; the ones below were real.
+
+Would have failed on a real server:
+- Listener of the Grid home: the static entry now has `(ENVS = "TNS_ADMIN=<database home>/network/admin")`.
+  Without it the server processes of the copy look for the primary alias in the Grid home and RMAN ends with
+  ORA-17629 / ORA-12154. Step 5.1 finds an entry without it and replaces it.
+- Database installer (3.6): the OS groups of the response file are only groups the database owner is a member
+  of (before: any group that exists, such as `oper` or `backupdba` made by the preinstall package, and the
+  installer stopped with INS-35341).
+- Standby redo logs (4.2, 9.3): with `db_create_file_dest` and a recovery area and no
+  `db_create_online_log_dest_n` (the usual ASM layout) Oracle made a second member in the recovery area. The
+  statements now name the place there too: one member per standby log.
+- 23ai: the instance is also found by its new process name `db_pmon_<SID>`.
+- A `startup mount` that only printed ORA-32004 (a deprecated parameter in the spfile) counted as failed.
+- 10.1: the lag diagnosis found no destination on 12.2 and newer (`target` is REMOTE there).
+
+Safer:
+- Nightly clean-up of archived logs: only while the database is a physical standby. After a switchover it
+  deletes nothing (before, it went on deleting the logs of the new primary).
+- A full disk no longer replaces the settings file with an empty one (the write is checked; the old file stays).
+  The files of the progress and of the primary commands are kept the same way.
+- Shared-storage test (2.14): the test file is made with noclobber, so root never writes through a link that a
+  member of the Oracle groups put there.
+- The files of the screen layout are in a folder of their own (mode 700) instead of readable files in /tmp.
+- The input of the copy (it holds the SYS password) is no longer passed through here-strings, which older bash
+  keeps in a temporary file.
+- ssh to the primary: no agent or port forwarding, whatever root's ssh configuration says.
+- A long job: Ctrl+C right after its start asks as later on; a job whose result was read is not taken for running
+  by the next run when programs it started are still there; the job no longer holds the output of the script
+  open (`| tee` ends with the script).
+- Output sent to a file (`> file`) is refused with a hint (the questions would not be seen); `| tee` works.
+- No colour codes with TERM=dumb. `--undo` renames the inventory and wallet files moved aside back
+  (`.old_<run>`), as `--show-changes` says. The free-space check of 2.14 counts the recovery area where it goes
+  on the standby. chrony is not installed next to a running ntpd. After `--roll-forward` the "Next" line names
+  `--roll-forward` again.
+
+Project:
+- Release: made only after the CI of that commit has passed, only from main, and only when CHANGELOG.md has
+  the section of the version.
+- Tests: they refuse to start on a machine that looks like a real Oracle server (they delete the users oracle
+  and grid); section 5.30 tests the fixes. `build.sh` takes every `src/NN_*.sh` by itself.
+- README: which release runs on which Oracle Linux, the real default of `FRA_SIZE`, the `[a]` answer, the
+  checksum, what the tests destroy, and a "Known limits" section (21c / 23ai read-only homes, the `--health`
+  key, the boot unit after a switchover, installer checksums). README.fa: the current menu.
+
 ## 5.29
 
 - The installer zips are also searched for in the folder of the script itself (first, three levels deep), so

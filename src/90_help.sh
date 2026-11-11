@@ -22,7 +22,7 @@ help_text() {
   local PTA=${PRIMARY_TNS_ADMIN:-\$ORACLE_HOME/network/admin} PLH=${PRIMARY_LISTENER_HOME:-<listener home on primary>}
   local G=0 SO=0; [[ "${USE_GRID:-}" == "yes" ]] && G=1; [[ "$OU" == "$GU" ]] && SO=1
   local LH LU; if [[ $G -eq 1 ]]; then LH=$GH; LU=$GU; else LH=$DBH; LU=$OU; fi
-  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
+  local AG; AG=$( [[ -n "${GRID_PGROUP:-}" ]] && GRP_USER=${GRID_USER:-} grp_or asmadmin "$GRID_PGROUP" 2>/dev/null || printf 'asmadmin')
   local DGS; DGS=$( [[ -n "${LOCS:-}" ]] && asm_dgs 2>/dev/null | paste -sd' ' - ); DGS=${DGS:-DATA FRA}
   # SQL on the primary by hand: the exact home and SID, so the environment of the user there does not matter
   # (three lines: who, then two complete commands, each one copyable on its own)
@@ -548,8 +548,8 @@ RUN    $PSQL
        select thread#, count(*) from v\$standby_log group by thread#;
        -- per thread: online groups + 1; size = the largest online log;
        -- blocksize 4096 if the online logs use it
-       -- with OMF or ASM:
-       alter database add standby logfile thread 1 size <M>M;
+       -- with OMF or ASM (name the place: without it Oracle makes a second member in the recovery area):
+       alter database add standby logfile thread 1 ('<+DG or db_create_file_dest>') size <M>M;
        -- without OMF:
        alter database add standby logfile thread 1 group <n> ('<redo folder>/srl_t1_g<n>.log') size <M>M;
 EXPECT For every thread: standby logs = online groups + 1
@@ -920,8 +920,8 @@ WHERE  This server ($S), SQL*Plus as sysdba
 RUN    $SSQL
        alter database recover managed standby database cancel;
        alter system set standby_file_management=manual scope=memory;
-       alter database add standby logfile thread 1 size <same as primary>M;
-       (this form is for OMF or ASM; otherwise add a file name)
+       alter database add standby logfile thread 1 ('<+DG>') size <same as primary>M;
+       (this form is for OMF or ASM, the place named so that there is one member; otherwise add a file name)
        alter system set standby_file_management=auto scope=memory;
 EXPECT Per thread: online groups + 1
        If apply ran before, it is started again afterwards:

@@ -17,9 +17,16 @@ in_inventory() {
   [[ -f "$inv" ]] && grep -q "LOC=\"$1\"" "$inv" && ! grep -q "LOC=\"$1\"[^>]*REMOVED=\"T\"" "$inv"
 }
 grp_or() {
-  # first group of the list that exists on this server
-  local g
-  for g in "$@"; do [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 && { printf '%s' "$g"; return 0; }; done
+  # first group of the list that exists on this server AND that the database owner is in (the installer stops
+  # with INS-35341 for a group the user is not a member of; the preinstall package creates oper, backupdba ...
+  # but adds no existing user to them). Before the user exists: the first group that exists.
+  # GRP_USER=<user> asks for another owner (the Grid owner for the groups of ASM).
+  local g mine="" u=${GRP_USER:-$ORACLE_USER}
+  id "$u" >/dev/null 2>&1 && mine=" $(id -nG "$u" 2>/dev/null) "
+  for g in "$@"; do
+    [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1 || continue
+    [[ -z "$mine" || "$mine" == *" $g "* ]] && { printf '%s' "$g"; return 0; }
+  done
   printf '%s' "$INSTALL_GROUP"
 }
 
@@ -1221,7 +1228,7 @@ grid_rsp_keys() {
   rsp_set  "$f" "$GRID_HOME" ORACLE_HOME oracleHome || true                 # staged (12.1) installer only
   rsp_set  "$f" "$INSTALL_GROUP" UNIX_GROUP_NAME unixGroupName || true
   rsp_set  "$f" "en" SELECTED_LANGUAGES || true
-  rsp_need "$f" "$(grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
+  rsp_need "$f" "$(GRP_USER=$GRID_USER grp_or asmdba dba)" oracle.install.asm.OSDBA OSDBA
   rsp_set  "$f" "$(getent group asmoper >/dev/null 2>&1 && printf asmoper)" oracle.install.asm.OSOPER OSOPER || true
   rsp_need "$f" "$(asm_owner_group)" oracle.install.asm.OSASM OSASM
   rsp_need "$f" "$ASM_PW" oracle.install.asm.SYSASMPassword sysasmPassword
@@ -1878,7 +1885,7 @@ c_3_8() {
   OBH=$(printf '%s\n' "$RUN_OUT" | grep -E '^/' | head -n 1); OBH=${OBH%/}
   if [[ "$OBH" == "$DB_HOME" ]]; then NOW="The Oracle home is read/write (orabasehome prints the home itself)"; return 0; fi
   NOW="The Oracle home is read-only. orabasehome prints:"$'\n'"  $OBH"
-  if [[ -n "$(ls -A "$ORACLE_BASE/dbs" 2>/dev/null)" ]] || pgrep -f "^ora_pmon_" >/dev/null 2>&1; then
+  if [[ -n "$(ls -A "$ORACLE_BASE/dbs" 2>/dev/null)" ]] || pgrep -f "^(ora|db)_pmon_" >/dev/null 2>&1; then
     NOW+=$'\n'"A database already uses it: there are files in $ORACLE_BASE/dbs, or an instance runs."$'\n'"The script does not change such a home."
     return 2
   fi

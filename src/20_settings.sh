@@ -152,7 +152,10 @@ save_settings() {
   local k tmp
   install -d -m 700 "$STATE_DIR"
   tmp="$SETTINGS_FILE.tmp.$$"
-  {
+  # the text is built first and written with one command: a write that fails (disk full) is then seen, and the
+  # old file stays (a loop that ends with "continue" would hide the failed writes before it)
+  local text
+  text=$(
     printf '# dg_standby_setup.sh %s settings - written %s\n' "$SCRIPT_VERSION" "$(ts)"
     printf '# Format KEY=VALUE, no spaces, no quotes.\n\n'
     printf '# ---- Standby values. You may change these. ----\n'
@@ -193,7 +196,8 @@ save_settings() {
       [[ ${LSNR_ASSUMED:-0} -eq 1 && ( "$k" == PORT || "$k" == LISTENER_NAME || "$k" == PRIMARY_SERVICE ) ]] && continue
       printf '%s=%s\n' "$k" "${!k}"
     done
-  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
+  ) || text=""       # (a text that was not built to its end is not written)
+  [[ "$text" == *"PRIMARY_IP="* ]] && ( umask 077; printf '%s\n' "$text" > "$tmp" ) 2>/dev/null && [[ -s "$tmp" ]] && chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS_FILE" || { rm -f -- "$tmp"; bad "Cannot write $SETTINGS_FILE. Is the disk full?"; return 1; }
   # values the script itself sets after you accepted (ASM method, installer files) stay accepted
   [[ ${SETTINGS_ACCEPTED:-0} -eq 1 ]] && save_accepted
   return 0

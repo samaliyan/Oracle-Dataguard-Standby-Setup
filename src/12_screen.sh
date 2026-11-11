@@ -286,7 +286,10 @@ ui_buf_start() {
   # $1 = 1: a clean area first. Lines collected before (a phase intro) stay in the collection.
   [[ $UI -eq 1 ]] || return 0
   if [[ -z "$UI_BUF_FILE" ]]; then
-    UI_BUF_FILE=$(mktemp /tmp/dg_screen.XXXXXXXX 2>/dev/null) || { UI_BUF_FILE=""; return 0; }
+    # a folder of its own (mode 700): the .cut / .res / .used files beside the text are not for other users to
+    # read, and nobody can put a file of such a name there first
+    local sd; sd=$(mktemp -d /tmp/dg_screen.XXXXXXXX 2>/dev/null) || { UI_BUF_FILE=""; return 0; }
+    UI_BUF_FILE=$sd/text
     CLEANUP_FILES+=("$UI_BUF_FILE" "$UI_BUF_FILE.cut" "$UI_BUF_FILE.res" "$UI_BUF_FILE.used")
   fi
   if [[ "$1" == 1 ]]; then ui_area_clear; : > "$UI_BUF_FILE"; UI_REC_A=-1; UI_REC_B=-1; UI_RES_A=-1; UI_RES_B=-1
