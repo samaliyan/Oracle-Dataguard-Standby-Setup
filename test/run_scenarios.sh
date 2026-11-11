@@ -931,7 +931,7 @@ rm -f "$R"
 # X8 standby redo log size is rounded UP to whole MB (else the primary would get more and more logs)
 fresh; jset $P "d['orl_bytes']=100000000; d['srl']=0"
 rc=$(DG_TEST_QUIT_AT=4.3 run $T/x8.txt --only 4)
-check "SRL size 100000000 bytes -> size 96M (rounded up)" "grep -q 'add standby logfile thread 1 ('+DATA') size 96M' $T/x8.txt"
+check "SRL size 100000000 bytes -> size 96M (rounded up)" "grep -qF \"add standby logfile thread 1 ('+DATA') size 96M\" $T/x8.txt"
 # X9 log_archive_config keeps other members; 4.7 pending restart
 fresh; jset $P "d['params']['log_archive_config']='DG_CONFIG=(PRODDB,OTHERSB)'; d['params']['remote_login_passwordfile']='NONE'; d['spparams']={'remote_login_passwordfile':'EXCLUSIVE'}"
 rc=$(DG_TEST_NOFIX=4.7 run $T/x9.txt --only 4)
