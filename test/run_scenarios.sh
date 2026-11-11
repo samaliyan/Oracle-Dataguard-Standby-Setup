@@ -118,7 +118,7 @@ PARTS=(
   [6]="T U V Z3 5.22"
   [7]="W X Z6 Z20"
   [8]="Y Z7 Z10 Z18"
-  [9]="Z8 Z9 Z14"
+  [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
   [11]="5.23"
 )
@@ -2395,6 +2395,28 @@ rc=$(DG_TEST_NO_QUERIES=0 run $T/r28d.txt --only 9.4 --verbose)
 check "--only 9.4 --verbose: the MRP query and its answer under 'Step 9.4', before the result" "sed -n '/^  Step 9\\.4 /,/Redo apply (MRP) is running/p' $T/r28d.txt | grep -q \"· STANDBY sqlplus: select count(\\*) from v\\\$managed_standby where process like 'MRP%';  ->  1\""
 rc=$(DG_TEST_NO_QUERIES=0 DG_VERBOSE=0 run $T/r28e.txt --only 9.4)
 check "--only 9.4 without --verbose: no query lines" "grep -q 'Redo apply (MRP) is running' $T/r28e.txt && ! grep -q '· STANDBY sqlplus' $T/r28e.txt"
+fi
+if part 5.29; then
+CUR=5.29; echo "== 5.29  The installer zips next to the script, in a folder outside the usual places"
+fresh empty
+SW=/var/dgt_sw; rm -rf $SW; mkdir -p $SW
+mv $T/stage/*.zip $SW/; cp -p $T/dg_standby_setup.sh $SW/
+# (the run of the copy in $SW, with the same environment as run())
+out=$T/r29a.txt
+( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=1 DG_VERBOSE=1 DG_TEST_NO_QUERIES=1 DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=$T/meminfo DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=1 DG_TEST_OUT=$out DG_TEST_QUIT_AT=3.2 \
+    timeout 600 python3 $DRV $SW/dg_standby_setup.sh >/dev/null 2>&1 )
+check "zips next to the script in $SW (not a usual place): found for the summary and used by step 3.1" "grep -qE 'Installer zips +Grid LINUX.X64_193000_grid_home.zip; database LINUX.X64_193000_db_home.zip +\\(found; step 3.1 uses them\\)' $out && ! grep -q 'not found' $out && grep -q 'GRID_MEDIA=$SW/LINUX.X64_193000_grid_home.zip' $out && grep -q 'DB_MEDIA=$SW/LINUX.X64_193000_db_home.zip' $out"
+# without them there: the message names the folder of the script
+rm -rf /var/dgt_hold; mkdir -p /var/dgt_hold; mv $SW/*.zip /var/dgt_hold/; out=$T/r29b.txt
+( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=1 DG_VERBOSE=1 DG_TEST_NO_QUERIES=1 DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=$T/meminfo DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=1 DG_TEST_OUT=$out DG_TEST_QUIT_AT=2.1 \
+    timeout 600 python3 $DRV $SW/dg_standby_setup.sh >/dev/null 2>&1 )
+check "the zips of the settings moved away: the summary says they are missing (problems first, and on the value line)" "grep -q 'The Grid installer zip of the settings is missing or not usable: $SW/LINUX.X64_193000_grid_home.zip' $out && grep -q 'Installer zips .*grid_home.zip (missing)' $out"
+# a new setup without any zip: the message names the folder of the script
+fresh empty; mv $T/stage/*.zip /var/dgt_hold/; out=$T/r29c.txt
+( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=1 DG_VERBOSE=1 DG_TEST_NO_QUERIES=1 DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=$T/meminfo DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=1 DG_TEST_OUT=$out DG_TEST_QUIT_AT=2.1 \
+    timeout 600 python3 $DRV $SW/dg_standby_setup.sh >/dev/null 2>&1 )
+check "no zips anywhere: the summary says to copy them next to the script ($SW) or to /stage" "grep -q 'No Grid installer zip found  ->  copy it next to this script ($SW) or to /stage' $out"
+rm -rf $SW /var/dgt_hold
 fi
 parts_done
 echo

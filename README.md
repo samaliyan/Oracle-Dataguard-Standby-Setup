@@ -161,6 +161,19 @@ aside, a half-unpacked software folder, the RMAN copy (the word `DUPLICATE`), th
 passwords, the listener restart (3.10), the standby restart steps (9.1, 9.2, 9.3, 9.7) and the deletion
 setting of archived logs (9.8). Typical use: `--check` first, put the installer zips in place, then `--yes`.
 
+### Installer files
+Put the Grid and database installer zips next to the script (or in /stage, /software, /install, /u01, /opt,
+/root, /home, /tmp, /mnt, /media; up to three folder levels down). The script finds them itself:
+- The release is read from the Oracle file name (`LINUX.X64_193000_db_home.zip`) or, for another name (an
+  edelivery `V982063-01.zip`, a renamed file), from inside the zip; Grid or database also from inside the zip.
+  Only the release of the primary is used, so other releases in the same folder do no harm.
+- The files must belong to root, oracle or grid, and only their owner may change them (for example
+  `chmod 644`); others are listed as not used, with the reason.
+- 12.1 comes as two zips: keep their names ending in `_1of2.zip` and `_2of2.zip`.
+- A Release Update and OPatch are not searched for: when the primary is patched, step 3.1 says so; set the
+  value "Release Update" on the summary screen (RU_DIR, the unzipped RU, and OPATCH_ZIP, `p6880880_*.zip`).
+The summary screen (step 1.4) shows the zips found, on the line "Installer zips".
+
 ### `--settings`
 Shows the summary screen and the values of the setup (a number changes one, `e` opens the settings file in
 `$EDITOR`), then stops.
