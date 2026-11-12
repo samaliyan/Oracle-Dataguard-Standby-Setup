@@ -157,6 +157,8 @@ undo_text() {
                 else printf 'by hand (the old port could not be read): srvctl modify listener -listener %s -endpoints TCP:<old port> ; then stop and start the listener' "$obj"; fi ;;
     LSNRSTART)  if [[ "$(detail_field "$det" via)" == srvctl ]]; then printf 'auto: srvctl stop listener -listener %s   (as %s)' "$obj" "${GRID_USER:-grid}"
                 else printf 'auto: lsnrctl stop %s   (as %s)' "$obj" "$(lsnr_user 2>/dev/null || printf '%s' "$ORACLE_USER")"; fi ;;
+    LSNRSTOP)   printf 'by hand, only if that listener is still needed (it held port %s, which the Grid listener uses now), as %s:  ORACLE_HOME=%s %s/bin/lsnrctl start %s' \
+                  "$(detail_field "$det" port)" "$(detail_field "$det" user)" "$(detail_field "$det" home)" "$(detail_field "$det" home)" "$obj" ;;
     INSTANCE)   printf 'auto: shut down the instance %s (srvctl stop database if it is registered, else shutdown immediate)' "$obj" ;;
     DUPLICATE)  printf 'by hand: shutdown abort, then remove the files of %s on this server only, NEVER those of the primary. Details:  %s --help-step 8.2' "$obj" "$SELF" ;;
     DUPLICATE_DONE) printf 'nothing separate: the copied standby %s goes with the DUPLICATE line' "$obj" ;;
@@ -263,7 +265,7 @@ change_word() {
     GROUP) printf 'group' ;; USER|USERMOD) printf 'user' ;; PKG) printf 'package' ;; FWPORT) printf 'firewall' ;;
     SERVICE|UNIT|UNITOFF) printf 'service' ;; CRONLINE|CRONOFF) printf 'crontab' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
-    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
+    LSNRRES|LSNRPORT|LSNRSTART|LSNRSTOP) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
     SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }

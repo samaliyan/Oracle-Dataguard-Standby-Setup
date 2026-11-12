@@ -216,8 +216,9 @@ d_2_3() {
 # ---- 2.4 limits ----
 LIMITS_FILE=/etc/security/limits.d/oracle-grid.conf
 limit_users() {
-  # the preinstall package sets limits only for the user named "oracle"; every other Oracle owner needs its own
-  [[ "$ORACLE_USER" != "oracle" ]] && printf '%s\n' "$ORACLE_USER"
+  # every Oracle owner. The preinstall package sets limits for the user named "oracle" only; that user is checked
+  # as well (the package may be missing or its file changed, and HugePages may need more memlock than it sets)
+  printf '%s\n' "$ORACLE_USER"
   use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
   return 0
 }
@@ -269,7 +270,7 @@ lim_line() {
 c_2_4() {
   local u it miss=() users=()
   LIM_TODO=()
-  if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
+  users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   # every limit the script sets is checked: its hard value as pam_limits uses it (a line for the user beats one
   # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
   # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
@@ -313,6 +314,7 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
+  [[ " ${miss[*]}" == *" oracle:"* ]] && NOW+=$'\n'"Its limits for oracle are missing or too low here as well (the package is not installed, or its file was changed)."
   [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
