@@ -3,6 +3,23 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.31
+
+The four small open points of the 5.30 review.
+
+- Step 3.9: every change is in the journal (`--show-changes`, `--undo`): the edit of listener.ora (undone from
+  its backup) and the stop of a listener of another home that held the port (how to start it again). The copy of
+  /etc/hosts that step 2.6 made in the same run is no longer replaced.
+- Step 2.4: the limits of the user `oracle` are checked like those of every other owner (before, the script
+  trusted the preinstall package without looking). A missing or too low limit is added; with HugePages on the
+  primary, memlock is checked against its SGA for `oracle` too.
+- PATH: the commands run as root use only folders of PATH that belong to root and that nobody else can write
+  to, plus the system folders. After `su` without `-`, a folder of the user who became root is left out (and
+  named once at the start).
+- Step 3.1 prints the SHA-256 of each installer file (also in the run log), to compare with Oracle's download
+  page or with the gold image on the primary.
+- Tests: section 5.31.
+
 ## 5.30
 
 A strict review by five independent reviewers (Oracle, installation, the engine, security, documents and tests).

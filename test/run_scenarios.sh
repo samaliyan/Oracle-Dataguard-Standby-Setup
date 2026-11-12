@@ -120,7 +120,7 @@ PARTS=(
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
-  [11]="5.23 5.30"
+  [11]="5.23 5.30 5.31"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -2496,6 +2496,38 @@ d=$T/ut530d; rm -rf $d; mkdir -p $d; echo keep > $d/victim; ln -s $d/victim $d/l
 ( umask 077; set -C; : > "$d/link" ) 2>/dev/null; r=$?
 check "noclobber (as used for the storage test file): a link of that name is not written through" "[[ $r -ne 0 && \$(cat $d/victim) == keep ]]"
 rm -rf $d $T/ut530 $T/ut530.log
+fi
+if part 5.31; then
+CUR=5.31; echo "== 5.31  3.9 in the journal, limits of oracle, a safe PATH, checksums of the installer files"
+fresh empty
+cat > $T/ut531.sh <<'EOF'
+#!/bin/bash
+S=$1; T=$2
+fn() { sed -n "/^$1()/,/^}/p" "$S"; }
+# 1) safe_path: a folder of another user, a folder others can write to and a relative entry are left out
+( source <(fn safe_path)
+  d=$T/ut531p; rm -rf $d; mkdir -p $d/ok $d/other $d/open; chmod 755 $d $d/ok $d/other; chmod 777 $d/open; chown nobody $d/other
+  PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
+  echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) | sed "s#$T/ut531p#D#g"
+# 2) limit_users: oracle is in the list, a separate grid owner too
+( source <(fn limit_users); use_grid() { return 0; }; single_owner() { return 1; }
+  ORACLE_USER=oracle; GRID_USER=grid; a=$(limit_users | paste -sd, -)
+  single_owner() { return 0; }; GRID_USER=oracle; b=$(limit_users | paste -sd, -)
+  echo "limusers=$a/$b" )
+# 3) the journal line of a stopped foreign listener tells how to start it again
+( source <(fn undo_text; fn detail_field; fn change_word)
+  echo "lsnrstop=$(undo_text LSNRSTOP LISTENER 'home=/u01/db user=oracle port=1521') [$(change_word LSNRSTOP)]" )
+EOF
+bash $T/ut531.sh $T/dg_standby_setup.sh $T > $T/ut531.txt 2>&1
+check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other D/open bin' $T/ut531.txt"
+check "unit: the limits of the user oracle are checked like those of the other owners" "grep -qx 'limusers=oracle,grid/oracle' $T/ut531.txt"
+check "unit: a stopped listener of another home is a journal line with the command that starts it again" "grep -qF 'lsnrstop=by hand, only if that listener is still needed (it held port 1521, which the Grid listener uses now), as oracle:  ORACLE_HOME=/u01/db /u01/db/bin/lsnrctl start LISTENER [listener]' $T/ut531.txt"
+rm -rf $T/ut531p
+# ---- a run up to the Grid install: 2.4 looks at oracle, 3.1 prints the checksums ----
+rc=$(DG_TEST_QUIT_AT=3.2 run $T/r31a.txt)
+gz=$(ls $T/stage/*grid*.zip 2>/dev/null | head -n 1)
+check "2.4: the limits of oracle are set or added by the script (no longer 'Not needed' without a look)" "! grep -q 'Not needed: the only Oracle owner is oracle' $T/r31a.txt && [[ \$(res 2.4 $T/r31a.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'oracle' $T/r31a.txt"
+check "3.1: the SHA-256 of every installer file is printed and is in the run log" "grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum \$gz | cut -d' ' -f1)  \$(basename \$gz)\" $T/r31a.txt && grep -q 'MEDIA' $T/log/run_*.log"
 fi
 parts_done
 echo

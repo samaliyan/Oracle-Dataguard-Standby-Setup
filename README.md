@@ -432,8 +432,8 @@ and read what it reports.
 - After a switchover (this server becomes the primary): the nightly clean-up of archived logs deletes nothing
   any more. Without Grid, the boot unit still starts the database only to MOUNT; open it yourself and review
   the unit.
-- The installer zips are not verified against Oracle's checksums. Compare them yourself (`sha256sum`) with the
-  values on the download page before step 3.1.
+- The installer zips cannot be verified by the script (it does not know Oracle's checksums). Step 3.1 prints
+  the SHA-256 of each file: compare it with the value on Oracle's download page before the software is installed.
 
 ## Disclaimer
 

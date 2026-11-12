@@ -154,7 +154,7 @@ EOF
   2.4) cat <<EOF
 TITLE  Limits for the Oracle owners
 WHERE  This server ($S), as root, file /etc/security/limits.d/oracle-grid.conf
-WHY    The preinstall package sets limits only for the user "oracle".
+WHY    The preinstall package sets limits only for the user "oracle"; the script checks that user as well.
        Every other owner needs them too.
 RUN    Add these lines for each owner:
        <user> soft nofile 1024

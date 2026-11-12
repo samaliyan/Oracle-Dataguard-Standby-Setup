@@ -318,6 +318,21 @@ d_3_1() {
   [[ -n "$F_GRID" ]] && GRID_MEDIA=$F_GRID; [[ -n "$F_DB" ]] && DB_MEDIA=$F_DB
   save_settings || return 1
   DONE_MSG="Installer files saved in $SETTINGS_FILE"
+  # their checksums, for you to compare (the script cannot know the right values: Oracle shows them on the
+  # download page of each file; a gold image has the value sha256sum gave on the primary)
+  local f sum lines=""
+  for f in ${F_GRID//,/ } ${F_DB//,/ }; do
+    [[ -f "$f" ]] || continue
+    say "Reading the checksum of $(basename "$f") ..."
+    sum=$(timeout 900 sha256sum -- "$f" 2>/dev/null | awk '{print $1}')
+    [[ "$sum" =~ ^[0-9a-f]{64}$ ]] && lines+=$'\n'"  $sum  $(basename "$f")"
+  done
+  if [[ -n "$lines" ]]; then
+    _log MEDIA "sha256:$lines"
+    say "SHA-256 of the installer files. Compare them with the values on Oracle's download page (a gold image:"
+    say "with  sha256sum <file>  on the primary) before the software is installed:$lines"
+  fi
+  return 0
 }
 
 #------------------------------------------------------------------------------
@@ -2028,7 +2043,8 @@ c_3_9() {
         fi
         # (a file whose last line has no newline gets one first; --undo takes the added text out again)
         L39_LEAD=0; [[ -s /etc/hosts && -n "$(tail -c 1 /etc/hosts)" ]] && L39_LEAD=1
-        cp_add root "cp -p /etc/hosts /etc/hosts.bak_$RUN_ID"
+        # (a copy step 2.6 made in this run is the original: it is not replaced)
+        cp_add root "[ -e /etc/hosts.bak_$RUN_ID ] || cp -p /etc/hosts /etc/hosts.bak_$RUN_ID"
         if [[ $L39_LEAD -eq 1 ]]; then cp_add root "printf '\\n%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"
         else cp_add root "printf '%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"; fi ;;
       port_lsnr)
@@ -2071,7 +2087,14 @@ srvctl start listener -listener $SB_LSNR"
 }
 d_3_9() {
   local hsz=""; [[ "${L39_CAUSE:-}" == hosts ]] && hsz=$(stat -c '%s' /etc/hosts 2>/dev/null)
-  cp_run || return 1
+  # the changes of the other causes are journaled as well (--show-changes, --undo): the stop of a listener of
+  # another home first (it is stopped even when a later command fails), the edit of listener.ora when it is done
+  [[ "${L39_CAUSE:-}" == port_lsnr ]] && journal LSNRSTOP "$L39_LNAME" "home=$L39_LHOME user=$L39_LUSER port=$PORT"
+  local lrc=0; cp_run || lrc=$?
+  if [[ "${L39_CAUSE:-}" == lsnr_host && -f "$L39_LORA.bak_$RUN_ID" ]] && ! cmp -s "$L39_LORA" "$L39_LORA.bak_$RUN_ID"; then
+    journal EDIT "$L39_LORA" "bak=$L39_LORA.bak_$RUN_ID md5=$(file_md5 "$L39_LORA")"
+  fi
+  [[ $lrc -eq 0 ]] || return 1
   if [[ "${L39_CAUSE:-}" == hosts ]]; then
     local txt="$L39_HOSTS_LINE"$'\n'; [[ ${L39_LEAD:-0} -eq 1 ]] && txt=$'\n'"$txt"
     journal_file_appended /etc/hosts "${hsz:-0}" "$txt" "" "${L39_LEAD:-0}"

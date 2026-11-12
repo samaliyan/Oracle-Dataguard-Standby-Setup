@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.30"
+readonly SCRIPT_VERSION="5.31"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -3545,6 +3545,8 @@ undo_text() {
                 else printf 'by hand (the old port could not be read): srvctl modify listener -listener %s -endpoints TCP:<old port> ; then stop and start the listener' "$obj"; fi ;;
     LSNRSTART)  if [[ "$(detail_field "$det" via)" == srvctl ]]; then printf 'auto: srvctl stop listener -listener %s   (as %s)' "$obj" "${GRID_USER:-grid}"
                 else printf 'auto: lsnrctl stop %s   (as %s)' "$obj" "$(lsnr_user 2>/dev/null || printf '%s' "$ORACLE_USER")"; fi ;;
+    LSNRSTOP)   printf 'by hand, only if that listener is still needed (it held port %s, which the Grid listener uses now), as %s:  ORACLE_HOME=%s %s/bin/lsnrctl start %s' \
+                  "$(detail_field "$det" port)" "$(detail_field "$det" user)" "$(detail_field "$det" home)" "$(detail_field "$det" home)" "$obj" ;;
     INSTANCE)   printf 'auto: shut down the instance %s (srvctl stop database if it is registered, else shutdown immediate)' "$obj" ;;
     DUPLICATE)  printf 'by hand: shutdown abort, then remove the files of %s on this server only, NEVER those of the primary. Details:  %s --help-step 8.2' "$obj" "$SELF" ;;
     DUPLICATE_DONE) printf 'nothing separate: the copied standby %s goes with the DUPLICATE line' "$obj" ;;
@@ -3651,7 +3653,7 @@ change_word() {
     GROUP) printf 'group' ;; USER|USERMOD) printf 'user' ;; PKG) printf 'package' ;; FWPORT) printf 'firewall' ;;
     SERVICE|UNIT|UNITOFF) printf 'service' ;; CRONLINE|CRONOFF) printf 'crontab' ;; ASMCFG|ASMLABEL|ASMINST|DISKGROUP) printf 'ASM' ;; SETTING) printf 'setting' ;;
     PART) printf 'disk' ;; UNZIP|SOFTWARE|ROOTSH|GRIDCONFIG|ROOHCTL|OPATCH) printf 'software' ;;
-    LSNRRES|LSNRPORT|LSNRSTART) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
+    LSNRRES|LSNRPORT|LSNRSTART|LSNRSTOP) printf 'listener' ;; INSTANCE|DUPLICATE|DUPLICATE_DONE|ROLLFWD|SRL|MRP) printf 'database' ;;
     SRVCTL|SRVCTL_OLD|SRVOPT) printf 'restart' ;; ASMGID) printf 'program' ;; DELETED) printf 'deleted' ;; CONFIRM) printf 'confirmed' ;; RMANCFG) printf 'RMAN' ;; *) printf '%s' "${1,,}" ;;
   esac
 }
@@ -6744,8 +6746,9 @@ d_2_3() {
 # ---- 2.4 limits ----
 LIMITS_FILE=/etc/security/limits.d/oracle-grid.conf
 limit_users() {
-  # the preinstall package sets limits only for the user named "oracle"; every other Oracle owner needs its own
-  [[ "$ORACLE_USER" != "oracle" ]] && printf '%s\n' "$ORACLE_USER"
+  # every Oracle owner. The preinstall package sets limits for the user named "oracle" only; that user is checked
+  # as well (the package may be missing or its file changed, and HugePages may need more memlock than it sets)
+  printf '%s\n' "$ORACLE_USER"
   use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
   return 0
 }
@@ -6797,7 +6800,7 @@ lim_line() {
 c_2_4() {
   local u it miss=() users=()
   LIM_TODO=()
-  if [[ -z "$(limit_users)" ]]; then NOW="Not needed: the only Oracle owner is oracle, and $(preinstall_pkg) sets its limits"; return 0; fi
+  users_ok || { NOW="The users do not exist yet (step 2.2)"; return 2; }
   # every limit the script sets is checked: its hard value as pam_limits uses it (a line for the user beats one
   # for a group, which beats *; among equal ones the last read wins; limits.conf is read before limits.d).
   # A missing limit, or one below the Oracle minimum, is added; the check after the action shows that it counts.
@@ -6841,6 +6844,7 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
+  [[ " ${miss[*]}" == *" oracle:"* ]] && NOW+=$'\n'"Its limits for oracle are missing or too low here as well (the package is not installed, or its file was changed)."
   [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
@@ -8910,6 +8914,21 @@ d_3_1() {
   [[ -n "$F_GRID" ]] && GRID_MEDIA=$F_GRID; [[ -n "$F_DB" ]] && DB_MEDIA=$F_DB
   save_settings || return 1
   DONE_MSG="Installer files saved in $SETTINGS_FILE"
+  # their checksums, for you to compare (the script cannot know the right values: Oracle shows them on the
+  # download page of each file; a gold image has the value sha256sum gave on the primary)
+  local f sum lines=""
+  for f in ${F_GRID//,/ } ${F_DB//,/ }; do
+    [[ -f "$f" ]] || continue
+    say "Reading the checksum of $(basename "$f") ..."
+    sum=$(timeout 900 sha256sum -- "$f" 2>/dev/null | awk '{print $1}')
+    [[ "$sum" =~ ^[0-9a-f]{64}$ ]] && lines+=$'\n'"  $sum  $(basename "$f")"
+  done
+  if [[ -n "$lines" ]]; then
+    _log MEDIA "sha256:$lines"
+    say "SHA-256 of the installer files. Compare them with the values on Oracle's download page (a gold image:"
+    say "with  sha256sum <file>  on the primary) before the software is installed:$lines"
+  fi
+  return 0
 }
 
 #------------------------------------------------------------------------------
@@ -10620,7 +10639,8 @@ c_3_9() {
         fi
         # (a file whose last line has no newline gets one first; --undo takes the added text out again)
         L39_LEAD=0; [[ -s /etc/hosts && -n "$(tail -c 1 /etc/hosts)" ]] && L39_LEAD=1
-        cp_add root "cp -p /etc/hosts /etc/hosts.bak_$RUN_ID"
+        # (a copy step 2.6 made in this run is the original: it is not replaced)
+        cp_add root "[ -e /etc/hosts.bak_$RUN_ID ] || cp -p /etc/hosts /etc/hosts.bak_$RUN_ID"
         if [[ $L39_LEAD -eq 1 ]]; then cp_add root "printf '\\n%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"
         else cp_add root "printf '%s\\n' '$L39_HOSTS_LINE' >> /etc/hosts"; fi ;;
       port_lsnr)
@@ -10663,7 +10683,14 @@ srvctl start listener -listener $SB_LSNR"
 }
 d_3_9() {
   local hsz=""; [[ "${L39_CAUSE:-}" == hosts ]] && hsz=$(stat -c '%s' /etc/hosts 2>/dev/null)
-  cp_run || return 1
+  # the changes of the other causes are journaled as well (--show-changes, --undo): the stop of a listener of
+  # another home first (it is stopped even when a later command fails), the edit of listener.ora when it is done
+  [[ "${L39_CAUSE:-}" == port_lsnr ]] && journal LSNRSTOP "$L39_LNAME" "home=$L39_LHOME user=$L39_LUSER port=$PORT"
+  local lrc=0; cp_run || lrc=$?
+  if [[ "${L39_CAUSE:-}" == lsnr_host && -f "$L39_LORA.bak_$RUN_ID" ]] && ! cmp -s "$L39_LORA" "$L39_LORA.bak_$RUN_ID"; then
+    journal EDIT "$L39_LORA" "bak=$L39_LORA.bak_$RUN_ID md5=$(file_md5 "$L39_LORA")"
+  fi
+  [[ $lrc -eq 0 ]] || return 1
   if [[ "${L39_CAUSE:-}" == hosts ]]; then
     local txt="$L39_HOSTS_LINE"$'\n'; [[ ${L39_LEAD:-0} -eq 1 ]] && txt=$'\n'"$txt"
     journal_file_appended /etc/hosts "${hsz:-0}" "$txt" "" "${L39_LEAD:-0}"
@@ -17274,7 +17301,7 @@ EOF
   2.4) cat <<EOF
 TITLE  Limits for the Oracle owners
 WHERE  This server ($S), as root, file /etc/security/limits.d/oracle-grid.conf
-WHY    The preinstall package sets limits only for the user "oracle".
+WHY    The preinstall package sets limits only for the user "oracle"; the script checks that user as well.
        Every other owner needs them too.
 RUN    Add these lines for each owner:
        <user> soft nofile 1024
@@ -18870,6 +18897,23 @@ run_end() {
   fi
   cleanup
 }
+safe_path() {
+  # The commands of this script run as root with the PATH it was started with. After "su" without "-", that PATH
+  # can still start with folders of the user who became root: a program put there under the name of a system
+  # tool would run as root. Only folders that belong to root and that nobody else can write to stay in PATH;
+  # the system folders are always there.
+  local d out="" dropped="" IFS=:
+  for d in $PATH; do
+    [[ "$d" == /* && -d "$d" ]] || { [[ -n "$d" && "$d" != /* ]] && dropped+=" $d"; continue; }   # (a folder that is not there: left out silently)
+    if [[ "$(stat -L -c '%u' -- "$d" 2>/dev/null)" == 0 && -z "$(find -L "$d" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then out+="${out:+:}$d"
+    else dropped+=" $d"; fi
+  done
+  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [[ ":$out:" == *":$d:"* ]] || out+="${out:+:}$d"
+  done
+  export PATH="$out"
+  PATH_DROPPED=${dropped# }
+}
 main() {
   # (replaces the plain clean-up trap of the core: the same clean-up, after the END line of the log)
   trap 'run_end $?' EXIT
@@ -18883,6 +18927,7 @@ main() {
   local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }
   [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit $ef; }
   cd / || exit $ef
+  safe_path
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
   # the folders and files root writes or reads (DG_* in the environment can move them): plain absolute paths only,
@@ -18956,6 +19001,10 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
+  if [[ -n "${PATH_DROPPED:-}" ]]; then
+    _log PATH "not used (not root's own, or writable by others): $PATH_DROPPED"
+    say "${C_D}Not used from PATH (not root's own folders, or writable by others): $PATH_DROPPED${C_N}"
+  fi
   [[ $FAST_WAITS -eq 1 ]] && _log WARN "DG_TEST_FAST_WAITS=1 is set: every wait is 0.2 seconds (a setting for the test suite)"
 
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"

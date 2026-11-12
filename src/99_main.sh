@@ -425,6 +425,23 @@ run_end() {
   fi
   cleanup
 }
+safe_path() {
+  # The commands of this script run as root with the PATH it was started with. After "su" without "-", that PATH
+  # can still start with folders of the user who became root: a program put there under the name of a system
+  # tool would run as root. Only folders that belong to root and that nobody else can write to stay in PATH;
+  # the system folders are always there.
+  local d out="" dropped="" IFS=:
+  for d in $PATH; do
+    [[ "$d" == /* && -d "$d" ]] || { [[ -n "$d" && "$d" != /* ]] && dropped+=" $d"; continue; }   # (a folder that is not there: left out silently)
+    if [[ "$(stat -L -c '%u' -- "$d" 2>/dev/null)" == 0 && -z "$(find -L "$d" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then out+="${out:+:}$d"
+    else dropped+=" $d"; fi
+  done
+  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [[ ":$out:" == *":$d:"* ]] || out+="${out:+:}$d"
+  done
+  export PATH="$out"
+  PATH_DROPPED=${dropped# }
+}
 main() {
   # (replaces the plain clean-up trap of the core: the same clean-up, after the END line of the log)
   trap 'run_end $?' EXIT
@@ -438,6 +455,7 @@ main() {
   local ef=1; [[ $HEALTH -eq 1 ]] && { ef=3; exec 7>&1; }
   [[ $EUID -eq 0 ]] || { printf 'Run this script as root, on the standby server.\n'; exit $ef; }
   cd / || exit $ef
+  safe_path
   os_info
   LOG_DIR=$(readlink -m -- "$LOG_DIR"); STATE_DIR=$(readlink -m -- "$STATE_DIR")
   # the folders and files root writes or reads (DG_* in the environment can move them): plain absolute paths only,
@@ -511,6 +529,10 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
+  if [[ -n "${PATH_DROPPED:-}" ]]; then
+    _log PATH "not used (not root's own, or writable by others): $PATH_DROPPED"
+    say "${C_D}Not used from PATH (not root's own folders, or writable by others): $PATH_DROPPED${C_N}"
+  fi
   [[ $FAST_WAITS -eq 1 ]] && _log WARN "DG_TEST_FAST_WAITS=1 is set: every wait is 0.2 seconds (a setting for the test suite)"
 
   printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
