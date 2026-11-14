@@ -301,7 +301,7 @@ menu_records() {
   case "$ANSWER" in
     q) menu_quit ;;
     s) print_progress_board ;;
-    c) if [[ -s "$JOURNAL_FILE" ]]; then show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
+    c) if [[ -s "$JOURNAL_FILE" ]]; then { ui_wanted && ui_changes_browse; } || show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
     u) while true; do
          ask "Step to undo, for example 2.9 (Enter = back)"
          st=${ANSWER//[[:space:]]/}
@@ -324,35 +324,40 @@ menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
 start_menu() {
   # shown when the script is run without options: one grouped menu. Next to each item, in grey, the switch that does
   # the same from the command line (for scripts and cron). Every item reaches the same code as its switch.
-  local c st mn def=1
+  local c st mn def=1 mback=0
   # Ctrl+C here only leaves the menu: nothing has started, the record of the last run stays as it is
   trap 'printf "\n"; menu_quit' INT
   while true; do
     load_progress
     # a finished standby: the daily check is the usual choice (Enter), a full setup is a check of every step again
     mn=$(menu_next); def=1; [[ "$mn" == "all done" ]] && def=9
-    printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
-    printf '\n  %sSetup%s\n' "$C_B" "$C_N"
-    if [[ $def -eq 9 ]]; then menu_line 1 "Full setup again (all done; checks every step)" "(no option)"
-    else menu_line 1 "Full setup ($mn)" "(no option)"; fi
-    menu_line 2 "Check only, change nothing" "--check"
-    menu_line 3 "OS preparation only (phase 2)" "--only os"
-    menu_line 4 "Grid Infrastructure and ASM only" "--only grid"
-    menu_line 5 "Database software only" "--only db"
-    menu_line 6 "Primary changes for the DBA (phase 4)" "--only primary"
-    menu_line 7 "Choose steps" "--only 2.1-2.4"
-    menu_line 8 "Start from a step" "--from 7.2"
-    printf '\n  %sAfter setup%s\n' "$C_B" "$C_N"
-    menu_line 9 "Health check" "--only 10   (cron: --health)"
-    menu_line 10 "Roll forward the standby from the primary" "--roll-forward"
-    printf '\n  %sInformation%s\n' "$C_B" "$C_N"
-    menu_line 11 "Status of every step" "--status"
-    menu_line 12 "Changes made, and undo" "--show-changes, --undo N.M"
-    menu_line 13 "The manual way of a step" "--help-step N.M"
-    menu_line 14 "Settings" "--settings"
-    printf '\n   q) Quit\n\n'
+    # the lines of the menu: "H|heading" or "number|text|the switch that does the same"
+    local -a mi=("H|Setup")
+    if [[ $def -eq 9 ]]; then mi+=("1|Full setup again (all done; checks every step)|(no option)")
+    else mi+=("1|Full setup ($mn)|(no option)"); fi
+    mi+=("2|Check only, change nothing|--check" "3|OS preparation only (phase 2)|--only os"
+         "4|Grid Infrastructure and ASM only|--only grid" "5|Database software only|--only db"
+         "6|Primary changes for the DBA (phase 4)|--only primary" "7|Choose steps|--only 2.1-2.4"
+         "8|Start from a step|--from 7.2"
+         "H|After setup" "9|Health check|--only 10   (cron: --health)" "10|Roll forward the standby from the primary|--roll-forward"
+         "H|Information" "11|Status of every step|--status" "12|Changes made, and undo|--show-changes, --undo N.M"
+         "13|The manual way of a step|--help-step N.M" "14|Settings|--settings")
     CUR_STEP=""
-    ask "Choice [$def]"
+    if ui_wanted; then
+      # a page: the arrow keys and Enter, or the number typed. What an item printed (status, changes, help) stays
+      # on the screen until Enter, then the page comes back.
+      if [[ $mback -eq 1 ]]; then mback=0; ask "Enter: back to the menu"; fi
+      ui_menu_ask "$def" "${mi[@]}"
+    else
+      printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
+      local e
+      for e in "${mi[@]}"; do
+        if [[ "$e" == "H|"* ]]; then printf '\n  %s%s%s\n' "$C_B" "${e#H|}" "$C_N"
+        else c=${e%%|*}; e=${e#*|}; menu_line "$c" "${e%%|*}" "${e#*|}"; fi
+      done
+      printf '\n   q) Quit\n\n'
+      ask "Choice [$def]"
+    fi
     c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=$def
     case "$c" in
       1) break ;;
@@ -388,19 +393,19 @@ start_menu() {
          break ;;
       9) parse_only 10; break ;;
       10) ROLL_FORWARD=1; parse_only 10; break ;;
-      11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100 ;;
-      12) menu_records ;;
+      11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100; mback=1 ;;
+      12) menu_records; mback=1 ;;
       13) while true; do
             ask "Which step, for example 9.2 (Enter = back)"
             st=${ANSWER//[[:space:]]/}
             [[ -z "$st" || "${st,,}" == b ]] && continue 2
             [[ "${st,,}" == q ]] && menu_quit
-            { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; break; }
+            { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; mback=1; break; }
             say "There is no step $st. To list the steps:  $SELF --help-step all"
           done ;;
       14) REVIEW_SETTINGS=1; ONLY_PHASE=1; break ;;
       q) menu_quit ;;
-      *) say "Please type a number from 1 to 14, or q." ;;
+      *) MENU_NOTE="Please type a number from 1 to 14, or q."; ui_wanted || say "$MENU_NOTE" ;;
     esac
   done
   _log INFO "menu choice $c${ONLY_TEXT:+ ($ONLY_TEXT)}${FROM_STEP:+ (from $FROM_STEP)}"
@@ -489,7 +494,12 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
       status_runs_block
       [[ -s "$JOURNAL_FILE" ]] && printf '\n  Changes made on this server: %s --show-changes\n' "$SELF"
     fi
-    [[ -n "$SHOW_CHANGES" ]] && show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"
+    if [[ -n "$SHOW_CHANGES" ]]; then
+      # with the screen layout and no step named: a list of the steps to look through (and to undo from);
+      # --plain, a pipe or a file get the report as text, as before
+      if [[ "$SHOW_CHANGES" == all ]] && ui_wanted && ui_changes_browse; then :
+      else show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"; fi
+    fi
     exit 0
   fi
   # every run asks questions: without a terminal (nohup, cron, ssh without -t) it would fail later at a confusing point

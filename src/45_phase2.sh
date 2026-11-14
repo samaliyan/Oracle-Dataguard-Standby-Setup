@@ -1448,9 +1448,10 @@ d_2_13() {
     if [[ $have -gt 0 ]]; then say "+$dg needs at least $(human_mb "$min"). Its disks have $(human_mb "$have"). Empty disks:"
     else say "+$dg needs at least $(human_mb "$min"). Empty disks:"; fi
     def=""
+    # (with the screen layout the list is on the page of the question: ui_check)
     for i in "${!disks[@]}"; do
-      if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")   (chosen)"
-      else say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")"; [[ -z "$def" ]] && def=$((i + 1)); fi
+      if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then [[ $UI -eq 1 ]] || say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")   (chosen)"
+      else [[ $UI -eq 1 ]] || say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")"; [[ -z "$def" ]] && def=$((i + 1)); fi
     done
     [[ -n "$def" ]] || { bad "Not enough empty disks for +$dg. Nothing was erased."; return 1; }
     local left=0
@@ -1465,19 +1466,30 @@ d_2_13() {
     [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
     while true; do
       if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
+      elif [[ $UI -eq 1 ]]; then
+        # a page: the empty disks as a list to mark (Space), with the size marked against the size needed
+        local -a drows=(); local dmodel
+        for i in "${!disks[@]}"; do
+          dmodel=$(lsblk -dn -o MODEL "${disks[$i]%% *}" 2>/dev/null | sed 's/  */ /g; s/^ //; s/ $//')
+          if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then drows+=("-|${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "chosen for another disk group")")
+          else drows+=(" |${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "$dmodel")"); fi
+        done
+        ui_check "Empty disks for +$dg" "Only empty disks are listed. Nothing is erased on this page." \
+          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${drows[@]}"
+        [[ -n "$ANSWER" ]] || { CHECK_NOTE="Mark at least one disk (Space), or type q to stop."; continue; }
       else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""
       local -a picks=(); read -ra picks <<< "$ANSWER"
       for n in "${picks[@]}"; do
-        if ! [[ "$n" =~ ^[0-9]{1,3}$ ]] || (( 10#$n < 1 || 10#$n > ${#disks[@]} )); then pick="bad"; say "Not a disk number: $n"; break; fi
+        if ! [[ "$n" =~ ^[0-9]{1,3}$ ]] || (( 10#$n < 1 || 10#$n > ${#disks[@]} )); then pick="bad"; say "Not a disk number: $n"; CHECK_NOTE="Not a disk number: $n"; break; fi
         n=$((10#$n))
         [[ "$nums" == *" $n "* ]] && continue
-        [[ "$used" == *" ${disks[$((n - 1))]%% *} "* ]] && { pick="bad"; say "${disks[$((n - 1))]%% *} is already chosen"; break; }
+        [[ "$used" == *" ${disks[$((n - 1))]%% *} "* ]] && { pick="bad"; say "${disks[$((n - 1))]%% *} is already chosen"; CHECK_NOTE="${disks[$((n - 1))]%% *} is already chosen for another disk group"; break; }
         nums+="$n "; total=$((total + ${disks[$((n - 1))]##* }))
       done
       [[ "$pick" == "bad" || "$nums" == " " ]] && continue
-      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB, but +$dg needs $need_more MB more. Choose more or bigger disks."; continue; fi
+      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB, but +$dg needs $need_more MB more. Choose more or bigger disks."; CHECK_NOTE="These disks have $(human_mb "$total"), but +$dg needs $(human_mb "$need_more"). Mark more or bigger disks."; continue; fi
       break
     done
     for n in $nums; do

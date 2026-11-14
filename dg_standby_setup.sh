@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.32"
+readonly SCRIPT_VERSION="5.34"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -3354,6 +3354,7 @@ ui_job_done() {
 
 # ---- the summary screen of step 1.4: on its own page, the question at its bottom ----
 # ---- answers typed or chosen with the arrow keys (the summary page and the choice pages) ----
+UK_SPACE=0          # 1: Space with nothing typed is given to that function ("$UK_MOVE" space)
 UK_DONE=0           # set to 1 by that function: the question ends at once, with ANSWER as it is
 UK_MOVE=""          # the function ui_keyline calls for an arrow key or Esc:  "$UK_MOVE" up|down|esc
 UIS_LAST=0          # the value the mark of the summary page was on last
@@ -3385,6 +3386,8 @@ ui_keyline() {
                [[ $UK_DONE -eq 1 ]] && break          # the page ends the question itself (Esc on a choice page)
              fi ;;
       $'\177'|$'\b') [[ -n "$ANSWER" ]] && { ANSWER=${ANSWER%?}; printf '\b \b'; } ;;
+      " ") # on a page with boxes to mark, Space with nothing typed marks; else it is text ("1 3")
+           if [[ -z "$ANSWER" && $UK_SPACE -eq 1 && -n "$UK_MOVE" ]]; then "$UK_MOVE" space; else ANSWER+=$c; printf '%s' "$c"; fi ;;
       *) [[ "$c" == [[:print:]] ]] && { ANSWER+=$c; printf '%s' "$c"; } ;;
     esac
   done
@@ -3416,8 +3419,9 @@ ui_sum_hint() {
   printf '\e7\e[%d;1H\e[2K    %s%s%s\e8' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"
 }
 ui_sum_move() {
-  # (called by ui_keyline inside ui_summary_ask) the mark goes up or down, around the ends; Esc takes it away
-  local new=$sel
+  # (called by ui_keyline inside ui_summary_ask) the mark goes up or down, around the ends; Esc takes it away.
+  # A value that is not on the page now: the page is drawn again from where that value is on it (UIS_TOP).
+  local new=$sel t sum avail
   [[ $vn -gt 0 ]] || return 0
   case "$1" in
     up)   if [[ $sel -eq 0 ]]; then new=$UIS_LAST; [[ $new -ge 1 && $new -le $vn ]] || new=$vn
@@ -3427,13 +3431,26 @@ ui_sum_move() {
     esc)  new=0 ;;
   esac
   [[ $new -eq $sel ]] && return 0
+  if [[ $new -gt 0 && -z "${vrow[$new]:-}" ]]; then
+    if [[ ${va[$new]} -lt $UIS_TOP ]]; then
+      # above the page: from the line before it (the heading, for the first value)
+      t=${va[$new]}; [[ $t -gt 0 ]] && t=$((t - 1)); [[ $new -eq 1 && $t -le 3 ]] && t=0
+    else
+      # below the page: the page ends with this value
+      avail=$((h - 2)); t=${vb[$new]}; sum=${R[$t]}
+      while [[ $t -gt 0 && $((sum + R[t - 1])) -le $avail ]]; do t=$((t - 1)); sum=$((sum + R[t])); done
+    fi
+    UIS_TOP=$t; sel=$new; UIS_LAST=$sel; redraw=1; UK_DONE=1
+    return 0
+  fi
   [[ $sel -gt 0 ]] && ui_sum_mark "$sel" 0
   [[ $new -gt 0 ]] && ui_sum_mark "$new" 1
   sel=$new; [[ $sel -gt 0 ]] && UIS_LAST=$sel
   ui_sum_hint
 }
+UIS_TOP=0           # the first line of the summary text that is on the page (the arrow keys move the page)
 ui_summary_ask() {
-  local -a L=() vrow=() va=() vb=(); local n h i f mine=0 used=0 q qi="    " vn=0 sel=0
+  local -a L=() R=() vrow=() va=() vb=(); local n h i f mine=0 used=0 q qi="    " vn=0 sel=0 redraw=0 in_v=0 avail note
   # the question in one line: below 100 columns with shorter labels (it starts the same way)
   q="[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"
   [[ $UI_COLS -lt 100 ]] && { q="[Enter] Start   [number] Change  [d] Details  [e] Edit  [h] Help  [q] Quit"; qi=""; }
@@ -3445,31 +3462,46 @@ ui_summary_ask() {
   if [[ ${#L[@]} -gt $h ]]; then SUMMARY_COMPACT=1 summary_text > "$f"; mapfile -t L < <(ui_fold "      " < "$f"); fi
   rm -f -- "$f"
   n=${#L[@]}
+  # The lines of the values ("   3  Label   value", and what continues them) are found in the whole text: the
+  # arrow keys move a mark over them, also to a value that is further down than the page shows.
+  for ((i = 0; i < n; i++)); do
+    ui_nrows "${L[$i]}"; R[$i]=$UI_N
+    ui_strip "${L[$i]}"
+    if [[ $vn -lt ${#SV_ID[@]} && "$UI_S" =~ ^\ \ (\ [1-9]|[1-9][0-9])\ \ [^\ ] && $((10#${BASH_REMATCH[1]// /})) -eq $((vn + 1)) ]]; then
+      vn=$((vn + 1)); va[$vn]=$i; vb[$vn]=$i; in_v=1
+    elif [[ $in_v -eq 1 && "$UI_S" == "      "* ]]; then vb[$vn]=$i
+    else in_v=0; fi
+  done
+  [[ $UIS_TOP -lt $n ]] || UIS_TOP=0
+  note=${SUM_NOTE:-}; SUM_NOTE=""
   ui_live_clear
   ui_keys_on
   # UI_ALT=1: an interrupt (Ctrl-C) at this question then also leaves the separate screen
   if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
-  printf '\e[r\e[H\e[2J %sSummary of this run%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s) -> standby of $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
-  # (a line longer than the width takes more rows: the terminal wraps it)
-  # The lines of the values ("   3  Label   value", and what continues them) are remembered with their screen
-  # row: the arrow keys move a mark over them.
-  local in_v=0
-  for ((i = 0; i < n; i++)); do
-    ui_nrows "${L[$i]}"; [[ $((used + UI_N)) -gt $((h - 1)) ]] && break
-    ui_strip "${L[$i]}"
-    if [[ $vn -lt ${#SV_ID[@]} && "$UI_S" =~ ^\ \ (\ [1-9]|[1-9][0-9])\ \ [^\ ] && $((10#${BASH_REMATCH[1]// /})) -eq $((vn + 1)) ]]; then
-      vn=$((vn + 1)); vrow[$vn]=$((3 + used)); va[$vn]=$i; vb[$vn]=$i; in_v=1
-    elif [[ $in_v -eq 1 && "$UI_S" == "      "* ]]; then vb[$vn]=$i
-    else in_v=0; fi
-    printf '%s\n' "${L[$i]}"; used=$((used + UI_N))
+  while true; do
+    printf '\e[r\e[H\e[2J %sSummary of this run%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s) -> standby of $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
+    # (a line longer than the width takes more rows: the terminal wraps it)
+    used=0; vrow=(); avail=$((h - 1))
+    if [[ $UIS_TOP -gt 0 ]]; then printf ' %s%s %d lines above%s\n' "$C_D" "$S_WAIT" "$UIS_TOP" "$C_N"; used=1; fi
+    for ((i = UIS_TOP; i < n; i++)); do
+      [[ $((used + R[i])) -gt $avail ]] && break
+      printf '%s\n' "${L[$i]}"; used=$((used + R[i]))
+    done
+    # the screen row of every value that is on the page, with all its lines
+    local k r=$((3 + (UIS_TOP > 0 ? 1 : 0))) j
+    for ((j = UIS_TOP; j < i; j++)); do
+      for ((k = 1; k <= vn; k++)); do [[ ${va[$k]} -eq $j && ${vb[$k]} -lt $i ]] && vrow[$k]=$r; done
+      r=$((r + R[j]))
+    done
+    [[ $i -lt $n ]] && printf ' %s%s %d more lines: d shows all%s\n' "$C_D" "$S_WAIT" $((n - i)) "$C_N"
+    # (a line feed after it: the question below is a line of its own in a copy of the output)
+    if [[ -n "$note" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${note:0:$((UI_COLS - 8))}" "$C_N"; note=""
+    else ui_sum_hint; printf '\e[%d;1H\n' $((UI_ROWS - 1)); fi
+    printf '\e[%d;1H\e[2K%s%s%s %s%s %s ' "$UI_ROWS" "$qi" "$C_C" "$S_ASK" "$q" "$C_N" "$S_END"
+    [[ $sel -gt 0 && -n "${vrow[$sel]:-}" ]] && ui_sum_mark "$sel" 1
+    redraw=0; UK_MOVE=ui_sum_move; ui_keyline || true; UK_MOVE=""
+    [[ $redraw -eq 1 ]] || break
   done
-  [[ $i -lt $n ]] && printf ' %s%s %d more lines: d shows all%s\n' "$C_D" "$S_WAIT" $((n - i)) "$C_N"
-  # (a line feed after it: the question below is a line of its own in a copy of the output)
-  if [[ -n "${SUM_NOTE:-}" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${SUM_NOTE:0:$((UI_COLS - 8))}" "$C_N"
-  else ui_sum_hint; printf '\e[%d;1H\n' $((UI_ROWS - 1)); fi
-  SUM_NOTE=""
-  printf '\e[%d;1H\e[2K%s%s%s %s%s %s ' "$UI_ROWS" "$qi" "$C_C" "$S_ASK" "$q" "$C_N" "$S_END"
-  UK_MOVE=ui_sum_move; ui_keyline || true; UK_MOVE=""
   # Enter with a value marked: that value is changed (as if its number was typed)
   [[ -z "$ANSWER" && $sel -gt 0 ]] && ANSWER=$sel
   # (a typed number counts as the value marked last: the arrow keys go on from there)
@@ -3477,6 +3509,206 @@ ui_summary_ask() {
   _log ASK "[1.4] summary -> ${ANSWER:-Enter}"
   [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
   ui_header; ui_region
+  return 0
+}
+# ---- the start menu as a page (arrow keys and Enter, or the number typed) ----
+MENU_NOTE=""        # a message for the menu page (shown above the question, once)
+ui_menu_item() {
+  # (called inside ui_menu_ask) item $1 of the menu drawn marked ($2 = 1) or plain
+  local i=$1 t
+  printf '\e7\e[%d;1H\e[2K' "${mrow[$i]}"
+  if [[ "${mk[$i]}" == q ]]; then t="    q) Quit"; else t=$(printf '  %3s) %-44s %s' "${mk[$i]}" "${ml[$i]}" "${ms[$i]}"); fi
+  if [[ $2 -eq 1 ]]; then printf '%s\e[7m%s%s %s' "$C_W" "$S_END" "${t:1:$((UI_COLS - 3))}" "$C_N"
+  elif [[ "${mk[$i]}" == q ]]; then printf '%s' "$t"
+  else printf '  %3s) %-44s %s%s%s' "${mk[$i]}" "${ml[$i]}" "$C_D" "${ms[$i]}" "$C_N"; fi
+  printf '\e8'
+}
+ui_menu_move() {
+  # (called by ui_keyline inside ui_menu_ask)
+  local new=$msel
+  case "$1" in
+    up)   new=$((msel - 1)); [[ $new -lt 0 ]] && new=$((${#mk[@]} - 1)) ;;
+    down) new=$((msel + 1)); [[ $new -ge ${#mk[@]} ]] && new=0 ;;
+    *)    return 0 ;;
+  esac
+  ui_menu_item "$msel" 0; ui_menu_item "$new" 1; msel=$new
+}
+ui_menu_ask() {
+  # The start menu on a page of its own. $1 the item that Enter takes at first, then the lines of the menu:
+  # "H|heading" or "number|text|the switch that does the same". Result in ANSWER: the number (typed, or of the
+  # marked item) or q. With fewer than 30 rows the empty lines between the groups are left out.
+  local def=$1; shift
+  local -a mk=() ml=() ms=() mrow=() hrow=() ht=(); local e row=3 gap=1 msel=0 i mine=0
+  [[ $UI_ROWS -lt 30 ]] && gap=0
+  for e in "$@"; do
+    if [[ "$e" == "H|"* ]]; then row=$((row + gap)); hrow+=("$row"); ht+=("${e#H|}"); row=$((row + 1))
+    else
+      mk+=("${e%%|*}"); e=${e#*|}; ml+=("${e%%|*}"); ms+=("${e#*|}"); mrow+=("$row"); row=$((row + 1))
+      [[ "${mk[${#mk[@]} - 1]}" == "$def" ]] && msel=$((${#mk[@]} - 1))
+    fi
+  done
+  row=$((row + gap)); mk+=(q); ml+=("Quit"); ms+=(""); mrow+=("$row")
+  ui_keys_on
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
+  printf '\e[r\e[H\e[2J %sWhat do you want to do?%s   %s%s, dg_standby_setup.sh %s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s 2>/dev/null)" "$SCRIPT_VERSION" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
+  for ((i = 0; i < ${#hrow[@]}; i++)); do printf '\e[%d;1H  %s%s%s' "${hrow[$i]}" "$C_B" "${ht[$i]}" "$C_N"; done
+  for ((i = 0; i < ${#mk[@]}; i++)); do ui_menu_item "$i" $(( i == msel ? 1 : 0 )); done
+  # (a line feed after it: the question below is a line of its own in a copy of the output)
+  if [[ -n "$MENU_NOTE" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${MENU_NOTE:0:$((UI_COLS - 8))}" "$C_N"
+  else e="$(ui_arrows): choose, Enter takes it     or type the number"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${e:0:$((UI_COLS - 6))}" "$C_N"; fi
+  MENU_NOTE=""
+  printf '\e[%d;1H\e[2K    %s%s Choice [%s]%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$def" "$C_N" "$S_END"
+  UK_MOVE=ui_menu_move; ui_keyline || true; UK_MOVE=""
+  [[ -z "$ANSWER" ]] && ANSWER=${mk[$msel]}
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
+  # what was chosen stays on the screen (the page is gone)
+  for ((i = 0; i < ${#mk[@]}; i++)); do
+    [[ "${mk[$i]}" == "${ANSWER//[[:space:]]/}" && "${mk[$i]}" != q ]] && printf '\n  %sMenu:%s %s) %s\n' "$C_D" "$C_N" "${mk[$i]}" "${ml[$i]}"
+  done
+  return 0
+}
+# ---- a page with rows to mark (the disks of step 2.13) or to choose from (the steps with changes) ----
+ui_rows_draw() {
+  # (called inside ui_check and ui_changes_browse) the rows of the list that fit (from ltop), the row of the
+  # cursor shown as such. lshow[i] = the text of row i, lmark[i] = "x" marked, " " not, "-" cannot be marked,
+  # "" a list without boxes.
+  local i r=$lrow t box
+  printf '\e7'
+  for ((i = ltop; i < ${#lshow[@]} && r < lrow + lcap; i++, r++)); do
+    box=""; case "${lmark[$i]:-}" in x) box="[x] " ;; " ") box="[ ] " ;; -) box=" -  " ;; esac
+    t="   $box${lshow[$i]}"; t=${t:0:$((UI_COLS - 2))}
+    printf '\e[%d;1H\e[2K' "$r"
+    if [[ $i -eq $lsel ]]; then printf '%s\e[7m %s%s %s' "$C_W" "$S_END" "${t:2}" "$C_N"
+    elif [[ "${lmark[$i]:-}" == "-" ]]; then printf '%s%s%s' "$C_D" "$t" "$C_N"
+    else printf '%s' "$t"; fi
+  done
+  for (( ; r < lrow + lcap; r++)); do printf '\e[%d;1H\e[2K' "$r"; done
+  # what is above and below the part shown
+  printf '\e[%d;1H\e[2K' $((lrow + lcap))
+  [[ ${#lshow[@]} -gt $lcap ]] && printf '   %s%s rows %d to %d of %d%s' "$C_D" "$S_WAIT" $((ltop + 1)) "$i" "${#lshow[@]}" "$C_N"
+  printf '\e8'
+}
+ui_rows_move() {
+  # (called by ui_keyline) the cursor of the list goes up or down, around the ends; the part shown follows it
+  case "$1" in
+    up)   lsel=$((lsel - 1)); [[ $lsel -lt 0 ]] && lsel=$((${#lshow[@]} - 1)) ;;
+    down) lsel=$((lsel + 1)); [[ $lsel -ge ${#lshow[@]} ]] && lsel=0 ;;
+    space) case "${lmark[$lsel]:-}" in x) lmark[$lsel]=" " ;; " ") lmark[$lsel]="x" ;; *) return 0 ;; esac
+           [[ -n "${lstatus_fn:-}" ]] && "$lstatus_fn" ;;
+    *)    return 0 ;;
+  esac
+  [[ $lsel -lt $ltop ]] && ltop=$lsel
+  [[ $lsel -ge $((ltop + lcap)) ]] && ltop=$((lsel - lcap + 1))
+  ui_rows_draw
+}
+CHECK_NOTE=""       # a message for the next page of ui_check (why the last answer was not taken)
+ui_check_status() {
+  # (called inside ui_check) the line under the title: how much is marked, and whether it is enough
+  local i tot=0 t
+  for ((i = 0; i < ${#lshow[@]}; i++)); do [[ "${lmark[$i]}" == x ]] && tot=$((tot + lmb[i])); done
+  if [[ $tot -ge $cneed ]]; then t="${C_G}Marked: $(human_mb "$tot")   needed: $(human_mb "$cneed")   $S_OK enough${C_N}"
+  else t="${C_Y}Marked: $(human_mb "$tot")   needed: $(human_mb "$cneed")   $(human_mb $((cneed - tot))) more to mark${C_N}"; fi
+  printf '\e7\e[4;1H\e[2K   %s\e8' "$t"
+}
+ui_check() {
+  # A page to mark rows of a list (the empty disks for a disk group). $1 title, $2 a line of explanation, $3 the
+  # MB that must be marked, $4 the question (the same words as without the page), $5 the numbers marked at first,
+  # then the rows as "state|size in MB|text": state " " can be marked, "-" cannot (shown, with its reason).
+  # Up / Down move, Space marks, Enter takes the marked rows; typed numbers and Enter work as before.
+  # Result in ANSWER: the numbers of the marked rows ("1 3"), the typed text, or "" when nothing is marked.
+  local title=$1 note=$2 cneed=$3 quest=$4 def=$5; shift 5
+  local -a lshow=() lmark=() lmb=(); local o lsel=0 ltop=0 lrow=6 lcap mine=0 i st lstatus_fn=ui_check_status first=-1 t
+  for o in "$@"; do
+    st=${o%%|*}; o=${o#*|}; lmb+=("${o%%|*}"); lshow+=("$(printf '%2d) %s' $((${#lshow[@]} + 1)) "${o#*|}")")
+    if [[ "$st" == "-" ]]; then lmark+=("-"); else lmark+=(" "); [[ $first -lt 0 ]] && first=$((${#lmark[@]} - 1)); fi
+  done
+  for i in $def; do [[ "$i" =~ ^[0-9]+$ && $i -ge 1 && $i -le ${#lmark[@]} && "${lmark[$((i - 1))]}" == " " ]] && { lmark[$((i - 1))]="x"; lsel=$((i - 1)); }; done
+  [[ "${lmark[$lsel]}" == "-" && $first -ge 0 ]] && lsel=$first
+  lcap=$((UI_ROWS - 9)); [[ $lcap -lt 3 ]] && lcap=3
+  [[ $lsel -ge $lcap ]] && ltop=$((lsel - lcap + 1))
+  ui_live_clear
+  ui_keys_on
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
+  printf '\e[r\e[H\e[2J %s%s%s\n %s%s%s\n   %s%s%s\n' "$C_W" "$title" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N" "$C_D" "${note:0:$((UI_COLS - 5))}" "$C_N"
+  ui_check_status
+  ui_rows_draw
+  # (never longer than the row: a wrapped line would move the page; a line feed after it: the question below
+  # is a line of its own in a copy of the output)
+  if [[ -n "$CHECK_NOTE" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${CHECK_NOTE:0:$((UI_COLS - 8))}" "$C_N"
+  else t="$(ui_arrows): move   Space: mark   Enter: use the marked ones   or type the numbers"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"; fi
+  CHECK_NOTE=""
+  printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$quest" "$C_N" "$S_END"
+  UK_SPACE=1; UK_MOVE=ui_rows_move; ui_keyline || true; UK_MOVE=""; UK_SPACE=0
+  if [[ -z "$ANSWER" ]]; then
+    for ((i = 0; i < ${#lmark[@]}; i++)); do [[ "${lmark[$i]}" == x ]] && ANSWER+="${ANSWER:+ }$((i + 1))"; done
+  fi
+  _log ASK "[${CUR_STEP:-}] $title -> ${ANSWER:-nothing marked}"
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
+  ui_header; ui_region
+  return 0
+}
+ui_changes_browse() {
+  # --show-changes with the screen layout: the steps that have changes as a list. Up / Down choose a step, Enter
+  # shows its changes with their undo, u goes on to the undo of that step (asked change by change, as --undo),
+  # a shows the whole report, q leaves. 1 = nothing to show as a list (the caller prints the text).
+  [[ -s "$JOURNAL_FILE" ]] || return 1
+  journal_load_undone
+  local l seq t run step kind obj det na=0 nh=0 np=0 i how tt f a note="" mine=0
+  local -a E=(); mapfile -t E < <(journal_entries | sort -s -t'|' -k4,4V)
+  [[ ${#E[@]} -gt 0 ]] || return 1
+  declare -A BN=() BA=() BH=() BP=(); local -a BO=() lshow=() lmark=(); local lsel=0 ltop=0 lrow=7 lcap lstatus_fn=""
+  for l in "${E[@]}"; do
+    IFS='|' read -r seq t run step kind obj det <<< "$l"
+    [[ -n "${BN[$step]:-}" ]] || { BO+=("$step"); BN[$step]=0; BA[$step]=0; BH[$step]=0; BP[$step]=0; }
+    BN[$step]=$((BN[$step] + 1))
+    if [[ "$kind" == PRIMARY ]]; then BP[$step]=$((BP[$step] + 1)); np=$((np + 1))
+    elif [[ "$(undo_text "$kind" "$obj" "$det")" == auto:* ]]; then BA[$step]=$((BA[$step] + 1)); na=$((na + 1))
+    else BH[$step]=$((BH[$step] + 1)); nh=$((nh + 1)); fi
+  done
+  for step in "${BO[@]}"; do
+    how=""
+    [[ ${BA[$step]} -gt 0 ]] && how+="${BA[$step]} auto, "
+    [[ ${BH[$step]} -gt 0 ]] && how+="${BH[$step]} by hand, "
+    [[ ${BP[$step]} -gt 0 ]] && how+="${BP[$step]} on the primary, "
+    tt=$(step_title_of "$step"); [[ ${#tt} -gt 44 ]] && tt="${tt:0:43}$S_WAIT"
+    lshow+=("$(printf '%-6s %-44s %7s  %s' "$step" "$tt" "${BN[$step]}" "${how%, }")"); lmark+=("")
+  done
+  lcap=$((UI_ROWS - 10)); [[ $lcap -lt 3 ]] && lcap=3
+  ui_keys_on
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
+  while true; do
+    ui_keys_on
+    printf '\e[r\e[H\e[2J %sChanges made by this script%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s 2>/dev/null)" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
+    printf '   On this server  %s   (%s undone by --undo, %s by hand)\n' "$((na + nh))" "$na" "$nh"
+    printf '   On the primary  %s   (commands you ran there; undo them there, by hand)\n' "$np"
+    printf '\n   %s   %-6s %-44s %7s  %s%s\n' "$C_D" "Step" "" "changes" "undo" "$C_N"
+    ui_rows_draw
+    if [[ -n "$note" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${note:0:$((UI_COLS - 8))}" "$C_N"; note=""
+    else t="$(ui_arrows): a step   Enter: its changes   u: undo it   a: all changes   q: leave"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"; fi
+    printf '\e[%d;1H\e[2K    %s%s Step (Enter: the marked one)%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$C_N" "$S_END"
+    UK_MOVE=ui_rows_move; ui_keyline || { ANSWER=q; }; UK_MOVE=""
+    a=${ANSWER//[[:space:]]/}; a=${a,,}
+    case "$a" in
+      q|b) break ;;
+      a|"") step=${BO[$lsel]}; [[ "$a" == a ]] && step=""
+            f=$(mktemp) || continue
+            CLEANUP_FILES+=("$f")
+            show_changes_cli "$step" > "$f"
+            ui_page "$f" "$([[ -n "$step" ]] && printf 'Changes of step %s  %s' "$step" "$(step_title_of "$step")" || printf 'All changes')" "" 0 12
+            rm -f -- "$f" ;;
+      u)    step=${BO[$lsel]}
+            if [[ $((BA[$step] + BH[$step])) -eq 0 ]]; then note="Step $step has only commands you ran on the primary: undo them there, by hand."; continue; fi
+            # the undo is the run of --undo for this step: its own lock, log and questions (each change is asked)
+            [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
+            tty_restore
+            exec "$SELF" --undo "$step" ;;
+      *)    for ((i = 0; i < ${#BO[@]}; i++)); do [[ "${BO[$i]}" == "$a" ]] && { lsel=$i; a=""; break; }; done
+            if [[ -z "$a" ]]; then [[ $lsel -lt $ltop ]] && ltop=$lsel; [[ $lsel -ge $((ltop + lcap)) ]] && ltop=$((lsel - lcap + 1))
+            else note="No change of step $a is recorded. Choose a step of the list, or a, u, q."; fi ;;
+    esac
+  done
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
+  tty_restore
   return 0
 }
 ui_pick_draw() {
@@ -3520,7 +3752,9 @@ ui_pick() {
     printf '\e[r\e[H\e[2J %s%s%s\n %s%s%s\n' "$C_W" "$title" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
     prow=4; [[ -n "$note" ]] && { printf '   %s%s%s\n' "$C_D" "${note:0:$((UI_COLS - 5))}" "$C_N"; prow=5; }
     ui_pick_draw
-    printf '\e[%d;1H\e[2K    %s%s: choose, Enter takes it     or type the value and press Enter     Esc: no change%s\n' $((UI_ROWS - 1)) "$C_D" "$(ui_arrows)" "$C_N"
+    # (never longer than the row: a wrapped line would move the page)
+    o="$(ui_arrows): choose, Enter takes it     or type the value     Esc: no change"
+    printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${o:0:$((UI_COLS - 6))}" "$C_N"
     printf '\e[%d;1H\e[2K    %s%s %s [%s]%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$title" "${cur:-automatic}" "$C_N" "$S_END"
     PICK_ESC=0; UK_MOVE=ui_pick_esc_or_move; ui_keyline || { UK_MOVE=""; ANSWER=$cur; break; }; UK_MOVE=""
     if [[ $PICK_ESC -eq 1 && -z "$ANSWER" ]]; then ANSWER=$cur; break; fi
@@ -8157,9 +8391,10 @@ d_2_13() {
     if [[ $have -gt 0 ]]; then say "+$dg needs at least $(human_mb "$min"). Its disks have $(human_mb "$have"). Empty disks:"
     else say "+$dg needs at least $(human_mb "$min"). Empty disks:"; fi
     def=""
+    # (with the screen layout the list is on the page of the question: ui_check)
     for i in "${!disks[@]}"; do
-      if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")   (chosen)"
-      else say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")"; [[ -z "$def" ]] && def=$((i + 1)); fi
+      if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then [[ $UI -eq 1 ]] || say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")   (chosen)"
+      else [[ $UI -eq 1 ]] || say "  $((i + 1))) ${disks[$i]%% *}  $(human_mb "${disks[$i]##* }")"; [[ -z "$def" ]] && def=$((i + 1)); fi
     done
     [[ -n "$def" ]] || { bad "Not enough empty disks for +$dg. Nothing was erased."; return 1; }
     local left=0
@@ -8174,19 +8409,30 @@ d_2_13() {
     [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
     while true; do
       if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
+      elif [[ $UI -eq 1 ]]; then
+        # a page: the empty disks as a list to mark (Space), with the size marked against the size needed
+        local -a drows=(); local dmodel
+        for i in "${!disks[@]}"; do
+          dmodel=$(lsblk -dn -o MODEL "${disks[$i]%% *}" 2>/dev/null | sed 's/  */ /g; s/^ //; s/ $//')
+          if [[ "$used" == *" ${disks[$i]%% *} "* ]]; then drows+=("-|${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "chosen for another disk group")")
+          else drows+=(" |${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "$dmodel")"); fi
+        done
+        ui_check "Empty disks for +$dg" "Only empty disks are listed. Nothing is erased on this page." \
+          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${drows[@]}"
+        [[ -n "$ANSWER" ]] || { CHECK_NOTE="Mark at least one disk (Space), or type q to stop."; continue; }
       else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""
       local -a picks=(); read -ra picks <<< "$ANSWER"
       for n in "${picks[@]}"; do
-        if ! [[ "$n" =~ ^[0-9]{1,3}$ ]] || (( 10#$n < 1 || 10#$n > ${#disks[@]} )); then pick="bad"; say "Not a disk number: $n"; break; fi
+        if ! [[ "$n" =~ ^[0-9]{1,3}$ ]] || (( 10#$n < 1 || 10#$n > ${#disks[@]} )); then pick="bad"; say "Not a disk number: $n"; CHECK_NOTE="Not a disk number: $n"; break; fi
         n=$((10#$n))
         [[ "$nums" == *" $n "* ]] && continue
-        [[ "$used" == *" ${disks[$((n - 1))]%% *} "* ]] && { pick="bad"; say "${disks[$((n - 1))]%% *} is already chosen"; break; }
+        [[ "$used" == *" ${disks[$((n - 1))]%% *} "* ]] && { pick="bad"; say "${disks[$((n - 1))]%% *} is already chosen"; CHECK_NOTE="${disks[$((n - 1))]%% *} is already chosen for another disk group"; break; }
         nums+="$n "; total=$((total + ${disks[$((n - 1))]##* }))
       done
       [[ "$pick" == "bad" || "$nums" == " " ]] && continue
-      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB, but +$dg needs $need_more MB more. Choose more or bigger disks."; continue; fi
+      if [[ $total -lt $need_more ]]; then bad "These disks have $total MB, but +$dg needs $need_more MB more. Choose more or bigger disks."; CHECK_NOTE="These disks have $(human_mb "$total"), but +$dg needs $(human_mb "$need_more"). Mark more or bigger disks."; continue; fi
       break
     done
     for n in $nums; do
@@ -18952,7 +19198,7 @@ menu_records() {
   case "$ANSWER" in
     q) menu_quit ;;
     s) print_progress_board ;;
-    c) if [[ -s "$JOURNAL_FILE" ]]; then show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
+    c) if [[ -s "$JOURNAL_FILE" ]]; then { ui_wanted && ui_changes_browse; } || show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
     u) while true; do
          ask "Step to undo, for example 2.9 (Enter = back)"
          st=${ANSWER//[[:space:]]/}
@@ -18975,35 +19221,40 @@ menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
 start_menu() {
   # shown when the script is run without options: one grouped menu. Next to each item, in grey, the switch that does
   # the same from the command line (for scripts and cron). Every item reaches the same code as its switch.
-  local c st mn def=1
+  local c st mn def=1 mback=0
   # Ctrl+C here only leaves the menu: nothing has started, the record of the last run stays as it is
   trap 'printf "\n"; menu_quit' INT
   while true; do
     load_progress
     # a finished standby: the daily check is the usual choice (Enter), a full setup is a check of every step again
     mn=$(menu_next); def=1; [[ "$mn" == "all done" ]] && def=9
-    printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
-    printf '\n  %sSetup%s\n' "$C_B" "$C_N"
-    if [[ $def -eq 9 ]]; then menu_line 1 "Full setup again (all done; checks every step)" "(no option)"
-    else menu_line 1 "Full setup ($mn)" "(no option)"; fi
-    menu_line 2 "Check only, change nothing" "--check"
-    menu_line 3 "OS preparation only (phase 2)" "--only os"
-    menu_line 4 "Grid Infrastructure and ASM only" "--only grid"
-    menu_line 5 "Database software only" "--only db"
-    menu_line 6 "Primary changes for the DBA (phase 4)" "--only primary"
-    menu_line 7 "Choose steps" "--only 2.1-2.4"
-    menu_line 8 "Start from a step" "--from 7.2"
-    printf '\n  %sAfter setup%s\n' "$C_B" "$C_N"
-    menu_line 9 "Health check" "--only 10   (cron: --health)"
-    menu_line 10 "Roll forward the standby from the primary" "--roll-forward"
-    printf '\n  %sInformation%s\n' "$C_B" "$C_N"
-    menu_line 11 "Status of every step" "--status"
-    menu_line 12 "Changes made, and undo" "--show-changes, --undo N.M"
-    menu_line 13 "The manual way of a step" "--help-step N.M"
-    menu_line 14 "Settings" "--settings"
-    printf '\n   q) Quit\n\n'
+    # the lines of the menu: "H|heading" or "number|text|the switch that does the same"
+    local -a mi=("H|Setup")
+    if [[ $def -eq 9 ]]; then mi+=("1|Full setup again (all done; checks every step)|(no option)")
+    else mi+=("1|Full setup ($mn)|(no option)"); fi
+    mi+=("2|Check only, change nothing|--check" "3|OS preparation only (phase 2)|--only os"
+         "4|Grid Infrastructure and ASM only|--only grid" "5|Database software only|--only db"
+         "6|Primary changes for the DBA (phase 4)|--only primary" "7|Choose steps|--only 2.1-2.4"
+         "8|Start from a step|--from 7.2"
+         "H|After setup" "9|Health check|--only 10   (cron: --health)" "10|Roll forward the standby from the primary|--roll-forward"
+         "H|Information" "11|Status of every step|--status" "12|Changes made, and undo|--show-changes, --undo N.M"
+         "13|The manual way of a step|--help-step N.M" "14|Settings|--settings")
     CUR_STEP=""
-    ask "Choice [$def]"
+    if ui_wanted; then
+      # a page: the arrow keys and Enter, or the number typed. What an item printed (status, changes, help) stays
+      # on the screen until Enter, then the page comes back.
+      if [[ $mback -eq 1 ]]; then mback=0; ask "Enter: back to the menu"; fi
+      ui_menu_ask "$def" "${mi[@]}"
+    else
+      printf '\n  %sWhat do you want to do?%s\n' "$C_W" "$C_N"
+      local e
+      for e in "${mi[@]}"; do
+        if [[ "$e" == "H|"* ]]; then printf '\n  %s%s%s\n' "$C_B" "${e#H|}" "$C_N"
+        else c=${e%%|*}; e=${e#*|}; menu_line "$c" "${e%%|*}" "${e#*|}"; fi
+      done
+      printf '\n   q) Quit\n\n'
+      ask "Choice [$def]"
+    fi
     c=${ANSWER//[[:space:]]/}; c=${c,,}; [[ -z "$c" ]] && c=$def
     case "$c" in
       1) break ;;
@@ -19039,19 +19290,19 @@ start_menu() {
          break ;;
       9) parse_only 10; break ;;
       10) ROLL_FORWARD=1; parse_only 10; break ;;
-      11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100 ;;
-      12) menu_records ;;
+      11) print_progress_board; printf '\n  %sEvery step%s\n' "$C_B" "$C_N"; ui_list_text 100; mback=1 ;;
+      12) menu_records; mback=1 ;;
       13) while true; do
             ask "Which step, for example 9.2 (Enter = back)"
             st=${ANSWER//[[:space:]]/}
             [[ -z "$st" || "${st,,}" == b ]] && continue 2
             [[ "${st,,}" == q ]] && menu_quit
-            { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; break; }
+            { valid_step "$st" || [[ "$st" == all || "$st" == health ]]; } && { help_cli "$st" || true; mback=1; break; }
             say "There is no step $st. To list the steps:  $SELF --help-step all"
           done ;;
       14) REVIEW_SETTINGS=1; ONLY_PHASE=1; break ;;
       q) menu_quit ;;
-      *) say "Please type a number from 1 to 14, or q." ;;
+      *) MENU_NOTE="Please type a number from 1 to 14, or q."; ui_wanted || say "$MENU_NOTE" ;;
     esac
   done
   _log INFO "menu choice $c${ONLY_TEXT:+ ($ONLY_TEXT)}${FROM_STEP:+ (from $FROM_STEP)}"
@@ -19140,7 +19391,12 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
       status_runs_block
       [[ -s "$JOURNAL_FILE" ]] && printf '\n  Changes made on this server: %s --show-changes\n' "$SELF"
     fi
-    [[ -n "$SHOW_CHANGES" ]] && show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"
+    if [[ -n "$SHOW_CHANGES" ]]; then
+      # with the screen layout and no step named: a list of the steps to look through (and to undo from);
+      # --plain, a pipe or a file get the report as text, as before
+      if [[ "$SHOW_CHANGES" == all ]] && ui_wanted && ui_changes_browse; then :
+      else show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"; fi
+    fi
     exit 0
   fi
   # every run asks questions: without a terminal (nohup, cron, ssh without -t) it would fail later at a confusing point
