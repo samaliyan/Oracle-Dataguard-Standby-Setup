@@ -116,9 +116,30 @@ def main():
     menu_answers = E("DG_TEST_MENU", "").split(",") if E("DG_TEST_MENU") else []
     summary_answers = E("DG_TEST_SUMMARY", "").split(",") if E("DG_TEST_SUMMARY") else []
     menu_steps = lst("DG_TEST_MENU_STEPS")
+    KEYS = {"<UP>": "\x1b[A", "<DOWN>": "\x1b[B", "<ESC>": "\x1b", "<ENTER>": "\n"}
+    def pump(t):
+        # read what arrives within t seconds (for the screen picture); not a prompt to answer
+        nonlocal full
+        end = time.time() + t
+        while time.time() < end:
+            rr, _, _ = select.select([fd], [], [], 0.1)
+            if fd in rr:
+                try: d = os.read(fd, 65536).decode(errors="replace")
+                except OSError: return
+                if not d: return
+                if vt: vt.feed(d)
+                full += ANSI.sub("", ANSI_ALL.sub("", d))
     def send(s):
         nonlocal answered, buf, ctx
         if s == "<CTRL-C>": os.write(fd, b"\x03")
+        elif re.search(r"<(UP|DOWN|ESC|ENTER|SNAP:[a-z0-9_]+)>", s):
+            # keys of the arrow pages: "<DOWN><DOWN><SNAP:name><ENTER>" (typed text between them is sent as it is)
+            for tok in re.findall(r"<[A-Z]+(?::[a-z0-9_]+)?>|[^<>]+", s):
+                if tok.startswith("<SNAP:"):
+                    pump(0.6)
+                    if vt: snap(tok[6:-1])
+                elif tok in KEYS: os.write(fd, KEYS[tok].encode()); pump(0.25)
+                else: os.write(fd, tok.encode())
         else: os.write(fd, (s + "\n").encode())
         answered += 1; buf = ""; ctx = ""
     hup_sent = False

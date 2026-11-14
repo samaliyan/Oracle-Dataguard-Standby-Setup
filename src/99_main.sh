@@ -59,7 +59,8 @@ Information
 
 How it works
   After phase 1 a summary screen shows what was found, where the standby goes, the plan, the
-  problems found now and the values of this run (a number changes one; Enter starts).
+  problems found now and the values of this run (the arrow keys and Enter, or a number, change one;
+  with no value marked, Enter starts).
   Each step shows what it found and the exact commands it will run ("Will run"), then asks:
     [y] Yes, do it   [a] Yes to all   [s] Skip   [h] Help   [q] Quit
   Commands for the primary are only shown. You run them there, answer r,
