@@ -355,12 +355,26 @@ sv_change() {
            elif names_on_demand "$v"; then sum_note "Step 10.7 runs only with --roll-forward. All steps are kept."
            elif ! parse_only "$v"; then sum_note "Not a step, range or part: $v. All steps are kept."; fi ;;
     data)  local dgl=""; use_grid && dgl=$(asm_dgs | sed 's/^/+/' | paste -sd' ' -)
+           if [[ $UI -eq 1 ]]; then
+             local -a po=("|the data disk group when this server has ASM, else the paths of the primary")
+             for a in $dgl; do po+=("$a|disk group (Oracle-managed file names)"); done
+             po+=("same|the same paths as on the primary" "*|a folder: type its full path")
+             ui_pick "Database files go to" "${DATA_DEST:-}" "Where the files of the standby database are put on this server." "${po[@]}"
+           else
            ask_default "Database files go to: a disk group (${dgl:-none here}), same (the paths of the primary), a folder, or Enter for automatic" "${DATA_DEST:-}"
+           fi
            v=${ANSWER//[[:space:]]/}
            valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 1; }
            [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 1; }
            DATA_DEST=$v ;;
-    fra)   ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
+    fra)   if [[ $UI -eq 1 ]]; then
+             local -a po=("|as the database files (with ASM: the recovery area disk group of the primary)")
+             use_grid && for a in $(asm_dgs | sed 's/^/+/'); do po+=("$a|disk group"); done
+             po+=("same|the same place as on the primary" "*|a folder: type its full path")
+             ui_pick "Recovery area" "${FRA_DEST:-}" "Where archived logs and the second log members go. Its size is asked next." "${po[@]}"
+           else
+           ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 1; }
            ask_default "Its size, for example 60G (Enter = $( num "${FRA_MB:-}" && [[ ${FRA_MB:-0} -gt 0 ]] && printf 'as on the primary: %s' "$(human_mb "$FRA_MB")" || printf 'estimate: %s' "$(human_mb "$(fra_estimate_mb)")"))" "${FRA_SIZE:-}"
            a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 1; }
@@ -386,9 +400,21 @@ sv_change() {
            ask_default "Database installer zip(s), comma separated (Enter = keep)" "$DB_MEDIA"; b=${ANSWER//[[:space:]]/}
            valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 1; }
            GRID_MEDIA=$a; DB_MEDIA=$b ;;
-    asm)   ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
+    asm)   if [[ $UI -eq 1 ]]; then
+             ui_pick "ASM disk method" "${ASM_METHOD:-}" "How the ASM disks get their names and their owner on this server." \
+               "|ASMLib if it works on this kernel, else udev" "asmlib|Oracle ASMLib (oracleasm)" "udev|udev rules"
+           else
+           ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 1; }; ASM_METHOD=$v ;;
-    arch)  ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
+    arch)  if [[ $UI -eq 1 ]]; then
+             local -a po=("timer|a systemd timer every night (it also runs after a missed time)" "crontab|a line in the crontab of $ORACLE_USER")
+             arch_in_fra && po+=("oracle|only the recovery area itself deletes them, when it needs space")
+             po+=("none|nothing: the disk fills up unless you delete them yourself")
+             ui_pick "Archived-log clean-up" "${ARCH_CLEANUP:-timer}" "How applied archived logs are deleted on the standby. Time and days are asked next." "${po[@]}"
+           else
+           ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 1; }
            [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 1; }
            if [[ "$v" == timer || "$v" == crontab ]]; then

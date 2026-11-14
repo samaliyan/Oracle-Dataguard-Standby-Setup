@@ -33,7 +33,7 @@ umask 022
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.31"
+readonly SCRIPT_VERSION="5.32"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -3353,8 +3353,87 @@ ui_job_done() {
 }
 
 # ---- the summary screen of step 1.4: on its own page, the question at its bottom ----
+# ---- answers typed or chosen with the arrow keys (the summary page and the choice pages) ----
+UK_DONE=0           # set to 1 by that function: the question ends at once, with ANSWER as it is
+UK_MOVE=""          # the function ui_keyline calls for an arrow key or Esc:  "$UK_MOVE" up|down|esc
+UIS_LAST=0          # the value the mark of the summary page was on last
+ui_keys_on() {
+  # no echo and no line mode while the keys of a page are read (a key typed between two reads, or before the
+  # page is drawn, would be shown by the terminal itself); cleanup() puts the terminal back on any exit
+  if [[ -z "$TTY_RESTORE" ]]; then
+    TTY_RESTORE=$(stty -g < "$PROMPT_IN" 2>/dev/null) && stty -echo -icanon min 1 time 0 < "$PROMPT_IN" 2>/dev/null
+  fi
+  return 0
+}
+ui_keyline() {
+  # One answer from the keyboard, read key by key. Typed text ends with Enter and is the answer (ANSWER), as with
+  # a plain read: an answer typed ahead or sent by a program works as before. While nothing is typed, the arrow
+  # keys and Esc call $UK_MOVE (the page moves its mark), and Enter returns ANSWER="". 1 = the input ended.
+  local c rest more
+  ANSWER=""; UK_DONE=0
+  ui_keys_on
+  while true; do
+    IFS= read -rsn1 c < "$PROMPT_IN" || { tty_restore; ANSWER=q; return 1; }
+    case "$c" in
+      "") break ;;
+      $'\e') rest=""; IFS= read -rsn2 -t 0.1 rest < "$PROMPT_IN" || true
+             if [[ "$rest" == "["[0-9]* ]]; then
+               # a longer sequence (Page Up, an arrow with Ctrl): read to its end and ignored
+               while IFS= read -rsn1 -t 0.1 more < "$PROMPT_IN"; do [[ "$more" == [A-Za-z~] ]] && break; done
+             elif [[ -z "$ANSWER" && -n "$UK_MOVE" ]]; then
+               case "$rest" in "[A"|"OA") "$UK_MOVE" up ;; "[B"|"OB") "$UK_MOVE" down ;; "") "$UK_MOVE" esc ;; esac
+               [[ $UK_DONE -eq 1 ]] && break          # the page ends the question itself (Esc on a choice page)
+             fi ;;
+      $'\177'|$'\b') [[ -n "$ANSWER" ]] && { ANSWER=${ANSWER%?}; printf '\b \b'; } ;;
+      *) [[ "$c" == [[:print:]] ]] && { ANSWER+=$c; printf '%s' "$c"; } ;;
+    esac
+  done
+  tty_restore
+  return 0
+}
+ui_arrows() { if [[ "$S_END" == '>' ]]; then printf 'Up / Down'; else printf '↑ ↓'; fi; }
+ui_sum_mark() {
+  # (called inside ui_summary_ask) the lines of value $1 drawn marked ($2 = 1) or as they were (0)
+  local k=$1 i row=${vrow[$1]:-} t
+  [[ -n "$row" ]] || return 0
+  printf '\e7'
+  for ((i = va[k]; i <= vb[k]; i++)); do
+    printf '\e[%d;1H\e[2K' "$row"
+    if [[ $2 -eq 1 ]]; then
+      ui_strip "${L[$i]}"; t=$UI_S; [[ $i -eq ${va[$k]} ]] && t="$S_END${t:1}"
+      printf '%s\e[7m%s%s' "$C_W" "$t" "$C_N"
+    else printf '%s' "${L[$i]}"; fi
+    ui_nrows "${L[$i]}"; row=$((row + UI_N))
+  done
+  printf '\e8'
+}
+ui_sum_hint() {
+  # (called inside ui_summary_ask) the line above the question: what the keys do now
+  local t
+  if [[ $sel -gt 0 ]]; then t="Enter changes: ${SV_LABEL[$((sel - 1))]}     Esc: no value chosen (Enter then starts)"
+  elif [[ $vn -gt 0 ]]; then t="$(ui_arrows): choose a value, Enter changes it     or type its number"
+  else t=""; fi
+  printf '\e7\e[%d;1H\e[2K    %s%s%s\e8' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"
+}
+ui_sum_move() {
+  # (called by ui_keyline inside ui_summary_ask) the mark goes up or down, around the ends; Esc takes it away
+  local new=$sel
+  [[ $vn -gt 0 ]] || return 0
+  case "$1" in
+    up)   if [[ $sel -eq 0 ]]; then new=$UIS_LAST; [[ $new -ge 1 && $new -le $vn ]] || new=$vn
+          else new=$((sel - 1)); [[ $new -lt 1 ]] && new=$vn; fi ;;
+    down) if [[ $sel -eq 0 ]]; then new=$UIS_LAST; [[ $new -ge 1 && $new -le $vn ]] || new=1
+          else new=$((sel + 1)); [[ $new -gt $vn ]] && new=1; fi ;;
+    esc)  new=0 ;;
+  esac
+  [[ $new -eq $sel ]] && return 0
+  [[ $sel -gt 0 ]] && ui_sum_mark "$sel" 0
+  [[ $new -gt 0 ]] && ui_sum_mark "$new" 1
+  sel=$new; [[ $sel -gt 0 ]] && UIS_LAST=$sel
+  ui_sum_hint
+}
 ui_summary_ask() {
-  local -a L=(); local n h i f mine=0 used=0 q qi="    "
+  local -a L=() vrow=() va=() vb=(); local n h i f mine=0 used=0 q qi="    " vn=0 sel=0
   # the question in one line: below 100 columns with shorter labels (it starts the same way)
   q="[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"
   [[ $UI_COLS -lt 100 ]] && { q="[Enter] Start   [number] Change  [d] Details  [e] Edit  [h] Help  [q] Quit"; qi=""; }
@@ -3367,24 +3446,98 @@ ui_summary_ask() {
   rm -f -- "$f"
   n=${#L[@]}
   ui_live_clear
+  ui_keys_on
   # UI_ALT=1: an interrupt (Ctrl-C) at this question then also leaves the separate screen
   if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
   printf '\e[r\e[H\e[2J %sSummary of this run%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s) -> standby of $PRIMARY_UNIQUE on ${PRIMARY_HOST:-$PRIMARY_IP}" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
   # (a line longer than the width takes more rows: the terminal wraps it)
+  # The lines of the values ("   3  Label   value", and what continues them) are remembered with their screen
+  # row: the arrow keys move a mark over them.
+  local in_v=0
   for ((i = 0; i < n; i++)); do
     ui_nrows "${L[$i]}"; [[ $((used + UI_N)) -gt $((h - 1)) ]] && break
+    ui_strip "${L[$i]}"
+    if [[ $vn -lt ${#SV_ID[@]} && "$UI_S" =~ ^\ \ (\ [1-9]|[1-9][0-9])\ \ [^\ ] && $((10#${BASH_REMATCH[1]// /})) -eq $((vn + 1)) ]]; then
+      vn=$((vn + 1)); vrow[$vn]=$((3 + used)); va[$vn]=$i; vb[$vn]=$i; in_v=1
+    elif [[ $in_v -eq 1 && "$UI_S" == "      "* ]]; then vb[$vn]=$i
+    else in_v=0; fi
     printf '%s\n' "${L[$i]}"; used=$((used + UI_N))
   done
   [[ $i -lt $n ]] && printf ' %s%s %d more lines: d shows all%s\n' "$C_D" "$S_WAIT" $((n - i)) "$C_N"
-  [[ -n "${SUM_NOTE:-}" ]] && printf '\e[%d;1H\e[2K    %s%s %s%s' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${SUM_NOTE:0:$((UI_COLS - 8))}" "$C_N"
+  # (a line feed after it: the question below is a line of its own in a copy of the output)
+  if [[ -n "${SUM_NOTE:-}" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${SUM_NOTE:0:$((UI_COLS - 8))}" "$C_N"
+  else ui_sum_hint; printf '\e[%d;1H\n' $((UI_ROWS - 1)); fi
   SUM_NOTE=""
   printf '\e[%d;1H\e[2K%s%s%s %s%s %s ' "$UI_ROWS" "$qi" "$C_C" "$S_ASK" "$q" "$C_N" "$S_END"
-  ANSWER=""; IFS= read -r ANSWER < "$PROMPT_IN" || ANSWER=q
+  UK_MOVE=ui_sum_move; ui_keyline || true; UK_MOVE=""
+  # Enter with a value marked: that value is changed (as if its number was typed)
+  [[ -z "$ANSWER" && $sel -gt 0 ]] && ANSWER=$sel
+  # (a typed number counts as the value marked last: the arrow keys go on from there)
+  [[ "$ANSWER" =~ ^[0-9]{1,2}$ ]] && (( 10#$ANSWER >= 1 && 10#$ANSWER <= vn )) && UIS_LAST=$((10#$ANSWER))
   _log ASK "[1.4] summary -> ${ANSWER:-Enter}"
   [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
   ui_header; ui_region
   return 0
 }
+ui_pick_draw() {
+  # (called inside ui_pick) the list of choices, the marked one shown as such
+  local i t
+  printf '\e7'
+  for ((i = 0; i < ${#pv[@]}; i++)); do
+    t=$(printf '   %-12s %s' "${pshow[$i]}" "${pt[$i]}"); t=${t:0:$((UI_COLS - 2))}
+    printf '\e[%d;1H\e[2K' $((prow + i))
+    if [[ $i -eq $psel ]]; then printf '%s\e[7m %s%s%s' "$C_W" "$S_END" "${t:2}" "$C_N"; else printf '%s' "$t"; fi
+  done
+  printf '\e8'
+}
+ui_pick_move() {
+  # (called by ui_keyline inside ui_pick)
+  case "$1" in
+    up)   psel=$((psel - 1)); [[ $psel -lt 0 ]] && psel=$((${#pv[@]} - 1)) ;;
+    down) psel=$((psel + 1)); [[ $psel -ge ${#pv[@]} ]] && psel=0 ;;
+    *)    return 0 ;;
+  esac
+  ui_pick_draw
+}
+ui_pick() {
+  # A page with a short list to choose from. $1 title, $2 the value now, $3 a line of explanation (may be empty),
+  # then the choices as "value|text": an empty value is "automatic", the value "*" stands for a value to type
+  # (a folder). The arrow keys move the mark and Enter takes it; a typed value and Enter works as well.
+  # Result in ANSWER (the value; "*" is never returned). Only with the screen layout.
+  local title=$1 cur=$2 note=$3; shift 3
+  local -a pv=() pt=() pshow=(); local o psel=0 prow=4 mine=0 i star=-1
+  for o in "$@"; do
+    pv+=("${o%%|*}"); pt+=("${o#*|}")
+    case "${o%%|*}" in "") pshow+=("automatic") ;; "*") pshow+=("(type it)"); star=$((${#pv[@]} - 1)) ;; *) pshow+=("${o%%|*}") ;; esac
+  done
+  # the mark starts on the value of now (a value that is not in the list: on "type it")
+  for ((i = 0; i < ${#pv[@]}; i++)); do [[ "${pv[$i]}" == "$cur" ]] && psel=$i; done
+  [[ "${pv[$psel]}" != "$cur" && $star -ge 0 ]] && psel=$star
+  ui_live_clear
+  ui_keys_on
+  if [[ $UI_ALT -eq 0 ]]; then printf '\e[?1049h'; UI_ALT=1; mine=1; fi
+  while true; do
+    printf '\e[r\e[H\e[2J %s%s%s\n %s%s%s\n' "$C_W" "$title" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
+    prow=4; [[ -n "$note" ]] && { printf '   %s%s%s\n' "$C_D" "${note:0:$((UI_COLS - 5))}" "$C_N"; prow=5; }
+    ui_pick_draw
+    printf '\e[%d;1H\e[2K    %s%s: choose, Enter takes it     or type the value and press Enter     Esc: no change%s\n' $((UI_ROWS - 1)) "$C_D" "$(ui_arrows)" "$C_N"
+    printf '\e[%d;1H\e[2K    %s%s %s [%s]%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$title" "${cur:-automatic}" "$C_N" "$S_END"
+    PICK_ESC=0; UK_MOVE=ui_pick_esc_or_move; ui_keyline || { UK_MOVE=""; ANSWER=$cur; break; }; UK_MOVE=""
+    if [[ $PICK_ESC -eq 1 && -z "$ANSWER" ]]; then ANSWER=$cur; break; fi
+    if [[ -z "$ANSWER" ]]; then
+      # the mark on "type it" with nothing typed: there is nothing to take yet
+      [[ "${pv[$psel]}" == "*" ]] && continue
+      ANSWER=${pv[$psel]}
+    fi
+    break
+  done
+  _log ASK "[${CUR_STEP:-}] $title -> ${ANSWER:-automatic}"
+  [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
+  ui_header; ui_region
+  return 0
+}
+PICK_ESC=0
+ui_pick_esc_or_move() { if [[ "$1" == esc ]]; then PICK_ESC=1; UK_DONE=1; else PICK_ESC=0; ui_pick_move "$1"; fi; }
 
 #------------------------------------------------------------------------------
 # Change journal and undo
@@ -6458,12 +6611,26 @@ sv_change() {
            elif names_on_demand "$v"; then sum_note "Step 10.7 runs only with --roll-forward. All steps are kept."
            elif ! parse_only "$v"; then sum_note "Not a step, range or part: $v. All steps are kept."; fi ;;
     data)  local dgl=""; use_grid && dgl=$(asm_dgs | sed 's/^/+/' | paste -sd' ' -)
+           if [[ $UI -eq 1 ]]; then
+             local -a po=("|the data disk group when this server has ASM, else the paths of the primary")
+             for a in $dgl; do po+=("$a|disk group (Oracle-managed file names)"); done
+             po+=("same|the same paths as on the primary" "*|a folder: type its full path")
+             ui_pick "Database files go to" "${DATA_DEST:-}" "Where the files of the standby database are put on this server." "${po[@]}"
+           else
            ask_default "Database files go to: a disk group (${dgl:-none here}), same (the paths of the primary), a folder, or Enter for automatic" "${DATA_DEST:-}"
+           fi
            v=${ANSWER//[[:space:]]/}
            valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder (/path): $v"; return 1; }
            [[ "$v" == +* ]] && ! use_grid && { sum_note "This standby has no ASM."; return 1; }
            DATA_DEST=$v ;;
-    fra)   ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
+    fra)   if [[ $UI -eq 1 ]]; then
+             local -a po=("|as the database files (with ASM: the recovery area disk group of the primary)")
+             use_grid && for a in $(asm_dgs | sed 's/^/+/'); do po+=("$a|disk group"); done
+             po+=("same|the same place as on the primary" "*|a folder: type its full path")
+             ui_pick "Recovery area" "${FRA_DEST:-}" "Where archived logs and the second log members go. Its size is asked next." "${po[@]}"
+           else
+           ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value dest "$v" || { sum_note "Not a disk group (+NAME), same, or a folder: $v"; return 1; }
            ask_default "Its size, for example 60G (Enter = $( num "${FRA_MB:-}" && [[ ${FRA_MB:-0} -gt 0 ]] && printf 'as on the primary: %s' "$(human_mb "$FRA_MB")" || printf 'estimate: %s' "$(human_mb "$(fra_estimate_mb)")"))" "${FRA_SIZE:-}"
            a=${ANSWER//[[:space:]]/}; [[ "$a" =~ ^[0-9]+$ ]] && a="${a}G"; valid_value gsize "${a^^}" || { sum_note "Use a size in GB, for example 60G."; return 1; }
@@ -6489,9 +6656,21 @@ sv_change() {
            ask_default "Database installer zip(s), comma separated (Enter = keep)" "$DB_MEDIA"; b=${ANSWER//[[:space:]]/}
            valid_value opt_paths "$a" && valid_value opt_paths "$b" || { sum_note "Use full paths of zip files."; return 1; }
            GRID_MEDIA=$a; DB_MEDIA=$b ;;
-    asm)   ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
+    asm)   if [[ $UI -eq 1 ]]; then
+             ui_pick "ASM disk method" "${ASM_METHOD:-}" "How the ASM disks get their names and their owner on this server." \
+               "|ASMLib if it works on this kernel, else udev" "asmlib|Oracle ASMLib (oracleasm)" "udev|udev rules"
+           else
+           ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value asmmethod "$v" || { sum_note "Use asmlib, udev or nothing."; return 1; }; ASM_METHOD=$v ;;
-    arch)  ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
+    arch)  if [[ $UI -eq 1 ]]; then
+             local -a po=("timer|a systemd timer every night (it also runs after a missed time)" "crontab|a line in the crontab of $ORACLE_USER")
+             arch_in_fra && po+=("oracle|only the recovery area itself deletes them, when it needs space")
+             po+=("none|nothing: the disk fills up unless you delete them yourself")
+             ui_pick "Archived-log clean-up" "${ARCH_CLEANUP:-timer}" "How applied archived logs are deleted on the standby. Time and days are asked next." "${po[@]}"
+           else
+           ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
+           fi
            v=${ANSWER//[[:space:]]/}; valid_value archmode "$v" && [[ -n "$v" ]] || { sum_note "Use timer, crontab, oracle or none."; return 1; }
            [[ "$v" == oracle ]] && ! arch_in_fra && { sum_note "oracle works only when the archived logs go to the recovery area."; return 1; }
            if [[ "$v" == timer || "$v" == crontab ]]; then
@@ -18531,7 +18710,8 @@ Information
 
 How it works
   After phase 1 a summary screen shows what was found, where the standby goes, the plan, the
-  problems found now and the values of this run (a number changes one; Enter starts).
+  problems found now and the values of this run (the arrow keys and Enter, or a number, change one;
+  with no value marked, Enter starts).
   Each step shows what it found and the exact commands it will run ("Will run"), then asks:
     [y] Yes, do it   [a] Yes to all   [s] Skip   [h] Help   [q] Quit
   Commands for the primary are only shown. You run them there, answer r,

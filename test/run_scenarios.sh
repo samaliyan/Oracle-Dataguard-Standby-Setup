@@ -120,7 +120,7 @@ PARTS=(
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
-  [11]="5.23 5.30 5.31"
+  [11]="5.23 5.30 5.31 5.32"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -2528,6 +2528,25 @@ rc=$(DG_TEST_QUIT_AT=3.2 run $T/r31a.txt)
 gz=$(ls $T/stage/*grid*.zip 2>/dev/null | head -n 1)
 check "2.4: the limits of oracle are set or added by the script (no longer 'Not needed' without a look)" "! grep -q 'Not needed: the only Oracle owner is oracle' $T/r31a.txt && [[ \$(res 2.4 $T/r31a.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'oracle' $T/r31a.txt"
 check "3.1: the SHA-256 of every installer file is printed and is in the run log" "grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum \$gz | cut -d' ' -f1)  \$(basename \$gz)\" $T/r31a.txt && grep -q 'MEDIA' $T/log/run_*.log"
+fi
+if part 5.32; then
+CUR=5.32; echo "== 5.32  The summary page with the arrow keys, and the choice pages"
+fresh empty; SN=$T/snaps32; rm -rf $SN
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN DG_TEST_SUMMARY='<SNAP:plain><DOWN><DOWN><DOWN><DOWN><SNAP:marked><ENTER>,<DOWN><SNAP:pick><ENTER>,<SNAP:after>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32a.txt)
+check "summary page: nothing is marked at first, and the line above the question says what the arrow keys do" "! grep -q '^›' $SN/*_plain.txt && grep -q 'choose a value, Enter changes it     or type its number' $SN/*_plain.txt"
+check "summary page: four times Down marks value 4, and the line above the question names it" "grep -qE '^›  4  Database files go to' $SN/*_marked.txt && [[ \$(grep -c '^›' $SN/*_marked.txt) == 1 ]] && grep -q 'Enter changes: Database files go to' $SN/*_marked.txt"
+check "Enter on the marked value opens its choice page: the choices with their meaning, the mark moved to +DATA by Down" "grep -q '^ Database files go to' $SN/*_pick.txt && grep -qE '^   automatic +the data disk group' $SN/*_pick.txt && grep -qE '^ › \\+DATA +disk group' $SN/*_pick.txt && grep -q '(type it)' $SN/*_pick.txt && ! grep -q '\\[B' $SN/*_pick.txt"
+check "Enter takes the marked choice: saved in the settings and shown on the summary page (no mark left, Enter would start)" "grep -qx 'DATA_DEST=+DATA' $T/varlib/settings.conf && grep -qE '^   4  Database files go to +\\+DATA \\(ASM\\)\$' $SN/*_after.txt && ! grep -q '^›' $SN/*_after.txt"
+# typed answers work as before (a number on the summary page, a value on the choice page); Esc changes nothing
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN/b DG_TEST_SUMMARY='11,udev,11,<ESC>,<UP><SNAP:up>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32b.txt)
+check "a typed number and a typed value work as before; Esc on a choice page changes nothing" "grep -qx 'ASM_METHOD=udev' $T/varlib/settings.conf"
+check "Up with nothing marked goes to the value that was marked last (11)" "grep -qE '^› 11  ASM disk method +udev' $SN/b/*_up.txt"
+# a small screen: only the values that are on the page can be marked
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/c DG_TEST_SUMMARY='<UP><SNAP:small>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32c.txt)
+check "24 rows, 80 columns: Up from nothing marks the last value that is on the page, and the question stays on the last row" "[[ \$(grep -c '^›' $SN/c/*_small.txt) == 1 ]] && tail -n 1 $SN/c/*_small.txt | grep -q 'Enter\\] Start'"
+# without the screen layout nothing changed: the question and the typed answers
+rc=$(DG_TEST_SUMMARY='11,asmlib,q' run $T/r32d.txt)
+check "plain output: the summary and its questions are as before (typed number, typed value)" "grep -q 'ASM disk method: asmlib, udev, or Enter for automatic' $T/r32d.txt && grep -qx 'ASM_METHOD=asmlib' $T/varlib/settings.conf"
 fi
 parts_done
 echo

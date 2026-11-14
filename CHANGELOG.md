@@ -3,6 +3,20 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.32
+
+The summary screen (step 1.4, `--settings`) is used with the keyboard like a form.
+
+- `↑` `↓` move a mark over the values of the run; `Enter` changes the marked value; `Esc` takes the mark away
+  (with no value marked, `Enter` starts, as before). The line above the question says what the keys do now.
+  After a change the mark is gone, and the arrow keys go on from the value that was changed.
+- Values with a fixed set of answers open a choice page that lists the answers with their meaning: where the
+  database files go, the recovery area, the ASM disk method, the clean-up of archived logs. `↑` `↓` and
+  `Enter` take one, `Esc` changes nothing, and a typed value works too (a folder is typed).
+- Nothing else changed: a typed number and typed values work as before, also typed ahead; `--plain` and a
+  screen too small for the layout ask the same questions as before.
+- Tests: section 5.32 (the test driver sends arrow keys and takes pictures of the pages).
+
 ## 5.31
 
 The four small open points of the 5.30 review.

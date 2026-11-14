@@ -130,6 +130,12 @@ where each kind of file of the standby goes, the plan, the problems found now (e
 what you do), and the values of this run, numbered: `[Enter] Start  [number] Change  [d] Details
 [e] Edit the file  [h] Help  [q] Quit`. A number asks only that value and saves it as the new default.
 
+With the screen layout the values are also chosen with the keyboard: `↑` `↓` move a mark over them, `Enter`
+changes the marked one, `Esc` takes the mark away (`Enter` then starts). A value with a fixed set of answers
+(where the database files and the recovery area go, the ASM disk method, the clean-up of archived logs) opens
+a page that lists the choices with their meaning: `↑` `↓` and `Enter`, or type the value. Typed numbers and
+typed values work as before, also with `--plain` and over a slow line.
+
 Each step shows what it found and the exact commands it will run (**Will run**, with the OS user and the
 environment), then asks `[y] Yes, do it  [a] Yes to all  [s] Skip  [h] Help  [q] Quit`. While it runs,
 each command is shown as `Running as grid: ...`; the log has the full command lines. Commands for you are
@@ -188,7 +194,7 @@ Put the Grid and database installer zips next to the script (or in /stage, /soft
 The summary screen (step 1.4) shows the zips found, on the line "Installer zips".
 
 ### `--settings`
-Shows the summary screen and the values of the setup (a number changes one, `e` opens the settings file in
+Shows the summary screen and the values of the setup (the arrow keys and Enter, or a number, change one; `e` opens the settings file in
 `$EDITOR`), then stops.
 
 ### `--status`
