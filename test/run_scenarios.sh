@@ -120,7 +120,7 @@ PARTS=(
   [8]="Y Z7 Z10 Z18"
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
-  [11]="5.23 5.30 5.31 5.32"
+  [11]="5.23 5.30 5.31 5.32 5.33"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -2547,6 +2547,22 @@ check "24 rows, 80 columns: Up from nothing marks the last value that is on the 
 # without the screen layout nothing changed: the question and the typed answers
 rc=$(DG_TEST_SUMMARY='11,asmlib,q' run $T/r32d.txt)
 check "plain output: the summary and its questions are as before (typed number, typed value)" "grep -q 'ASM disk method: asmlib, udev, or Enter for automatic' $T/r32d.txt && grep -qx 'ASM_METHOD=asmlib' $T/varlib/settings.conf"
+fi
+if part 5.33; then
+CUR=5.33; echo "== 5.33  The start menu as a page, and the summary page that moves with the mark"
+fresh empty; SN=$T/snaps33; rm -rf $SN
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_MENU='<SNAP:menu0><DOWN><DOWN><SNAP:menu><ENTER>' DG_TEST_SUMMARY='<UP><SNAP:last><DOWN><SNAP:first><ESC>11<ENTER>,<DOWN><SNAP:pick><ESC>,q' DG_TEST_TIMEOUT=200 run $T/r33a.txt)
+check "menu page (24 x 80): every item and the question are on the page, the mark is on the item Enter takes (1)" "grep -q '^ What do you want to do?' $SN/*_menu0.txt && grep -qE '^›   1\\) Full setup' $SN/*_menu0.txt && grep -qE '^   14\\) Settings +--settings' $SN/*_menu0.txt && grep -q '^    q) Quit' $SN/*_menu0.txt && tail -n 1 $SN/*_menu0.txt | grep -q 'Choice \\[1\\]' && [[ \$(grep -c '' $SN/*_menu0.txt) -le 24 ]]"
+check "menu page: twice Down marks item 3 (one mark only), Enter takes it: the run is phase 2 only, and the choice stays on the screen" "grep -qE '^›   3\\) OS preparation only' $SN/*_menu.txt && [[ \$(grep -c '^›' $SN/*_menu.txt) == 1 ]] && grep -q 'Menu: 3) OS preparation only (phase 2)' $T/r33a.txt && grep -q 'This run: phase 2 only' $T/r33a.txt"
+check "summary page (24 rows): Up from nothing goes to the last value, which is below the page: the page moves there" "grep -qE '^› 14  Release Update' $SN/*_last.txt && grep -qE '[0-9]+ lines above\$' $SN/*_last.txt && tail -n 1 $SN/*_last.txt | grep -q 'Enter\\] Start'"
+check "summary page: Down from the last value goes around to the first one, and the page moves back (its heading is shown)" "grep -qE '^›  1  Mode' $SN/*_first.txt && grep -q '^Values of this run' $SN/*_first.txt"
+check "the lines above the question never wrap at 80 columns (the pages stay in place): choice page" "grep -q '^ ASM disk method' $SN/*_pick.txt && grep -qE '^ › asmlib' $SN/*_pick.txt && tail -n 1 $SN/*_pick.txt | grep -q 'ASM disk method \\[automatic\\]'"
+# a typed number at the menu page works as before; a wrong answer is said on the page
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=30x100 DG_TEST_SNAPDIR=$SN/b DG_TEST_MENU='99,<SNAP:note>2<ENTER>' DG_TEST_SUMMARY='q' DG_TEST_TIMEOUT=200 run $T/r33b.txt)
+check "menu page: a wrong answer is named on the page; the typed number 2 starts the check mode" "grep -q 'Please type a number from 1 to 14, or q.' $SN/b/*_note.txt && grep -q 'Menu: 2) Check only, change nothing' $T/r33b.txt"
+# without the screen layout the menu is printed and asked as before
+rc=$(DG_TEST_MENU=2 DG_TEST_SUMMARY='q' run $T/r33c.txt)
+check "plain output: the menu is the same text as before, asked with 'Choice [1]'" "grep -q '^  What do you want to do?' $T/r33c.txt && grep -qE '^    3\\) OS preparation only \\(phase 2\\) +--only os' $T/r33c.txt && grep -q '^   q) Quit' $T/r33c.txt && grep -q 'Choice \\[1\\]' $T/r33c.txt && ! grep -q 'Menu: ' $T/r33c.txt"
 fi
 parts_done
 echo

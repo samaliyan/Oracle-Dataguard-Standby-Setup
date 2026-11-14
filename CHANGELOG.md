@@ -3,6 +3,19 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.33
+
+- The start menu is a page with the screen layout: `↑` `↓` move the mark (it starts on the item Enter takes),
+  `Enter` takes the marked item, a typed number works as before. On a terminal with fewer than 30 rows the
+  empty lines between the groups are left out, so all 14 items fit in 24 rows. What an item prints (status,
+  changes, the manual way of a step) stays on the screen until Enter; the chosen item is named on the screen.
+- Summary page on a small terminal: the page moves with the mark, so the values below the page can be
+  reached with the arrow keys too (before: only by their number). "… N lines above" says that it moved.
+- The line above a question on these pages is never longer than the terminal is wide (a wrapped line moved
+  the page by one row on 80 columns).
+- Without the screen layout (`--plain`, a small or plain terminal) the menu is printed and asked as before.
+- Tests: section 5.33.
+
 ## 5.32
 
 The summary screen (step 1.4, `--settings`) is used with the keyboard like a form.

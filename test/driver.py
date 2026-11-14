@@ -134,11 +134,16 @@ def main():
         if s == "<CTRL-C>": os.write(fd, b"\x03")
         elif re.search(r"<(UP|DOWN|ESC|ENTER|SNAP:[a-z0-9_]+)>", s):
             # keys of the arrow pages: "<DOWN><DOWN><SNAP:name><ENTER>" (typed text between them is sent as it is)
-            for tok in re.findall(r"<[A-Z]+(?::[a-z0-9_]+)?>|[^<>]+", s):
+            toks = re.findall(r"<[A-Z]+(?::[a-z0-9_]+)?>|[^<>]+", s)
+            for n, tok in enumerate(toks):
                 if tok.startswith("<SNAP:"):
                     pump(0.6)
                     if vt: snap(tok[6:-1])
-                elif tok in KEYS: os.write(fd, KEYS[tok].encode()); pump(0.25)
+                elif tok in KEYS:
+                    os.write(fd, KEYS[tok].encode())
+                    # what the key draws is read here, except after the last key: the next question must
+                    # reach the main loop (after Esc the script waits 0.1 s for the rest of a sequence)
+                    if n < len(toks) - 1: pump(0.25)
                 else: os.write(fd, tok.encode())
         else: os.write(fd, (s + "\n").encode())
         answered += 1; buf = ""; ctx = ""
@@ -228,6 +233,7 @@ def main():
         # an installer prerequisite failure: [r] run it again after a fix, [i] ignore them (then IGNORE), [q]
         if bt.startswith("[r] I fixed them, run it again"): send(E("DG_TEST_PREREQ", "i")); continue
         if bt.startswith("Steps to run, for example"): send(menu_steps.pop(0) if menu_steps else ""); continue
+        if bt.startswith("Enter: back to the menu"): send(""); continue
         if bt.startswith("Answer y automatically for this server"): send(E("DG_TEST_MENU_YES", "n")); continue
         if bt.startswith("[c] Changes made, with undo commands   [u] Undo a step"): send(E("DG_TEST_MENU_REC", "b")); continue
         if bt.startswith("Step to undo, for example"): send(E("DG_TEST_MENU_UNDO", "")); continue

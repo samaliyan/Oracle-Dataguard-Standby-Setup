@@ -134,7 +134,9 @@ With the screen layout the values are also chosen with the keyboard: `↑` `↓`
 changes the marked one, `Esc` takes the mark away (`Enter` then starts). A value with a fixed set of answers
 (where the database files and the recovery area go, the ASM disk method, the clean-up of archived logs) opens
 a page that lists the choices with their meaning: `↑` `↓` and `Enter`, or type the value. Typed numbers and
-typed values work as before, also with `--plain` and over a slow line.
+typed values work as before, also with `--plain` and over a slow line. On a small terminal the page moves
+with the mark, so every value can be reached. The start menu is a page of the same kind: `↑` `↓` and `Enter`,
+or the number of the item.
 
 Each step shows what it found and the exact commands it will run (**Will run**, with the OS user and the
 environment), then asks `[y] Yes, do it  [a] Yes to all  [s] Skip  [h] Help  [q] Quit`. While it runs,
