@@ -301,7 +301,7 @@ menu_records() {
   case "$ANSWER" in
     q) menu_quit ;;
     s) print_progress_board ;;
-    c) if [[ -s "$JOURNAL_FILE" ]]; then show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
+    c) if [[ -s "$JOURNAL_FILE" ]]; then { ui_wanted && ui_changes_browse; } || show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
     u) while true; do
          ask "Step to undo, for example 2.9 (Enter = back)"
          st=${ANSWER//[[:space:]]/}
@@ -494,7 +494,12 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
       status_runs_block
       [[ -s "$JOURNAL_FILE" ]] && printf '\n  Changes made on this server: %s --show-changes\n' "$SELF"
     fi
-    [[ -n "$SHOW_CHANGES" ]] && show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"
+    if [[ -n "$SHOW_CHANGES" ]]; then
+      # with the screen layout and no step named: a list of the steps to look through (and to undo from);
+      # --plain, a pipe or a file get the report as text, as before
+      if [[ "$SHOW_CHANGES" == all ]] && ui_wanted && ui_changes_browse; then :
+      else show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"; fi
+    fi
     exit 0
   fi
   # every run asks questions: without a terminal (nohup, cron, ssh without -t) it would fail later at a confusing point

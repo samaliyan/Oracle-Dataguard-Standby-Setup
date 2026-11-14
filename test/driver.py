@@ -116,6 +116,7 @@ def main():
     menu_answers = E("DG_TEST_MENU", "").split(",") if E("DG_TEST_MENU") else []
     summary_answers = E("DG_TEST_SUMMARY", "").split(",") if E("DG_TEST_SUMMARY") else []
     menu_steps = lst("DG_TEST_MENU_STEPS")
+    changes_answers = lst("DG_TEST_CHANGES")
     KEYS = {"<UP>": "\x1b[A", "<DOWN>": "\x1b[B", "<ESC>": "\x1b", "<ENTER>": "\n"}
     def pump(t):
         # read what arrives within t seconds (for the screen picture); not a prompt to answer
@@ -185,13 +186,15 @@ def main():
                 elif jobkeys and jobkeys[0][1] == "d": jobkeys.pop(0); snap("alt_job_output")
                 time.sleep(0.2); os.write(fd, b"q"); buf = ""
                 # one q only: wait until the separate screen is closed (or 5 s)
+                # (a page opened from another page, as the changes of a step from the list of --show-changes,
+                # closes back to that page: its question is in what arrives here, so it is kept for the loop)
                 t_end = time.time() + 5
-                while vt.in_alt and time.time() < t_end:
+                while vt.in_alt and "q: close" in vt.text() and time.time() < t_end:
                     r3, _, _ = select.select([fd], [], [], 0.2)
                     if fd in r3:
                         try: d3 = os.read(fd, 65536).decode(errors="replace")
                         except OSError: break
-                        vt.feed(d3); d3 = ANSI.sub("", ANSI_ALL.sub("", d3)); full += d3; ctx += d3
+                        vt.feed(d3); d3 = ANSI.sub("", ANSI_ALL.sub("", d3)); full += d3; ctx += d3; buf += d3
                 continue
             if jobkeys and re.search(re.escape(jobkeys[0][0]) + r"   running, ", full[-400:]):
                 os.write(fd, jobkeys[0][1].encode()); jobkeys[0] = (jobkeys[0][0] + " (sent)", jobkeys[0][1]); time.sleep(0.5); continue
@@ -234,6 +237,8 @@ def main():
         if bt.startswith("[r] I fixed them, run it again"): send(E("DG_TEST_PREREQ", "i")); continue
         if bt.startswith("Steps to run, for example"): send(menu_steps.pop(0) if menu_steps else ""); continue
         if bt.startswith("Enter: back to the menu"): send(""); continue
+        # the list of --show-changes with the screen layout: DG_TEST_CHANGES=answer,answer (then q)
+        if bt == "Step (Enter: the marked one)": send(changes_answers.pop(0) if changes_answers else "q"); continue
         if bt.startswith("Answer y automatically for this server"): send(E("DG_TEST_MENU_YES", "n")); continue
         if bt.startswith("[c] Changes made, with undo commands   [u] Undo a step"): send(E("DG_TEST_MENU_REC", "b")); continue
         if bt.startswith("Step to undo, for example"): send(E("DG_TEST_MENU_UNDO", "")); continue
@@ -256,7 +261,7 @@ def main():
         if bt == "Type it again": send(E("DG_TEST_ASMPW2", E("DG_TEST_ASMPW", "Asm_Pass123"))); continue
         if "Number of the database" in bt: send(E("DG_TEST_DBPICK", "1")); continue
         if "Full path of the database ORACLE_HOME on the primary" in bt: send(E("DG_TEST_HOMEPATH", "")); continue
-        if re.search(r"Disk numbers for \+\S+, separated by spaces \(q = stop, nothing is erased\) \[\d+\]$", bt):
+        if re.search(r"Disk numbers for \+\S+(, separated by spaces)? \(q = stop, nothing is erased\) \[\d+\]$", bt):
             send(disk_picks.pop(0) if disk_picks else ""); continue
         m = re.search(r"Type (\S+) to continue, or n to stop$", bt)
         if m:

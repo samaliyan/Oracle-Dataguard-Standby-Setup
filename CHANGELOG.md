@@ -3,6 +3,19 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.34
+
+- Step 2.13 with the screen layout: the empty disks for a disk group are a list to mark. `↑` `↓` move,
+  `Space` marks, `Enter` takes the marked disks; the size marked is shown against the size needed, and an
+  answer that is not taken (too small, already chosen) is said on the page. Typed numbers work as before.
+  Nothing else changed: the commands are shown next and every disk is confirmed by typing its name.
+- `--show-changes` with the screen layout and no step named: a list of the steps that have changes, with
+  their number of changes and how they are undone. `Enter` shows the changes of the marked step with their
+  undo, `u` goes on to the undo of that step (the run of `--undo STEP`: every change is asked), `a` shows the
+  whole report, `q` leaves. Menu item 12 uses the same list. `--show-changes STEP`, `--plain` and output to a
+  pipe or a file give the report as text, as before.
+- Tests: section 5.34 (a new part 12 of the suite).
+
 ## 5.33
 
 - The start menu is a page with the screen layout: `↑` `↓` move the mark (it starts on the item Enter takes),

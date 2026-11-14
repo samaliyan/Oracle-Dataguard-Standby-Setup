@@ -121,6 +121,7 @@ PARTS=(
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
   [11]="5.23 5.30 5.31 5.32 5.33"
+  [12]="5.34"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -2563,6 +2564,30 @@ check "menu page: a wrong answer is named on the page; the typed number 2 starts
 # without the screen layout the menu is printed and asked as before
 rc=$(DG_TEST_MENU=2 DG_TEST_SUMMARY='q' run $T/r33c.txt)
 check "plain output: the menu is the same text as before, asked with 'Choice [1]'" "grep -q '^  What do you want to do?' $T/r33c.txt && grep -qE '^    3\\) OS preparation only \\(phase 2\\) +--only os' $T/r33c.txt && grep -q '^   q) Quit' $T/r33c.txt && grep -q 'Choice \\[1\\]' $T/r33c.txt && ! grep -q 'Menu: ' $T/r33c.txt"
+fi
+if part 5.34; then
+CUR=5.34; echo "== 5.34  The disks of step 2.13 as a list to mark, and --show-changes as a list of steps"
+fresh empty; SN=$T/snaps34; rm -rf $SN
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_DISK_PICKS='<SNAP:d0><DOWN> <SNAP:d1> <UP> <SNAP:d2><DOWN> <ENTER>,<SNAP:e0><ENTER>' DG_TEST_QUIT_AT=2.14 DG_TEST_TIMEOUT=300 run $T/r34a.txt)
+check "2.13 page: the empty disks with their sizes, the suggested one marked, the size marked against the size needed" "grep -q '^ Empty disks for +DATA' $SN/*_d0.txt && grep -qE '^ › \\[x\\]  1\\) /dev/sdb +200 GB' $SN/*_d0.txt && grep -qE '^   \\[ \\]  2\\) /dev/sdc +100 GB' $SN/*_d0.txt && grep -qE 'Marked: 200 GB +needed: [0-9]+ GB .* enough' $SN/*_d0.txt && tail -n 1 $SN/*_d0.txt | grep -q 'Disk numbers for +DATA (q = stop, nothing is erased) \\[1\\]'"
+check "2.13 page: Down and Space mark the second disk too, and the sum follows (300 GB)" "grep -qE '^   \\[x\\]  1\\) /dev/sdb' $SN/*_d1.txt && grep -qE '^ › \\[x\\]  2\\) /dev/sdc' $SN/*_d1.txt && grep -q 'Marked: 300 GB' $SN/*_d1.txt"
+check "2.13 page: with nothing marked the line says how much is missing" "grep -qE 'Marked: 0 MB +needed: [0-9]+ GB +[0-9]+ GB more to mark' $SN/*_d2.txt && ! grep -q '\\[x\\]' $SN/*_d2.txt"
+check "2.13 page: disks that are too small together are not taken: the page comes back and says why" "grep -qE '! These disks have 100 GB, but \\+DATA needs [0-9]+ GB' $SN/*_e0.txt"
+check "2.13: Enter then takes the suggested disk; both disk groups get their disk, each confirmed by its name as before" "grep -qx 'DATA_1|/dev/sdb1' $T/varlib/asm_disks && grep -qx 'FRA_1|/dev/sdc1' $T/varlib/asm_disks && grep -q 'Type /dev/sdb to continue' $T/r34a.txt"
+# ---- --show-changes with the screen layout: the steps as a list, the changes of one, the undo of one ----
+fresh empty
+rc=$(DG_TEST_QUIT_AT=2.11 run $T/r34b.txt)
+[[ -f /etc/security/limits.d/oracle-grid.conf ]] && lim_before=1 || lim_before=0
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/c DG_TEST_KEYS='x:d' DG_TEST_CHANGES='<SNAP:c0><DOWN><DOWN><DOWN><SNAP:c1><ENTER>,<SNAP:c2>9.9<ENTER>,<SNAP:c3>u<ENTER>' DG_TEST_UNDO=y DG_TEST_TIMEOUT=200 run $T/r34c.txt --show-changes)
+check "--show-changes page: the counts, one row per step with its changes and how they are undone, the mark on the first" "grep -q '^ Changes made by this script' $SN/c/*_c0.txt && grep -qE 'On this server +[0-9]+ +\\([0-9]+ undone by --undo, [0-9]+ by hand\\)' $SN/c/*_c0.txt && grep -qE '^ › 2\\.1 +Groups .* 10 by hand' $SN/c/*_c0.txt && grep -qE '^   2\\.5 +Software folders .* auto' $SN/c/*_c0.txt"
+check "--show-changes page: three times Down marks step 2.4; Enter opens its changes with their undo" "grep -qE '^ › 2\\.4 +Limits for the Oracle owners' $SN/c/*_c1.txt && grep -q '^ Changes of step 2.4  Limits for the Oracle owners' $SN/c/*alt*.txt && grep -q 'NEW        /etc/security/limits.d/oracle-grid.conf' $SN/c/*alt*.txt"
+check "--show-changes page: back on the list after the changes of a step; a step without changes is said on the page" "grep -qE '^ › 2\\.4 ' $SN/c/*_c2.txt && grep -q 'No change of step 9.9 is recorded' $SN/c/*_c3.txt"
+check "--show-changes page: u goes on to the undo of the marked step (asked change by change, as --undo)" "[[ $lim_before -eq 1 && ! -e /etc/security/limits.d/oracle-grid.conf && $rc -eq 0 ]] && grep -q 'Undo of step 2.4 finished' $T/r34c.txt"
+# as text when it is not a screen: --plain, and a step named
+rc=$(run $T/r34d.txt --show-changes)
+check "--show-changes without the screen layout: the report as text, as before" "grep -q 'Changes made by this script' $T/r34d.txt && grep -qE '^  Step 2\\.1  Groups' $T/r34d.txt && ! grep -q 'Step (Enter: the marked one)' $T/r34d.txt"
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/e DG_TEST_TIMEOUT=100 run $T/r34e.txt --show-changes 2.1)
+check "--show-changes STEP: the report of that step as text, also on a screen" "grep -q 'Changes made by this script  (step 2.1)' $T/r34e.txt && ! grep -q 'Step (Enter: the marked one)' $T/r34e.txt"
 fi
 parts_done
 echo
