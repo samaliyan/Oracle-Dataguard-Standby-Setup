@@ -152,7 +152,9 @@ def main():
                     os.write(fd, KEYS[tok].encode())
                     # what the key draws is read here, except after the last key: the next question must
                     # reach the main loop (after Esc the script waits 0.4 s for the rest of a sequence)
-                    if n < len(toks) - 1: pump(0.25)
+                    # After Esc the wait is longer than those 0.4 s: a key that arrives just as that wait of the
+                    # script ends can be lost in bash's "read -t" (seen on the CI machines: "11" became "1").
+                    if n < len(toks) - 1: pump(0.9 if tok == "<ESC>" else 0.25)
                 else: os.write(fd, tok.encode())
         else: os.write(fd, (s + "\n").encode())
         answered += 1; buf = ""; ctx = ""
