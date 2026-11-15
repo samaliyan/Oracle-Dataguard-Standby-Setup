@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 #==============================================================================
 #  dg_standby_setup.sh  -  Oracle Data Guard physical standby builder (12.1 - 23ai)
 #
@@ -30,15 +30,55 @@ set -o pipefail
 # there this check is left off. The script itself never relies on it.
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then set -u; fi
 umask 022
-# The PATH this script was started with can hold folders of the user who became root ("su" without "-"): from
-# the first command on only the system folders are used. safe_path (main) adds back the folders of the caller's
-# PATH that are root's own all the way down.
+# The environment this script was started with can come from the user who became root ("su" without "-"): a
+# program in a folder of PATH, a function or a start file for bash, another editor, a program ssh would run to ask
+# for a password, the test settings of this script. So the script starts itself once more with an environment
+# that holds only the variables listed here (terminal, language, time zone, proxies, the ssh agent, the editor,
+# four settings of this script), in bash's "-p" mode: no start file is read and no function is taken from the
+# environment, and none is left in it for a shell this script starts. (Started as "bash script" with BASH_ENV
+# set, bash has read that file before this line: start it as ./script, as the README says.)
+# Every other DG_* variable is a test setting: it stays only with DG_TEST_HOOKS=1 AND the file the test suite
+# makes as root on its machine (/etc/dgt_test_machine), so an environment alone cannot switch the tests' hooks on.
+# From here on only the system folders are in PATH. safe_path (main) adds the folders of the caller's PATH that
+# root holds all the way down.
+_hooks=0
+[[ "${DG_TEST_HOOKS:-}" == 1 && -f /etc/dgt_test_machine && ! -L /etc/dgt_test_machine && -O /etc/dgt_test_machine ]] && _hooks=1
+_keep=(); _dirty=0; _drop=""
+if [[ -r /proc/$$/environ ]]; then
+  while IFS= read -r -d '' _e; do
+    _n=${_e%%=*}
+    case "$_n" in
+      PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT|DG_ENV_DROPPED) _keep+=("$_e") ;;
+      http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) _keep+=("$_e") ;;
+      DG_*) if [[ $_hooks -eq 1 && "$_n" =~ ^[A-Z0-9_]+$ ]]; then _keep+=("$_e"); else _dirty=1; [[ "$_n" =~ ^[A-Z0-9_]+$ ]] && _drop+=" $_n"; fi ;;
+      *) _dirty=1 ;;
+    esac
+  done < /proc/$$/environ
+  if [[ ( $_dirty -eq 1 || $- != *p* ) && -r "${BASH_SOURCE[0]}" && -x /bin/bash && -x /usr/bin/env ]]; then
+    _o=-p; [[ $- == *x* ]] && _o+=x; [[ $- == *v* ]] && _o+=v
+    exec /usr/bin/env -i "${_keep[@]+"${_keep[@]}"}" ${_drop:+"DG_ENV_DROPPED=$_drop"} /bin/bash "$_o" "${BASH_SOURCE[0]}" "$@"
+  fi
+fi
+# (no /proc, or the start above was not possible: the variables are taken out in place)
+ENV_DROPPED=${DG_ENV_DROPPED:-}; [[ "$ENV_DROPPED" =~ ^[A-Z0-9_\ ]*$ ]] || ENV_DROPPED=""
+for _v in $(compgen -e); do
+  case "$_v" in
+    PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT) ;;
+    http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) ;;
+    DG_ENV_DROPPED) unset "$_v" ;;
+    DG_*) [[ $_hooks -eq 1 ]] || { ENV_DROPPED+=" $_v"; unset "$_v"; } ;;
+    *) unset "$_v" 2>/dev/null ;;
+  esac
+done
+TEST_HOOKS=$_hooks          # 1: the DG_* test settings of the environment are in use (the test suite)
+unset _v _e _n _keep _dirty _drop _o _hooks
+export HOME=~root USER=root LOGNAME=root
 ORIG_PATH=${PATH:-}
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.35"
+readonly SCRIPT_VERSION="5.36"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -393,7 +433,7 @@ cleanup() {
     [[ "$(dirname "$f")" == /tmp/dg_rsp.* || "$(dirname "$f")" == /tmp/dg_screen.* ]] && rmdir -- "$(dirname "$f")" 2>/dev/null
   done
   if [[ ( $SSH_OPEN -eq 1 || ${HEALTH_SSH_OPEN:-0} -eq 1 ) && -n "$SSH_CTL" ]]; then
-    ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
+    timeout 10 ssh -o ControlPath="$SSH_CTL" -O exit "${PRIMARY_SSH_USER:-x}@${PRIMARY_IP:-x}" >/dev/null 2>&1 || true
     rm -f -- "$SSH_CTL"
   fi
 }
@@ -561,9 +601,27 @@ build_envs() {
              "TNS_ADMIN=$GRID_HOME/network/admin" "NLS_LANG=AMERICAN_AMERICA.AL32UTF8" "${gx[@]+"${gx[@]}"}" )
 }
 
-# fd 9 is the lock of this script: no child (listener, instance) may keep it
-as_oracle() { ( cd / && runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" 9>&- ); }
-as_grid()   { ( cd / && runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" 9>&- ); }
+# fd 9 is the lock of this script: no child (listener, instance) may keep it.
+# The command runs in a session of its own (setsid): a program of an Oracle home, which its owner can change, has
+# no terminal of root to type into (it could answer the next question of this script), and Ctrl+C reaches this
+# script at once: it ends the command (run_waited) and then stops.
+run_waited() {
+  # "$@" in the background, waited for. A stop of the script (Ctrl+C, a closed terminal, kill) ends the command
+  # as well and is passed on only after it has ended: the lock of this script is never free while a command of
+  # a step still runs. (The command gets TERM; runuser and timeout pass it on.)
+  local p=""
+  trap '[[ -n "$p" ]] && { kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; exit 130' INT HUP TERM
+  "$@" <&0 9>&- & p=$!
+  wait "$p"
+}
+as_oracle() { ( cd / && run_waited setsid runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" ); }
+as_grid()   { ( cd / && run_waited setsid runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" ); }
+clean_ctl() {
+  # stdin -> stdout without control characters (all but tab and line feed; a carriage return too). What a
+  # command, the primary or a file gives is shown on the terminal of root: an escape sequence in it could redraw
+  # the screen, for example the commands this script shows for you to run.
+  LC_ALL=C tr -d '\000-\010\013-\037\177'
+}
 # The standby listener runs from the Grid home when there is Grid, else from the database home.
 # Its name is always LISTENER: Grid creates ora.LISTENER.lsnr, and only the port has to match the primary.
 readonly SB_LSNR=LISTENER
@@ -634,7 +692,7 @@ run_logged() {
   tmp=$(mktemp /tmp/dg_out.XXXXXXXX) || { RUN_OUT="cannot create a temporary file"; return 1; }
   CLEANUP_FILES+=("$tmp")
   "$@" > "$tmp" 2>&1 < /dev/null 9>&- || rc=$?
-  RUN_OUT=$(cat "$tmp"); rm -f -- "$tmp"
+  RUN_OUT=$(clean_ctl < "$tmp"); rm -f -- "$tmp"
   { printf 'command (as %s): %s\n' "$du" "$dc"; printf '%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | mask_pw | log_block "$title"
   return "$rc"
 }
@@ -861,7 +919,8 @@ run_long() {
     "$@" >> "$f" 2>&1; r=$?; d=$SECONDS
     printf "#| ---- end %s, exit code %s, after %s min %s s ----\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$r" $((d / 60)) $((d % 60)) >> "$f"
     echo $r > "$f.rc.t" && mv -f -- "$f.rc.t" "$f.rc"
-    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 > /dev/null 2>&1 9>&- &
+    kill -0 "$sp" 2>/dev/null || { IFS=,; for x in $k; do [ -n "$x" ] && { rm -f -- "$x"; rmdir -- "${x%/*}" 2>/dev/null; }; done; }
+    exit $r' dg_long_job "$out" "$JOB_KEEP" "$$" "${pre[@]}" "$@" <&0 > /dev/null 2>&1 9>&- &
   local bg=$! n=0 jpid=""
   while [[ ! -s "$out.pid" && $n -lt 300 ]]; do sleep 0.1; n=$((n + 1)); done
   jpid=$(cat "$out.pid" 2>/dev/null); rm -f -- "$out.pid"
@@ -938,7 +997,7 @@ If this run stops, the next run will not know that $title is still running."
     fi
   done
   TAIL_PID=""
-  wait "$bg" 2>/dev/null
+  local bg_rc=0; wait "$bg" 2>/dev/null || bg_rc=$?
   # the wrapper may have been killed while its command goes on: wait for the whole job
   n=0
   while job_running "$jpid"; do
@@ -959,6 +1018,8 @@ If this run stops, the next run will not know that $title is still running."
   done
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
   local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"
+  # (the file with the exit code could not be written, a full disk: the code of the job as this script saw it end)
+  if ! num "$rc" && ! job_running "$jpid"; then [[ $bg_rc -lt 126 ]] && rc=$bg_rc; fi
   # the result is read here: the job file goes also when programs the job left behind still run (with the exit
   # code file gone, the next run would take the job itself for running)
   { num "$rc" || ! job_running "$jpid"; } && rm -f -- "$JOB_FILE"; JOB_PID=""
@@ -969,7 +1030,7 @@ If this run stops, the next run will not know that $title is still running."
   if [[ -n "$SYS_PW$ASM_PW" ]]; then ( umask 077; mask_pw < "$out" > "$out.m" ) && mv -f -- "$out.m" "$out"; rm -f -- "$out.m"; fi
   chmod 640 "$out" 2>/dev/null
   # RUN_OUT: the output of the command only (without the header and footer lines of the file)
-  RUN_OUT=$(grep -v '^#| ' "$out")
+  RUN_OUT=$(grep -v '^#| ' "$out" | clean_ctl)
   job_log_tail "$out" "$rc" | log_block "$title (output: $out)"
   local jd; jd=$(dur_text $((SECONDS - t0)))
   # the last progress (an RMAN copy: datafiles done of all), then the time the job took

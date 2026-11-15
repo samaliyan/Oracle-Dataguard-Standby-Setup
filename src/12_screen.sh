@@ -978,13 +978,20 @@ ui_keyline() {
       $'\e')
         # what follows Esc within a moment belongs to it: "[" ... (an arrow, Page Up, a function key) or "O" and
         # a letter. Nothing follows: the Esc key itself. Never is a part of such a sequence taken as typed text.
-        rest=""; IFS= read -rsn1 -t 0.4 rest < "$PROMPT_IN" || rest=""
+        local after_enter=0
+        rest=""
+        if IFS= read -rsn1 -t 0.4 rest < "$PROMPT_IN"; then
+          [[ -z "$rest" ]] && after_enter=1          # Enter right after Esc: the Esc key, then Enter
+        else rest=""; fi
         case "$rest" in
           "[") more=""; rest=""
                while IFS= read -rsn1 -t 0.4 more < "$PROMPT_IN"; do
                  # (the Linux console sends "[[A" for F1: the second "[" is not the end)
                  if [[ -z "$rest" && "$more" == "[" ]]; then IFS= read -rsn1 -t 0.4 more < "$PROMPT_IN" || true; rest=x; break; fi
-                 rest+=$more; [[ "$more" == [@-~] ]] && break
+                 rest+=$more
+                 # the sequence ends with the first character that is not a parameter (digits ; : < = > ?). No
+                 # range of characters here: on bash 4.2 a range follows the language, not the character codes.
+                 case "$more" in [0123456789]|";"|":"|"<"|"="|">"|"?"|" "|"!"|'"'|"#"|"$"|"%"|"&"|"'"|"("|")"|"*"|"+"|","|"-"|"."|"/") ;; *) break ;; esac
                done ;;
           O)   more=""; IFS= read -rsn1 -t 0.4 more < "$PROMPT_IN" || more=""; rest=$more ;;
           "")  rest=esc ;;
@@ -993,7 +1000,8 @@ ui_keyline() {
         if [[ -z "$ANSWER" && -n "$UK_MOVE" ]]; then
           case "$rest" in A) "$UK_MOVE" up ;; B) "$UK_MOVE" down ;; esc) "$UK_MOVE" esc ;; esac
           [[ $UK_DONE -eq 1 ]] && break          # the page ends the question itself (Esc on a choice page)
-        fi ;;
+        fi
+        [[ $after_enter -eq 1 ]] && break ;;
       $'\177'|$'\b') [[ -n "$ANSWER" ]] && { ANSWER=${ANSWER%?}; if [[ $UK_ROW -gt 0 ]]; then ui_key_show; else printf '\b \b'; fi; } ;;
       $'\025') ANSWER=""; ui_key_show ;;                                     # Ctrl+U
       $'\027') ANSWER=${ANSWER%"${ANSWER##*[! ]}"}; ANSWER=${ANSWER%"${ANSWER##* }"}; ui_key_show ;;   # Ctrl+W
@@ -1070,7 +1078,8 @@ ui_summary_ask() {
   local -a L=() R=() vrow=() va=() vb=(); local n h i f mine=0 used=0 q qi="    " vn=0 sel=0 redraw=0 in_v=0 avail note
   # the question in one line: below 100 columns with shorter labels (it starts the same way)
   q="[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"
-  [[ $UI_COLS -lt 100 ]] && { q="[Enter] Start   [number] Change  [d] Details  [e] Edit  [h] Help  [q] Quit"; qi=""; }
+  # (below 100 columns short enough that a typed number of two digits and more is seen)
+  [[ $UI_COLS -lt 100 ]] && { q="[Enter] Start   [number] Change   [d]etails [e]dit [h]elp [q]uit"; qi=""; }
   f=$(mktemp) || { ask "[Enter] Start   [number] Change   [d] Details   [e] Edit the file   [h] Help   [q] Quit"; return 0; }
   CLEANUP_FILES+=("$f")
   ui_size || true          # (the terminal may have been made larger or smaller since the last page)
@@ -1180,7 +1189,7 @@ ui_menu_ask() {
   else e="$(ui_arrows): choose, Enter takes it     or type the number"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${e:0:$((UI_COLS - 6))}" "$C_N"; fi
   MENU_NOTE=""
   printf '\e[%d;1H\e[2K    %s%s Choice [%s]%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$def" "$C_N" "$S_END"
-  UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + 8 + ${#def} + 1 + 3 ))          # "    ? Choice [def] > "
+  UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + 8 + ${#def} + 1 + 4 ))          # "    ? Choice [def] > "
   UK_MOVE=ui_menu_move; ui_keyline; UK_MOVE=""
   [[ -z "$ANSWER" ]] && ANSWER=${mk[$msel]}
   [[ $mine -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
@@ -1230,9 +1239,12 @@ ui_check_status() {
   # enough. Every marked row is named here, so a mark that is not on the part of the list shown is still seen.
   local i tot=0 t nums=""
   for ((i = 0; i < ${#lshow[@]}; i++)); do [[ "${lmark[$i]}" == x ]] && { tot=$((tot + lmb[i])); nums+="${nums:+, }$((i + 1))"; }; done
+  # (one row whatever is marked: a long list of numbers is cut, the sizes stay)
+  local room=$((UI_COLS - 62)); [[ $room -lt 8 ]] && room=8
+  [[ ${#nums} -gt $room ]] && nums="${nums:0:$((room - 1))}$S_WAIT"
   if [[ -z "$nums" ]]; then t="${C_Y}Nothing marked: Enter takes the row of the cursor.   Needed: $(human_mb "$cneed")${C_N}"
   elif [[ $tot -ge $cneed ]]; then t="${C_G}Marked: $nums = $(human_mb "$tot")   needed: $(human_mb "$cneed")   $S_OK enough${C_N}"
-  else t="${C_Y}Marked: $nums = $(human_mb "$tot")   needed: $(human_mb "$cneed")   $(human_mb $((cneed - tot))) more to mark${C_N}"; fi
+  else t="${C_Y}Marked: $nums = $(human_mb "$tot")   needed: $(human_mb "$cneed")   $(human_mb $((cneed - tot))) more${C_N}"; fi
   printf '\e7\e[4;1H\e[2K   %s\e8' "$t"
 }
 ui_check() {
@@ -1250,7 +1262,14 @@ ui_check() {
     if [[ "$st" == "-" ]]; then lmark+=("-"); else lmark+=(" "); [[ $first -lt 0 ]] && first=$((${#lmark[@]} - 1)); fi
   done
   [[ "$def" =~ ^[0-9]+$ && $def -ge 1 && $def -le ${#lmark[@]} ]] && lsel=$((def - 1))
-  for i in $marks; do [[ "$i" =~ ^[0-9]+$ && $i -ge 1 && $i -le ${#lmark[@]} && "${lmark[$((i - 1))]}" == " " ]] && lmark[$((i - 1))]="x"; done
+  # (the marks of an answer that was not taken: plain numbers only, read without file name expansion; 08 is 8)
+  local -a mk0=(); read -ra mk0 <<< "$marks"
+  for i in "${mk0[@]+"${mk0[@]}"}"; do
+    [[ "$i" =~ ^[0-9]{1,3}$ ]] || continue
+    i=$((10#$i)); [[ $i -ge 1 && $i -le ${#lmark[@]} && "${lmark[$((i - 1))]}" == " " ]] && lmark[$((i - 1))]="x"
+  done
+  # (a question longer than the row would move the page: a long disk group name is cut, the default stays)
+  if [[ ${#quest} -gt $((UI_COLS - 18)) ]]; then quest="${quest%% (*}"; quest="${quest:0:$((UI_COLS - 24 - ${#def}))} [$def]"; fi
   [[ "${lmark[$lsel]}" == "-" && $first -ge 0 ]] && lsel=$first
   ui_size || true
   lcap=$((UI_ROWS - 9)); [[ $lcap -lt 3 ]] && lcap=3
@@ -1267,7 +1286,7 @@ ui_check() {
   else t="$(ui_arrows): move   Space: mark   Enter: use them   or type the numbers   h: help"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"; fi
   CHECK_NOTE=""
   printf '\e[%d;1H\e[2K    %s%s %s%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$quest" "$C_N" "$S_END"
-  UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + ${#quest} + 3 ))
+  UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + ${#quest} + 4 ))
   UK_SPACE=1; UK_MOVE=ui_rows_move; ui_keyline; UK_MOVE=""; UK_SPACE=0
   if [[ -z "$ANSWER" ]]; then
     for ((i = 0; i < ${#lmark[@]}; i++)); do [[ "${lmark[$i]}" == x ]] && ANSWER+="${ANSWER:+ }$((i + 1))"; done
@@ -1298,13 +1317,16 @@ ui_changes_browse() {
     elif [[ "$(undo_text "$kind" "$obj" "$det")" == auto:* ]]; then BA[$step]=$((BA[$step] + 1)); na=$((na + 1))
     else BH[$step]=$((BH[$step] + 1)); nh=$((nh + 1)); fi
   done
+  # (the title column is narrower below 100 columns, so the "undo" column is not cut)
+  ui_size || true
+  local tw=44; [[ $UI_COLS -lt 100 ]] && tw=30
   for step in "${BO[@]}"; do
     how=""
     [[ ${BA[$step]} -gt 0 ]] && how+="${BA[$step]} auto, "
     [[ ${BH[$step]} -gt 0 ]] && how+="${BH[$step]} by hand, "
     [[ ${BP[$step]} -gt 0 ]] && how+="${BP[$step]} on the primary, "
-    tt=$(step_title_of "$step"); [[ ${#tt} -gt 44 ]] && tt="${tt:0:43}$S_WAIT"
-    lshow+=("$(printf '%-6s %-44s %7s  %s' "$step" "$tt" "${BN[$step]}" "${how%, }")"); lmark+=("")
+    tt=$(step_title_of "$step"); [[ ${#tt} -gt $tw ]] && tt="${tt:0:$((tw - 1))}$S_WAIT"
+    lshow+=("$(printf "%-6s %-${tw}s %7s  %s" "$step" "$tt" "${BN[$step]}" "${how%, }")"); lmark+=("")
   done
   BROWSE_UNDO=""
   ui_keys_on
@@ -1317,12 +1339,12 @@ ui_changes_browse() {
     printf '\e[r\e[H\e[2J %sChanges made by this script%s   %s%s%s\n %s%s%s\n' "$C_W" "$C_N" "$C_D" "$(hostname -s 2>/dev/null)" "$C_N" "$C_B" "$(rule $((UI_COLS - 2)))" "$C_N"
     printf '   On this server  %s   (%s undone by --undo, %s by hand)\n' "$((na + nh))" "$na" "$nh"
     printf '   On the primary  %s   (commands you ran there; undo them there, by hand)\n' "$np"
-    printf '\n   %s   %-6s %-44s %7s  %s%s\n' "$C_D" "Step" "" "changes" "undo" "$C_N"
+    printf "\n   %s%-6s %-${tw}s %7s  %s%s\n" "$C_D" "Step" "" "changes" "undo" "$C_N"
     ui_rows_draw
     if [[ -n "$note" ]]; then printf '\e[%d;1H\e[2K    %s%s %s%s\n' $((UI_ROWS - 1)) "$C_Y" "$S_WARN" "${note:0:$((UI_COLS - 8))}" "$C_N"; note=""
     else t="$(ui_arrows): a step   Enter: its changes   u: undo it   a: all changes   q: leave"; printf '\e[%d;1H\e[2K    %s%s%s\n' $((UI_ROWS - 1)) "$C_D" "${t:0:$((UI_COLS - 6))}" "$C_N"; fi
     printf '\e[%d;1H\e[2K    %s%s Step (Enter: the marked one)%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$C_N" "$S_END"
-    UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + 28 + 3 ))                  # "    ? Step (Enter: the marked one) > "
+    UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + 28 + 4 ))                  # "    ? Step (Enter: the marked one) > "
     UK_MOVE=ui_rows_move; ui_keyline; UK_MOVE=""
     a=${ANSWER//[[:space:]]/}; a=${a,,}
     case "$a" in
@@ -1396,15 +1418,16 @@ ui_pick() {
     # (a long value now: its end is shown, so the question stays on its row)
     curs=${cur:-automatic}; [[ ${#curs} -gt 24 ]] && curs="$S_WAIT${curs: -23}"
     printf '\e[%d;1H\e[2K    %s%s %s [%s]%s %s ' "$UI_ROWS" "$C_C" "$S_ASK" "$title" "$curs" "$C_N" "$S_END"
-    UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + ${#title} + 2 + ${#curs} + 1 + 3 ))
+    UK_ROW=$UI_ROWS; UK_COL=$(( 4 + 2 + ${#title} + 2 + ${#curs} + 1 + 4 ))
     PICK_ESC=0; UK_MOVE=ui_pick_esc_or_move; ui_keyline; UK_MOVE=""
     if [[ $PICK_ESC -eq 1 && -z "$ANSWER" ]]; then ANSWER=$cur; break; fi
     # h or ?: the help of the step, then the page again
     if [[ "${ANSWER,,}" == h || "$ANSWER" == "?" ]]; then ui_show "Help  $S_DOT  step ${CUR_STEP:-1.4}" show_help "${CUR_STEP:-1.4}"; continue; fi
     if [[ -z "$ANSWER" ]]; then
       # the mark on "type it" with nothing typed: there is nothing to take yet
-      [[ "${pv[$psel]}" == "*" ]] && continue
-      ANSWER=${pv[$psel]}
+      # (the value of now is such a typed one: Enter keeps it, as without the page)
+      if [[ "${pv[$psel]}" == "*" ]]; then [[ -n "$cur" ]] || continue; ANSWER=$cur
+      else ANSWER=${pv[$psel]}; fi
     fi
     break
   done

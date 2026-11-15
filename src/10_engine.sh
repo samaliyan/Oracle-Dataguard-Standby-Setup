@@ -534,6 +534,9 @@ run_step() {
     cp_reset; job_show_reset; DONE_AS_OK=0   # (the job list of phase 3 is cleared like the command list)
     ui_live "$S_WAIT checking ..."
     "$checkfn"; rc=$?
+    # (0 correct, 1 to do, 2 cannot be checked. Any other code is a fault inside the check, a command not found
+    # for example: taken as "cannot be checked", never as "to do")
+    if [[ $rc -gt 2 ]]; then _log WARN "the check of step $CUR_STEP ended with the unexpected code $rc"; [[ -n "${NOW:-}" ]] || NOW="The check of this step ended with an error (code $rc). Details are in the log."; rc=2; fi
     ui_live_clear
     vq_dump
     # (plain output: the title waits only for a step that is already correct; block and hint often run in a pipe,
@@ -898,7 +901,12 @@ primary_pending_add() {
   fi
   # (grep: 0 or 1 = written, with or without lines; 2 = it could not read or write: the old file stays)
   local gr=0
-  { grep -v "^$1|" "$f" 2>/dev/null || gr=$?; printf '%s|%s|%s\n' "$1" "${u:--}" "$how" && [[ $gr -le 1 || ! -e "$f" ]]; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; chmod 600 "$f" 2>/dev/null
+  u=${u//$'\n'/ ; }          # (one line per step)
+  if ! { { grep -v "^$1|" "$f" 2>/dev/null || gr=$?; printf '%s|%s|%s\n' "$1" "${u:--}" "$how" && [[ $gr -le 1 || ! -e "$f" ]]; } > "$f.n" 2>/dev/null && mv -f -- "$f.n" "$f"; }; then
+    [[ ${PENDING_WARNED:-0} -eq 1 ]] || { PENDING_WARNED=1; warn "Cannot write $f. Is the disk full?
+The commands you run on the primary for this step may then be missing from --show-changes."; }
+  fi
+  chmod 600 "$f" 2>/dev/null
   return 0
 }
 primary_pending_get() { [[ -n "$STATE_DIR" ]] || return 0; grep -m1 "^$1|" "$(primary_pending_file)" 2>/dev/null | cut -d'|' -f2; return 0; }

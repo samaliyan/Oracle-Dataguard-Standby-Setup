@@ -388,7 +388,8 @@ secure_rsp() {
 }
 finish_rsp() {
   local d; d=$(dirname "$1")
-  chown "$2:$INSTALL_GROUP" "$1" && chmod 600 "$1" && chown "$2:$INSTALL_GROUP" "$d" && chmod 700 "$d"
+  # (modes first, the owner last: after the chown the folder is the user's, and root touches it no more)
+  chmod 600 "$1" && chmod 700 "$d" && chown "$2:$INSTALL_GROUP" "$1" && chown "$2:$INSTALL_GROUP" "$d"
 }
 remove_rsp() { [[ -n "$1" ]] && rm -f -- "$1" && rmdir -- "$(dirname "$1")" 2>/dev/null; return 0; }
 rsp_set() {
@@ -911,7 +912,10 @@ The owner must be root, $ORACLE_USER or $GRID_USER, and only the owner may chang
     # the OPatch the media brings
     local -a mz=(); IFS=',' read -ra mz <<< "${src#media=}"
     for f in "${mz[@]}"; do
-      unzip -Z1 "$f" 2>/dev/null | grep -q '^OPatch/' || continue
+      # (the listing into a variable first: "unzip | grep -q" under pipefail fails on a real zip, where grep ends
+      # at the first match and unzip is stopped by the closed pipe)
+      local zl; zl=$(unzip -Z1 "$f" 2>/dev/null) || true
+      grep -q '^OPatch/' <<< "$zl" || continue
       exists=1; OP_HAVE=$(unzip -p "$f" OPatch/version.txt 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)
     done
   fi
@@ -1025,7 +1029,8 @@ sw_folder_ok() {
   # local storage only, and no other file system mounted inside it (rm -rf would go into it)
   fst=$(findmnt -n -o FSTYPE --target "$(existing_parent "$d")" 2>/dev/null | head -n 1)
   case "$fst" in nfs*|cifs|smb*|acfs|fuse*|glusterfs|ceph*|ocfs2|gfs2|"") return 1 ;; esac
-  [[ -d "$d" ]] && findmnt -rn -o TARGET 2>/dev/null | grep -q "^$d/" && return 1
+  local mnts; mnts=$(findmnt -rn -o TARGET 2>/dev/null) || true
+  [[ -d "$d" ]] && grep -q "^$d/" <<< "$mnts" && return 1
   sw_in_use "$d" && return 1
   return 0
 }
@@ -1938,7 +1943,9 @@ c_3_8() {
   return 1
 }
 # journaled first: a roohctl that stops half-way has still changed the home, and the undo must be listed
-d_3_8() { journal ROOHCTL "$DB_HOME"; cp_run_one oracle "$DB_HOME/bin/roohctl -disable" || { bad "roohctl failed: $(tail -n 3 <<< "$RUN_OUT")"; return 1; }; }
+d_3_8() { journal ROOHCTL "$DB_HOME"; cp_run_one oracle "$DB_HOME/bin/roohctl -disable" || { bad "roohctl failed: $(tail -n 3 <<< "$RUN_OUT")"
+    [[ ${DB_MAJOR:-0} -ge 21 ]] && hint <<< "Release $DB_MAJOR has read-only Oracle homes only, and this script keeps the spfile, the password file and tnsnames.ora inside the home: a standby of this release cannot be finished with it yet."
+    return 1; }; }
 rw_home_ok() {
   db_sw_ok || return 1
   [[ -x "$DB_HOME/bin/orabasehome" ]] || return 0

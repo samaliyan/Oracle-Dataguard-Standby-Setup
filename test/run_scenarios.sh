@@ -1,6 +1,8 @@
 #!/bin/bash
-# Scenario tests for dg_standby_setup.sh v4 (mock standby + mock primary over mock ssh).
+# Scenario tests for dg_standby_setup.sh (mock standby + mock primary over mock ssh).
 set -uo pipefail
+# the DG_* settings of the tests (state and log folders, answers, timings) are used by the script only with this
+export DG_TEST_HOOKS=1
 T=/tmp/dgt
 TD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRV=$TD/driver.py
@@ -20,7 +22,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_TEST_NO_QUERIES=${DG_TEST_NO_QUERIES:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_TEST_NO_QUERIES=${DG_TEST_NO_QUERIES:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out DG_TEST_UNAME=${DGT_UNAME:-} \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -56,9 +58,9 @@ cmds_whitelisted() {
        || [[ "$l" =~ ^lsblk\ -nsP\ -o\ TYPE,WWN,SERIAL\ \"\$\(findmnt\ -n\ -o\ SOURCE\ --target\ /[A-Za-z0-9_./-]+\)\"$ ]] \
        || [[ "$l" =~ ^grep\ -o\ \'NAME=\"oracle.crs\"\ VER=\"\[0-9.\]\*\"\'\ /[A-Za-z0-9_./-]+/inventory/ContentsXML/comps.xml$ ]] \
        || [[ "$l" =~ ^env\ ORACLE_HOME=/[^\ ]+\ /[^\ ]+/bin/(orabase|orabasehome)$ ]] \
-       || [[ "$l" =~ ^env\ ORACLE_HOME=/[^\ ]+(\ TNS_ADMIN=/[^\ ]+)?\ timeout\ 120\ /[^\ ]+/bin/lsnrctl\ status\ [A-Z_]+$ ]] \
+       || [[ "$l" =~ ^env\ NLS_LANG=AMERICAN_AMERICA\.AL32UTF8\ LC_ALL=C\ ORACLE_HOME=/[^\ ]+(\ TNS_ADMIN=/[^\ ]+)?\ timeout\ 120\ /[^\ ]+/bin/lsnrctl\ status\ [A-Z_]+$ ]] \
        || [[ "$l" =~ ^cat\ /[A-Za-z0-9_./-]+/ContentsXML/inventory\.xml$ ]] \
-       || [[ "$l" =~ ^env\ ORACLE_HOME=/[^\ ]+\ TNS_ADMIN=/[^\ ]+\ /[^\ ]+/bin/tnsping\ [a-z_]+\ 1$ ]] \
+       || [[ "$l" =~ ^env\ NLS_LANG=AMERICAN_AMERICA\.AL32UTF8\ LC_ALL=C\ ORACLE_HOME=/[^\ ]+\ TNS_ADMIN=/[^\ ]+\ /[^\ ]+/bin/tnsping\ [a-z_]+\ 1$ ]] \
        || [[ "$l" =~ ^getent\ ahostsv4\ [A-Za-z0-9.-]+$ ]] \
        || [[ "$l" =~ ^sh\ -c\ \'e=\$\(LC_ALL=C\ timeout\ 8\ bash\ -c\ \"exec\ 3\<\>/dev/tcp/[0-9.]+/[0-9]+\"\ 2\>\&1\)\;\ r=\$\?\;\ case\ \"\$r:\$e\"\ in\ 0:\*\)\ echo\ OPEN\;\;\ 124:\*\)\ echo\ TIMEOUT\;\;\ \*refused\*\)\ echo\ REFUSED\;\;\ \*unreachable\*\)\ echo\ UNREACH\;\;\ \*No\\\ route\*\)\ echo\ NOROUTE\;\;\ \*\)\ echo\ BLOCKED\;\;\ esac\'$ ]] \
        || [[ "$l" == "nproc" || "$l" == "hostname -I" || "$l" == "dd if=/dev/zero bs=1M count=64 status=none" ]] \
@@ -121,7 +123,7 @@ PARTS=(
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
   [11]="5.23 5.30 5.31 5.32 5.33"
-  [12]="5.34"
+  [12]="5.34 5.36"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -261,7 +263,7 @@ check "ssh control socket closed at exit" "[[ ! -e $T/varlib/ssh_ctl ]]"
 check "every primary step shows ON PRIMARY block" "[[ \$(grep -c 'Run on the PRIMARY (prim01)' $T/b.txt) -ge 9 ]]"
 check "primary steps recorded DONE_BY_YOU" "[[ \$(res 4.1 $T/b.txt) == DONE_BY_YOU && \$(res 9.5 $T/b.txt) == DONE_BY_YOU ]]"
 check "actions file lists primary commands" "grep -q 'alter database force logging' $T/log/actions_*.txt"
-check "every [y] question comes after a Plan of the same step" "awk '/^  \\[[0-9]+\\.[0-9]+\\] /{p=0} /Plan:/{p=1} /\\[y\\] do it/{if(!p){bad=1}} END{exit bad}' $T/b.txt"
+check "every [y] question comes after a Plan of the same step" "awk '/^  Step [0-9]+\\.[0-9]+ /{p=0} /^    (Plan|Will run) /{p=1} /\\[y\\] Yes, do it/{n++; if(!p){bad=1}} END{exit (bad || n < 20)}' $T/b.txt"
 check "/etc/hosts backup kept" "ls /etc/hosts.bak_* >/dev/null 2>&1"
 cp $T/b.txt $T/b_full.txt
 
@@ -372,10 +374,14 @@ check "--help-step all prints every step (77, with 9.9) and the help of --health
 check "--help-step uses saved names" "grep -q 'PRODDB_STBY' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help-step 9.10 2>&1); check "--help-step unknown -> message" "grep -q 'No help for step' <<< \"\$out\""
 out=$(cd $T && bash ./dg_standby_setup.sh --help 2>&1); check "--help shows usage" "grep -q -- '--primary' <<< \"\$out\""
-for st in 1.1 1.2 1.3 1.4 1.5 1.6 2.1 2.2 2.3 2.4 2.5 2.6 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14 2.15 2.16 3.1 3.2 3.3 3.4 3.5 3.6 3.7 3.8 3.9 3.10 3.11 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10 4.11 5.1 5.2 5.3 5.4 6.1 6.2 6.3 7.1 7.2 7.3 7.4 7.5 7.6 7.7 8.1 8.2 9.1 9.2 9.3 9.4 9.5 9.6 9.7 9.8 10.1 10.2 10.3 10.4; do
-  grep -q "run_step $st " $T/dg_standby_setup.sh || fail "step $st exists in the script"
+# (the ids of the help: read from the script, so a step added later is in this check by itself)
+help_ids=$(sed -n '/^readonly HELP_IDS=(/,/)/p' $T/dg_standby_setup.sh | tr -d '()' | sed 's/^readonly HELP_IDS=//' | tr -s ' \n' ' ')
+nhelp=0; nbad=0
+for st in $help_ids; do
+  nhelp=$((nhelp + 1))
+  grep -qE "run_step $st |run_step \"$st\" " $T/dg_standby_setup.sh || { nbad=$((nbad + 1)); echo "    no run_step for help id $st"; }
 done
-pass "all help ids are real steps"
+check "all help ids are real steps ($nhelp ids read from the script)" "[[ $nhelp -ge 70 && $nbad -eq 0 ]]"
 
 fi
 if part I; then
@@ -431,7 +437,7 @@ check "not enough space in +DATA -> no duplicate" "grep -q 'Not enough space her
 fresh; jset $P "d['params']['log_archive_dest_3']='service=other'; d['params']['db_create_online_log_dest_1']='+REDO1'"
 rc=$(run $T/l4.txt)
 check "primary-only parameters remapped/cleared in RMAN script (the logs go to the standby's own disk group, not +REDO1)" "grep -q \"set db_create_online_log_dest_1='+DATA'\" $T/log/duplicate_*.rman && ! grep -q REDO1 $T/log/duplicate_*.rman && grep -q \"set log_archive_dest_state_3='defer'\" $T/log/duplicate_*.rman && grep -q \"dg_config=(PRODDB,PRODDB_STBY)\" $T/log/duplicate_*.rman"
-check "rman script has no password" "! grep -q Welcome_123 $T/log/duplicate_*.rman $T/log/duplicate_*.log"
+check "rman script has no password (the script and its log are there, and the password is in neither)" "ls $T/log/duplicate_*.rman >/dev/null && ! grep -q Welcome_123 $T/log/duplicate_*.rman $T/log/duplicate_*.log"
 
 fi
 if part M; then
@@ -531,7 +537,7 @@ check "gid already used by another group -> manual instructions shown" "grep -q 
 fresh; jset $P "d['ids']['oracle']=d['ids']['oracle']+',10(wheel),990(docker)'"
 rc=$(DG_TEST_QUIT_AT=2.1 run $T/p11.txt)
 check "non-Oracle groups (wheel, docker) not copied" "! grep -qE 'GROUP_GIDS=.*(wheel|docker)' $T/varlib/settings.conf"
-fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > /tmp/claude-hosts.$$; cat /etc/hosts >> /tmp/claude-hosts.$$; cp /tmp/claude-hosts.$$ /etc/hosts; rm -f /tmp/claude-hosts.$$
+fresh empty; printf '%s\n' "127.0.1.1    $(hostname -s)" > $T/hosts.new; cat /etc/hosts >> $T/hosts.new; cp $T/hosts.new /etc/hosts; rm -f $T/hosts.new
 rc=$(DG_TEST_QUIT_AT=2.8 run $T/p12.txt)
 # the address the script puts in: the first non-loopback one of this machine (as in setup_env.sh)
 SIPRE=$(hostname -I | tr ' ' '\n' | grep -v '^127\.' | grep -E '^[0-9.]+$' | head -n 1); SIPRE=${SIPRE//./\\.}
@@ -1282,7 +1288,7 @@ EOF
 }
 check "9.8: the clean-up timer must be running, and its last run must not have failed" "[[ \$(ut_timer) == 'ok off failed' ]]"
 fresh; rc=$(DG_TEST_QUIT_AT=1.3 run $T/z35.txt --from 10.0)
-check "--from 10.0 is the same as --from 10" "! grep -q 'There is no step 10.0' $T/z35.txt"
+check "--from 10.0 is the same as --from 10 (the run starts and reaches the primary, with no word about an unknown step)" "! grep -q 'There is no step 10.0' $T/z35.txt && grep -q 'Step 1.2' $T/z35.txt && grep -qE 'from 10|phase 10' $T/z35.txt"
 
 fi
 if part Z9; then  CUR=Z
@@ -2508,8 +2514,9 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
 # 1) safe_path: a folder of another user, a folder others can write to and a relative entry are left out
 ( source <(fn path_dir_safe; fn safe_path)
   d=$T/ut531p; rm -rf $d; mkdir -p $d/ok $d/other $d/open; chmod 755 $d $d/ok $d/other; chmod 777 $d/open; chown nobody $d/other
-  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
-  echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) | sed "s#$T/ut531p#D#g"
+  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; TEST_HOOKS=0; safe_path
+  echo "path=$PATH"; echo "dropped=$PATH_DROPPED"
+  ORIG_PATH="$d/ok:/usr/bin"; TEST_HOOKS=1; safe_path; echo "testpath=$PATH" ) | sed "s#$T/ut531p#D#g"
 # 2) limit_users: oracle is in the list, a separate grid owner too
 ( source <(fn limit_users); use_grid() { return 0; }; single_owner() { return 1; }
   ORACLE_USER=oracle; GRID_USER=grid; a=$(limit_users | paste -sd, -)
@@ -2520,7 +2527,7 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
   echo "lsnrstop=$(undo_text LSNRSTOP LISTENER 'home=/u01/db user=oracle port=1521') [$(change_word LSNRSTOP)]" )
 EOF
 bash $T/ut531.sh $T/dg_standby_setup.sh $T > $T/ut531.txt 2>&1
-check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt"
+check "unit: PATH has the system folders first, then only root's own folders that others cannot write to; what is left out is named (the test suite's stand-ins go first only with DG_TEST_HOOKS=1)" "grep -Eqx 'path=(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin:D/ok' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt && grep -Eqx 'testpath=D/ok:(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin' $T/ut531.txt"
 check "unit: the limits of the user oracle are checked like those of the other owners" "grep -qx 'limusers=oracle,grid/oracle' $T/ut531.txt"
 check "unit: a stopped listener of another home is a journal line with the command that starts it again" "grep -qF 'lsnrstop=by hand, only if that listener is still needed (it held port 1521, which the Grid listener uses now), as oracle:  ORACLE_HOME=/u01/db /u01/db/bin/lsnrctl start LISTENER [listener]' $T/ut531.txt"
 rm -rf $T/ut531p
@@ -2538,8 +2545,8 @@ for t in dirname basename date stat find mktemp readlink hostname id; do printf 
 check "PATH: programs in a folder of another user at the front of PATH are never run as root (from the first line on)" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r31p.txt"
 ln -sfn /usr/bin $ev/lnk
 ( source <(sed -n '/^path_dir_safe()/,/^}/p; /^safe_path()/,/^}/p' $T/dg_standby_setup.sh); mkdir -p $ev/sub; chown root $ev/sub; chmod 755 $ev/sub
-  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
-check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -qx \"path=/usr/bin:$T/rootbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
+  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; TEST_HOOKS=1; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
+check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -Eqx \"path=$T/rootbin:(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
 rm -rf $ev
 fi
 if part 5.32; then
@@ -2584,7 +2591,7 @@ CUR=5.34; echo "== 5.34  The disks of step 2.13 as a list to mark, and --show-ch
 fresh empty; SN=$T/snaps34; rm -rf $SN
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_DISK_PICKS='<SNAP:d0><DOWN> <SNAP:d1><ENTER>,<SNAP:e0><DOWN> <UP><SNAP:d2><ENTER>' DG_TEST_QUIT_AT=2.14 DG_TEST_TIMEOUT=300 run $T/r34a.txt)
 check "2.13 page: the empty disks with their sizes, the cursor on the suggested one, nothing marked by the page itself" "grep -q '^ Empty disks for +DATA' $SN/*_d0.txt && grep -qE '^ › \\[ \\]  1\\) /dev/sdb +200 GB' $SN/*_d0.txt && grep -qE '^   \\[ \\]  2\\) /dev/sdc +100 GB' $SN/*_d0.txt && grep -q 'Nothing marked: Enter takes the row of the cursor' $SN/*_d0.txt && tail -n 1 $SN/*_d0.txt | grep -q 'Disk numbers for +DATA (q = stop, nothing is erased) \\[1\\]'"
-check "2.13 page: Down and Space mark the second disk: the line names the marked rows, their size and what is missing" "grep -qE '^   \\[ \\]  1\\) /dev/sdb' $SN/*_d1.txt && grep -qE '^ › \\[x\\]  2\\) /dev/sdc' $SN/*_d1.txt && grep -qE 'Marked: 2 = 100 GB +needed: [0-9]+ GB +[0-9]+ GB more to mark' $SN/*_d1.txt"
+check "2.13 page: Down and Space mark the second disk: the line names the marked rows, their size and what is missing" "grep -qE '^   \\[ \\]  1\\) /dev/sdb' $SN/*_d1.txt && grep -qE '^ › \\[x\\]  2\\) /dev/sdc' $SN/*_d1.txt && grep -qE 'Marked: 2 = 100 GB +needed: [0-9]+ GB +[0-9]+ GB more' $SN/*_d1.txt"
 check "2.13 page: a disk that is too small is not taken: the page comes back, says why, and keeps the mark" "grep -qE '! These disks have 100 GB, but \\+DATA needs [0-9]+ GB' $SN/*_e0.txt && grep -qE '\\[x\\]  2\\) /dev/sdc' $SN/*_e0.txt"
 check "2.13 page: the mark taken away again, the cursor on disk 1: nothing is marked" "grep -qE '^ › \\[ \\]  1\\) /dev/sdb' $SN/*_d2.txt && ! grep -q '\\[x\\]' $SN/*_d2.txt"
 check "2.13: Enter with nothing marked takes the disk of the cursor; both disk groups get their disk, each confirmed by its name as before" "grep -qx 'DATA_1|/dev/sdb1' $T/varlib/asm_disks && grep -qx 'FRA_1|/dev/sdc1' $T/varlib/asm_disks && grep -q 'Type /dev/sdb to continue' $T/r34a.txt"
@@ -2602,6 +2609,55 @@ rc=$(run $T/r34d.txt --show-changes)
 check "--show-changes without the screen layout: the report as text, as before" "grep -q 'Changes made by this script' $T/r34d.txt && grep -qE '^  Step 2\\.1  Groups' $T/r34d.txt && ! grep -q 'Step (Enter: the marked one)' $T/r34d.txt"
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/e DG_TEST_TIMEOUT=100 run $T/r34e.txt --show-changes 2.1)
 check "--show-changes STEP: the report of that step as text, also on a screen" "grep -q 'Changes made by this script  (step 2.1)' $T/r34e.txt && ! grep -q 'Step (Enter: the marked one)' $T/r34e.txt"
+fi
+if part 5.36; then
+CUR=5.36; echo "== 5.36  Fixes of the full review: the environment, keys sent fast, step 3.10, settings that cannot work"
+fresh empty
+# ---- the environment of the caller: no start file, no function, no program of another user's folder runs ----
+ev=$T/ut536evil; rm -rf $ev; mkdir -p $ev; chmod 755 $ev
+for t in bash env dirname basename date stat find mktemp readlink hostname id compgen; do printf '#!/bin/sh\necho "$0" >> %s/ran\nexec /usr/bin/%s "$@"\n' "$ev" "$t" > $ev/$t; done
+printf 'echo bashenv >> %s/ran\n' "$ev" > $ev/benv; chmod 755 $ev/*; chown -R nobody $ev; chmod 777 $ev
+# (a stand-in for hostname that is a bash script: a function left in the environment would run inside it)
+printf '#!/bin/bash\ndate > /dev/null\nexec /usr/bin/hostname "$@"\n' > $T/rootbin/hostname; chmod 755 $T/rootbin/hostname
+( cd $T && export BASH_ENV=$ev/benv PATH=$ev:$T/rootbin:$PATH DG_PLAIN=1 DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log
+  date() { echo fn >> $ev/ran; /usr/bin/date "$@"; }; export -f date
+  timeout 60 ./dg_standby_setup.sh --status > $T/r36e.txt 2>&1 )
+rm -f $T/rootbin/hostname
+check "environment: a start file for bash (BASH_ENV), an exported function (also inside a bash script the script starts) and programs named bash, env, date ... in another user's folder at the front of PATH never run as root" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36e.txt"
+( cd $T && unset DG_TEST_HOOKS; DG_STATE_DIR=$T/ut536state DG_LOG_DIR=$T/ut536log DG_PLAIN=1 timeout 60 ./dg_standby_setup.sh --status > $T/r36f.txt 2>&1 )
+check "environment: without DG_TEST_HOOKS=1 the test settings (another state and log folder) are not used" "[[ ! -e $T/ut536state && ! -e $T/ut536log ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36f.txt"
+mv /etc/dgt_test_machine /etc/dgt_test_machine.off
+( cd $T && DG_TEST_HOOKS=1 DG_STATE_DIR=$T/ut536state DG_LOG_DIR=$T/ut536log DG_PLAIN=1 timeout 60 ./dg_standby_setup.sh --status > $T/r36g.txt 2>&1 )
+mv /etc/dgt_test_machine.off /etc/dgt_test_machine
+check "environment: DG_TEST_HOOKS=1 alone switches nothing on (it needs the file the test suite makes as root on its machine)" "[[ ! -e $T/ut536state && ! -e $T/ut536log ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36g.txt"
+check "the script starts with #!/bin/bash -p (bash by its full path, in the mode that reads no start file)" "head -n 1 $T/dg_standby_setup.sh | grep -qx '#!/bin/bash -p'"
+rm -rf $ev $T/ut536state $T/ut536log
+# ---- keys that arrive together ----
+SN=$T/snaps36; rm -rf $SN
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_SUMMARY='<DOWNDOWN><SNAP:two>12345<SNAP:typed><ENTER>,<DOWN><ESCENTER>' DG_TEST_QUIT_AT=2.1 DG_TEST_TIMEOUT=200 run $T/r36a.txt)
+check "two arrow keys sent in one write move the mark twice, and nothing of them is taken as typed text" "grep -qE '^›  2  Yes to all' $SN/*_two.txt && [[ \$(grep -c '^›' $SN/*_two.txt) == 1 ]] && tail -n 1 $SN/*_two.txt | grep -qE 'uit ›\$'"
+check "80 columns: a typed answer of five characters is seen whole on the question row" "tail -n 1 $SN/*_typed.txt | grep -q '› 12345\$'"
+check "Esc and Enter sent together: the mark is taken away and Enter starts the run" "grep -q 'Step 2.1' $T/r36a.txt && ! grep -q 'Mode .*check only' $T/r36a.txt"
+# ---- step 3.10: the Grid listener is moved to the port of the primary ----
+fresh empty; jset $P "d['port']=1525"
+rc=$(DG_TEST_QUIT_AT=3.11 run $T/r36b.txt)
+check "3.10: the primary listens on 1525: the Grid listener is changed to it (srvctl modify, stop, start), journaled with the old port" "grep -q 'srvctl modify listener -listener LISTENER -endpoints TCP:1525' $T/r36b.txt && [[ \$(res 3.10 $T/r36b.txt) == DONE ]] && grep -qE '\\|3\\.10\\|LSNRPORT\\|LISTENER\\|.*old=1521' $T/varlib/changes.log && python3 -c \"import json,sys; sys.exit(0 if json.load(open('$S')).get('lsnr_port') == 1525 else 1)\""
+rc=$(DG_TEST_UNDO=y run $T/r36c.txt --undo 3.10)
+check "3.10 undo: the listener goes back to the old port" "python3 -c \"import json,sys; sys.exit(0 if json.load(open('$S')).get('lsnr_port') == 1521 else 1)\""
+# ---- settings that would end in a dead end are refused on the summary ----
+cat > $T/ut536.sh <<'EOF'
+#!/bin/bash
+S=$1
+fn() { sed -n "/^$1()/,/^}/p" "$S"; }
+( source <(fn validate_settings; fn valid_value; fn asm_dgs; sed -n '/^readonly SETTING_SPECS="/,/^readonly STANDBY_KEYS=/p' "$S")
+  bad() { echo "BAD: $1" | head -n 1; }; warn() { :; }; all_locs() { printf '%s\n' "$LOCS_T"; }; use_grid() { return 0; }
+  ip_of() { echo 10.0.0.1; }; ipv4_of() { echo 10.0.0.1; }; hostname() { echo vm; }
+  for k in $(for s in $SETTING_SPECS; do echo "${s%%:*}"; done); do printf -v "$k" '%s' x; done
+  USE_GRID=yes; GRID_HOME=/u01/g; GRID_BASE=/u01/gb; ORACLE_BASE=/u01/ob; DB_HOME=/u01/ob/h; INVENTORY_DIR=/u01/inv; DATA_DG=DATA; DB_NAME=db; PRIMARY_UNIQUE=db
+  LOCS_T='+FRA'; STANDBY_HOST=vm; validate_settings 2>&1 | grep -c 'do not use the disk group +DATA'
+  LOCS_T='+DATA'; STANDBY_HOST=localhost.localdomain; validate_settings 2>&1 | grep -c 'no host name of its own yet' ) 2>/dev/null | paste -sd/ -
+EOF
+check "unit: the summary refuses a placement that leaves out the disk group Grid is installed with, and a server still named localhost" "[[ \$(bash $T/ut536.sh $T/dg_standby_setup.sh) == 1/1 ]]"
 fi
 parts_done
 echo

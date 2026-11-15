@@ -199,7 +199,8 @@ def udevadm():
         return 0
     return 0
 def uname():
-    r = os.environ.get("DGT_UNAME", "5.4.17-2136.330.7.1.el8uek.x86_64")
+    # (DG_TEST_UNAME: the script keeps only DG_* test settings in its environment; run() sets it from DGT_UNAME)
+    r = os.environ.get("DG_TEST_UNAME") or os.environ.get("DGT_UNAME") or "5.4.17-2136.330.7.1.el8uek.x86_64"
     print(r if "-r" in a else "Linux"); return 0
 def noop(): return 0
 def crontab():

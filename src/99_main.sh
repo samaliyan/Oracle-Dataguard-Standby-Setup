@@ -41,7 +41,8 @@ After setup
   --only 10            Health check, with the screen and questions
                          dg_standby_setup.sh --only 10
   --health             Health check for cron or monitoring: no questions, no changes; exit 0 OK,
-                       1 WARNING, 2 CRITICAL, 3 UNKNOWN (needs an ssh key: --help-step health)
+                       1 WARNING, 2 CRITICAL, 3 UNKNOWN (--help-step health; with the ssh key of
+                       step 9.9 it also checks the primary side)
                          dg_standby_setup.sh --health
   --roll-forward       Bring a standby that cannot catch up up to date from the primary (18c+)
                          dg_standby_setup.sh --roll-forward
@@ -102,7 +103,8 @@ Exit codes
   0  Every step is OK
   1  Stopped by you, or some steps are not OK or skipped (normal for --check on a new server)
   2  Wrong option or unknown step
-  4  A step failed and the run cannot go on (the last lines name the step, its error and what to do)
+  1  also: the run stopped on an error (the last lines name it and what to do)
+  4  The RMAN copy (step 8.2) failed (the last lines name its error, the cause and what to do)
   With --health:  0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check, or a wrong option)
 
 Run with no option to see all of this as a menu.
@@ -478,10 +480,13 @@ safe_path() {
     if [[ -n "$r" && "$r" != *:* ]] && path_dir_safe "$r"; then [[ ":$out:" == *":$r:"* ]] || out+="${out:+:}$r"
     else dropped+="${dropped:+, }$d"; fi
   done
-  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
-    [[ ":$out:" == *":$d:"* ]] || out+="${out:+:}$d"
-  done
-  export PATH="$out"
+  # the system folders first: a tool of the system is never replaced by a program of the same name in another
+  # folder (the Grid home's bin, for example, holds its own unzip). The test suite puts its stand-ins first.
+  local sys="/usr/sbin:/usr/bin:/sbin:/bin" o2=""
+  for d in /usr/local/bin /usr/local/sbin; do path_dir_safe "$d" && sys="$d:$sys"; done
+  IFS=: read -r -a ents <<< "$out"
+  for d in "${ents[@]+"${ents[@]}"}"; do [[ -n "$d" && ":$sys:" != *":$d:"* ]] && o2+="${o2:+:}$d"; done
+  if [[ ${TEST_HOOKS:-0} -eq 1 ]]; then export PATH="${o2:+$o2:}$sys"; else export PATH="$sys${o2:+:$o2}"; fi
   PATH_DROPPED=$dropped
 }
 main() {
@@ -505,7 +510,7 @@ main() {
   local pv
   for pv in "$LOG_DIR" "$STATE_DIR" "$SHORT_DIR" "$FSTAB_FILE" "$SHM_UNIT_FILE" "$OS_RELEASE_FILE" "$MEMINFO_FILE" "$SYSTEMD_RUN_DIR"; do
     v_path "$pv" || { printf 'Not a plain absolute path (only letters, digits and _ . / -): %s
-Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
+(Other folders can only be set by the test suite.)
 ' "$pv"; exit $ef; }
   done
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
@@ -517,7 +522,11 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   PROGRESS_FILE="$STATE_DIR/progress"; LASTRUN_FILE="$STATE_DIR/last_run"; JOURNAL_FILE="$STATE_DIR/changes.log"
   [[ $HEALTH -eq 1 ]] && { health_main; exit 3; }
   if [[ $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" ]]; then
-    # read-only views: no lock, no log, no connection
+    # read-only views: no lock, no log, no connection, and no record of a run (a stop of the view, or its output
+    # ended by "| head", is not a stopped run)
+    LASTRUN_FILE=""
+    trap 'tty_restore; [[ ${UI_ALT:-0} -eq 1 ]] && { printf "\e[?1049l"; UI_ALT=0; }; printf "\n"; exit 130' INT
+    trap 'exit 0' PIPE
     init_settings; [[ -f "$SETTINGS_FILE" ]] && load_settings soft >/dev/null 2>&1
     printf '\n  %sOracle Data Guard Standby Setup%s   %sversion %s%s\n' "$C_B" "$C_N" "$C_D" "$SCRIPT_VERSION" "$C_N"
     printf '  %s\n' "$(rule 70)"
@@ -539,7 +548,9 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
           # the same question as from the menu
           show_changes_cli "$BROWSE_UNDO"
           if confirm "Undo the changes of step $BROWSE_UNDO now? Each change is asked again before it is undone."; then
-            local urc=0; "$BASH" "$SELF" --undo "$BROWSE_UNDO" || urc=$?
+            # (Ctrl+C during the undo is the undo's own stop: this view only passes its exit code on)
+            trap : INT
+            local urc=0; "$BASH" -p "$SELF" --undo "$BROWSE_UNDO" || urc=$?
             exit $urc
           fi
         fi
@@ -561,8 +572,10 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   # one run at a time (a second run would take over the ssh connection and the settings)
   exec 9> "$STATE_DIR/lock" || { printf 'Cannot open %s/lock\n' "$STATE_DIR"; exit 1; }
   if ! flock -n 9; then printf 'Another run of this script is active on this server. Wait for it to end, then try again.\n'; exit 1; fi
-  LOG_FILE="$LOG_DIR/run_$RUN_ID.log"; : > "$LOG_FILE" && chmod 640 "$LOG_FILE" || { LOG_FILE=""; printf 'Cannot write the log in %s. Is the file system read-only or full?\n' "$LOG_DIR"; exit 1; }
-  ACTIONS_FILE="$LOG_DIR/actions_$RUN_ID.txt"; : > "$ACTIONS_FILE" && chmod 640 "$ACTIONS_FILE" || { printf 'Cannot write in %s\n' "$LOG_DIR"; exit 1; }
+  # (made with its final mode: with the log folder given to the install group in step 9.8, nobody of that group
+  # can open the files in the moment before a chmod)
+  LOG_FILE="$LOG_DIR/run_$RUN_ID.log"; ( umask 027; : > "$LOG_FILE" ) && chmod 640 "$LOG_FILE" || { LOG_FILE=""; printf 'Cannot write the log in %s. Is the file system read-only or full?\n' "$LOG_DIR"; exit 1; }
+  ACTIONS_FILE="$LOG_DIR/actions_$RUN_ID.txt"; ( umask 027; : > "$ACTIONS_FILE" ) && chmod 640 "$ACTIONS_FILE" || { printf 'Cannot write in %s\n' "$LOG_DIR"; exit 1; }
   [[ -n "$UNDO_STEP" ]] && run_undo
 
   init_settings
@@ -585,6 +598,17 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
+  if [[ -n "${ENV_DROPPED:-}" ]]; then
+    _log WARN "settings of the test suite in the environment were not used:$ENV_DROPPED"
+    say "${C_D}Not used from the environment (settings of the test suite):$ENV_DROPPED${C_N}"
+  fi
+  [[ ${TEST_HOOKS:-0} -eq 1 ]] && _log WARN "the DG_* test settings of the environment are in use (DG_TEST_HOOKS=1 on a machine of the test suite)"
+  # the script file itself: in a folder another user can change, it could be replaced while it runs
+  if ! path_dir_safe "$SCRIPT_DIR"; then
+    _log WARN "the script is in a folder that is not root's own all the way down: $SCRIPT_DIR"
+    warn "This script is in a folder that another user can change ($SCRIPT_DIR).
+Copy it to a folder of root (for example /root or /usr/local/sbin) and run it from there."
+  fi
   if [[ -n "${PATH_DROPPED:-}" ]]; then
     _log PATH "not used (not root's own, or writable by others): $PATH_DROPPED"
     say "${C_D}Not used from PATH (not root's own folders, or writable by others): $PATH_DROPPED${C_N}"

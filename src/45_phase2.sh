@@ -925,7 +925,7 @@ d_2_10() { cp_run && journal SERVICE chronyd; }
 PROF_TODO=()
 login_env() {
   # what the user really gets after login (the profile is run in a login shell on THIS server)
-  timeout 20 runuser -l "$1" -s /bin/bash -c 'printf "%s|%s|%s\n" "${ORACLE_SID:-}" "${ORACLE_HOME:-}" "${ORACLE_BASE:-}"' < /dev/null 2>/dev/null 9>&- | tail -n 1
+  timeout 20 setsid runuser -l "$1" -s /bin/bash -c 'printf "%s|%s|%s\n" "${ORACLE_SID:-}" "${ORACLE_HOME:-}" "${ORACLE_BASE:-}"' < /dev/null 2>/dev/null 9>&- | tail -n 1
 }
 profile_specs() {
   printf '%s\n' "$ORACLE_USER|$ORACLE_BASE|$DB_HOME|$STANDBY_SID"
@@ -1076,7 +1076,7 @@ To use ASMLib instead: answer s, install oracleasm-support (step 2.3), then run 
 }
 d_2_12() {
   case "$A212_MODE" in
-    to_udev|save) ASM_METHOD=udev; save_settings; return 0 ;;
+    to_udev|save) ASM_METHOD=udev; save_settings; journal SETTING ASM_METHOD "ASM_METHOD=udev"; return 0 ;;
     udevd)
       # the udev service of the system: started (nothing else changes); a part of every Linux system
       cp_run || { bad "systemd-udevd did not start. To see why:  systemctl status systemd-udevd"; return 1; }

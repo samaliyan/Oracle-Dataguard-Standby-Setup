@@ -71,7 +71,9 @@ health_exit() {
   HEALTH_BUF=()
   health_out "Result: $worst (exit $code)${HEALTH_LOG:+. Details: $HEALTH_LOG}"
   printf '%s\n' "${HEALTH_BUF[0]}" >&7; HEALTH_BUF=()
-  dg_state_save health "$worst" "$HEALTH_LOG"
+  # (a run that could not even start, the lock was busy or there are no settings, read nothing: the state
+  # recorded by the last real check stays)
+  [[ ${HEALTH_STARTED:-0} -eq 1 ]] && dg_state_save health "$worst" "$HEALTH_LOG"
   _log STOP "health result $worst"
   exit "$code"
 }
@@ -162,6 +164,7 @@ health_main() {
   users_ok || health_exit UNKNOWN "The Oracle users of the settings do not exist on this server."
   build_envs
   db_sw_ok || health_exit UNKNOWN "The database software is not installed here (phase 3)."
+  HEALTH_STARTED=1          # from here on the check reads the standby: its result is recorded
   # a long job (the copy, a roll forward, an installer) is maintenance: the standby is not expected to be in sync
   if job_alive >> "$HEALTH_LOG" 2>&1; then health_exit UNKNOWN "Maintenance is running: $JOB_TITLE (session $JOB_PID). The check was not done."; fi
   # a roll forward that ended while no run watched: redo apply stays stopped until it is finished

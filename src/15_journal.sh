@@ -31,6 +31,8 @@ journal() {
   seq=$(journal_next_seq)
   install -d -m 700 "$STATE_DIR"
   [[ -s "$JOURNAL_FILE" ]] || printf '#journal v1 (seq|time|run|step|kind|object|detail)\n' >> "$JOURNAL_FILE" 2>/dev/null
+  # (a last line that was cut off, by a full disk for example, is ended first: the new entry is a line of its own)
+  [[ -s "$JOURNAL_FILE" && -n "$(tail -c 1 -- "$JOURNAL_FILE" 2>/dev/null)" ]] && printf '\n' >> "$JOURNAL_FILE" 2>/dev/null
   if ! printf '%s|%s|%s|%s|%s|%s|%s\n' "$seq" "$(ts)" "$RUN_ID" "${CUR_STEP:-start}" "$1" "$o" "$d" >> "$JOURNAL_FILE" 2>/dev/null; then
     [[ $JOURNAL_WARNED -eq 1 ]] || { JOURNAL_WARNED=1; warn "Cannot write the change journal $JOURNAL_FILE. Is the disk full?
 Changes of this run may be missing from --show-changes and --undo."; }
@@ -482,7 +484,11 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       local to; to=$(detail_field "$det" to)
       [[ -e "$to" ]] || { say "$to is gone. Nothing to rename back."; return 0; }
       [[ -e "$obj" ]] && { say "$obj exists again. The renamed copy $to is left as it is."; return 2; }
-      mv -f -- "$to" "$obj" || return 1
+      # as the owner of the folder (not root): in a folder of oracle or grid a name could be made a link in the
+      # moment before the move; -T: the target is never taken as a folder to move into
+      local rown; rown=$(stat -c '%U' -- "$(dirname "$obj")" 2>/dev/null)
+      if [[ -n "$rown" && "$rown" != root && "$rown" != UNKNOWN ]]; then runuser -u "$rown" -- mv -fT -- "$to" "$obj" || return 1
+      else mv -fT -- "$to" "$obj" || return 1; fi
       say "Renamed $to back to $obj"; return 0 ;;
     DIR)
       [[ -d "$obj" ]] || { say "$obj is already gone."; return 0; }
@@ -545,8 +551,11 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
       if _db_registered; then
         run_logged "srvctl stop database" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" -stopoption immediate || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
       else
-        sql_local_long "shutdown immediate" || { bad "shutdown immediate failed: $(ora_errors "$SQL_OUT")
-Trying shutdown abort."; sql_local "shutdown abort" || return 1; }
+        # (a clean shutdown of a mounted or only started instance prints ORA-01109 / ORA-01507 first: no failure)
+        if ! sql_local_long "shutdown immediate" && ! { grep -qE 'ORA-(01109|01507)' <<< "$SQL_OUT" && ! grep -E '(ORA|SP2)-[0-9]+' <<< "$SQL_OUT" | grep -qvE 'ORA-(01109|01507)'; }; then
+          bad "shutdown immediate failed: $(ora_errors "$SQL_OUT")
+Trying shutdown abort."; sql_local "shutdown abort" || return 1
+        fi
       fi
       say "Instance $obj is down."; return 0 ;;
     SRVCTL)

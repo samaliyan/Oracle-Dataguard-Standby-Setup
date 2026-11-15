@@ -52,8 +52,14 @@ jobs:
             git -c core.fileMode=false diff --stat -- dg_standby_setup.sh
             exit 1
           fi
-      - name: Version
-        run: sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/version \1/p' dg_standby_setup.sh
+      - name: Version (the same in the script, the first CHANGELOG section and the Persian README)
+        run: |
+          v=$(sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/\1/p' dg_standby_setup.sh)
+          echo "version $v"
+          c=$(sed -n 's/^## \([0-9][0-9.]*\)$/\1/p' CHANGELOG.md | head -n 1)
+          [ "$v" = "$c" ] || { echo "::error file=CHANGELOG.md::the first section of CHANGELOG.md is $c, the script is $v"; exit 1; }
+          grep -q "dg_standby_setup-$v\.sh" README.fa.md || { echo "::error file=README.fa.md::README.fa.md does not name dg_standby_setup-$v.sh"; exit 1; }
+          head -n 1 dg_standby_setup.sh | grep -qx '#!/bin/bash -p' || { echo "::error file=src/00_core.sh::the first line must be #!/bin/bash -p"; exit 1; }
       - name: The parts of the test suite (one test job each)
         id: parts
         run: |

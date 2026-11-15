@@ -14,7 +14,7 @@ nf_reset() { NF_TAG=(); NF_SUMS=""; }
 nf_add() { NF_TAG[${#CP_CMD[@]}]=$1; shift; cp_add "$@"; }      # $1 tag (may be empty), then as cp_add
 nf_q() {
   # one word of a shell command line: as it is when plain, else in single quotes
-  if [[ "$1" =~ ^[A-Za-z0-9_./,:+=@%-]+$ ]]; then printf '%s' "$1"; else printf "'%s'" "${1//\'/\'\\\'\'}"; fi
+  if [[ "$1" =~ ^[A-Za-z0-9_./,:+=@%-]+$ ]]; then printf '%s' "$1"; else local sq="'"; printf "'%s'" "${1//$sq/$sq\\$sq$sq}"; fi
 }
 nf_lsnr_role() { if use_grid; then printf 'grid'; else printf 'oracle'; fi; }
 nf_role_user() { case "$1" in grid) printf '%s' "$GRID_USER" ;; oracle) printf '%s' "$ORACLE_USER" ;; *) printf 'root' ;; esac; }
@@ -780,7 +780,7 @@ c_6_1() {
     local pex=""; prim_probe exists "$DB_HOME/dbs/orapw$PRIMARY_SID" && pex=$(head -n 1 <<< "$RUN_OUT")
     if [[ "$pex" == YES ]]; then pfile="$DB_HOME/dbs/orapw$PRIMARY_SID"
     elif [[ "$pex" != NO ]]; then NOW="Cannot tell whether $DB_HOME/dbs/orapw$PRIMARY_SID is on the primary (no answer$([[ $PROBE_TIMED_OUT -eq 1 ]] && printf ' in time'))."$'\n'"Answer r to check again."; return 2
-    else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"; return 2; fi
+    else NOW="The password file of the primary was not found."$'\n'"v\$passwordfile_info is empty and $DB_HOME/dbs/orapw$PRIMARY_SID does not exist."$'\n'"To find it, run on the primary as $ORACLE_USER:"$'\n'"  $DB_HOME/bin/srvctl config database -db $PRIMARY_UNIQUE | grep -i 'password file'"$'\n'"If that shows a path in ASM (it starts with +; usual on 12.1 with Grid), copy the file out there as the Grid owner,"$'\n'"  asmcmd pwcopy <that path> /tmp/orapw_for_standby_$PRIMARY_SID"$'\n'"bring it to this server as $DB_HOME/dbs/orapw$STANDBY_SID (owner $ORACLE_USER, mode 640), and answer r."; return 2; fi
   fi
   [[ "$pfile" =~ ^\+[A-Za-z0-9_./+-]+$ || "$pfile" =~ ^/[A-Za-z0-9_./-]+$ ]] || { NOW="The primary password file has an unusual path: '$pfile'"; return 2; }
   if [[ -f "$d" ]]; then NOW="The password file here has the wrong owner, mode or format:"$'\n'"  $d"; else NOW="This server has no password file yet."$'\n'"  $d"; fi
@@ -913,7 +913,7 @@ tde_sso_stale() {
   local d=$1 out rc=0; TDE_SSO_WHY=""
   if [[ -f "$d/ewallet.p12" && "$d/cwallet.sso" -ot "$d/ewallet.p12" ]]; then TDE_SSO_WHY="it is older than ewallet.p12"; return 0; fi
   [[ -x "$DB_HOME/bin/orapki" ]] || return 1
-  out=$(timeout 120 runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$DB_HOME/bin/orapki" wallet display -wallet "$d" < /dev/null 2>&1 9>&-) || rc=$?
+  out=$(as_oracle timeout 120 "$DB_HOME/bin/orapki" wallet display -wallet "$d" < /dev/null 2>&1 | clean_ctl) || rc=$?
   printf '%s\n(exit code %s)\n' "$out" "$rc" | log_block "orapki wallet display -wallet $d (no password: auto-login)"
   [[ $rc -eq 124 ]] && { TDE_SSO_WHY="orapki gave no answer in 120 seconds"; return 2; }
   if grep -qiE 'PKI-02[0-9]+|password|unable to open' <<< "$out"; then

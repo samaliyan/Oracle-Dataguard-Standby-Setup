@@ -75,9 +75,10 @@ prim_probe() {
     profile_of)  cmd="sh -c 'f=~$1/.bash_profile; if [ -r \"\$f\" ]; then grep -sE \"^[[:space:]]*(export[[:space:]]+)?(ORACLE_HOME|ORACLE_SID|ORACLE_BASE|TNS_ADMIN)=\" \"\$f\" ~$1/.bashrc; true; else echo NOREAD; fi'" ;;
     orabase)     cmd="env ORACLE_HOME=$1 $1/bin/orabase" ;;
     orabasehome) cmd="env ORACLE_HOME=$1 $1/bin/orabasehome" ;;
-    lsnr)        cmd="env ORACLE_HOME=$1${3:+ TNS_ADMIN=$3} timeout 120 $1/bin/lsnrctl status $2" ;;
+    # (lsnrctl and tnsping answer in the language of NLS_LANG; the texts are read here, so English is asked for)
+    lsnr)        cmd="env NLS_LANG=AMERICAN_AMERICA.AL32UTF8 LC_ALL=C ORACLE_HOME=$1${3:+ TNS_ADMIN=$3} timeout 120 $1/bin/lsnrctl status $2" ;;
     invxml)      cmd="cat $1/ContentsXML/inventory.xml" ;;
-    tnsping)     cmd="env ORACLE_HOME=$1 TNS_ADMIN=$2 $1/bin/tnsping $3 1" ;;
+    tnsping)     cmd="env NLS_LANG=AMERICAN_AMERICA.AL32UTF8 LC_ALL=C ORACLE_HOME=$1 TNS_ADMIN=$2 $1/bin/tnsping $3 1" ;;
     hosts)       cmd="getent ahostsv4 $1" ;;
     # can the primary open a TCP connection to $1:$2 (this server)? Only a connect, nothing is sent.
     # OPEN, REFUSED (the network lets it through, nothing listens yet), TIMEOUT (dropped), UNREACH (no route on the
@@ -97,11 +98,13 @@ prim_probe() {
   CLEANUP_FILES+=("$err")
   # a stuck remote command (a hung NFS path, a wedged listener) must not stop the script for ever
   out=$(prim_ssh "echo $PROBE_MARK; $cmd" < /dev/null 2>"$err") || rc=$?
+  # (what the primary sends is shown and logged here: no control characters, see clean_ctl)
+  out=$(printf '%s\n' "$out" | clean_ctl)
   PROBE_TIMED_OUT=0; PROBE_ERR=""; PROBE_REACHED=0
   [[ $rc -eq 124 ]] && { printf 'no answer from the primary within %s s (%s)\n' "$PROBE_TIMEOUT" "$p" >> "$err"; PROBE_TIMED_OUT=1; warn "The primary did not answer in time ($p). The result of this check is unknown.
-Time limits: 120 s on the primary, $PROBE_TIMEOUT s here."; }
+Time limits: 120 s on the primary, $PROBE_TIMEOUT s here." >&2; }
   probe_log "$p" "$cmd" "$rc" "$out" "$err"
-  PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null)
+  PROBE_ERR=$(head -c 2000 "$err" 2>/dev/null | clean_ctl)
   rm -f "$err"
   # PROBE_REACHED: the command ran on the primary (the marker came back on a line of its own); else ssh itself failed
   local nl=$'\n'"$out"$'\n'
@@ -116,6 +119,9 @@ probe_log() {
   [[ -n "$LOG_FILE" ]] || return 0
   local o n e=""
   o=$(grep -vxF -- "$PROBE_MARK" <<< "$4" | sed '/^[[:space:]]*$/d')
+  # the process list of the primary: only the lines this script reads go into the log (a command line of another
+  # program there can hold a password)
+  [[ "$1" == ps ]] && o=$(grep -E '(ora|db|asm)_pmon_|tnslsnr|ocssd|ohasd' <<< "$o")
   [[ -s "$5" ]] && e=$(sed 's/^/stderr: /' -- "$5")
   [[ -n "$e" ]] && o+="${o:+$'\n'}$e"
   n=$(grep -c . <<< "$o")
@@ -151,7 +157,8 @@ readonly SQL_MARK="__DG_SQL_OUTPUT__"
 sql_result() {
   # $1 raw sqlplus output, $2 rc. SQL_OUT = only the lines after the marker
   # (so login banners, glogin.sql output, "Session altered." are ignored).
-  local raw=$1 rc=$2
+  local raw rc=$2
+  raw=$(printf '%s\n' "$1" | clean_ctl)
   if [[ "$raw" == *"$SQL_MARK"* ]]; then SQL_OUT=${raw#*"$SQL_MARK"}
   else SQL_OUT=$raw; [[ $rc -eq 0 ]] && rc=1; fi
   SQL_OUT=$(printf '%s\n' "$SQL_OUT" | sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d')

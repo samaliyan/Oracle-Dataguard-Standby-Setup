@@ -1,7 +1,71 @@
 # Changelog
 
-The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
-(with a `.sha256` checksum).
+The script file of a version is attached to its release on GitHub as `dg_standby_setup-<version>.sh` (with a
+`.sha256` checksum). A release is made for the version that reaches the main branch: versions that were merged
+together (5.33 with 5.34) have one release, under the newer number.
+
+## 5.36
+
+A full review of 5.35 by six independent reviewers (Oracle, installation, the engine, security, the keyboard
+pages, documents and tests) before the first use on real servers. No fault was found that damages data on the
+default path; these were real and are fixed.
+
+The environment of the user who became root (`su` without `-`):
+- The script starts with `#!/bin/bash -p` (bash by its full path; no start file and no function is taken from
+  the environment) and starts itself once more with an environment that holds only a short list of variables:
+  terminal, language, time zone, proxies, the ssh agent, the editor, `DG_VERBOSE`, `DG_PLAIN`,
+  `DG_SQL_TIMEOUT`, `DG_POLL_WAIT`. Before, `BASH_ENV`, exported functions (also inside the shells the script
+  starts), `SSH_ASKPASS` and a program named `bash` in a folder of PATH could run as root.
+- The test settings (`DG_STATE_DIR`, `DG_PROMPT_IN`, `DG_SYS_PASSWORD` ...) are used only with
+  `DG_TEST_HOOKS=1` on a machine of the test suite (it makes a file as root there); what is not used is named
+  on the screen. `EDITOR` is used only when the program is in a folder root holds.
+- PATH: the system folders come first; a folder of the caller's PATH never replaces a tool of the system.
+- The script says when it is started from a folder another user can change.
+
+Commands and what they print:
+- A program of an Oracle home (sqlplus, srvctl, lsnrctl, orapki, the login profile) runs in a session of its
+  own: it has no terminal of root to type into.
+- Ctrl+C, a closed terminal or a stop of the script ends the command of the step that runs and then the
+  script (before: Ctrl+C did nothing until the command had ended, up to 30 minutes for a shutdown). The lock
+  of the script is never free while a command of a step still runs. Installers, root scripts and the RMAN
+  copy keep running in their own session, as before.
+- Control characters are taken out of everything a command, the primary or a file gives before it is shown or
+  logged (an escape sequence could redraw the screen, for example the commands shown for you to run).
+- The process list of the primary is no longer copied into the run log (only the lines the script reads).
+- The run log is created with its final mode; the undo of a rename runs as the owner of the folder; the folder
+  of a response file gets its modes before it is given to the installer's user.
+
+Oracle:
+- A tablespace that is offline on the primary no longer makes a good copy count as failed.
+- lsnrctl and tnsping on the primary are asked for English messages (a primary user with another `NLS_LANG`
+  made the listener and alias checks fail).
+- 10.1: the age of the last data from the primary is taken from the instance's own clock (a time zone of the
+  instance other than the session's gave a false alarm or switched the check off).
+- A clean shutdown of a mounted instance (ORA-01109 / ORA-01507) is not an error; a warning of RMAN in the
+  cron clean-up is not a failed run; 12.1 with the password file in ASM: the step says how to bring it over.
+
+Installation:
+- With `RU_DIR` and real installer zips, steps 3.2 and 3.6 failed on the first try ("was not shown before"):
+  the OPatch of the media was not found in a long zip listing.
+- The summary refuses a placement in ASM that leaves out the disk group Grid is installed with (step 3.2 could
+  not go on), and a server whose host name is still localhost (it took "localhost" off the 127.0.0.1 line).
+  A standby with all its files in folders needs no Grid: the summary switches it off at once.
+- A check that ends with an unexpected code is "cannot be checked", never "to do"; the exit code of a long job
+  is known also when its file could not be written; the journal never appends to a cut-off line; `--health`
+  that could not start keeps the last recorded state; the read-only views write no record of a run.
+
+Keyboard pages:
+- Oracle Linux 7 with a UTF-8 language: two arrow keys in a row typed a letter (a character range that follows
+  the language on bash 4.2).
+- 80 columns: a typed answer is seen (the question is shorter); `h` shows the help on the summary; Enter keeps
+  a typed folder on a choice page; Esc and Enter sent together work; the status line and a long disk group
+  name no longer move the disk page; the list of changes fits 80 columns.
+- Ctrl+C on `--show-changes` ends the view quietly.
+
+Help and documents: `fal_server` (keep the names that are there), `-applyPSU` for 12.2, 21c on Oracle Linux,
+step 1.4, the exit codes (4 is the failed RMAN copy), kernel parameters and ASMLib 3 under "Known limits".
+Two wheel files that came into the repository by mistake are removed. CI checks that the version is the same in
+the script, the changelog and the Persian README.
 
 ## 5.35
 

@@ -54,12 +54,12 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
 - Unzip: a line "title|output|folder" is written to STATE_DIR/unzip_failed before each unzip and removed only
   when the unzip ends with 0 (also when it ended while no run was watching). The installer never starts while
   a line is there.
-- Duplicate marker <DB_HOME>/dbs/.dg_duplicate_done_<SID>: "duplicate" (RMAN finished) or "seen" (a mounted
-  standby compared with the primary). Either kind counts as complete; either kind plus the
+- Duplicate marker <DB_HOME>/dbs/.dg_duplicate_done_<SID>: "duplicate" (RMAN finished), "copied" or "seen" (a
+  mounted standby compared with the primary). Any kind counts as complete; either kind plus the
   spfile marks a standby that is shut down as built. A standby once "seen" complete is never offered the
   clean-up/duplicate again; later datafile header errors are only reported.
 - Standby listener: always LISTENER, port of the primary.
-- RMAN: SET NEWNAME per datafile/tempfile (+DG or the same path), parameters that do not fit are cleared.
+- RMAN: SET NEWNAME per datafile/tempfile (+DG, a folder, or the same path: DATA_DEST), parameters that do not fit are cleared.
 - Start at boot: no Grid -> systemd unit (listener, mount, apply, clean stop); Grid -> unit after
   oracle-ohasd that starts apply once Oracle Restart has mounted the standby.
 
@@ -178,7 +178,8 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
 - /dev/shm boot size (5.14): with systemd running, "systemctl cat dev-shm.mount" (the last Options line wins, also
   in /run and /usr/lib). A file outside /etc is never changed; an /etc drop-in zz-dg-standby-shm.conf sets the size.
 - Tests (5.15): the harness runs the script with DG_TEST_FAST_WAITS=1 (every nap is 0.2 s; the mocks answer at
-  once). A full regression runs once, at the end of a version; the GitHub copy gets a short smoke run.
+  once). GitHub Actions runs every part of the suite on every push (.github/workflows/ci.yml), and some sections
+  on Oracle Linux 7 (bash 4.2).
 - Release Update identity (5.14): RU_DIR is the numbered folder (or holds exactly one); one of its patches must be
   on the primary's database home and, with Grid, its Grid home; only the home being installed is compared (5.15). Checked in 3.1 when an install is pending, and
   again in 3.2 and 3.6 before the installer runs.
@@ -188,7 +189,7 @@ master then runs with StrictHostKeyChecking=yes: ssh never asks to accept a key,
   under the step that started it. --check while a job runs judges phase 3 (installers) or 7 (duplicate) and
   later as WAITS. Check mode writes nothing to the progress or last-run files (only its log): they keep the
   results of the real runs.
-- After a failed duplicate only [q] is offered: 7.2 shows the clean-up (instance from the leftover spfile,
+- After a failed duplicate the run stops with exit code 4 and the error (no question): 7.2 shows the clean-up (instance from the leftover spfile,
   files of the failed copy); 8.1 refuses a dirty auxiliary.
 - Questions: 1.2, 1.3 and 1.5 ask nothing but the passwords; the saved PRIMARY_SID is reused; the ORACLE_HOME
   comes from the process environment or the inventory before anyone is asked; listener values that were only
@@ -242,3 +243,20 @@ values are kept in settings.accepted and differences are shown. One run at a tim
   health_report prints them under each check's line. DG_TEST_NO_QUERIES=1 (set by the test suite, which runs with
   DG_VERBOSE=1) leaves them out.
 - --health: HEALTH_BUILT_OK=1 after the start found the standby built; need_built then returns at once.
+
+## 5.30 to 5.36 notes
+- Reviews: 5.30, 5.35 and 5.36 are the results of independent reviews (CHANGELOG has every fix).
+- Environment (5.36): the script runs in bash's -p mode and keeps only a short list of environment variables
+  (00_core.sh, top); DG_* test settings need DG_TEST_HOOKS=1. PATH is the system folders from the first line;
+  safe_path adds the caller's folders that root holds all the way down, after the system folders.
+- Commands as oracle / grid run in a session of their own (setsid, as_oracle / as_grid): no terminal of root for a
+  program of an Oracle home, and Ctrl+C reaches the script at once. Root commands of a plan are waited for the
+  same way.
+- Output of commands, of the primary and of files is shown without control characters (clean_ctl).
+- Listener of the Grid home (5.30): the static entry has ENVS TNS_ADMIN of the database home.
+- Keyboard pages (5.32 to 5.36, 12_screen.sh): ui_keyline reads one answer key by key (typed text works as
+  before); pages: summary (ui_summary_ask), choice (ui_pick), start menu (ui_menu_ask), list to mark (ui_check,
+  the disks of 2.13), list of steps with changes (ui_changes_browse). Without the screen layout the old plain
+  questions are asked.
+- Journal kinds added: LSNRSTOP (3.9, by hand). Settings: DATA_DEST, FRA_DEST, FRA_SIZE, ARCH_CLEANUP*.
+- 21c on Oracle Linux 9 needs Release Update 21.12 (RU_DIR); 21c and 23ai cannot be finished yet (read-only homes).

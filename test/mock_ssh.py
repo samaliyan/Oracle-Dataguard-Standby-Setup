@@ -194,8 +194,8 @@ def remote(cmd, stdin_data):
     if m:
         if int(str(P["version"]).split(".")[0]) < 18: print("bash: orabasehome: command not found", file=sys.stderr); return 127
         print(m.group(1)); return 0
-    m = re.fullmatch(r"env ORACLE_HOME=(\S+)(?: TNS_ADMIN=\S+)? timeout 120 (\S+)/bin/lsnrctl status (\S+)", cmd)
-    if m is None: m = re.fullmatch(r"env ORACLE_HOME=(\S+) (\S+)/bin/lsnrctl status (\S+)", cmd)
+    m = re.fullmatch(r"env (?:NLS_LANG=\S+ LC_ALL=C )?ORACLE_HOME=(\S+)(?: TNS_ADMIN=\S+)? timeout 120 (\S+)/bin/lsnrctl status (\S+)", cmd)
+    if m is None: m = re.fullmatch(r"env (?:NLS_LANG=\S+ LC_ALL=C )?ORACLE_HOME=(\S+) (\S+)/bin/lsnrctl status (\S+)", cmd)
     if m:
         lh = P.get("listener_home", P["grid_home"] if grid else P["db_home"])
         if m.group(1) != lh or m.group(3) != P.get("listener_name", "LISTENER"):
@@ -206,7 +206,7 @@ def remote(cmd, stdin_data):
         for sv in svcs: print(f'Service "{sv}" has 1 instance(s).\n  Instance "{P["sid"]}", status READY, has 1 handler(s) for this service...')
         if P.get("static"): print(f'  Instance "{P["sid"]}", status UNKNOWN, has 1 handler(s) for this service...')
         print("The command completed successfully"); return 0
-    m = re.fullmatch(r"env ORACLE_HOME=(\S+) TNS_ADMIN=(\S+) (\S+)/bin/tnsping (\S+) 1", cmd)
+    m = re.fullmatch(r"env (?:NLS_LANG=\S+ LC_ALL=C )?ORACLE_HOME=(\S+) TNS_ADMIN=(\S+) (\S+)/bin/tnsping (\S+) 1", cmd)
     if m:
         if P.get("tns_stby"):
             h = P.get("tns_stby_host", P["stby_host"])

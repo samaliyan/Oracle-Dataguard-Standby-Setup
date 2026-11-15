@@ -22,7 +22,7 @@ summary_facts() {
   prim_sql "select count(*) from v\$standby_log;" && num "$(first_line)" && SUM_SRL=$(first_line)
   if [[ "$PRIMARY_CDB" == YES ]] && prim_sql "select count(*) from v\$pdbs where name<>'PDB\$SEED';"; then num "$(first_line)" && SUM_PDBS=$(first_line); fi
   prim_sql "select upper(value) from v\$parameter where name='dg_broker_start';" && SUM_BROKER=$(first_line)
-  prim_sql "select count(*) from v\$archive_dest where status<>'INACTIVE' and target='STANDBY';" && num "$(first_line)" && SUM_DESTS=$(first_line)
+  prim_sql "select count(*) from v\$archive_dest where status<>'INACTIVE' and target in ('STANDBY','REMOTE');" && num "$(first_line)" && SUM_DESTS=$(first_line)
   # the names table: where the spfile and the password file of the primary are, its protection mode, the
   # log_archive_dest_N that step 4.4 uses (the same choice as 4.4: one that names the standby, else 2, else the first free)
   prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && SUM_SPFILE=$(first_line)
@@ -440,10 +440,18 @@ sv_change() {
     lag)   ask_default "Seconds of lag that the health check accepts" "${HEALTH_LAG_MAX:-300}"
            v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 1; }; HEALTH_LAG_MAX=$v ;;
   esac
+  # the standby keeps nothing in ASM (all its files in folders): it needs no Grid, as discovery decides at the
+  # next run; with a place in ASM again, Grid is back (its values are read from the primary at every run)
+  local old_ug=$USE_GRID
+  if [[ "$id" == data || "$id" == fra ]]; then
+    if [[ -z "$(asm_dgs 2>/dev/null)" ]]; then [[ "$USE_GRID" == yes ]] && { USE_GRID=no; sum_note "No file of this standby is in ASM now: Grid is not installed here."; }
+    elif [[ "$USE_GRID" != yes && -n "$GRID_HOME" && -n "$GRID_BASE" ]]; then USE_GRID=yes; fi
+  fi
   if [[ "$id" != mode && "$id" != yes && "$id" != range ]]; then
     if ! validate_settings >/dev/null 2>&1; then
       sum_note "Not saved: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
       while IFS= read -r k; do [[ -n "$k" ]] && printf -v "${k%%=*}" '%s' "${k#*=}"; done <<< "$snap"     # the values from before
+      USE_GRID=$old_ug
       return 1
     fi
     save_settings; save_accepted
