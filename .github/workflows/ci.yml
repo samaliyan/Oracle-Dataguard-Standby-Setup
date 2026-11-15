@@ -4,7 +4,8 @@
 #   test        test/run_scenarios.sh, in parts: one job per part, in parallel. The parts are PARTS at the top
 #               of run_scenarios.sh (the build job reads them). The tests make users and groups and write
 #               /etc, so they run as root (sudo) on a throw-away runner.
-#   ol7         a short part on Oracle Linux 7 itself (bash 4.2, Python 3.6), in a container
+#   ol7         a short part on Oracle Linux 7 itself (bash 4.2, Python 3.6), in a container: sections A and Q,
+#               and the sections of the newest changes (the keyboard pages)
 name: CI
 
 on:
@@ -97,7 +98,7 @@ jobs:
   ol7:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     name: test on Oracle Linux 7 (bash 4.2)
     steps:
       # checkout runs on the runner: the actions need a newer glibc than Oracle Linux 7 has
@@ -105,11 +106,12 @@ jobs:
       # SYS_RESOURCE: step 2.4 sets the limits of oracle and grid (nofile 65536, ...), and pam_limits
       # must raise them when runuser opens a session; root in a container cannot without it
       # ("runuser: cannot open session: Permission denied"), root on a real server can
-      - name: Sections A and Q in oraclelinux:7
+      # (the 5.3x sections: the fixes of the review and the keyboard pages, which must work on bash 4.2 too)
+      - name: Sections A, Q and 5.30 to 5.34 in oraclelinux:7
         run: |
           docker run --rm --cap-add SYS_RESOURCE -v "$PWD:/src" -w /src oraclelinux:7-slim bash -c '
             set -e
             yum install -y -q python3 zip unzip perl procps-ng util-linux shadow-utils hostname findutils which >/dev/null
             cat /etc/oracle-release; bash --version | head -n 1; python3 --version
             bash ./build.sh
-            bash test/run_scenarios.sh --sections A,Q || { rc=$?; bash test/show_failures.sh; exit $rc; }'
+            bash test/run_scenarios.sh --sections A,Q,5.30,5.31,5.32,5.33,5.34 || { rc=$?; bash test/show_failures.sh; exit $rc; }'
