@@ -136,9 +136,8 @@ cp_role_run() {
        for v in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
          [[ -n "${!v:-}" ]] && pv+=("$v=${!v}")
        done
-       # (run in the background and waited for: Ctrl+C then reaches this script at once; the command itself ends
-       # at its time limit, see as_oracle)
-       ( cd / && { env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" <&0 9>&- & wait $!; } ) ;;
+       # (run in the background and waited for, see run_waited: Ctrl+C ends the command, then the script)
+       ( cd / && run_waited env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" ) ;;
   esac
 }
 cp_exec() {

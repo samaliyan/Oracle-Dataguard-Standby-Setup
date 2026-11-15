@@ -32,25 +32,46 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
 umask 022
 # The environment this script was started with can come from the user who became root ("su" without "-"): a
 # program in a folder of PATH, a function or a start file for bash, another editor, a program ssh would run to ask
-# for a password, the test settings of this script. So:
-#  - bash runs in its "-p" mode (first line; started as "bash script", it starts itself again that way): no start
-#    file of the environment is read and no function is taken from it;
-#  - only the variables listed here stay (terminal, language, time zone, proxies, the ssh agent, the editor, the
-#    two documented settings of this script); every other DG_* variable is a test setting and stays only with
-#    DG_TEST_HOOKS=1 (the test suite sets it);
-#  - from here on only the system folders are in PATH. safe_path (main) adds back the folders of the caller's
-#    PATH that root holds all the way down.
-if [[ $- != *p* && -r "${BASH_SOURCE[0]}" && -x /bin/bash ]]; then exec /bin/bash -p "${BASH_SOURCE[0]}" "$@"; fi
-ENV_DROPPED=""
+# for a password, the test settings of this script. So the script starts itself once more with an environment
+# that holds only the variables listed here (terminal, language, time zone, proxies, the ssh agent, the editor,
+# four settings of this script), in bash's "-p" mode: no start file is read and no function is taken from the
+# environment, and none is left in it for a shell this script starts. (Started as "bash script" with BASH_ENV
+# set, bash has read that file before this line: start it as ./script, as the README says.)
+# Every other DG_* variable is a test setting: it stays only with DG_TEST_HOOKS=1 AND the file the test suite
+# makes as root on its machine (/etc/dgt_test_machine), so an environment alone cannot switch the tests' hooks on.
+# From here on only the system folders are in PATH. safe_path (main) adds the folders of the caller's PATH that
+# root holds all the way down.
+_hooks=0
+[[ "${DG_TEST_HOOKS:-}" == 1 && -f /etc/dgt_test_machine && ! -L /etc/dgt_test_machine && -O /etc/dgt_test_machine ]] && _hooks=1
+_keep=(); _dirty=0; _drop=""
+if [[ -r /proc/$$/environ ]]; then
+  while IFS= read -r -d '' _e; do
+    _n=${_e%%=*}
+    case "$_n" in
+      PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT|DG_ENV_DROPPED) _keep+=("$_e") ;;
+      http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) _keep+=("$_e") ;;
+      DG_*) if [[ $_hooks -eq 1 && "$_n" =~ ^[A-Z0-9_]+$ ]]; then _keep+=("$_e"); else _dirty=1; [[ "$_n" =~ ^[A-Z0-9_]+$ ]] && _drop+=" $_n"; fi ;;
+      *) _dirty=1 ;;
+    esac
+  done < /proc/$$/environ
+  if [[ ( $_dirty -eq 1 || $- != *p* ) && -r "${BASH_SOURCE[0]}" && -x /bin/bash && -x /usr/bin/env ]]; then
+    _o=-p; [[ $- == *x* ]] && _o+=x; [[ $- == *v* ]] && _o+=v
+    exec /usr/bin/env -i "${_keep[@]+"${_keep[@]}"}" ${_drop:+"DG_ENV_DROPPED=$_drop"} /bin/bash "$_o" "${BASH_SOURCE[0]}" "$@"
+  fi
+fi
+# (no /proc, or the start above was not possible: the variables are taken out in place)
+ENV_DROPPED=${DG_ENV_DROPPED:-}; [[ "$ENV_DROPPED" =~ ^[A-Z0-9_\ ]*$ ]] || ENV_DROPPED=""
 for _v in $(compgen -e); do
   case "$_v" in
-    PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_TEST_HOOKS) ;;
+    PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT) ;;
     http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) ;;
-    DG_*) [[ "${DG_TEST_HOOKS:-}" == 1 ]] || { ENV_DROPPED+=" $_v"; unset "$_v"; } ;;
+    DG_ENV_DROPPED) unset "$_v" ;;
+    DG_*) [[ $_hooks -eq 1 ]] || { ENV_DROPPED+=" $_v"; unset "$_v"; } ;;
     *) unset "$_v" 2>/dev/null ;;
   esac
 done
-unset _v
+TEST_HOOKS=$_hooks          # 1: the DG_* test settings of the environment are in use (the test suite)
+unset _v _e _n _keep _dirty _drop _o _hooks
 export HOME=~root USER=root LOGNAME=root
 ORIG_PATH=${PATH:-}
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -583,10 +604,18 @@ build_envs() {
 # fd 9 is the lock of this script: no child (listener, instance) may keep it.
 # The command runs in a session of its own (setsid): a program of an Oracle home, which its owner can change, has
 # no terminal of root to type into (it could answer the next question of this script), and Ctrl+C reaches this
-# script at once instead of after the command has ended (the command goes on to its own time limit). The script
-# waits for it with "wait", so the exit code is the command's.
-as_oracle() { ( cd / && { setsid runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" <&0 9>&- & wait $!; } ); }
-as_grid()   { ( cd / && { setsid runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" <&0 9>&- & wait $!; } ); }
+# script at once: it ends the command (run_waited) and then stops.
+run_waited() {
+  # "$@" in the background, waited for. A stop of the script (Ctrl+C, a closed terminal, kill) ends the command
+  # as well and is passed on only after it has ended: the lock of this script is never free while a command of
+  # a step still runs. (The command gets TERM; runuser and timeout pass it on.)
+  local p=""
+  trap '[[ -n "$p" ]] && { kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; exit 130' INT HUP TERM
+  "$@" <&0 9>&- & p=$!
+  wait "$p"
+}
+as_oracle() { ( cd / && run_waited setsid runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" ); }
+as_grid()   { ( cd / && run_waited setsid runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" ); }
 clean_ctl() {
   # stdin -> stdout without control characters (all but tab and line feed; a carriage return too). What a
   # command, the primary or a file gives is shown on the terminal of root: an escape sequence in it could redraw
@@ -968,7 +997,7 @@ If this run stops, the next run will not know that $title is still running."
     fi
   done
   TAIL_PID=""
-  wait "$bg" 2>/dev/null
+  local bg_rc=0; wait "$bg" 2>/dev/null || bg_rc=$?
   # the wrapper may have been killed while its command goes on: wait for the whole job
   n=0
   while job_running "$jpid"; do
@@ -990,7 +1019,7 @@ If this run stops, the next run will not know that $title is still running."
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
   local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"
   # (the file with the exit code could not be written, a full disk: the code of the job as this script saw it end)
-  if ! num "$rc" && ! job_running "$jpid"; then local wrc=0; wait "$bg" 2>/dev/null || wrc=$?; [[ $wrc -lt 126 ]] && rc=$wrc; fi
+  if ! num "$rc" && ! job_running "$jpid"; then [[ $bg_rc -lt 126 ]] && rc=$bg_rc; fi
   # the result is read here: the job file goes also when programs the job left behind still run (with the exit
   # code file gone, the next run would take the job itself for running)
   { num "$rc" || ! job_running "$jpid"; } && rm -f -- "$JOB_FILE"; JOB_PID=""
@@ -2354,9 +2383,8 @@ cp_role_run() {
        for v in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
          [[ -n "${!v:-}" ]] && pv+=("$v=${!v}")
        done
-       # (run in the background and waited for: Ctrl+C then reaches this script at once; the command itself ends
-       # at its time limit, see as_oracle)
-       ( cd / && { env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" <&0 9>&- & wait $!; } ) ;;
+       # (run in the background and waited for, see run_waited: Ctrl+C ends the command, then the script)
+       ( cd / && run_waited env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" ) ;;
   esac
 }
 cp_exec() {
@@ -4466,7 +4494,7 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
         run_logged "srvctl stop database" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" -stopoption immediate || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
       else
         # (a clean shutdown of a mounted or only started instance prints ORA-01109 / ORA-01507 first: no failure)
-        if ! sql_local_long "shutdown immediate" && grep -E '(ORA|SP2)-[0-9]+' <<< "$SQL_OUT" | grep -qvE 'ORA-(01109|01507)'; then
+        if ! sql_local_long "shutdown immediate" && ! { grep -qE 'ORA-(01109|01507)' <<< "$SQL_OUT" && ! grep -E '(ORA|SP2)-[0-9]+' <<< "$SQL_OUT" | grep -qvE 'ORA-(01109|01507)'; }; then
           bad "shutdown immediate failed: $(ora_errors "$SQL_OUT")
 Trying shutdown abort."; sql_local "shutdown abort" || return 1
         fi
@@ -4823,7 +4851,9 @@ validate_settings() {
     [[ -n "$DATA_DG" ]] || { bad "DATA_DG (the first ASM disk group) is empty."; bad_n=1; }
     # Grid is installed here with the first disk group of the primary (+$DATA_DG): the standby must keep files in
     # it, else step 2.13 prepares no disk for it and step 3.2 cannot install Grid
-    if [[ -n "$DATA_DG" ]] && ! asm_dgs 2>/dev/null | grep -qx "${DATA_DG^^}"; then
+    # (no place in ASM at all, a folder standby of an ASM primary: no Grid is needed here; the summary switches
+    # it off, see sv_change)
+    if [[ -n "$DATA_DG" && -n "$(asm_dgs 2>/dev/null)" ]] && ! asm_dgs 2>/dev/null | grep -qx "${DATA_DG^^}"; then
       bad "The database files and the recovery area do not use the disk group +$DATA_DG, with which Grid is installed here.
 Put the database files or the recovery area there (values \"Database files go to\" / \"Recovery area\"), or leave both automatic."; bad_n=1
     fi
@@ -7103,10 +7133,18 @@ sv_change() {
     lag)   ask_default "Seconds of lag that the health check accepts" "${HEALTH_LAG_MAX:-300}"
            v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 1; }; HEALTH_LAG_MAX=$v ;;
   esac
+  # the standby keeps nothing in ASM (all its files in folders): it needs no Grid, as discovery decides at the
+  # next run; with a place in ASM again, Grid is back (its values are read from the primary at every run)
+  local old_ug=$USE_GRID
+  if [[ "$id" == data || "$id" == fra ]]; then
+    if [[ -z "$(asm_dgs 2>/dev/null)" ]]; then [[ "$USE_GRID" == yes ]] && { USE_GRID=no; sum_note "No file of this standby is in ASM now: Grid is not installed here."; }
+    elif [[ "$USE_GRID" != yes && -n "$GRID_HOME" && -n "$GRID_BASE" ]]; then USE_GRID=yes; fi
+  fi
   if [[ "$id" != mode && "$id" != yes && "$id" != range ]]; then
     if ! validate_settings >/dev/null 2>&1; then
       sum_note "Not saved: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
       while IFS= read -r k; do [[ -n "$k" ]] && printf -v "${k%%=*}" '%s' "${k#*=}"; done <<< "$snap"     # the values from before
+      USE_GRID=$old_ug
       return 1
     fi
     save_settings; save_accepted
@@ -19624,7 +19662,7 @@ safe_path() {
   for d in /usr/local/bin /usr/local/sbin; do path_dir_safe "$d" && sys="$d:$sys"; done
   IFS=: read -r -a ents <<< "$out"
   for d in "${ents[@]+"${ents[@]}"}"; do [[ -n "$d" && ":$sys:" != *":$d:"* ]] && o2+="${o2:+:}$d"; done
-  if [[ "${DG_TEST_HOOKS:-}" == 1 ]]; then export PATH="${o2:+$o2:}$sys"; else export PATH="$sys${o2:+:$o2}"; fi
+  if [[ ${TEST_HOOKS:-0} -eq 1 ]]; then export PATH="${o2:+$o2:}$sys"; else export PATH="$sys${o2:+:$o2}"; fi
   PATH_DROPPED=$dropped
 }
 main() {
@@ -19648,7 +19686,7 @@ main() {
   local pv
   for pv in "$LOG_DIR" "$STATE_DIR" "$SHORT_DIR" "$FSTAB_FILE" "$SHM_UNIT_FILE" "$OS_RELEASE_FILE" "$MEMINFO_FILE" "$SYSTEMD_RUN_DIR"; do
     v_path "$pv" || { printf 'Not a plain absolute path (only letters, digits and _ . / -): %s
-Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
+(Other folders can only be set by the test suite.)
 ' "$pv"; exit $ef; }
   done
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
@@ -19736,8 +19774,11 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
-  [[ -n "${ENV_DROPPED:-}" ]] && _log WARN "test settings in the environment were not used (they need DG_TEST_HOOKS=1):$ENV_DROPPED"
-  [[ "${DG_TEST_HOOKS:-}" == 1 ]] && _log WARN "DG_TEST_HOOKS=1 is set: the DG_* test settings of the environment are in use (a setting for the test suite)"
+  if [[ -n "${ENV_DROPPED:-}" ]]; then
+    _log WARN "settings of the test suite in the environment were not used:$ENV_DROPPED"
+    say "${C_D}Not used from the environment (settings of the test suite):$ENV_DROPPED${C_N}"
+  fi
+  [[ ${TEST_HOOKS:-0} -eq 1 ]] && _log WARN "the DG_* test settings of the environment are in use (DG_TEST_HOOKS=1 on a machine of the test suite)"
   # the script file itself: in a folder another user can change, it could be replaced while it runs
   if ! path_dir_safe "$SCRIPT_DIR"; then
     _log WARN "the script is in a folder that is not root's own all the way down: $SCRIPT_DIR"

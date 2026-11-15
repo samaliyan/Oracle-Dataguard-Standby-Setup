@@ -254,7 +254,9 @@ validate_settings() {
     [[ -n "$DATA_DG" ]] || { bad "DATA_DG (the first ASM disk group) is empty."; bad_n=1; }
     # Grid is installed here with the first disk group of the primary (+$DATA_DG): the standby must keep files in
     # it, else step 2.13 prepares no disk for it and step 3.2 cannot install Grid
-    if [[ -n "$DATA_DG" ]] && ! asm_dgs 2>/dev/null | grep -qx "${DATA_DG^^}"; then
+    # (no place in ASM at all, a folder standby of an ASM primary: no Grid is needed here; the summary switches
+    # it off, see sv_change)
+    if [[ -n "$DATA_DG" && -n "$(asm_dgs 2>/dev/null)" ]] && ! asm_dgs 2>/dev/null | grep -qx "${DATA_DG^^}"; then
       bad "The database files and the recovery area do not use the disk group +$DATA_DG, with which Grid is installed here.
 Put the database files or the recovery area there (values \"Database files go to\" / \"Recovery area\"), or leave both automatic."; bad_n=1
     fi

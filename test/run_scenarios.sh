@@ -2514,9 +2514,9 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
 # 1) safe_path: a folder of another user, a folder others can write to and a relative entry are left out
 ( source <(fn path_dir_safe; fn safe_path)
   d=$T/ut531p; rm -rf $d; mkdir -p $d/ok $d/other $d/open; chmod 755 $d $d/ok $d/other; chmod 777 $d/open; chown nobody $d/other
-  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; DG_TEST_HOOKS=0 safe_path
+  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; TEST_HOOKS=0; safe_path
   echo "path=$PATH"; echo "dropped=$PATH_DROPPED"
-  ORIG_PATH="$d/ok:/usr/bin"; DG_TEST_HOOKS=1 safe_path; echo "testpath=$PATH" ) | sed "s#$T/ut531p#D#g"
+  ORIG_PATH="$d/ok:/usr/bin"; TEST_HOOKS=1; safe_path; echo "testpath=$PATH" ) | sed "s#$T/ut531p#D#g"
 # 2) limit_users: oracle is in the list, a separate grid owner too
 ( source <(fn limit_users); use_grid() { return 0; }; single_owner() { return 1; }
   ORACLE_USER=oracle; GRID_USER=grid; a=$(limit_users | paste -sd, -)
@@ -2545,7 +2545,7 @@ for t in dirname basename date stat find mktemp readlink hostname id; do printf 
 check "PATH: programs in a folder of another user at the front of PATH are never run as root (from the first line on)" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r31p.txt"
 ln -sfn /usr/bin $ev/lnk
 ( source <(sed -n '/^path_dir_safe()/,/^}/p; /^safe_path()/,/^}/p' $T/dg_standby_setup.sh); mkdir -p $ev/sub; chown root $ev/sub; chmod 755 $ev/sub
-  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
+  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; TEST_HOOKS=1; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
 check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -qx \"path=$T/rootbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
 rm -rf $ev
 fi
@@ -2617,12 +2617,19 @@ fresh empty
 ev=$T/ut536evil; rm -rf $ev; mkdir -p $ev; chmod 755 $ev
 for t in bash env dirname basename date stat find mktemp readlink hostname id compgen; do printf '#!/bin/sh\necho "$0" >> %s/ran\nexec /usr/bin/%s "$@"\n' "$ev" "$t" > $ev/$t; done
 printf 'echo bashenv >> %s/ran\n' "$ev" > $ev/benv; chmod 755 $ev/*; chown -R nobody $ev; chmod 777 $ev
+# (a stand-in for hostname that is a bash script: a function left in the environment would run inside it)
+printf '#!/bin/bash\ndate > /dev/null\nexec /usr/bin/hostname "$@"\n' > $T/rootbin/hostname; chmod 755 $T/rootbin/hostname
 ( cd $T && export BASH_ENV=$ev/benv PATH=$ev:$T/rootbin:$PATH DG_PLAIN=1 DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log
   date() { echo fn >> $ev/ran; /usr/bin/date "$@"; }; export -f date
   timeout 60 ./dg_standby_setup.sh --status > $T/r36e.txt 2>&1 )
-check "environment: a start file for bash (BASH_ENV), an exported function and programs named bash, env, date ... in another user's folder at the front of PATH never run as root" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36e.txt"
+rm -f $T/rootbin/hostname
+check "environment: a start file for bash (BASH_ENV), an exported function (also inside a bash script the script starts) and programs named bash, env, date ... in another user's folder at the front of PATH never run as root" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36e.txt"
 ( cd $T && unset DG_TEST_HOOKS; DG_STATE_DIR=$T/ut536state DG_LOG_DIR=$T/ut536log DG_PLAIN=1 timeout 60 ./dg_standby_setup.sh --status > $T/r36f.txt 2>&1 )
 check "environment: without DG_TEST_HOOKS=1 the test settings (another state and log folder) are not used" "[[ ! -e $T/ut536state && ! -e $T/ut536log ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36f.txt"
+mv /etc/dgt_test_machine /etc/dgt_test_machine.off
+( cd $T && DG_TEST_HOOKS=1 DG_STATE_DIR=$T/ut536state DG_LOG_DIR=$T/ut536log DG_PLAIN=1 timeout 60 ./dg_standby_setup.sh --status > $T/r36g.txt 2>&1 )
+mv /etc/dgt_test_machine.off /etc/dgt_test_machine
+check "environment: DG_TEST_HOOKS=1 alone switches nothing on (it needs the file the test suite makes as root on its machine)" "[[ ! -e $T/ut536state && ! -e $T/ut536log ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r36g.txt"
 check "the script starts with #!/bin/bash -p (bash by its full path, in the mode that reads no start file)" "head -n 1 $T/dg_standby_setup.sh | grep -qx '#!/bin/bash -p'"
 rm -rf $ev $T/ut536state $T/ut536log
 # ---- keys that arrive together ----

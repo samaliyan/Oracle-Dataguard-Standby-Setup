@@ -32,25 +32,46 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
 umask 022
 # The environment this script was started with can come from the user who became root ("su" without "-"): a
 # program in a folder of PATH, a function or a start file for bash, another editor, a program ssh would run to ask
-# for a password, the test settings of this script. So:
-#  - bash runs in its "-p" mode (first line; started as "bash script", it starts itself again that way): no start
-#    file of the environment is read and no function is taken from it;
-#  - only the variables listed here stay (terminal, language, time zone, proxies, the ssh agent, the editor, the
-#    two documented settings of this script); every other DG_* variable is a test setting and stays only with
-#    DG_TEST_HOOKS=1 (the test suite sets it);
-#  - from here on only the system folders are in PATH. safe_path (main) adds back the folders of the caller's
-#    PATH that root holds all the way down.
-if [[ $- != *p* && -r "${BASH_SOURCE[0]}" && -x /bin/bash ]]; then exec /bin/bash -p "${BASH_SOURCE[0]}" "$@"; fi
-ENV_DROPPED=""
+# for a password, the test settings of this script. So the script starts itself once more with an environment
+# that holds only the variables listed here (terminal, language, time zone, proxies, the ssh agent, the editor,
+# four settings of this script), in bash's "-p" mode: no start file is read and no function is taken from the
+# environment, and none is left in it for a shell this script starts. (Started as "bash script" with BASH_ENV
+# set, bash has read that file before this line: start it as ./script, as the README says.)
+# Every other DG_* variable is a test setting: it stays only with DG_TEST_HOOKS=1 AND the file the test suite
+# makes as root on its machine (/etc/dgt_test_machine), so an environment alone cannot switch the tests' hooks on.
+# From here on only the system folders are in PATH. safe_path (main) adds the folders of the caller's PATH that
+# root holds all the way down.
+_hooks=0
+[[ "${DG_TEST_HOOKS:-}" == 1 && -f /etc/dgt_test_machine && ! -L /etc/dgt_test_machine && -O /etc/dgt_test_machine ]] && _hooks=1
+_keep=(); _dirty=0; _drop=""
+if [[ -r /proc/$$/environ ]]; then
+  while IFS= read -r -d '' _e; do
+    _n=${_e%%=*}
+    case "$_n" in
+      PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT|DG_ENV_DROPPED) _keep+=("$_e") ;;
+      http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) _keep+=("$_e") ;;
+      DG_*) if [[ $_hooks -eq 1 && "$_n" =~ ^[A-Z0-9_]+$ ]]; then _keep+=("$_e"); else _dirty=1; [[ "$_n" =~ ^[A-Z0-9_]+$ ]] && _drop+=" $_n"; fi ;;
+      *) _dirty=1 ;;
+    esac
+  done < /proc/$$/environ
+  if [[ ( $_dirty -eq 1 || $- != *p* ) && -r "${BASH_SOURCE[0]}" && -x /bin/bash && -x /usr/bin/env ]]; then
+    _o=-p; [[ $- == *x* ]] && _o+=x; [[ $- == *v* ]] && _o+=v
+    exec /usr/bin/env -i "${_keep[@]+"${_keep[@]}"}" ${_drop:+"DG_ENV_DROPPED=$_drop"} /bin/bash "$_o" "${BASH_SOURCE[0]}" "$@"
+  fi
+fi
+# (no /proc, or the start above was not possible: the variables are taken out in place)
+ENV_DROPPED=${DG_ENV_DROPPED:-}; [[ "$ENV_DROPPED" =~ ^[A-Z0-9_\ ]*$ ]] || ENV_DROPPED=""
 for _v in $(compgen -e); do
   case "$_v" in
-    PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_TEST_HOOKS) ;;
+    PATH|TERM|LANG|LC_ALL|LC_CTYPE|TZ|SSH_AUTH_SOCK|EDITOR|DG_VERBOSE|DG_PLAIN|DG_SQL_TIMEOUT|DG_POLL_WAIT) ;;
     http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) ;;
-    DG_*) [[ "${DG_TEST_HOOKS:-}" == 1 ]] || { ENV_DROPPED+=" $_v"; unset "$_v"; } ;;
+    DG_ENV_DROPPED) unset "$_v" ;;
+    DG_*) [[ $_hooks -eq 1 ]] || { ENV_DROPPED+=" $_v"; unset "$_v"; } ;;
     *) unset "$_v" 2>/dev/null ;;
   esac
 done
-unset _v
+TEST_HOOKS=$_hooks          # 1: the DG_* test settings of the environment are in use (the test suite)
+unset _v _e _n _keep _dirty _drop _o _hooks
 export HOME=~root USER=root LOGNAME=root
 ORIG_PATH=${PATH:-}
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -583,10 +604,18 @@ build_envs() {
 # fd 9 is the lock of this script: no child (listener, instance) may keep it.
 # The command runs in a session of its own (setsid): a program of an Oracle home, which its owner can change, has
 # no terminal of root to type into (it could answer the next question of this script), and Ctrl+C reaches this
-# script at once instead of after the command has ended (the command goes on to its own time limit). The script
-# waits for it with "wait", so the exit code is the command's.
-as_oracle() { ( cd / && { setsid runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" <&0 9>&- & wait $!; } ); }
-as_grid()   { ( cd / && { setsid runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" <&0 9>&- & wait $!; } ); }
+# script at once: it ends the command (run_waited) and then stops.
+run_waited() {
+  # "$@" in the background, waited for. A stop of the script (Ctrl+C, a closed terminal, kill) ends the command
+  # as well and is passed on only after it has ended: the lock of this script is never free while a command of
+  # a step still runs. (The command gets TERM; runuser and timeout pass it on.)
+  local p=""
+  trap '[[ -n "$p" ]] && { kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; exit 130' INT HUP TERM
+  "$@" <&0 9>&- & p=$!
+  wait "$p"
+}
+as_oracle() { ( cd / && run_waited setsid runuser -u "$ORACLE_USER" -- env -i "${ORA_ENV[@]}" "$@" ); }
+as_grid()   { ( cd / && run_waited setsid runuser -u "$GRID_USER"   -- env -i "${GRID_ENV[@]}" "$@" ); }
 clean_ctl() {
   # stdin -> stdout without control characters (all but tab and line feed; a carriage return too). What a
   # command, the primary or a file gives is shown on the terminal of root: an escape sequence in it could redraw
@@ -968,7 +997,7 @@ If this run stops, the next run will not know that $title is still running."
     fi
   done
   TAIL_PID=""
-  wait "$bg" 2>/dev/null
+  local bg_rc=0; wait "$bg" 2>/dev/null || bg_rc=$?
   # the wrapper may have been killed while its command goes on: wait for the whole job
   n=0
   while job_running "$jpid"; do
@@ -990,7 +1019,7 @@ If this run stops, the next run will not know that $title is still running."
   n=0; while [[ ! -f "$out.rc" && $n -lt 50 ]]; do sleep 0.1; n=$((n + 1)); done
   local rc; rc=$(cat "$out.rc" 2>/dev/null); rm -f -- "$out.rc"
   # (the file with the exit code could not be written, a full disk: the code of the job as this script saw it end)
-  if ! num "$rc" && ! job_running "$jpid"; then local wrc=0; wait "$bg" 2>/dev/null || wrc=$?; [[ $wrc -lt 126 ]] && rc=$wrc; fi
+  if ! num "$rc" && ! job_running "$jpid"; then [[ $bg_rc -lt 126 ]] && rc=$bg_rc; fi
   # the result is read here: the job file goes also when programs the job left behind still run (with the exit
   # code file gone, the next run would take the job itself for running)
   { num "$rc" || ! job_running "$jpid"; } && rm -f -- "$JOB_FILE"; JOB_PID=""

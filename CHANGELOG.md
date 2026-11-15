@@ -12,18 +12,23 @@ default path; these were real and are fixed.
 
 The environment of the user who became root (`su` without `-`):
 - The script starts with `#!/bin/bash -p` (bash by its full path; no start file and no function is taken from
-  the environment) and keeps only a short list of variables: terminal, language, time zone, proxies, the ssh
-  agent, the editor, `DG_VERBOSE`, `DG_PLAIN`. Before, `BASH_ENV`, exported functions, `SSH_ASKPASS` and a
-  program named `bash` in a folder of PATH could run as root.
+  the environment) and starts itself once more with an environment that holds only a short list of variables:
+  terminal, language, time zone, proxies, the ssh agent, the editor, `DG_VERBOSE`, `DG_PLAIN`,
+  `DG_SQL_TIMEOUT`, `DG_POLL_WAIT`. Before, `BASH_ENV`, exported functions (also inside the shells the script
+  starts), `SSH_ASKPASS` and a program named `bash` in a folder of PATH could run as root.
 - The test settings (`DG_STATE_DIR`, `DG_PROMPT_IN`, `DG_SYS_PASSWORD` ...) are used only with
-  `DG_TEST_HOOKS=1`. `EDITOR` is used only when the program is in a folder root holds.
+  `DG_TEST_HOOKS=1` on a machine of the test suite (it makes a file as root there); what is not used is named
+  on the screen. `EDITOR` is used only when the program is in a folder root holds.
 - PATH: the system folders come first; a folder of the caller's PATH never replaces a tool of the system.
 - The script says when it is started from a folder another user can change.
 
 Commands and what they print:
 - A program of an Oracle home (sqlplus, srvctl, lsnrctl, orapki, the login profile) runs in a session of its
-  own: it has no terminal of root to type into, and Ctrl+C reaches the script at once (before: only after the
-  command had ended, up to 30 minutes for a shutdown).
+  own: it has no terminal of root to type into.
+- Ctrl+C, a closed terminal or a stop of the script ends the command of the step that runs and then the
+  script (before: Ctrl+C did nothing until the command had ended, up to 30 minutes for a shutdown). The lock
+  of the script is never free while a command of a step still runs. Installers, root scripts and the RMAN
+  copy keep running in their own session, as before.
 - Control characters are taken out of everything a command, the primary or a file gives before it is shown or
   logged (an escape sequence could redraw the screen, for example the commands shown for you to run).
 - The process list of the primary is no longer copied into the run log (only the lines the script reads).
@@ -42,8 +47,9 @@ Oracle:
 Installation:
 - With `RU_DIR` and real installer zips, steps 3.2 and 3.6 failed on the first try ("was not shown before"):
   the OPatch of the media was not found in a long zip listing.
-- The summary refuses a placement that leaves out the disk group Grid is installed with (step 3.2 could not go
-  on), and a server whose host name is still localhost (it took "localhost" off the 127.0.0.1 line).
+- The summary refuses a placement in ASM that leaves out the disk group Grid is installed with (step 3.2 could
+  not go on), and a server whose host name is still localhost (it took "localhost" off the 127.0.0.1 line).
+  A standby with all its files in folders needs no Grid: the summary switches it off at once.
 - A check that ends with an unexpected code is "cannot be checked", never "to do"; the exit code of a long job
   is known also when its file could not be written; the journal never appends to a cut-off line; `--health`
   that could not start keeps the last recorded state; the read-only views write no record of a run.

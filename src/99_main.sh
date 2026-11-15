@@ -486,7 +486,7 @@ safe_path() {
   for d in /usr/local/bin /usr/local/sbin; do path_dir_safe "$d" && sys="$d:$sys"; done
   IFS=: read -r -a ents <<< "$out"
   for d in "${ents[@]+"${ents[@]}"}"; do [[ -n "$d" && ":$sys:" != *":$d:"* ]] && o2+="${o2:+:}$d"; done
-  if [[ "${DG_TEST_HOOKS:-}" == 1 ]]; then export PATH="${o2:+$o2:}$sys"; else export PATH="$sys${o2:+:$o2}"; fi
+  if [[ ${TEST_HOOKS:-0} -eq 1 ]]; then export PATH="${o2:+$o2:}$sys"; else export PATH="$sys${o2:+:$o2}"; fi
   PATH_DROPPED=$dropped
 }
 main() {
@@ -510,7 +510,7 @@ main() {
   local pv
   for pv in "$LOG_DIR" "$STATE_DIR" "$SHORT_DIR" "$FSTAB_FILE" "$SHM_UNIT_FILE" "$OS_RELEASE_FILE" "$MEMINFO_FILE" "$SYSTEMD_RUN_DIR"; do
     v_path "$pv" || { printf 'Not a plain absolute path (only letters, digits and _ . / -): %s
-Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
+(Other folders can only be set by the test suite.)
 ' "$pv"; exit $ef; }
   done
   { [[ -d "$LOG_DIR" ]] || install -d -m 750 "$LOG_DIR"; } && { [[ -d "$STATE_DIR" ]] || install -d -m 700 "$STATE_DIR"; } || { printf 'Cannot create %s or %s. Is the file system read-only or full?\n' "$LOG_DIR" "$STATE_DIR"; exit $ef; }
@@ -598,8 +598,11 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
   local first_run=0; [[ -n "$PRIMARY_SSH_USER" ]] || first_run=1
   [[ -n "$PRIMARY_SSH_USER" ]] || PRIMARY_SSH_USER=oracle
   _log START "dg_standby_setup.sh $SCRIPT_VERSION mode=$MODE from=${FROM_STEP:--} only=${ONLY_PHASE:--} to=${TO_STEP:--} pid=$$"
-  [[ -n "${ENV_DROPPED:-}" ]] && _log WARN "test settings in the environment were not used (they need DG_TEST_HOOKS=1):$ENV_DROPPED"
-  [[ "${DG_TEST_HOOKS:-}" == 1 ]] && _log WARN "DG_TEST_HOOKS=1 is set: the DG_* test settings of the environment are in use (a setting for the test suite)"
+  if [[ -n "${ENV_DROPPED:-}" ]]; then
+    _log WARN "settings of the test suite in the environment were not used:$ENV_DROPPED"
+    say "${C_D}Not used from the environment (settings of the test suite):$ENV_DROPPED${C_N}"
+  fi
+  [[ ${TEST_HOOKS:-0} -eq 1 ]] && _log WARN "the DG_* test settings of the environment are in use (DG_TEST_HOOKS=1 on a machine of the test suite)"
   # the script file itself: in a folder another user can change, it could be replaced while it runs
   if ! path_dir_safe "$SCRIPT_DIR"; then
     _log WARN "the script is in a folder that is not root's own all the way down: $SCRIPT_DIR"

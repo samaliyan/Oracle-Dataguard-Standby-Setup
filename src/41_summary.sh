@@ -440,10 +440,18 @@ sv_change() {
     lag)   ask_default "Seconds of lag that the health check accepts" "${HEALTH_LAG_MAX:-300}"
            v=${ANSWER//[[:space:]]/}; [[ "$v" =~ ^[0-9]{1,6}$ ]] || { sum_note "Use a number of seconds."; return 1; }; HEALTH_LAG_MAX=$v ;;
   esac
+  # the standby keeps nothing in ASM (all its files in folders): it needs no Grid, as discovery decides at the
+  # next run; with a place in ASM again, Grid is back (its values are read from the primary at every run)
+  local old_ug=$USE_GRID
+  if [[ "$id" == data || "$id" == fra ]]; then
+    if [[ -z "$(asm_dgs 2>/dev/null)" ]]; then [[ "$USE_GRID" == yes ]] && { USE_GRID=no; sum_note "No file of this standby is in ASM now: Grid is not installed here."; }
+    elif [[ "$USE_GRID" != yes && -n "$GRID_HOME" && -n "$GRID_BASE" ]]; then USE_GRID=yes; fi
+  fi
   if [[ "$id" != mode && "$id" != yes && "$id" != range ]]; then
     if ! validate_settings >/dev/null 2>&1; then
       sum_note "Not saved: $(validate_settings 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^[^A-Za-z]*//' | grep -v '^$' | head -n 1)"
       while IFS= read -r k; do [[ -n "$k" ]] && printf -v "${k%%=*}" '%s' "${k#*=}"; done <<< "$snap"     # the values from before
+      USE_GRID=$old_ug
       return 1
     fi
     save_settings; save_accepted

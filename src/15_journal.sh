@@ -552,7 +552,7 @@ Drop the disk group first (see the ASMLABEL lines), with ASM running."; return 2
         run_logged "srvctl stop database" as_oracle timeout 1800 "$DB_HOME/bin/srvctl" stop database -db "$STANDBY_UNIQUE" -stopoption immediate || { bad "$(tail -n 2 <<< "$RUN_OUT")"; return 1; }
       else
         # (a clean shutdown of a mounted or only started instance prints ORA-01109 / ORA-01507 first: no failure)
-        if ! sql_local_long "shutdown immediate" && grep -E '(ORA|SP2)-[0-9]+' <<< "$SQL_OUT" | grep -qvE 'ORA-(01109|01507)'; then
+        if ! sql_local_long "shutdown immediate" && ! { grep -qE 'ORA-(01109|01507)' <<< "$SQL_OUT" && ! grep -E '(ORA|SP2)-[0-9]+' <<< "$SQL_OUT" | grep -qvE 'ORA-(01109|01507)'; }; then
           bad "shutdown immediate failed: $(ora_errors "$SQL_OUT")
 Trying shutdown abort."; sql_local "shutdown abort" || return 1
         fi
