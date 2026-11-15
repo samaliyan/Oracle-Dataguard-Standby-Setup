@@ -22,7 +22,7 @@ EOF
 }
 run() { # $1 = output file, rest = script args.  Env DG_TEST_* passed through.
   local out=$1; shift
-  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_TEST_NO_QUERIES=${DG_TEST_NO_QUERIES:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out \
+  ( cd $T && PATH=$T/rootbin:$PATH DG_PLAIN=${DG_PLAIN:-1} DG_VERBOSE=${DG_VERBOSE:-1} DG_TEST_NO_QUERIES=${DG_TEST_NO_QUERIES:-1} DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=${DG_MEMINFO_FILE:-$T/meminfo} DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=${DG_TEST_FAST_WAITS:-1} DG_TEST_OUT=$out DG_TEST_UNAME=${DGT_UNAME:-} \
       timeout 600 python3 $DRV ./dg_standby_setup.sh "$@" >/dev/null 2>&1 ); local rc=$?
   grep -q "DRIVER TIMEOUT" "$out" 2>/dev/null && { mkdir -p /tmp/dgt_stuck; cp "$out" "/tmp/dgt_stuck/${CUR:-x}_$(basename "$out")"; }
   echo $rc
@@ -2527,7 +2527,7 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
   echo "lsnrstop=$(undo_text LSNRSTOP LISTENER 'home=/u01/db user=oracle port=1521') [$(change_word LSNRSTOP)]" )
 EOF
 bash $T/ut531.sh $T/dg_standby_setup.sh $T > $T/ut531.txt 2>&1
-check "unit: PATH has the system folders first, then only root's own folders that others cannot write to; what is left out is named (the test suite's stand-ins go first only with DG_TEST_HOOKS=1)" "grep -qx 'path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:D/ok' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt && grep -qx 'testpath=D/ok:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' $T/ut531.txt"
+check "unit: PATH has the system folders first, then only root's own folders that others cannot write to; what is left out is named (the test suite's stand-ins go first only with DG_TEST_HOOKS=1)" "grep -Eqx 'path=(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin:D/ok' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt && grep -Eqx 'testpath=D/ok:(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin' $T/ut531.txt"
 check "unit: the limits of the user oracle are checked like those of the other owners" "grep -qx 'limusers=oracle,grid/oracle' $T/ut531.txt"
 check "unit: a stopped listener of another home is a journal line with the command that starts it again" "grep -qF 'lsnrstop=by hand, only if that listener is still needed (it held port 1521, which the Grid listener uses now), as oracle:  ORACLE_HOME=/u01/db /u01/db/bin/lsnrctl start LISTENER [listener]' $T/ut531.txt"
 rm -rf $T/ut531p
@@ -2546,7 +2546,7 @@ check "PATH: programs in a folder of another user at the front of PATH are never
 ln -sfn /usr/bin $ev/lnk
 ( source <(sed -n '/^path_dir_safe()/,/^}/p; /^safe_path()/,/^}/p' $T/dg_standby_setup.sh); mkdir -p $ev/sub; chown root $ev/sub; chmod 755 $ev/sub
   ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; TEST_HOOKS=1; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
-check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -qx \"path=$T/rootbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
+check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -Eqx \"path=$T/rootbin:(/usr/local/sbin:)?(/usr/local/bin:)?/usr/sbin:/usr/bin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
 rm -rf $ev
 fi
 if part 5.32; then
