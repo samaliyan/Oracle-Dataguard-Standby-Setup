@@ -628,7 +628,7 @@ arch_log_traversable() {
 arch_cron_last_errors() {
   # RMAN-/ORA- lines of the last run in the cron log (since its last "=== dg_arch_cleanup" line)
   local f; f=$(arch_cron_log); [[ -r "$f" ]] || return 0
-  awk '/^=== dg_arch_cleanup /{buf=""; next} /^(RMAN|ORA)-[0-9]+/{buf=buf $0 "\n"} END{printf "%s", buf}' "$f" | head -n 3
+  awk '/^=== dg_arch_cleanup /{buf=""; next} /^(RMAN|ORA)-[0-9]+/ && !/[Ww]arning/{buf=buf $0 "\n"} END{printf "%s", buf}' "$f" | head -n 3
 }
 arch_cron_state() {
   # ok | line (missing, twice or different) | script (missing or different) | log (the log cannot be written by oracle)
@@ -1242,7 +1242,7 @@ c_10_1() {
     NOW=""
     # datum_time: when the standby last received data from the primary. v$dataguard_stats keeps its last
     # values when nothing arrives any more, so a lag of 0 on a broken link would look healthy without it
-    sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-')||'|'||nvl(to_char(max(case when name='transport lag' and datum_time is not null then round((sysdate-to_date(datum_time,'MM/DD/YYYY HH24:MI:SS'))*86400) end)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
+    sql_local "select nvl(max(decode(name,'transport lag',value)),'-')||'|'||nvl(max(decode(name,'apply lag',value)),'-')||'|'||nvl(to_char(max(case when name='transport lag' and datum_time is not null then round((to_date(time_computed,'MM/DD/YYYY HH24:MI:SS')-to_date(datum_time,'MM/DD/YYYY HH24:MI:SS'))*86400) end)),'-') from v\$dataguard_stats;" || { NOW="Cannot read v\$dataguard_stats"; return 2; }
     IFS='|' read -r tl al age <<< "$(first_line)"
     tls=$(lag_seconds "$tl"); als=$(lag_seconds "$al")
     # kept for the status line and the perfdata of --health
@@ -1684,7 +1684,7 @@ rf_login_test() {
   CLEANUP_FILES+=("$ltmp")
   { printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"; printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$PRIMARY_TNS"; printf 'exit\n'; } \
     | as_oracle timeout 120 "$DB_HOME/bin/rman" > "$ltmp" 2>&1 || lrc=1
-  RUN_OUT=$(mask_pw < "$ltmp"); rm -f -- "$ltmp"
+  RUN_OUT=$(clean_ctl < "$ltmp" | mask_pw); rm -f -- "$ltmp"
   printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman login test (roll forward)"
   grep -q 'connected to target database' <<< "$RUN_OUT" && grep -q 'connected to auxiliary database' <<< "$RUN_OUT" && return 0
   NOW="RMAN cannot log in to both databases with the sys password: $(grep -E '(RMAN|ORA)-[0-9]+' <<< "$RUN_OUT" | head -n 2 | tr '\n' ' ')"

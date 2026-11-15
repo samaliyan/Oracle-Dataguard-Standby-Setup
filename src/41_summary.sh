@@ -22,7 +22,7 @@ summary_facts() {
   prim_sql "select count(*) from v\$standby_log;" && num "$(first_line)" && SUM_SRL=$(first_line)
   if [[ "$PRIMARY_CDB" == YES ]] && prim_sql "select count(*) from v\$pdbs where name<>'PDB\$SEED';"; then num "$(first_line)" && SUM_PDBS=$(first_line); fi
   prim_sql "select upper(value) from v\$parameter where name='dg_broker_start';" && SUM_BROKER=$(first_line)
-  prim_sql "select count(*) from v\$archive_dest where status<>'INACTIVE' and target='STANDBY';" && num "$(first_line)" && SUM_DESTS=$(first_line)
+  prim_sql "select count(*) from v\$archive_dest where status<>'INACTIVE' and target in ('STANDBY','REMOTE');" && num "$(first_line)" && SUM_DESTS=$(first_line)
   # the names table: where the spfile and the password file of the primary are, its protection mode, the
   # log_archive_dest_N that step 4.4 uses (the same choice as 4.4: one that names the standby, else 2, else the first free)
   prim_sql "select nvl(value,'-') from v\$parameter where name='spfile';" && SUM_SPFILE=$(first_line)

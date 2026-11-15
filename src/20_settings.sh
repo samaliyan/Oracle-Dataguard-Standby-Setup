@@ -252,9 +252,19 @@ validate_settings() {
     [[ "$GRID_HOME/" != "$GRID_BASE/"* ]] || warn "The Grid home $GRID_HOME is inside the Grid base $GRID_BASE. This is the same on the primary, so it is kept."
     [[ "$GRID_HOME/" != "$ORACLE_BASE/"* ]] || warn "The Grid home $GRID_HOME is inside the Oracle base $ORACLE_BASE. This is the same on the primary, so it is kept."
     [[ -n "$DATA_DG" ]] || { bad "DATA_DG (the first ASM disk group) is empty."; bad_n=1; }
+    # Grid is installed here with the first disk group of the primary (+$DATA_DG): the standby must keep files in
+    # it, else step 2.13 prepares no disk for it and step 3.2 cannot install Grid
+    if [[ -n "$DATA_DG" ]] && ! asm_dgs 2>/dev/null | grep -qx "${DATA_DG^^}"; then
+      bad "The database files and the recovery area do not use the disk group +$DATA_DG, with which Grid is installed here.
+Put the database files or the recovery area there (values \"Database files go to\" / \"Recovery area\"), or leave both automatic."; bad_n=1
+    fi
   elif all_locs | grep -q '^+'; then
     bad "USE_GRID must be yes, because the primary keeps files in ASM."; bad_n=1
   fi
+  # a server that still has the host name of a fresh install: "localhost" would go into /etc/hosts, the listener
+  # and the alias of the standby
+  case "${STANDBY_HOST,,}" in localhost|localhost.*|localhost4*|localhost6*)
+    bad "This server has no host name of its own yet ($STANDBY_HOST). Give it one first:  hostnamectl set-hostname <name>"; bad_n=1 ;; esac
   [[ "$DB_NAME" =~ [\$#] || "$PRIMARY_UNIQUE" =~ [\$#] ]] && { bad "This script does not support database names with \$ or # ($DB_NAME, $PRIMARY_UNIQUE)."; bad_n=1; }
   # names are resolved first: a host name on one side and its address on the other is the same server
   local sip pip; sip=$(ipv4_of "$STANDBY_IP"); pip=$(ipv4_of "$PRIMARY_IP")

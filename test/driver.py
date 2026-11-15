@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Expect-style driver for dg_standby_setup.sh v3 (stdlib only).
+"""Expect-style driver for dg_standby_setup.sh (stdlib only).
 Runs the script in a pty and answers prompts. When the script prints commands for
 the PRIMARY and asks '[r] I did it', the driver applies those changes to the mock
 primary (as the DBA would) and answers r.
@@ -117,7 +117,8 @@ def main():
     summary_answers = E("DG_TEST_SUMMARY", "").split(",") if E("DG_TEST_SUMMARY") else []
     menu_steps = lst("DG_TEST_MENU_STEPS")
     changes_answers = lst("DG_TEST_CHANGES")
-    KEYS = {"<UP>": "\x1b[A", "<DOWN>": "\x1b[B", "<ESC>": "\x1b", "<ENTER>": "\n"}
+    # (DOWNDOWN and ESCENTER: two keys in one write, as a held key or a fast hand sends them)
+    KEYS = {"<UP>": "\x1b[A", "<DOWN>": "\x1b[B", "<ESC>": "\x1b", "<ENTER>": "\n", "<DOWNDOWN>": "\x1b[B\x1b[B", "<ESCENTER>": "\x1b\n"}
     def pump(t):
         # read what arrives within t seconds (for the screen picture); not a prompt to answer
         nonlocal full
@@ -138,7 +139,7 @@ def main():
     def send(s):
         nonlocal answered, buf, ctx
         if s == "<CTRL-C>": os.write(fd, b"\x03")
-        elif re.search(r"<(UP|DOWN|ESC|ENTER|SNAP:[a-z0-9_]+)>", s):
+        elif re.search(r"<(UP|DOWN|ESC|ENTER|DOWNDOWN|ESCENTER|SNAP:[a-z0-9_]+)>", s):
             # keys of the arrow pages: "<DOWN><DOWN><SNAP:name><ENTER>" (typed text between them is sent as it is)
             toks = re.findall(r"<[A-Z]+(?::[a-z0-9_]+)?>|[^<>]+", s)
             for n, tok in enumerate(toks):
@@ -148,7 +149,7 @@ def main():
                 elif tok in KEYS:
                     os.write(fd, KEYS[tok].encode())
                     # what the key draws is read here, except after the last key: the next question must
-                    # reach the main loop (after Esc the script waits 0.1 s for the rest of a sequence)
+                    # reach the main loop (after Esc the script waits 0.4 s for the rest of a sequence)
                     if n < len(toks) - 1: pump(0.25)
                 else: os.write(fd, tok.encode())
         else: os.write(fd, (s + "\n").encode())

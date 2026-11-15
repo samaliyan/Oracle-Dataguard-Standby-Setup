@@ -302,7 +302,8 @@ manual way.
 
 ### Exit codes
 `0` every step OK; `1` stopped by you, or some steps are not OK or skipped (normal for `--check` on a new
-server); `2` wrong option or unknown step; `4` a step failed. With `--health`: `0` OK, `1` WARNING,
+server), or the run stopped on an error; `2` wrong option or unknown step; `4` the RMAN copy (step 8.2)
+failed. Quit at the start menu is `0`. With `--health`: `0` OK, `1` WARNING,
 `2` CRITICAL, `3` UNKNOWN.
 
 ## Daily check from cron
@@ -430,7 +431,7 @@ cd test && ./run_scenarios.sh
 The suite can also run in parts: `./run_scenarios.sh --list-parts` shows them, `--part 3` runs one, and
 `--sections A,Q` runs only the named sections. GitHub Actions (`.github/workflows/ci.yml`) runs shellcheck,
 the build check (`bash -n`, and the committed script must match the build of `src/`), every part as its own job, and
-sections A and Q on Oracle Linux 7 (bash 4.2) in a container.
+sections A and Q and the sections of the newest changes on Oracle Linux 7 (bash 4.2) in a container.
 
 The mocks are not real Oracle. Before using the script in production, run `--check` on the real servers
 and read what it reports.
@@ -446,6 +447,11 @@ and read what it reports.
 - After a switchover (this server becomes the primary): the nightly clean-up of archived logs deletes nothing
   any more. Without Grid, the boot unit still starts the database only to MOUNT; open it yourself and review
   the unit.
+- Kernel parameters (sysctl) are not checked or set by the script: they come from the Oracle preinstall package
+  of step 2.3. If that package cannot be installed (no Oracle repository), set them by hand; the installer's own
+  checks name what is missing.
+- ASMLib version 3 (UEK 7) is not tested: if step 2.12 does not accept a working ASMLib, set the ASM disk
+  method to udev on the summary screen.
 - The installer zips cannot be verified by the script (it does not know Oracle's checksums). Step 3.1 prints
   the SHA-256 of each file: compare it with the value on Oracle's download page before the software is installed.
 

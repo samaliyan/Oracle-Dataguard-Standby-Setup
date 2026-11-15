@@ -59,13 +59,15 @@ standby_complete() {
     fi
     return 0
   fi
-  sql_local "select (select count(*) from v\$datafile)||'|'||(select count(*) from v\$datafile_header where error is not null) from dual;" || { SC_INFO="cannot read the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
+  sql_local "select (select count(*) from v\$datafile)||'|'||(select count(*) from v\$datafile_header where error is not null and file# not in (select file# from v\$datafile where status='OFFLINE')) from dual;" || { SC_INFO="cannot read the standby ($(ora_errors "$SQL_OUT"))"; return 2; }
   local sc se pc; IFS='|' read -r sc se <<< "$(first_line)"
   need_ssh || { SC_INFO="no ssh connection to the primary for the comparison"; return 2; }
   prim_sql "select count(*) from v\$datafile;" || { SC_INFO="cannot read the primary ($(ora_errors "$SQL_OUT"))"; return 2; }
   pc=$(first_line)
   num "$sc" && num "$se" && num "$pc" || { SC_INFO="unexpected answers ($sc, $se, $pc)"; return 2; }
-  # complete: no datafile header has an error. Fewer datafiles than the primary means apply is behind
+  # complete: no datafile header has an error (a file that is OFFLINE in the control file, a tablespace taken
+  # offline on the primary, is not counted: its header has no usable data and that is not a failed copy).
+  # Fewer datafiles than the primary means apply is behind
   # (new tablespaces on primary), not a failed copy (a failed copy shows the missing files as errors).
   if [[ "$se" == "0" && "$sc" -gt 0 ]]; then
     # a complete physical standby that this script did not copy (made by hand, or by another tool) is accepted
@@ -1419,7 +1421,7 @@ dup_prechecks() {
     # the passwords travel on stdin only (never in a file, never in argv)
     { printf 'connect target sys/"%s"@%s\n' "$SYS_PW" "$PRIMARY_TNS"; printf 'connect auxiliary sys/"%s"@%s\n' "$SYS_PW" "$STANDBY_TNS"; printf 'exit\n'; } \
       | as_oracle timeout 120 "$DB_HOME/bin/rman" > "$ltmp" 2>&1 || lrc=1
-    RUN_OUT=$(cat "$ltmp"); rm -f -- "$ltmp"
+    RUN_OUT=$(clean_ctl < "$ltmp"); rm -f -- "$ltmp"
     printf '%s\n(exit code %s)\n' "$RUN_OUT" "$lrc" | log_block "rman login test"
     # success = both "connected to" lines (RMAN may print harmless warnings next to them)
     if ! grep -q 'connected to target database' <<< "$RUN_OUT" || ! grep -q 'connected to auxiliary database' <<< "$RUN_OUT"; then
@@ -1787,7 +1789,7 @@ dup_verify() {
   sql_local "select database_role from v\$database;" || { warn "The new standby could not be read after the copy ($(ora_errors "$SQL_OUT"))."; return 2; }
   [[ "$(first_line)" == "PHYSICAL STANDBY" ]] || { bad "RMAN reported success, but the database role is $(first_line), not PHYSICAL STANDBY."; return 1; }
   local sc se pc
-  sql_local "select (select count(*) from v\$datafile)||'|'||(select count(*) from v\$datafile_header where error is not null) from dual;" || { warn "The datafiles of the new standby could not be read ($(ora_errors "$SQL_OUT"))."; return 2; }
+  sql_local "select (select count(*) from v\$datafile)||'|'||(select count(*) from v\$datafile_header where error is not null and file# not in (select file# from v\$datafile where status='OFFLINE')) from dual;" || { warn "The datafiles of the new standby could not be read ($(ora_errors "$SQL_OUT"))."; return 2; }
   IFS='|' read -r sc se <<< "$(first_line)"
   num "$sc" && num "$se" || { warn "Unexpected answer when the datafiles were counted ($sc, $se)."; return 2; }
   # header errors are a failed copy whatever the primary says (checked before the primary is read)

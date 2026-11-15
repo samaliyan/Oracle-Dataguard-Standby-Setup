@@ -136,7 +136,9 @@ cp_role_run() {
        for v in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
          [[ -n "${!v:-}" ]] && pv+=("$v=${!v}")
        done
-       ( cd / && env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" 9>&- ) ;;
+       # (run in the background and waited for: Ctrl+C then reaches this script at once; the command itself ends
+       # at its time limit, see as_oracle)
+       ( cd / && { env -i "PATH=$PATH" "LANG=C" "LC_ALL=C" "HOME=/root" ${pv[@]+"${pv[@]}"} "$@" <&0 9>&- & wait $!; } ) ;;
   esac
 }
 cp_exec() {
@@ -170,11 +172,11 @@ cp_exec() {
   else
     cp_role_run "${CP_ROLE[$i]}" timeout -k 30 "${CP_TO[$i]}" bash -c "${CP_CMD[$i]}" > "$tmp" 2>&1 < /dev/null || rc=$?
   fi
-  RUN_OUT=$(cat -- "$tmp"); rm -f -- "$tmp"
+  RUN_OUT=$(clean_ctl < "$tmp"); rm -f -- "$tmp"
   # sqlplus ends with 0 also after an error: an ORA- or SP2- line in its output is a failure
   # (sqlplus by name or by a full path that ends in /sqlplus)
   [[ $rc -eq 0 && ( "$first" == sqlplus* || "$first" =~ ^[^[:space:]]*/sqlplus([[:space:]]|$) ) ]] \
-    && awk '/^(ORA|SP2)-[0-9]+/ && !/^ORA-32004/ {f=1} END {exit !f}' <<< "$RUN_OUT" && rc=1   # (ORA-32004: a deprecated parameter in the spfile, the start itself worked)
+    && awk -v sd="$([[ "${CP_IN[$i],,}" == *shutdown* ]] && printf 1)" '/^(ORA|SP2)-[0-9]+/ && !/^ORA-32004/ && !(sd == 1 && /^ORA-(01109|01507)/) {f=1} END {exit !f}' <<< "$RUN_OUT" && rc=1   # (ORA-32004: a deprecated parameter in the spfile, the start itself worked)
   { printf 'as %s: ' "$(cp_user "${CP_ROLE[$i]}")"; cp_entry_text "$i"; printf -- '--- output ---\n%s\n(exit code %s)\n' "$RUN_OUT" "$rc"; } | log_block "RUN"
   return "$rc"
 }
@@ -229,6 +231,7 @@ short_script() {
   printf '%s' "$f"
 }
 cp_script_text() {
+  local sq="'"          # (a single quote inside single quotes: '\'' ; written with a variable, the same on bash 4.2 and 5)
   # the whole list as a root shell script (for short_script): each entry runs as its user, in its environment;
   # the first command that fails stops the script (set -e)
   local i r u h s
@@ -245,7 +248,7 @@ cp_script_text() {
     esac
     printf '\n'
     if [[ "$u" == root ]]; then printf '%s' "${CP_CMD[$i]}"
-    else printf "runuser -u %s -- env -i HOME=/ LANG=C ORACLE_HOME=%s ORACLE_SID=%s PATH=%s/bin:/usr/bin:/bin timeout %s bash -c '%s'" "$u" "$h" "$s" "$h" "${CP_TO[$i]}" "${CP_CMD[$i]//\'/\'\\\'\'}"; fi
+    else printf "runuser -u %s -- env -i HOME=/ LANG=C ORACLE_HOME=%s ORACLE_SID=%s PATH=%s/bin:/usr/bin:/bin timeout %s bash -c '%s'" "$u" "$h" "$s" "$h" "${CP_TO[$i]}" "${CP_CMD[$i]//$sq/$sq\\$sq$sq}"; fi
     if [[ -n "${CP_IN[$i]}" ]]; then printf " <<'EOF'\n%s\nEOF\n" "${CP_IN[$i]}"; else printf '\n'; fi
   done
 }

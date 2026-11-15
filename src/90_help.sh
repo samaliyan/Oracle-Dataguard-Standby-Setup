@@ -79,9 +79,11 @@ TITLE  Standby settings
 WHERE  This server ($S), file ${SETTINGS_FILE:-/var/lib/dg_standby_setup/settings.conf}
 WHY    Paths, users and groups are the same as on the primary.
        They are read from it at every run.
-       You can change only the values under "This server (standby)": names, installer
-       files, RU_DIR, OPATCH_ZIP, the ASM disk method and the RMAN channels.
-RUN    Type a to accept, or e to edit (KEY=VALUE lines, no spaces).
+       You can change only the values of this standby: where its files go, its names, the
+       installer files, the Release Update, the ASM disk method, the RMAN channels, the clean-up.
+RUN    On the summary screen: Enter starts; a number (or the arrow keys and Enter) changes one
+       value; d shows the details; e opens the file in an editor (the lines under
+       "Standby values", KEY=VALUE, no spaces).
        To change them later, run the script with --settings.
 EXPECT STANDBY_UNIQUE differs from $PU.
        STANDBY_SID has at most 12 characters.
@@ -106,14 +108,16 @@ RUN    cat /etc/os-release
        For 19c on OL9:
        1. Unzip the Release Update (with Grid: the GI Release Update) into a folder.
        2. Copy the newest OPatch zip (p6880880) to this server.
-       3. In the settings (step 1.4, e), set RU_DIR=<folder> and OPATCH_ZIP=<zip>.
+       3. On the summary screen (step 1.4) set the value "Release Update" (RU_DIR and OPATCH_ZIP).
 EXPECT A supported pair:
        12.1, 12.2, 18c   Oracle Linux 7 only
        19c               OL7, OL8 (the 19.3 installer gets CV_ASSUME_DISTID=OEL7.8),
                          OL9 only with Release Update 19.19 or later,
                          applied by the installer (-applyRU)
-       21c               OL7, OL8, OL9
+       21c               OL7, OL8; OL9 only with Release Update 21.12 or later (RU_DIR)
        23ai              OL8, OL9
+       21c and 23ai cannot be finished with this script yet: their Oracle home is read-only
+       (step 3.8).
 EOF
   ;;
   2.1) cat <<EOF
@@ -390,7 +394,7 @@ WHERE  This server ($S), as $GU
 WHY    Needed only when the primary uses ASM.
 RUN    12.2 and newer:
        cd $GH ; unzip -q <grid zip> ; ./gridSetup.sh
-       (with a Release Update, add:  -applyRU <folder>)
+       (with a Release Update, add:  -applyRU <folder>   on 12.2:  -applyPSU <folder>)
        12.1 (both zips into one stage folder):
        cd <stage folder> ; unzip -q <grid zip 1of2> ; unzip -q <grid zip 2of2> ; ./grid/runInstaller
        In the installer choose: Standalone Server (Oracle Restart),
@@ -470,6 +474,8 @@ WHY    From 18c a home can be read-only. This setup keeps the spfile, the passwo
 RUN    $DBH/bin/orabasehome
        $DBH/bin/roohctl -disable      (only on a new home without any database)
 EXPECT orabasehome prints $DBH
+IF     21c and 23ai have read-only homes only: roohctl -disable is refused there, and this
+       script cannot finish a standby of these releases yet.
 EOF
   ;;
   3.9) cat <<EOF
@@ -621,8 +627,10 @@ TITLE  fal_server (for switchover)
 WHERE  The primary ($P), SQL*Plus as sysdba
 WHY    Used only after a switchover. You may skip it.
 RUN    $PSQL
+       show parameter fal_server
+       -- keep the names that are there: add $ST to them, for example 'other_stby','$ST'
        alter system set fal_server='$ST' scope=both;
-EXPECT show parameter fal_server  shows $ST
+EXPECT show parameter fal_server  shows $ST (and the names it had before)
 EOF
   ;;
   4.9) cat <<EOF
@@ -1148,7 +1156,6 @@ EXPECT The same patches in both database homes.
 IF     Different: normal for a short time while a Release Update is applied standby first
        (Release Updates and patches marked Standby-First allow it). Finish it on both
        servers; datapatch runs only on the primary. The Grid home is not compared here.
-       A RAC primary: only the node the script connects to is read.
 EOF
   ;;
   10.8) cat <<EOF

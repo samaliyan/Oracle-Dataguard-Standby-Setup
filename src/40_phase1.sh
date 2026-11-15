@@ -148,7 +148,15 @@ File: $SETTINGS_FILE"
 }
 pick_editor() {
   local e
-  for e in "${EDITOR:-}" vi vim nano; do [[ -n "$e" ]] && command -v "${e%% *}" >/dev/null 2>&1 && { printf '%s' "$e"; return 0; }; done
+  # (EDITOR comes from the environment, which may be the one of the user who became root: it is used only when
+  # the program is in a folder that root holds all the way down, as the folders of PATH)
+  local ep
+  for e in "${EDITOR:-}" vi vim nano; do
+    [[ -n "$e" ]] || continue
+    ep=$(command -v "${e%% *}" 2>/dev/null) || continue
+    [[ "$ep" == /* ]] && ep=$(readlink -f -- "$ep" 2>/dev/null) && path_dir_safe "$(dirname "$ep")" || continue
+    printf '%s' "$e"; return 0
+  done
   return 1
 }
 d_1_4() {
@@ -174,7 +182,7 @@ d_1_4() {
             return 0 ;;
         d)  local f; f=$(mktemp) && CLEANUP_FILES+=("$f") && summary_details_text > "$f"
             if [[ $UI -eq 1 ]]; then ui_page "$f" "Details"; else cat -- "$f"; fi; rm -f -- "$f" ;;
-        h)  show_help 1.4 || true ;;
+        h|"?"|help) if [[ $UI -eq 1 ]]; then ui_show "Help  $S_DOT  step 1.4" show_help 1.4; else show_help 1.4 || true; fi ;;
         q)  user_stop "Stopped by you" ;;
         e)  SUMMARY_DONE=1; L14_EDIT=1; break ;;          # the file in an editor: the way below
         *)  if [[ "$a" =~ ^[0-9]{1,2}$ ]] && (( 10#$a >= 1 && 10#$a <= ${#SV_ID[@]} )); then sv_change "$((10#$a))" && changed_any=1
