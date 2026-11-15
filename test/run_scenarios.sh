@@ -123,7 +123,7 @@ PARTS=(
   [9]="Z8 Z9 Z14 5.29"
   [10]="Z12 Z13 5.28"
   [11]="5.23 5.30 5.31 5.32 5.33"
-  [12]="5.34 5.36"
+  [12]="5.34 5.36 5.37"
 )
 SEL_PART=${DG_PART:-}; SEL_SECTIONS=${DG_SECTIONS:-}; LIST_PARTS=0
 while [[ $# -gt 0 ]]; do
@@ -2658,6 +2658,118 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
   LOCS_T='+DATA'; STANDBY_HOST=localhost.localdomain; validate_settings 2>&1 | grep -c 'no host name of its own yet' ) 2>/dev/null | paste -sd/ -
 EOF
 check "unit: the summary refuses a placement that leaves out the disk group Grid is installed with, and a server still named localhost" "[[ \$(bash $T/ut536.sh $T/dg_standby_setup.sh) == 1/1 ]]"
+fi
+if part 5.37; then
+CUR=5.37; echo "== 5.37  The key of --health runs only its read-only commands (the gate); --health --json and --prom-file"
+# ---- the gate itself, as sshd would start it (SSH_ORIGINAL_COMMAND), with a stand-in for sqlplus ----
+cat > $T/ut537.sh <<'EOF'
+#!/bin/bash
+S=$1; T=$2; G=$T/ut537g; H=$G/home
+rm -rf $G; mkdir -p $H/bin $H/inventory/oneoffs/12345678
+printf '#!/bin/bash\necho "SQLPLUS $ORACLE_HOME $ORACLE_SID $TNS_ADMIN $*"; cat\n' > $H/bin/sqlplus; chmod 755 $H/bin/sqlplus
+fn() { sed -n "/^$1()/,/^}/p" "$S"; }
+source <(fn v_path; fn v_name; sed -n '/^health_gate_text()/,/^health_key_plan()/p' "$S" | sed '$d')
+HEALTH_GATE_VER=$(sed -n 's/^readonly HEALTH_GATE_VER=\([0-9]*\).*/\1/p' "$S")
+DB_HOME=$H PRIMARY_SID=PRODDB PRIMARY_TNS_ADMIN="" health_gate_text > $G/gate.sh || { echo "no gate"; exit 1; }
+bash -n $G/gate.sh || exit 1
+g() { local o rc; o=$(SSH_ORIGINAL_COMMAND="$1" bash $G/gate.sh 2>&1); rc=$?; printf '%s|%s\n' "$rc" "$(printf '%s' "$o" | tr '\n' '~')"; }
+# the lines the script itself sends before and after the SELECT
+hdr=$(sed -n "/^readonly SQL_HEADER='/,/'$/p" "$S" | sed "s/^readonly SQL_HEADER='//; s/'$//")
+mark=$(sed -n 's/^readonly SQL_MARK="\(.*\)"$/\1/p' "$S")
+inp() { printf 'set define off echo off\n%s\n%s\nprompt %s\n%s\nexit\n' "connect / as sysdba" "$hdr" "$mark" "$1"; }
+Q="env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME=$H ORACLE_SID=PRODDB TNS_ADMIN=$H/network/admin timeout 60 $H/bin/sqlplus -S /nolog"
+{
+echo "ver=$(g "echo __DG_PROBE_ab12__; dg_gate_version" < /dev/null)"
+echo "ls=$(g "echo __DG_PROBE_ab12__; timeout 120 ls -1A $H/inventory/oneoffs" < /dev/null)"
+echo "own=$(g "timeout 120 stat -c '%U %G' $H/inventory" < /dev/null)"
+echo "ex=$(g "echo __DG_PROBE_ab12__; sh -c 'timeout 120 test -e $H/inventory/oneoffs; r=\$?; [ \$r -eq 0 ] && echo YES; [ \$r -eq 1 ] && echo NO; true'" < /dev/null)"
+echo "sql=$(inp 'select force_logging from v$database;' | g "$Q")"
+n=0
+for c in "id" "" "bash" "timeout 120 ls -1A /etc" "timeout 120 ls -1A $H/inventory/oneoffs; id" "echo __DG_PROBE_ab__; id" "cat /etc/passwd" "scp -t /tmp/x" \
+         "timeout 120 stat -c '%U %G' /etc/shadow" "${Q/ORACLE_SID=PRODDB/ORACLE_SID=OTHER}" "${Q/$H\/bin/\/tmp\/bin}" "$Q; id" "${Q/timeout 60/timeout 60 -s 9}" "${Q/TNS_ADMIN=/TNS_ADMIN=\$(id)}"; do
+  r=$(inp 'select 1 from dual;' | g "$c"); [[ "${r%%|*}" == 126 && "$r" != *SQLPLUS* && "$r" != *uid=* ]] && n=$((n + 1))
+done
+echo "refused_cmds=$n"
+n=0
+for q in 'alter system switch logfile;' 'select 1 from dual; host id' 'host id' '!id' '@/tmp/x.sql' 'select dbms_scheduler.x from dual;' 'select 1 from dual' \
+         'select sys.f from dual;' 'select 1 into x from dual;' 'select 1 from dual; --x' 'begin null; end;' 'shutdown abort' 'select utl_file.x from dual;' 'spool /tmp/x'; do
+  r=$(inp "$q" | g "$Q"); [[ "${r%%|*}" == 126 && "$r" != *SQLPLUS* ]] && n=$((n + 1))
+done
+echo "refused_sql=$n"
+r=$(printf 'select 1 from dual;\nselect 2 from dual;\n' | g "$Q"); echo "two=${r%%|*}"
+r=$(printf 'exit\n' | g "$Q"); echo "none=${r%%|*}"
+# the gate and readonly_guard refuse the same words
+a=$(fn readonly_guard | grep -o "(insert|update[^']*" | head -n 1); b=$(grep -o "(insert|update[^']*" $G/gate.sh | head -n 1)
+echo "words=$([[ -n "$a" && "$a" == "$b" ]] && echo same || echo differ)"
+# JSON strings: a backslash, a quote, a tab and a line end
+source <(fn json_str)
+printf 'json=%s\n' "$(json_str 'a\b "c" & d'$'\t''e'$'\n''f')"
+} 2>&1 | sed "s#$G#G#g"
+EOF
+bash $T/ut537.sh $T/dg_standby_setup.sh $T > $T/ut537.txt 2>&1
+check "gate: its version, the patch folders of the home and their owner are answered" "grep -qx 'ver=0|__DG_PROBE_ab12__~DG_GATE 1 G/home PRODDB' $T/ut537.txt && grep -qx 'ls=0|__DG_PROBE_ab12__~12345678' $T/ut537.txt && grep -qx 'own=0|root root' $T/ut537.txt && grep -qx 'ex=0|__DG_PROBE_ab12__~YES' $T/ut537.txt"
+check "gate: one SELECT goes to sqlplus of the fixed home and SID, with the lines the script sends around it" "grep -q '^sql=0|SQLPLUS G/home PRODDB G/home/network/admin -S /nolog~set define off echo off~connect / as sysdba~.*~select force_logging from v\$database;~exit\$' $T/ut537.txt"
+check "gate: any other command, another home or SID, or a command added after an allowed one is refused (exit 126) and nothing runs" "grep -qx 'refused_cmds=14' $T/ut537.txt"
+check "gate: a statement that is not one read-only SELECT is refused (alter, host, @file, PL/SQL, a second statement, no SELECT at all)" "grep -qx 'refused_sql=14' $T/ut537.txt && grep -qx 'two=126' $T/ut537.txt && grep -qx 'none=126' $T/ut537.txt"
+check "gate: it refuses the same words as the read-only rule of the script" "grep -qx 'words=same' $T/ut537.txt"
+check "JSON text: a backslash and a quote are escaped, a tab and a line end become a space" "grep -qxF 'json=\"a\\\\b \\\"c\\\" & d e f\"' $T/ut537.txt"
+rm -rf $T/ut537g
+# ---- step 9.9 and --health with the gate ----
+fresh empty; rc=$(run $T/r37a.txt)
+check "9.9: the commands for the primary write the gate and a key line with command= ; the step is done" "[[ $rc -eq 0 ]] && grep -q \"cat > ~/.ssh/dg_health_gate.sh <<'DG_GATE_END'\" $T/log/actions_*.txt && grep -qF 'command=\"\$HOME/.ssh/dg_health_gate.sh\",from=\"' $T/log/actions_*.txt && grep -qF \"sed -i.dg_bak '/ dg_standby_setup health \" $T/log/actions_*.txt && grep -q 'runs only the read-only commands of --health' $T/log/run_*.log"
+jset $P "d['health_gate']=0"
+rc=$(run $T/r37b.txt --only 9.9)
+check "9.9: a key of an older version (a full shell on the primary) is shown as not limited, with the commands that replace its line" "grep -q 'the key is not limited there' $T/r37b.txt && grep -q 'dg_health_gate.sh' $T/r37b.txt && [[ \$(python3 -c \"import json;print(json.load(open('$P')).get('health_gate'))\") == 1 ]]"
+jset $P "d['health_gate']=7"
+rc=$(DG_TEST_QUIT_AT=9.9 run $T/r37c.txt --only 9.9)
+check "9.9: a gate of another version is named with both versions" "grep -q 'is version 7; this script needs version 1' $T/r37c.txt"
+jset $P "d['health_gate']=1; d['gate_home']='/u01/old_home'"
+rc=$(DG_TEST_QUIT_AT=9.9 run $T/r37d.txt --only 9.9)
+check "9.9: a gate written for another home of the primary is named (it would refuse the queries of --health)" "grep -q 'was written for another home or SID (/u01/old_home PRODDB)' $T/r37d.txt"
+jset $P "d.pop('gate_home')"
+# ---- --health --json ----
+hj() { # $1 = name of the output files, rest = options: --health straight on stdout (no terminal, as from cron)
+  local n=$1; shift
+  ( cd $T && PATH=$T/rootbin:$PATH DG_SSH_DIR=$T/ssh DG_LOG_DIR=$T/log DG_STATE_DIR=$T/varlib DG_OS_RELEASE_FILE=$T/os-release DG_FSTAB_FILE=$T/fstab DG_SHM_UNIT_FILE=$T/dev-shm.mount DG_MEMINFO_FILE=$T/meminfo DG_POLL_WAIT=1 DG_TEST_FAST_WAITS=1 \
+      ./dg_standby_setup.sh --health "$@" > $T/$n.json 2> $T/$n.err < /dev/null; echo $? > $T/$n.rc )
+}
+hj r37j --json
+cat > $T/r37j.py <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1])); st = {c['id']: c['state'] for c in d['checks']}
+if sys.argv[2] == "ok":
+    assert d['state'] == 'OK' and d['exit_code'] == 0 and d['primary_checked'] is True and d['standby'] == 'PRODDB_STBY', d
+    assert d['checks'][0]['id'] == 'instance' and all(k in st for k in ('10.1', '10.6', '10.8')) and set(st.values()) == {'OK'}, st
+    assert d['lag'] == {'transport_seconds': 0, 'apply_seconds': 1, 'limit_seconds': 300}, d['lag']
+    assert set(d['data_guard']) == {'role', 'open_mode', 'protection_mode', 'redo_apply', 'last_applied'} and d['data_guard']['redo_apply'] == 'running', d
+    assert d['summary'].startswith('OK - ') and d['log'].endswith('.log'), d
+else:
+    assert d['state'] == 'CRITICAL' and d['exit_code'] == 2 and d['primary_checked'] is False, d
+    assert st['10.4'] == 'CRITICAL' and st['10.6'] == 'SKIPPED', st
+    assert 'does not exist' in d['prom_file_error'], d
+EOF
+check "--health --json: one JSON object and nothing else on stdout; state, exit code, the checks, the lag and the primary side (read by a JSON parser)" "[[ \$(cat $T/r37j.rc) == 0 ]] && python3 $T/r37j.py $T/r37j.json ok"
+jset $P "d['root_key']=0"; jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
+rm -rf $T/prom
+hj r37k --json --prom-file $T/prom/dg.prom
+check "--health --json with a problem and no key: CRITICAL with exit 2, the failed check, the primary not checked, the metrics file that could not be written" "[[ \$(cat $T/r37k.rc) == 2 ]] && python3 $T/r37j.py $T/r37k.json bad"
+jset $P "d['root_key']=1"; jset $S "d['instances']['PRODDB_STBY']['mrp']=1"
+# ---- --health --prom-file ----
+rm -rf $T/prom; install -d -m 755 $T/prom
+rc=$(run $T/r37p.txt --health --prom-file $T/prom/dg.prom)
+check "--health --prom-file: the text output as before, and the metrics file (mode 644, no temporary file left)" "[[ $rc == 0 ]] && grep -q 'Result: OK (exit 0)' $T/r37p.txt && [[ \$(stat -c '%a' $T/prom/dg.prom) == 644 && \$(ls -A $T/prom | wc -l) == 1 ]]"
+L='{standby="PRODDB_STBY"}'
+check "--prom-file: state, time of the run, each check, lag in seconds, redo apply, with the standby as label" "grep -qxF 'dg_health_state$L 0' $T/prom/dg.prom && grep -qE '^dg_health_last_run_timestamp_seconds.standby=\"PRODDB_STBY\". [0-9]{10}\$' $T/prom/dg.prom && grep -qxF 'dg_health_check_state{standby=\"PRODDB_STBY\",check=\"instance\"} 0' $T/prom/dg.prom && grep -qxF 'dg_health_check_state{standby=\"PRODDB_STBY\",check=\"10.4\"} 0' $T/prom/dg.prom && grep -qxF 'dg_transport_lag_seconds$L 0' $T/prom/dg.prom && grep -qxF 'dg_apply_lag_seconds$L 1' $T/prom/dg.prom && grep -qxF 'dg_lag_limit_seconds$L 300' $T/prom/dg.prom && grep -qxF 'dg_redo_apply_running$L 1' $T/prom/dg.prom && grep -qxF 'dg_health_primary_checked$L 1' $T/prom/dg.prom && [[ \$(grep -c '^# TYPE ' $T/prom/dg.prom) == \$(grep -c '^# HELP ' $T/prom/dg.prom) ]]"
+jset $S "d['instances']['PRODDB_STBY']['mrp']=0"
+rc=$(run $T/r37q.txt --health --prom-file $T/prom/dg.prom)
+check "--prom-file: a problem is in the file (state 2, the check 2, redo apply 0)" "[[ $rc == 2 ]] && grep -qxF 'dg_health_state$L 2' $T/prom/dg.prom && grep -qxF 'dg_health_check_state{standby=\"PRODDB_STBY\",check=\"10.4\"} 2' $T/prom/dg.prom && grep -qxF 'dg_redo_apply_running$L 0' $T/prom/dg.prom"
+jset $S "d['instances']['PRODDB_STBY']['mrp']=1"
+rm -rf $T/prom2 $T/prom3; install -d -m 777 $T/prom2; install -d -m 755 $T/prom3; ln -s $T/prom_target $T/prom3/dg.prom
+rc=$(run $T/r37r.txt --health --prom-file $T/prom2/dg.prom); rc2=$(run $T/r37s.txt --health --prom-file $T/prom3/dg.prom)
+check "--prom-file: nothing is written in a folder others can write to, or through a link; the output says so and the state of the check stays" "[[ $rc == 0 && $rc2 == 0 ]] && grep -q 'Note: the metrics file .*/prom2/dg.prom was not written: the folder .* must belong to root' $T/r37r.txt && [[ -z \$(ls -A $T/prom2) ]] && grep -q 'was not written: it is a link' $T/r37s.txt && [[ ! -e $T/prom_target ]]"
+rm -rf $T/prom $T/prom2 $T/prom3
+out=$(cd $T && ./dg_standby_setup.sh --json 2>&1); rc=$?; out2=$(cd $T && ./dg_standby_setup.sh --health --prom-file relative.prom 2>&1); rc2=$?; out3=$(cd $T && ./dg_standby_setup.sh --status --prom-file /tmp/x.prom 2>&1); rc3=$?
+check "--json and --prom-file belong to --health; a path that is not plain and absolute is refused (exit 3 with --health)" "[[ $rc == 2 && $rc2 == 3 && $rc3 == 2 ]] && grep -q 'belong to --health' <<< \"\$out\" && grep -q 'invalid value for --prom-file' <<< \"\$out2\" && grep -q 'belong to --health' <<< \"\$out3\""
 fi
 parts_done
 echo

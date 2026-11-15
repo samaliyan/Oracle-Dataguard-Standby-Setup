@@ -334,23 +334,64 @@ cat /root/.ssh/dg_health_proddb_stby.pub
 ```
 
 ```bash
-# 2) on the primary, as the ssh user (oracle): one line, the standby's address, then the whole .pub line
+# 2) on the primary, as the ssh user (oracle): the commands that step 9.9 shows (also in the "Commands for
+#    you" file of the run). They write the gate script ~/.ssh/dg_health_gate.sh and add one line:
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
-echo 'from="192.0.2.20",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... dg_standby_setup health stby01' >> ~/.ssh/authorized_keys
+cat > ~/.ssh/dg_health_gate.sh <<'DG_GATE_END'
+...                                   # (the gate, with the home and the SID of your primary: copy it from the step)
+DG_GATE_END
+chmod 700 ~/.ssh/dg_health_gate.sh
+touch ~/.ssh/authorized_keys
+sed -i.dg_bak '/ dg_standby_setup health stby01$/d' ~/.ssh/authorized_keys     # an older line of this key
+echo 'command="$HOME/.ssh/dg_health_gate.sh",from="192.0.2.20",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... dg_standby_setup health stby01' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
 ```bash
-# 3) test on the standby, as root: prints OK without a password question
+# 3) test on the standby, as root: prints "DG_GATE 1 <home> <SID>" without a password question
 ssh -i /root/.ssh/dg_health_proddb_stby -o BatchMode=yes \
-  -o UserKnownHostsFile=/var/lib/dg_standby_setup/primary_known_hosts oracle@192.0.2.10 echo OK
+  -o UserKnownHostsFile=/var/lib/dg_standby_setup/primary_known_hosts oracle@192.0.2.10 dg_gate_version
 ```
 
 `from=` lets the key in only from the standby's address; `no-pty` and the `no-*-forwarding` options give it
-no terminal and no tunnels. `--health` uses this key when the file exists (`IdentityFile`, `BatchMode=yes`,
-and the same host key check as the setup). To take it back: remove the line on the primary, and
-`./dg_standby_setup.sh --undo 9.9` on the standby.
+no terminal and no tunnels. `command=` makes sshd start the gate for whatever is asked with this key, and
+the gate runs only the read-only commands of `--health`: the owner and the list of
+`<home>/inventory[/oneoffs]` (patch level), and `sqlplus / as sysdba` of the one home and SID with exactly one
+`SELECT` on one line (no second statement, no word that changes data or runs code). Anything else is
+refused with exit 126. The home and the SID are fixed in the gate: after a move to another home, step 9.9
+shows the commands again. A key set up by a version before 5.37 has no gate: `--health` keeps working with it,
+and step 9.9 shows it as "not limited" with the commands that replace its line. `--health` uses this key when the file exists (`IdentityFile`, `BatchMode=yes`,
+and the same host key check as the setup). To take it back: remove the line and `~/.ssh/dg_health_gate.sh`
+on the primary, and `./dg_standby_setup.sh --undo 9.9` on the standby.
+
+### JSON and Prometheus
+
+`--health --json` prints one JSON object instead of the text (the exit code is the same): `state`,
+`exit_code`, `summary` (the status line), `checks` (id, state, text of each), `lag` (seconds, `null` when not
+known), `data_guard` (role, open mode, protection mode, redo apply, last applied log), `primary_checked` and
+`log`. A failure before the check starts (a wrong option, not root) is plain text with exit 3.
+
+`--health --prom-file FILE` also writes metrics in the text format of Prometheus, for the textfile collector
+of node_exporter. The file is written whole and then renamed, with mode 644, only in a folder that belongs to
+root and that others cannot write to (never through a link). A file that cannot be written is a note in the
+output and does not change the state.
+
+```bash
+17 * * * *  /root/dg_standby_setup.sh --health --prom-file /var/lib/node_exporter/textfile_collector/dg_standby.prom >/dev/null
+```
+
+| Metric | Meaning |
+|---|---|
+| `dg_health_state` | 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN |
+| `dg_health_check_state{check="10.1"}` | the same per check (`instance`, `10.1` ... `10.8`); -1 = SKIPPED |
+| `dg_health_last_run_timestamp_seconds` | when `--health` last ran; alert when it gets old |
+| `dg_health_primary_checked` | 1 when the checks of the primary were done |
+| `dg_transport_lag_seconds`, `dg_apply_lag_seconds` | lag, when it could be read |
+| `dg_lag_limit_seconds` | the accepted lag (HEALTH_LAG_MAX) |
+| `dg_redo_apply_running` | 1 when MRP runs |
+
+Every metric has the label `standby="<standby unique name>"`.
 
 HEALTH_LAG_MAX in the settings sets the accepted lag (300 seconds by default, at least 30).
 
@@ -441,9 +482,10 @@ and read what it reports.
 - The script was tested against mocks only (see above), not yet end to end on real servers. Use `--check` first.
 - 21c and 23ai: the Oracle home is read-only there and `roohctl -disable` is no longer possible; the script
   still expects a read/write home (step 3.8), so a standby of these releases cannot be finished with it yet.
-- The key for `--health` (step 9.9) lets root of the standby log in as the Oracle owner of the primary without
-  a password. Its `authorized_keys` line limits where it may come from and forbids forwarding and a terminal,
-  but not the commands. Protect root on the standby accordingly.
+- The key for `--health` (step 9.9) lets root of the standby run the read-only checks of `--health` as the
+  Oracle owner of the primary without a password. Its gate allows one `SELECT` as sysdba per call, filtered by
+  words: that is a strong limit, not a proof that no SELECT can have a side effect. A key set up before 5.37
+  has no gate until you replace its line (step 9.9 shows how). Protect root on the standby accordingly.
 - After a switchover (this server becomes the primary): the nightly clean-up of archived logs deletes nothing
   any more. Without Grid, the boot unit still starts the database only to MOUNT; open it yourself and review
   the unit.

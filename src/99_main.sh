@@ -44,6 +44,10 @@ After setup
                        1 WARNING, 2 CRITICAL, 3 UNKNOWN (--help-step health; with the ssh key of
                        step 9.9 it also checks the primary side)
                          dg_standby_setup.sh --health
+      --json             with --health: the result as one JSON object instead of text
+      --prom-file FILE   with --health: also write metrics for Prometheus into FILE (the textfile
+                         collector of node_exporter)
+                         dg_standby_setup.sh --health --prom-file /var/lib/node_exporter/textfile_collector/dg_standby.prom
   --roll-forward       Bring a standby that cannot catch up up to date from the primary (18c+)
                          dg_standby_setup.sh --roll-forward
 Information
@@ -156,6 +160,8 @@ parse_args() {
       --user) [[ $# -ge 2 ]] && valid_value name "$2" && [[ "$2" != "root" ]] || { printf 'Missing or invalid value for --user. Give the Oracle software owner, not root.\n'; exit $PX; }; CLI_USER=$2; shift ;;
       --check) MODE="check" ;;
       --health) HEALTH=1 ;;
+      --json) HEALTH_JSON=1 ;;
+      --prom-file) [[ $# -ge 2 ]] && v_path "$2" && [[ "$2" != */ ]] || { printf 'Missing or invalid value for --prom-file (a file with its full path; only letters, digits and _ . / -)\n'; exit $PX; }; HEALTH_PROM=$2; shift ;;
       --roll-forward) ROLL_FORWARD=1 ;;
       --settings) REVIEW_SETTINGS=1 ;;
       --status) STATUS_ONLY=1 ;;
@@ -193,6 +199,9 @@ parse_args() {
       printf '%s\n' '--roll-forward cannot be combined with --check, --yes, --only, --from, --undo, --settings, --status, --show-changes or --health.'; exit $PX
     fi
     parse_only 10 || exit $PX
+  fi
+  if [[ $HEALTH -eq 0 && ( $HEALTH_JSON -eq 1 || -n "$HEALTH_PROM" ) ]]; then
+    printf '%s\n' '--json and --prom-file belong to --health.'; exit $PX
   fi
   # --health is a whole mode of its own (exit 3 = "unknown" for a monitoring system, never 2 = "critical")
   if [[ $HEALTH -eq 1 && ( "$MODE" == "check" || $STATUS_ONLY -eq 1 || -n "$SHOW_CHANGES" || -n "$FROM_STEP" || -n "$ONLY_TEXT" || -n "$UNDO_STEP" || $REVIEW_SETTINGS -eq 1 || $YES_MODE -eq 1 || -n "$CLI_IP" || -n "$CLI_USER" || -n "$HELP_STEP" || ${ROLL_FORWARD:-0} -eq 1 ) ]]; then

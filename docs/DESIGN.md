@@ -260,3 +260,18 @@ values are kept in settings.accepted and differences are shown. One run at a tim
   questions are asked.
 - Journal kinds added: LSNRSTOP (3.9, by hand). Settings: DATA_DEST, FRA_DEST, FRA_SIZE, ARCH_CLEANUP*.
 - 21c on Oracle Linux 9 needs Release Update 21.12 (RU_DIR); 21c and 23ai cannot be finished yet (read-only homes).
+
+## 5.37 notes
+- The key of --health is limited to its commands (85_health.sh): the authorized_keys line has
+  command="$HOME/.ssh/dg_health_gate.sh", so sshd starts the gate for every request made with the key. The gate
+  (health_gate_text; the user puts it on the primary with the commands of step 9.9, the script never writes
+  there) has the home and the SID fixed in it (TNS_ADMIN must be a plain path) and runs its own copy of a request that matches: the
+  owner / list / existence of <home>/inventory[/oneoffs], and sqlplus with exactly one SELECT that passes the
+  same word rule as readonly_guard. It answers "dg_gate_version" with "DG_GATE <n> <home> <SID>"; health_key_test reads that
+  (HKT_GATE, HKT_GATE_FOR), and step 9.9 is "to do" again when the version, the home or the SID differ. HEALTH_GATE_VER must be raised whenever --health sends the primary a command the gate does not
+  list: step 9.9 then shows the new commands. A key without a gate (set up before 5.37) still works for
+  --health; step 9.9 reports it as not limited. The interactive run never uses this key.
+- --health --json (health_json): the same facts as the text, one object on stdout; the text goes to the log
+  only. --health --prom-file F (health_prom_write): Prometheus text format, written to a temporary file in the
+  same folder and renamed; only in a folder of root that others cannot write to, never through a link; written
+  on every end of the run (also UNKNOWN), a failure is a note and never changes the state.

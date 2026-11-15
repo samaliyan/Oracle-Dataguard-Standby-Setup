@@ -44,7 +44,9 @@ def fix_primary(text):
     if "remote_login_passwordfile=exclusive" in text: p["remote_login_passwordfile"] = "EXCLUSIVE"
     if "alter user sys identified" in text: pri["sys_in_pwfile"] = True
     # step 9.9: the key line added to ~/.ssh/authorized_keys of the ssh user on the primary
-    if "authorized_keys" in text and "dg_standby_setup health" in text: pri["root_key"] = 1
+    if "authorized_keys" in text and "dg_standby_setup health" in text:
+        pri["root_key"] = 1
+        if "dg_health_gate.sh" in text: pri["health_gate"] = 1     # (the commands of 5.37 write the gate too)
     m = re.search(r"fal_server=('[^;]*') scope", text)
     if m: p["fal_server"] = m.group(1).replace("'", "")
     if "tnsnames.ora" in text and ("cat >>" in text or "entry must be" in text): pri["tns_stby"] = 1; pri.pop("tns_stby_host", None)

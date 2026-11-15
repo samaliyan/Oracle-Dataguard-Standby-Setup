@@ -120,4 +120,4 @@ jobs:
             yum install -y -q python3 zip unzip perl procps-ng util-linux shadow-utils hostname findutils which >/dev/null
             cat /etc/oracle-release; bash --version | head -n 1; python3 --version
             bash ./build.sh
-            bash test/run_scenarios.sh --sections A,Q,5.30,5.31,5.32,5.33,5.34 || { rc=$?; bash test/show_failures.sh; exit $rc; }'
+            bash test/run_scenarios.sh --sections A,Q,5.30,5.31,5.32,5.33,5.34,5.37 || { rc=$?; bash test/show_failures.sh; exit $rc; }'
