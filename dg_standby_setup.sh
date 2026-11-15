@@ -17993,7 +17993,7 @@ in=""; n=0; sel=0
 while IFS= read -r l || [[ -n "$l" ]]; do
   n=$((n + 1)); [[ $n -le 12 && ${#l} -le 8000 ]] || no
   case "$l" in
-    "set define off echo off"|"connect / as sysdba"|"whenever sqlerror exit 3"|"prompt __DG_SQL_OUTPUT__"|"exit") ;;
+    "set define off echo off"|"connect / as sysdba"|"whenever sqlerror exit 3"|"prompt __DG_SQL_""OUTPUT__"|"exit") ;;
     "set heading off feedback off pagesize 0 verify off echo off trimspool on linesize 4000 tab off") ;;
     *) sel=$((sel + 1)); [[ $sel -eq 1 ]] && sel_ok "$l" || no ;;
   esac

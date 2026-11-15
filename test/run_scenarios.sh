@@ -63,6 +63,7 @@ cmds_whitelisted() {
        || [[ "$l" =~ ^env\ NLS_LANG=AMERICAN_AMERICA\.AL32UTF8\ LC_ALL=C\ ORACLE_HOME=/[^\ ]+\ TNS_ADMIN=/[^\ ]+\ /[^\ ]+/bin/tnsping\ [a-z_]+\ 1$ ]] \
        || [[ "$l" =~ ^getent\ ahostsv4\ [A-Za-z0-9.-]+$ ]] \
        || [[ "$l" =~ ^sh\ -c\ \'e=\$\(LC_ALL=C\ timeout\ 8\ bash\ -c\ \"exec\ 3\<\>/dev/tcp/[0-9.]+/[0-9]+\"\ 2\>\&1\)\;\ r=\$\?\;\ case\ \"\$r:\$e\"\ in\ 0:\*\)\ echo\ OPEN\;\;\ 124:\*\)\ echo\ TIMEOUT\;\;\ \*refused\*\)\ echo\ REFUSED\;\;\ \*unreachable\*\)\ echo\ UNREACH\;\;\ \*No\\\ route\*\)\ echo\ NOROUTE\;\;\ \*\)\ echo\ BLOCKED\;\;\ esac\'$ ]] \
+       || [[ "$l" == "dg_gate_version" ]] \
        || [[ "$l" == "nproc" || "$l" == "hostname -I" || "$l" == "dd if=/dev/zero bs=1M count=64 status=none" ]] \
        || hostres_ok "$l" \
        || [[ "$l" == "ps -eo pid,user:32,args" ]] || [[ "$l" =~ ^readlink\ /proc/[0-9]+/exe$ ]] \
