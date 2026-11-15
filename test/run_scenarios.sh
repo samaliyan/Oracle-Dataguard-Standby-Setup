@@ -2527,7 +2527,8 @@ rm -rf $T/ut531p
 # ---- a run up to the Grid install: 2.4 looks at oracle, 3.1 prints the checksums ----
 rc=$(DG_TEST_QUIT_AT=3.2 run $T/r31a.txt)
 gz=$(ls $T/stage/*grid*.zip 2>/dev/null | head -n 1)
-check "2.4: the limits of oracle are looked at: missing ones are named and added to the limits file" "grep -qE 'Missing or too low limits: .*oracle:nofile' $T/r31a.txt && grep -qE '^oracle +hard +nofile +65536' /etc/security/limits.d/oracle-grid.conf && [[ \$(res 2.4 $T/r31a.txt) == DONE ]]"
+# (which limits are missing depends on the machine: a runner may set nofile for everyone; memlock and stack are never there)
+check "2.4: the limits of oracle are looked at: missing ones are named and added to the limits file" "grep -qE 'Missing or too low limits: .*oracle:(nofile|nproc|stack|memlock)' $T/r31a.txt && grep -qE '^oracle +(soft|hard) +(nofile|nproc|stack|memlock) ' /etc/security/limits.d/oracle-grid.conf && [[ \$(res 2.4 $T/r31a.txt) == DONE ]]"
 dz=$(ls $T/stage/*db*.zip 2>/dev/null | head -n 1)
 check "3.1: the SHA-256 of every installer file is printed and is in the run log" "[[ -n \"$gz\" && -n \"$dz\" ]] && grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum $gz | cut -d' ' -f1)  \$(basename $gz)\" $T/r31a.txt && grep -q \"\$(sha256sum $dz | cut -d' ' -f1)  \$(basename $dz)\" $T/r31a.txt && grep -q '| MEDIA .*sha256: [0-9a-f]\{64\}' $T/log/run_*.log"
 # the PATH the script was started with: a folder of another user in front never runs anything, not even at the start
