@@ -301,7 +301,10 @@ menu_records() {
   case "$ANSWER" in
     q) menu_quit ;;
     s) print_progress_board ;;
-    c) if [[ -s "$JOURNAL_FILE" ]]; then { ui_wanted && ui_changes_browse; } || show_changes_cli ""; else say "No changes are recorded on this server."; fi ;;
+    c) if [[ -s "$JOURNAL_FILE" ]]; then
+         if ui_wanted && ui_changes_browse; then [[ -n "$BROWSE_UNDO" ]] && menu_undo_step "$BROWSE_UNDO"
+         else show_changes_cli ""; fi
+       else say "No changes are recorded on this server."; fi ;;
     u) while true; do
          ask "Step to undo, for example 2.9 (Enter = back)"
          st=${ANSWER//[[:space:]]/}
@@ -310,15 +313,20 @@ menu_records() {
          valid_step "$st" && break
          say "There is no step $st. To list the steps:  $SELF --help-step all"
        done
-       if [[ -z "$(journal_entries "$st")" ]]; then say "No change of step $st is recorded, so there is nothing to undo."; return 0; fi
-       say "First, what it would undo:"
-       show_changes_cli "$st"
-       confirm "Undo the changes of step $st now? Each change is asked again before it is undone." || return 0
-       # from here changes are made: Ctrl+C is a stop in the middle (fatal), not a quit at the menu
-       trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
-       UNDO_STEP=$st; run_undo ;;
+       menu_undo_step "$st" ;;
   esac
   return 0
+}
+menu_undo_step() {
+  # $1 step: what its undo would do is shown, asked once, then the undo runs (every change is asked again)
+  local st=$1
+  if [[ -z "$(journal_entries "$st")" ]]; then say "No change of step $st is recorded, so there is nothing to undo."; return 0; fi
+  say "First, what it would undo:"
+  show_changes_cli "$st"
+  confirm "Undo the changes of step $st now? Each change is asked again before it is undone." || return 0
+  # from here changes are made: Ctrl+C is a stop in the middle (fatal), not a quit at the menu
+  trap 'printf "\n"; fatal "Interrupted by user (Ctrl+C)"' INT
+  UNDO_STEP=$st; run_undo
 }
 menu_quit() { _log STOP "quit at the start menu"; printf '\n'; exit 0; }
 start_menu() {
@@ -525,7 +533,16 @@ Check DG_LOG_DIR, DG_STATE_DIR and the other DG_* paths in the environment.
     if [[ -n "$SHOW_CHANGES" ]]; then
       # with the screen layout and no step named: a list of the steps to look through (and to undo from);
       # --plain, a pipe or a file get the report as text, as before
-      if [[ "$SHOW_CHANGES" == all ]] && ui_wanted && ui_changes_browse; then :
+      if [[ "$SHOW_CHANGES" == all ]] && ui_wanted && ui_changes_browse; then
+        if [[ -n "$BROWSE_UNDO" ]]; then
+          # u on the list: the undo is a run of --undo for that step (its own lock, log and questions), after
+          # the same question as from the menu
+          show_changes_cli "$BROWSE_UNDO"
+          if confirm "Undo the changes of step $BROWSE_UNDO now? Each change is asked again before it is undone."; then
+            local urc=0; "$BASH" "$SELF" --undo "$BROWSE_UNDO" || urc=$?
+            exit $urc
+          fi
+        fi
       else show_changes_cli "$([[ "$SHOW_CHANGES" == all ]] || printf '%s' "$SHOW_CHANGES")"; fi
     fi
     exit 0

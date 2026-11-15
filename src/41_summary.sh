@@ -360,6 +360,7 @@ sv_change() {
              for a in $dgl; do po+=("$a|disk group (Oracle-managed file names)"); done
              po+=("same|the same paths as on the primary" "*|a folder: type its full path")
              ui_pick "Database files go to" "${DATA_DEST:-}" "Where the files of the standby database are put on this server." "${po[@]}"
+             [[ $PICK_ESC -eq 1 ]] && return 1          # Esc: nothing is changed, nothing more is asked
            else
            ask_default "Database files go to: a disk group (${dgl:-none here}), same (the paths of the primary), a folder, or Enter for automatic" "${DATA_DEST:-}"
            fi
@@ -372,6 +373,7 @@ sv_change() {
              use_grid && for a in $(asm_dgs | sed 's/^/+/'); do po+=("$a|disk group"); done
              po+=("same|the same place as on the primary" "*|a folder: type its full path")
              ui_pick "Recovery area" "${FRA_DEST:-}" "Where archived logs and the second log members go. Its size is asked next." "${po[@]}"
+             [[ $PICK_ESC -eq 1 ]] && return 1          # Esc: nothing is changed, nothing more is asked
            else
            ask_default "Recovery area: a disk group, same, a folder, or Enter for automatic" "${FRA_DEST:-}"
            fi
@@ -403,6 +405,7 @@ sv_change() {
     asm)   if [[ $UI -eq 1 ]]; then
              ui_pick "ASM disk method" "${ASM_METHOD:-}" "How the ASM disks get their names and their owner on this server." \
                "|ASMLib if it works on this kernel, else udev" "asmlib|Oracle ASMLib (oracleasm)" "udev|udev rules"
+             [[ $PICK_ESC -eq 1 ]] && return 1          # Esc: nothing is changed, nothing more is asked
            else
            ask_default "ASM disk method: asmlib, udev, or Enter for automatic" "${ASM_METHOD:-}"
            fi
@@ -412,6 +415,7 @@ sv_change() {
              arch_in_fra && po+=("oracle|only the recovery area itself deletes them, when it needs space")
              po+=("none|nothing: the disk fills up unless you delete them yourself")
              ui_pick "Archived-log clean-up" "${ARCH_CLEANUP:-timer}" "How applied archived logs are deleted on the standby. Time and days are asked next." "${po[@]}"
+             [[ $PICK_ESC -eq 1 ]] && return 1          # Esc: nothing is changed, nothing more is asked
            else
            ask_default "Clean-up: timer, crontab$(arch_in_fra && printf ', oracle'), none" "${ARCH_CLEANUP:-timer}"
            fi

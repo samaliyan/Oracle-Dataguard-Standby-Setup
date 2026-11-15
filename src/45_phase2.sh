@@ -1470,6 +1470,7 @@ d_2_13() {
     local nfree=0; for i in "${!disks[@]}"; do [[ "$used" == *" ${disks[$i]%% *} "* ]] || nfree=$((nfree + 1)); done
     local auto1=0; [[ $nfree -eq 1 && ${disks[$((def - 1))]##* } -ge $need_more ]] && auto1=1
     [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
+    local dlast=""
     while true; do
       if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
       elif [[ $UI -eq 1 ]]; then
@@ -1481,8 +1482,11 @@ d_2_13() {
           else drows+=(" |${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "$dmodel")"); fi
         done
         ui_check "Empty disks for +$dg" "Only empty disks are listed. Nothing is erased on this page." \
-          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${drows[@]}"
+          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${dlast:-}" "${drows[@]}"
         [[ -n "$ANSWER" ]] || { CHECK_NOTE="Mark at least one disk (Space), or type q to stop."; continue; }
+        # h or ?: the help of the step, then the page again
+        if [[ "${ANSWER,,}" == h || "$ANSWER" == "?" ]]; then ui_show "Help  $S_DOT  step 2.13" show_help 2.13; continue; fi
+        dlast=$ANSWER          # (an answer that is not taken: its marks are on the page again)
       else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""

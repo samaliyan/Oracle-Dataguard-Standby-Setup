@@ -19,6 +19,24 @@ An independent review of the versions 5.31 to 5.34 (two reviewers), and what it 
 - Step 3.1: the checksums are shown again from the second run on (kept with the size and time of each file,
   so a file is read once), a file whose checksum cannot be read is named, the OPatch zip is included, and the
   lines are indented like the text around them.
+- Keyboard pages:
+  - Tab between two numbers no longer joins them ("1<Tab>3" was read as 13, a wrong disk number); Tab is a
+    space, Ctrl+U empties the answer, Ctrl+W takes its last word away, Ctrl+D with nothing typed stops as at a
+    plain question, and another control key rings the bell instead of being dropped silently.
+  - Space before Enter is no longer an answer of its own on the summary, the menu and the choice pages (it made
+    Enter start the run, or saved "automatic", instead of taking the marked row).
+  - The disk page of 2.13 marks nothing by itself: the cursor starts on the suggested disk, Enter with nothing
+    marked takes the row of the cursor, the line under the title names every marked row (also one that is not
+    on the part of the list shown), and the marks stay when an answer is not taken. `h` shows the help.
+  - An arrow key whose parts arrive slowly (a slow line) is no longer taken as Esc and typed text; the keys of
+    the Linux console are read to their end.
+  - Esc on a choice page changes nothing and asks nothing more (before, the clean-up page went on to ask the
+    time and saved "timer").
+  - `u` on the list of `--show-changes` shows the changes of the step and asks once before the undo starts, as
+    the menu does; steps that are no step numbers are not offered for undo.
+  - A long title, a long value or a long typed answer no longer moves the page (the typed answer is shown in
+    its field, its end when it is long); the pages read the size of the terminal again each time they are
+    drawn; Ctrl+C on the `--show-changes` page leaves the page before the message is shown.
 - Tests: the mocks stay in PATH whatever the umask; checks of 5.31 that could not fail now test what their
   title says; a test that a program in a user's folder at the front of PATH is never run; the pictures of the
   pages are taken when the screen has been quiet. The Oracle Linux 7 job (bash 4.2) also runs the sections
