@@ -8,6 +8,7 @@
 # Worst first: CRITICAL, then UNKNOWN, then WARNING. SKIPPED counts as nothing: the checks of the primary are
 # SKIPPED when root has no ssh key for it (10.3 and 10.5 are then done on the standby side only).
 #------------------------------------------------------------------------------
+HEALTH_JSON=0; HEALTH_PROM=""   # --json: the result as one JSON object; --prom-file F: metrics for Prometheus in F
 HEALTH=0; HEALTH_SSH_OPEN=0; HEALTH_SSH_ERR=""; HEALTH_SSH_NOKEY=0; HEALTH_LOG=""; HEALTH_REPORTED=0
 declare -A HEALTH_STATE=(); declare -A HEALTH_TEXT=(); HEALTH_ORDER=(); HEALTH_BUF=()
 
@@ -42,6 +43,86 @@ health_status_line() {
   printf '%s - %s%s' "$worst" "$(tr -d '|' <<< "$txt")" "${perf:+ | $perf}"
 }
 
+json_str() {
+  # $1 as a JSON string: printable ASCII only (what Oracle and the tools print under LC_ALL=C), \ and " escaped
+  local s bs='\' dq='"'
+  s=$(printf '%s' "$1" | LC_ALL=C tr '\n\t' '  ' | LC_ALL=C tr -cd '\040-\176')
+  # (pattern and replacement quoted: a bare backslash in a replacement is an escape on newer bash)
+  s=${s//"$bs"/"$bs$bs"}; s=${s//"$dq"/"$bs$dq"}
+  printf '"%s"' "$s"
+}
+json_num() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi; }
+health_state_num() { case "$1" in OK) printf 0 ;; WARNING) printf 1 ;; CRITICAL) printf 2 ;; SKIPPED) printf -- -1 ;; *) printf 3 ;; esac; }
+health_json() {
+  # $1 overall state, $2 exit code, $3 the status line, $4 why the run stopped (or empty), $5 why the metrics
+  # file was not written (or empty). One JSON object on stdout: the same facts as the text output
+  local id sep="" tl=-1 al=-1
+  [[ "${HC_TLS:--1}" -ge 0 ]] && tl=$HC_TLS; [[ "${HC_ALS:--1}" -ge 0 ]] && al=$HC_ALS
+  printf '{\n  "tool": "dg_standby_setup.sh",\n  "version": %s,\n' "$(json_str "$SCRIPT_VERSION")"
+  printf '  "time": %s,\n  "host": %s,\n' "$(json_str "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" "$(json_str "$(hostname -s 2>/dev/null)")"
+  printf '  "standby": %s,\n  "primary": %s,\n' "$(json_str "${STANDBY_UNIQUE:-}")" "$(json_str "${PRIMARY_UNIQUE:-}")"
+  printf '  "state": %s,\n  "exit_code": %s,\n  "summary": %s,\n' "$(json_str "$1")" "$2" "$(json_str "$3")"
+  [[ -n "$4" ]] && printf '  "stopped": %s,\n' "$(json_str "$4")"
+  [[ -n "$5" ]] && printf '  "prom_file_error": %s,\n' "$(json_str "$5")"
+  printf '  "primary_checked": %s,\n' "$([[ $HEALTH_SSH_OPEN -eq 1 ]] && printf true || printf false)"
+  printf '  "lag": {"transport_seconds": %s, "apply_seconds": %s, "limit_seconds": %s},\n' "$(json_num "$tl")" "$(json_num "$al")" "$(json_num "${HC_LIM:-}")"
+  printf '  "data_guard": {"role": %s, "open_mode": %s, "protection_mode": %s, "redo_apply": %s, "last_applied": %s},\n' \
+    "$(json_str "$DGS_ROLE")" "$(json_str "$DGS_OPEN")" "$(json_str "$DGS_PROT")" "$(json_str "$DGS_MRP")" "$(json_str "$DGS_APPLIED")"
+  printf '  "checks": ['
+  for id in "${HEALTH_ORDER[@]+"${HEALTH_ORDER[@]}"}"; do
+    printf '%s\n    {"id": %s, "state": %s, "text": %s}' "$sep" "$(json_str "$([[ "$id" == 0.0 ]] && printf instance || printf '%s' "$id")")" "$(json_str "${HEALTH_STATE[$id]}")" "$(json_str "${HEALTH_TEXT[$id]}")"
+    sep=","
+  done
+  printf '\n  ],\n  "log": %s\n}\n' "$(json_str "$HEALTH_LOG")"
+}
+health_prom_write() {
+  # $1 overall state: the metrics file of --prom-file (the text format of Prometheus, for the textfile collector
+  # of node_exporter). Written whole to a new file beside it, then renamed: a reader never sees half a file.
+  # Root writes it, so only in a folder that only root can change, and never through a link. On a failure the
+  # reason is printed (one line) and the result is 1.
+  local f=$HEALTH_PROM d id n lab tmp
+  d=$(dirname -- "$f")
+  [[ -d "$d" ]] || { printf 'the folder %s does not exist' "$d"; return 1; }
+  dir_root_only "$f" || { printf 'the folder %s must belong to root and not be writable by others' "$d"; return 1; }
+  [[ ! -L "$f" && ( ! -e "$f" || -f "$f" ) ]] || { printf 'it is a link or not a plain file'; return 1; }
+  tmp=$(mktemp "$d/.dg_prom.XXXXXXXX" 2>/dev/null) || { printf 'cannot create a file in %s' "$d"; return 1; }
+  lab="standby=\"$(printf '%s' "${STANDBY_UNIQUE:-}" | LC_ALL=C tr -cd 'A-Za-z0-9_.+-')\""
+  {
+    printf '# HELP dg_health_state Result of dg_standby_setup.sh --health: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.\n# TYPE dg_health_state gauge\n'
+    printf 'dg_health_state{%s} %s\n' "$lab" "$(health_state_num "$1")"
+    printf '# HELP dg_health_last_run_timestamp_seconds When --health last ran (alert when this gets old).\n# TYPE dg_health_last_run_timestamp_seconds gauge\n'
+    printf 'dg_health_last_run_timestamp_seconds{%s} %s\n' "$lab" "$(date +%s)"
+    printf '# HELP dg_health_primary_checked 1 when the checks of the primary were done (the ssh key of step 9.9), else 0.\n# TYPE dg_health_primary_checked gauge\n'
+    printf 'dg_health_primary_checked{%s} %s\n' "$lab" "$([[ $HEALTH_SSH_OPEN -eq 1 ]] && printf 1 || printf 0)"
+    if [[ ${#HEALTH_ORDER[@]} -gt 0 ]]; then
+      printf '# HELP dg_health_check_state Result of one check: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN, -1 SKIPPED.\n# TYPE dg_health_check_state gauge\n'
+      for id in "${HEALTH_ORDER[@]}"; do
+        n=$id; [[ "$id" == 0.0 ]] && n=instance
+        printf 'dg_health_check_state{%s,check="%s"} %s\n' "$lab" "$n" "$(health_state_num "${HEALTH_STATE[$id]}")"
+      done
+    fi
+    if [[ "${HC_TLS:--1}" -ge 0 ]]; then
+      printf '# HELP dg_transport_lag_seconds Transport lag of the standby (v$dataguard_stats).\n# TYPE dg_transport_lag_seconds gauge\n'
+      printf 'dg_transport_lag_seconds{%s} %s\n' "$lab" "$HC_TLS"
+    fi
+    if [[ "${HC_ALS:--1}" -ge 0 ]]; then
+      printf '# HELP dg_apply_lag_seconds Apply lag of the standby (v$dataguard_stats).\n# TYPE dg_apply_lag_seconds gauge\n'
+      printf 'dg_apply_lag_seconds{%s} %s\n' "$lab" "$HC_ALS"
+    fi
+    if [[ "${HC_LIM:-}" =~ ^[0-9]+$ ]]; then
+      printf '# HELP dg_lag_limit_seconds The lag --health accepts (HEALTH_LAG_MAX).\n# TYPE dg_lag_limit_seconds gauge\n'
+      printf 'dg_lag_limit_seconds{%s} %s\n' "$lab" "$HC_LIM"
+    fi
+    if [[ -n "${DGS_MRP:-}" ]]; then
+      printf '# HELP dg_redo_apply_running 1 when redo apply (MRP) runs on the standby, else 0.\n# TYPE dg_redo_apply_running gauge\n'
+      printf 'dg_redo_apply_running{%s} %s\n' "$lab" "$([[ "$DGS_MRP" == running ]] && printf 1 || printf 0)"
+    fi
+  } > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; printf 'cannot write in %s (full?)' "$d"; return 1; }
+  chmod 644 -- "$tmp" 2>/dev/null
+  mv -fT -- "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp"; printf 'cannot rename the new file to %s' "$f"; return 1; }
+  return 0
+}
+
 health_exit() {
   # $1 overall state when the run cannot go on (UNKNOWN), $2 the reason; or no arguments: the end of the run
   local worst=OK id st code l
@@ -64,13 +145,25 @@ health_exit() {
   done
   case "$worst" in OK) code=0 ;; WARNING) code=1 ;; CRITICAL) code=2 ;; *) code=3 ;; esac
   # a CRITICAL check found before the stop is the summary; otherwise the reason of the stop
+  # the metrics file first: when it cannot be written, the output says so (the state of the check stays)
+  local perr=""
+  if [[ -n "$HEALTH_PROM" ]]; then
+    perr=$(health_prom_write "$worst") || { health_out "  Note: the metrics file $HEALTH_PROM was not written: $perr"; _log WARN "health: metrics file $HEALTH_PROM not written: $perr"; }
+  fi
   l=$(health_status_line "$worst" "$([[ -n "${1:-}" && "$worst" == UNKNOWN ]] && printf '%s' "${2:-}")")
-  printf '%s\n' "$l" >&7
   [[ -n "$HEALTH_LOG" ]] && printf '\n%s\n' "$l" >> "$HEALTH_LOG"
-  for l in "${HEALTH_BUF[@]+"${HEALTH_BUF[@]}"}"; do printf '%s\n' "$l" >&7; done
-  HEALTH_BUF=()
-  health_out "Result: $worst (exit $code)${HEALTH_LOG:+. Details: $HEALTH_LOG}"
-  printf '%s\n' "${HEALTH_BUF[0]}" >&7; HEALTH_BUF=()
+  if [[ $HEALTH_JSON -eq 1 ]]; then
+    # (the text lines are in the log; stdout is the JSON object alone)
+    HEALTH_BUF=()
+    health_out "Result: $worst (exit $code)${HEALTH_LOG:+. Details: $HEALTH_LOG}"; HEALTH_BUF=()
+    health_json "$worst" "$code" "$l" "${2:-}" "$perr" >&7
+  else
+    printf '%s\n' "$l" >&7
+    for l in "${HEALTH_BUF[@]+"${HEALTH_BUF[@]}"}"; do printf '%s\n' "$l" >&7; done
+    HEALTH_BUF=()
+    health_out "Result: $worst (exit $code)${HEALTH_LOG:+. Details: $HEALTH_LOG}"
+    printf '%s\n' "${HEALTH_BUF[0]}" >&7; HEALTH_BUF=()
+  fi
   # (a run that could not even start, the lock was busy or there are no settings, read nothing: the state
   # recorded by the last real check stays)
   [[ ${HEALTH_STARTED:-0} -eq 1 ]] && dg_state_save health "$worst" "$HEALTH_LOG"
@@ -373,6 +466,9 @@ status_runs_block() {
   return 0
 }
 
+HKT_GATE=""                 # the version the gate on the primary answered with (empty: the key is not limited)
+HKT_GATE_FOR=""             # and the "<home> <SID>" it was written for
+readonly HEALTH_GATE_VER=1  # raised whenever --health sends another command to the primary (the gate lists them)
 health_key_test() {
   # true when root can open an ssh connection to the primary with a key alone, as --health does. A connection
   # of its own (never the one of this run), closed again at once; it never asks for a password
@@ -383,17 +479,94 @@ health_key_test() {
   if timeout 30 ssh "${idf[@]+"${idf[@]}"}" -o BatchMode=yes -o ControlMaster=yes -o ControlPath="$ctl" -o ControlPersist=10 \
        -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UserKnownHostsFile="$ROOT_KH $KH_FILE" \
        -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 -fN "$PRIMARY_SSH_USER@$PRIMARY_IP" < /dev/null > /dev/null 2>&1 9>&-; then rc=0; fi
+  # is the key limited to the commands of --health (the gate of step 9.9)? The gate answers this one word with its
+  # version; a key with a full shell answers "command not found"
+  HKT_GATE=""; HKT_GATE_FOR=""
+  if [[ $rc -eq 0 ]]; then
+    local g; g=$(timeout 30 ssh -o ControlMaster=no -o ControlPath="$ctl" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o CheckHostIP=no \
+        -o UserKnownHostsFile="$ROOT_KH $KH_FILE" "$PRIMARY_SSH_USER@$PRIMARY_IP" "echo $PROBE_MARK; dg_gate_version" 2>/dev/null < /dev/null | clean_ctl)
+    g=$(grep -E '^DG_GATE [0-9]{1,3}( |$)' <<< "$g" | head -n 1)
+    if [[ -n "$g" ]]; then g=${g#DG_GATE }; HKT_GATE=${g%% *}; HKT_GATE_FOR=""; [[ "$g" == *" "* ]] && HKT_GATE_FOR=${g#* }; fi
+  fi
   [[ -e "$ctl" ]] && timeout 10 ssh -o ControlPath="$ctl" -O exit "$PRIMARY_SSH_USER@$PRIMARY_IP" >/dev/null 2>&1
   rm -f -- "$ctl"
   return $rc
 }
 # the key of step 9.9 for --health: root's own, used only by this script (DG_SSH_DIR moves the folder, for tests)
 health_key_file() { printf '%s/dg_health_%s' "${DG_SSH_DIR:-$(dirname "$ROOT_KH")}" "${STANDBY_UNIQUE,,}"; }
+health_gate_file() { printf '%s' '$HOME/.ssh/dg_health_gate.sh'; }     # (on the primary; $HOME is the ssh user's)
 health_key_line() {
   # the line for ~/.ssh/authorized_keys on the primary: the key, usable only from this server, without a
-  # terminal or forwarding (--health runs its read-only commands over it)
+  # terminal or forwarding, and only for the gate script (health_gate_text): whatever --health asks for, sshd
+  # starts the gate, and the gate runs it only when it is one of the read-only commands of --health
   local pub; pub=$(head -n 1 "$(health_key_file).pub" 2>/dev/null | tr -cd '[:print:]')
-  printf 'from="%s",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s' "${STANDBY_IP:-<address of this server>}" "${pub:-<the line of $(health_key_file).pub>}"
+  printf 'command="%s",from="%s",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s' "$(health_gate_file)" "${STANDBY_IP:-<address of this server>}" "${pub:-<the line of $(health_key_file).pub>}"
+}
+health_gate_text() {
+  # The gate: a script of the ssh user on the primary, started by sshd for every command that comes with the key
+  # of --health (command="..." in authorized_keys). It never runs what it was sent: it compares the request
+  # with the few commands --health uses and runs its own copy of the one that matches:
+  #   - the owner and the list of <home>/inventory and <home>/inventory/oneoffs (check 10.6)
+  #   - sqlplus "/ as sysdba" of this home and SID with exactly one SELECT (the same rule as readonly_guard:
+  #     one line, no second statement, no word that changes data or runs code)
+  # The home and the SID are fixed in it (TNS_ADMIN must be a plain path). It answers "dg_gate_version" with
+  # its version, home and SID. A change of the commands of --health needs a new gate (HEALTH_GATE_VER), and so
+  # does another home or SID of the primary: step 9.9 then shows the commands again.
+  local h=$DB_HOME sid=$PRIMARY_SID
+  v_path "$h" && v_name "$sid" || return 1
+  printf '#!/bin/bash\n# dg_standby_setup.sh: gate %s for the ssh key of --health (read-only checks from the standby)\n' "$HEALTH_GATE_VER"
+  printf "H='%s'; S='%s'; V=%s\n" "$h" "$sid" "$HEALTH_GATE_VER"
+  cat <<'DG_GATE_BODY'
+PATH=/usr/bin:/bin; LC_ALL=C; export PATH LC_ALL
+c=${SSH_ORIGINAL_COMMAND:-}
+no() { echo "dg_health_gate: this key runs only the read-only checks of dg_standby_setup.sh --health" >&2; exit 126; }
+m='^echo (__DG_PROBE_[0-9a-f]+__); (.*)$'
+if [[ "$c" =~ $m ]]; then echo "${BASH_REMATCH[1]}"; c=${BASH_REMATCH[2]}; fi
+case "$c" in
+  dg_gate_version) echo "DG_GATE $V $H $S"; exit 0 ;;
+  "timeout 120 stat -c '%U %G' $H/inventory") exec timeout 120 stat -c '%U %G' "$H/inventory" ;;
+  "timeout 120 stat -c '%U %G' $H/inventory/oneoffs") exec timeout 120 stat -c '%U %G' "$H/inventory/oneoffs" ;;
+  "timeout 120 ls -1A $H/inventory/oneoffs") exec timeout 120 ls -1A "$H/inventory/oneoffs" ;;
+  "sh -c 'timeout 120 test -e $H/inventory/oneoffs; r=\$?; [ \$r -eq 0 ] && echo YES; [ \$r -eq 1 ] && echo NO; true'")
+    timeout 120 test -e "$H/inventory/oneoffs"; r=$?; [ $r -eq 0 ] && echo YES; [ $r -eq 1 ] && echo NO; exit 0 ;;
+esac
+q='^env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME=([^ ]+) ORACLE_SID=([^ ]+) TNS_ADMIN=([^ ]+) timeout ([0-9]{1,4}) ([^ ]+)/bin/sqlplus -S /nolog$'
+[[ "$c" =~ $q ]] || no
+[[ "${BASH_REMATCH[1]}" == "$H" && "${BASH_REMATCH[2]}" == "$S" && "${BASH_REMATCH[5]}" == "$H" ]] || no
+t=${BASH_REMATCH[4]}; T=${BASH_REMATCH[3]}; p='^/[A-Za-z0-9_./-]+$'
+[[ "$T" =~ $p && "$T" != *..* ]] || no
+sel_ok() {
+  local l=${1,,}
+  [[ "$l" =~ ^select[[:space:]] && "$l" == *";" ]] || return 1
+  l=${l%;}
+  [[ "$l" == *";"* || "$l" == *"&"* || "$l" == *"--"* || "$l" == *"/*"* || "$l" == *"@"* ]] && return 1
+  l=$(printf '%s\n' "$l" | sed -E 's/"//g; s/[[:space:]]*\.[[:space:]]*/./g')
+  printf '%s\n' "$l" | grep -Eq '(^|[^a-z0-9_$#])(insert|update|delete|merge|upsert|alter|drop|create|grant|revoke|truncate|rename|comment|begin|declare|exec|execute|call|commit|rollback|savepoint|lock|shutdown|startup|host|spool|connect|into|nextval|for[[:space:]]+update|dbms_[a-z0-9_]*|utl_[a-z0-9_]*|sys\.[a-z0-9_]*)([^a-z0-9_$#]|$)' && return 1
+  return 0
+}
+in=""; n=0; sel=0
+while IFS= read -r l || [[ -n "$l" ]]; do
+  n=$((n + 1)); [[ $n -le 12 && ${#l} -le 8000 ]] || no
+  case "$l" in
+    "set define off echo off"|"connect / as sysdba"|"whenever sqlerror exit 3"|"prompt __DG_SQL_""OUTPUT__"|"exit") ;;
+    "set heading off feedback off pagesize 0 verify off echo off trimspool on linesize 4000 tab off") ;;
+    *) sel=$((sel + 1)); [[ $sel -eq 1 ]] && sel_ok "$l" || no ;;
+  esac
+  in+="$l"$'\n'
+done
+[[ $sel -eq 1 ]] || no
+printf '%s' "$in" | env -u TWO_TASK -u LOCAL -u SQLPATH -u ORACLE_PATH -u ORACLE_PDB_SID ORACLE_HOME="$H" ORACLE_SID="$S" TNS_ADMIN="$T" timeout "$t" "$H/bin/sqlplus" -S /nolog
+DG_GATE_BODY
+}
+health_key_plan() {
+  # the commands for the ssh user on the primary: the gate, then the line of the key (an older line of this
+  # server's key is replaced; a copy of the file stays as authorized_keys.dg_bak)
+  local gate; gate=$(health_gate_text) || return 1
+  printf 'mkdir -p ~/.ssh\nchmod 700 ~/.ssh\n'
+  printf "cat > ~/.ssh/dg_health_gate.sh <<'DG_GATE_END'\n%s\nDG_GATE_END\n" "$gate"
+  printf 'chmod 700 ~/.ssh/dg_health_gate.sh\ntouch ~/.ssh/authorized_keys\n'
+  printf "sed -i.dg_bak '/ dg_standby_setup health %s\$/d' ~/.ssh/authorized_keys\n" "$(hostname -s)"
+  printf "echo '%s' >> ~/.ssh/authorized_keys\nchmod 600 ~/.ssh/authorized_keys" "$(health_key_line)"
 }
 health_key_hint() {
   # what to do when --health cannot log in to the primary with a key; $1 = indent

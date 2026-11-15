@@ -51,6 +51,10 @@ def remote(cmd, stdin_data):
     if cmd.startswith("timeout 120 "): cmd = cmd[len("timeout 120 "):]
     P = pri
     grid = P.get("grid", True)
+    # the gate of the --health key (step 9.9) answers with its version; a key with a full shell does not know the word
+    if cmd == "dg_gate_version":
+        if P.get("health_gate", 1): print("DG_GATE %s %s %s" % (P.get("health_gate", 1), P.get("gate_home", P["db_home"]), P["sid"])); return 0
+        print("bash: dg_gate_version: command not found", file=sys.stderr); return 127
     if cmd == "hostname -s; hostname -f":
         print(P["host"].split(".")[0]); print(P["host"]); return 0
     if cmd == "cat /etc/oratab":

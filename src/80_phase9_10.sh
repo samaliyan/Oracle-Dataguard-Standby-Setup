@@ -1130,7 +1130,8 @@ phase_9() {
 
 # ---- 9.9 ssh key for --health ----
 # --health (cron) cannot type a password: it logs in to the primary with a key of root, made for this purpose
-# (health_key_file), that the primary accepts only from this server, without a terminal or forwarding. Optional:
+# (health_key_file), that the primary accepts only from this server, without a terminal or forwarding, and only for
+# the gate script (health_gate_text): the key runs the read-only commands of --health and nothing else. Optional:
 # without it --health checks this standby only (10.3 and 10.5 on the standby side, 10.6 skipped).
 c_9_9() {
   local kf m o; kf=$(health_key_file)
@@ -1150,17 +1151,23 @@ c_9_9() {
     cp_add root "chown root:root $kf"; cp_add root "chmod 600 $kf"
     return 1
   fi
-  if health_key_test; then
-    NOW="Key $kf: root logs in to $PRIMARY_SSH_USER@$PRIMARY_IP without a password (BatchMode). --health checks the primary too."
+  local works=0; health_key_test && works=1
+  if [[ $works -eq 1 && "$HKT_GATE" == "$HEALTH_GATE_VER" && "$HKT_GATE_FOR" == "$DB_HOME $PRIMARY_SID" ]]; then
+    NOW="Key $kf: root logs in to $PRIMARY_SSH_USER@$PRIMARY_IP without a password (BatchMode). --health checks the primary too."$'\n'"On the primary the key runs only the read-only commands of --health (the gate ~$PRIMARY_SSH_USER/.ssh/dg_health_gate.sh)."
     return 0
   fi
-  NOW="The key $kf exists, but the primary does not accept it yet (ssh with BatchMode=yes, the host key as in step 1.2)."
+  if [[ $works -eq 1 && "$HKT_GATE" == "$HEALTH_GATE_VER" ]]; then
+    NOW="The primary accepts the key $kf, but its gate (~$PRIMARY_SSH_USER/.ssh/dg_health_gate.sh) was written for another home or SID (${HKT_GATE_FOR:-not said}); the primary now has $DB_HOME $PRIMARY_SID."$'\n'"The gate refuses the queries of --health for this database until it is written again."
+  elif [[ $works -eq 1 && -n "$HKT_GATE" ]]; then
+    NOW="The primary accepts the key $kf, but its gate (~$PRIMARY_SSH_USER/.ssh/dg_health_gate.sh) is version $HKT_GATE; this script needs version $HEALTH_GATE_VER."$'\n'"With the old gate --health may not be able to do every check of the primary."
+  elif [[ $works -eq 1 ]]; then
+    NOW="The primary accepts the key $kf, but the key is not limited there: with it, root of this server can run any command as $PRIMARY_SSH_USER on the primary."$'\n'"--health works as it is. The commands below limit the key to the read-only commands of --health."
+  else
+    NOW="The key $kf exists, but the primary does not accept it yet (ssh with BatchMode=yes, the host key as in step 1.2)."
+  fi
   KIND_NOW=primary; PRIMARY_HOW_STEP=$PRIMARY_SSH_USER
-  PLAN="mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-echo '$(health_key_line)' >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys"
-  PLAN_UNDO="remove the line ending with 'dg_standby_setup health $(hostname -s)' from ~$PRIMARY_SSH_USER/.ssh/authorized_keys"
+  PLAN=$(health_key_plan) || { NOW="The home, the SID or TNS_ADMIN of the primary is not a plain value: the gate for the key cannot be written"; return 2; }
+  PLAN_UNDO="remove the line ending with 'dg_standby_setup health $(hostname -s)' from ~$PRIMARY_SSH_USER/.ssh/authorized_keys, and the file ~$PRIMARY_SSH_USER/.ssh/dg_health_gate.sh"
   return 1
 }
 d_9_9() {

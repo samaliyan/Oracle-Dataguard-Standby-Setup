@@ -1043,27 +1043,33 @@ EOF
 TITLE  ssh key for --health (monitoring)
 WHERE  This server ($S) as root, then the primary ($P) as $SU9
 WHY    --health runs from cron and cannot type a password: it logs in to the primary with this
-       key of root. The primary accepts it only from this server, without a terminal or forwarding.
+       key of root. The primary accepts it only from this server, without a terminal or forwarding,
+       and only for the gate script: the key runs the read-only commands of --health (the patch
+       folders of the home, and sqlplus with one SELECT), nothing else.
        Optional: without it --health checks this standby only (10.3 and 10.5 on the standby side,
        10.6 SKIPPED), and says so in its output.
 RUN    On this server, as root:
        install -d -m 700 $(dirname "$KF")
        ssh-keygen -q -t ed25519 -N '' -C 'dg_standby_setup health $S' -f $KF
        cat $KF.pub
-       On the primary, as $SU9 (the line: from="..." options, then the whole line of $KF.pub):
-       mkdir -p ~/.ssh
-       chmod 700 ~/.ssh
-       echo 'from="$SIP",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty <line of $KF.pub>' \\
-         >> ~/.ssh/authorized_keys
-       chmod 600 ~/.ssh/authorized_keys
+       On the primary, as $SU9: the commands the step shows (they are long: the gate script
+       ~/.ssh/dg_health_gate.sh with the home and SID of the primary, then one line in
+       ~/.ssh/authorized_keys; an older line of this key is replaced). The line is:
+       command="\$HOME/.ssh/dg_health_gate.sh",from="$SIP",no-port-forwarding,
+         no-X11-forwarding,no-agent-forwarding,no-pty <line of $KF.pub>
        Test, on this server as root:
        ssh -i $KF -o BatchMode=yes -o UserKnownHostsFile=${STATE_DIR:-/var/lib/dg_standby_setup}/primary_known_hosts \\
-         $SU9@${PRIMARY_IP:-<primary IP>} echo OK
-EXPECT OK, without a password question. The step shows the exact line with the real key.
+         $SU9@${PRIMARY_IP:-<primary IP>} dg_gate_version
+EXPECT "DG_GATE 1 <home> <SID>", without a password question. The step shows the exact commands with the real key.
 IF     "Permission denied": the line is not in ~$SU9/.ssh/authorized_keys, the from= address is
        not the one this server uses to reach the primary, or ~/.ssh or the file are writable by others
        (sshd StrictModes). "Host key verification failed": step 1.2 (the primary's host key).
-       To take it back: remove that line on the primary, and  $SELF --undo 9.9  here.
+       "another home or SID": the gate has the home and the SID of the primary fixed in it; after
+       a move to another home, run the commands of the step again.
+       "not limited": the key was set up before version 5.37, with a full shell on the primary.
+       --health works with it; the commands of the step replace its line by one with the gate.
+       To take it back: remove that line and ~/.ssh/dg_health_gate.sh on the primary, and
+       $SELF --undo 9.9  here.
 EOF
   ;;
   10.1) cat <<EOF
@@ -1221,6 +1227,10 @@ RUN    $SELF --health
        (in a crontab file, % must be written \%; the line above has none)
        From a monitoring agent (NRPE and the like): allow 300 seconds (a problem is looked at
        twice, 60 seconds apart), for example  check_nrpe ... -t 300
+       $SELF --health --json                the result as one JSON object (same exit code)
+       $SELF --health --prom-file FILE      also metrics for Prometheus in FILE (node_exporter
+         textfile collector; a folder of root that others cannot write to), for example
+         /var/lib/node_exporter/textfile_collector/dg_standby.prom
 EXPECT Exit 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (could not check), as monitoring systems
        expect. CRITICAL counts first, then UNKNOWN, then WARNING; SKIPPED counts as nothing.
        A problem in 10.1 to 10.4 (lag, gap, last log, apply) is checked once more after

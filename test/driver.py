@@ -44,7 +44,9 @@ def fix_primary(text):
     if "remote_login_passwordfile=exclusive" in text: p["remote_login_passwordfile"] = "EXCLUSIVE"
     if "alter user sys identified" in text: pri["sys_in_pwfile"] = True
     # step 9.9: the key line added to ~/.ssh/authorized_keys of the ssh user on the primary
-    if "authorized_keys" in text and "dg_standby_setup health" in text: pri["root_key"] = 1
+    if "authorized_keys" in text and "dg_standby_setup health" in text:
+        pri["root_key"] = 1
+        if "dg_health_gate.sh" in text: pri["health_gate"] = 1     # (the commands of 5.37 write the gate too)
     m = re.search(r"fal_server=('[^;]*') scope", text)
     if m: p["fal_server"] = m.group(1).replace("'", "")
     if "tnsnames.ora" in text and ("cat >>" in text or "entry must be" in text): pri["tns_stby"] = 1; pri.pop("tns_stby_host", None)
@@ -150,7 +152,9 @@ def main():
                     os.write(fd, KEYS[tok].encode())
                     # what the key draws is read here, except after the last key: the next question must
                     # reach the main loop (after Esc the script waits 0.4 s for the rest of a sequence)
-                    if n < len(toks) - 1: pump(0.25)
+                    # After Esc the wait is longer than those 0.4 s: a key that arrives just as that wait of the
+                    # script ends can be lost in bash's "read -t" (seen on the CI machines: "11" became "1").
+                    if n < len(toks) - 1: pump(0.9 if tok == "<ESC>" else 0.25)
                 else: os.write(fd, tok.encode())
         else: os.write(fd, (s + "\n").encode())
         answered += 1; buf = ""; ctx = ""

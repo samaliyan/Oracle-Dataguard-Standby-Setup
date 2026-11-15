@@ -4,6 +4,38 @@ The script file of a version is attached to its release on GitHub as `dg_standby
 `.sha256` checksum). A release is made for the version that reaches the main branch: versions that were merged
 together (5.33 with 5.34) have one release, under the newer number.
 
+## 5.37
+
+The key that `--health` uses on the primary is limited to its read-only commands, and `--health` can report
+as JSON and as Prometheus metrics.
+
+- **Step 9.9, the ssh key of `--health`:** the line for `authorized_keys` on the primary now has
+  `command="$HOME/.ssh/dg_health_gate.sh"`. The gate is a short script that step 9.9 shows with the other
+  commands for the primary (you run them there, as before; the script still writes nothing on the primary).
+  Whatever is asked with the key, sshd starts the gate, and the gate runs only: the owner and the list of
+  `<home>/inventory` and `<home>/inventory/oneoffs` (check 10.6), and `sqlplus / as sysdba` of the one home
+  and SID with exactly one `SELECT` on one line that has no word that changes data or runs code (the same
+  rule the script applies before it sends a query). Everything else is refused with exit 126. Until now the
+  key gave root of the standby a full shell as the Oracle owner of the primary.
+- The gate has the home and the SID of the primary fixed in it. Step 9.9 asks it for its version, home and
+  SID, and shows the commands again when one of them no longer fits (a new home after patching, for example).
+- **A key set up by an earlier version** keeps working for `--health`. Step 9.9 shows it as "not limited" and
+  gives the commands that replace its line (the old line is removed, `authorized_keys.dg_bak` is kept).
+- **`--health --json`:** the result as one JSON object instead of the text: state, exit code, the status
+  line, every check with its state and text, the lag in seconds, the state of Data Guard, whether the primary
+  was checked, and the log. The exit code is unchanged.
+- **`--health --prom-file FILE`:** also writes metrics in the text format of Prometheus (for the textfile
+  collector of node_exporter): `dg_health_state`, `dg_health_check_state{check=...}`,
+  `dg_health_last_run_timestamp_seconds`, `dg_health_primary_checked`, `dg_transport_lag_seconds`,
+  `dg_apply_lag_seconds`, `dg_lag_limit_seconds`, `dg_redo_apply_running`. The file is written whole and then
+  renamed, only in a folder of root that others cannot write to and never through a link; a file that cannot
+  be written is a note in the output.
+- Tests: section 5.37 (the gate run as sshd would start it, with allowed and refused requests; step 9.9 with
+  no gate and with a gate of another version; the JSON read by a parser; the metrics file).
+
+Limits: the gate filters a `SELECT` by words, which is a strong limit but not a proof that no query can have a
+side effect. Not tried against a real sshd or a real primary yet.
+
 ## 5.36
 
 A full review of 5.35 by six independent reviewers (Oracle, installation, the engine, security, the keyboard

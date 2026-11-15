@@ -39,7 +39,7 @@
 فایل اسکریپت هر نسخه در صفحه‌ی Releases همین مخزن است، با نامی مثل این:
 
 ```
-dg_standby_setup-5.36.sh
+dg_standby_setup-5.37.sh
 ```
 
 کنار آن یک فایل sha256 هم هست برای بررسی سالم بودن فایل. تغییرهای هر نسخه در این فایل است:
@@ -387,29 +387,63 @@ ssh-keygen -q -t ed25519 -N '' -C 'dg_standby_setup health stby01' -f /root/.ssh
 cat /root/.ssh/dg_health_proddb_stby.pub
 ```
 
-بعد روی سرور اصلی با کاربر ssh (معمولاً oracle). یک خط: آدرس استندبای، و بعد کل خط فایل pub:
+بعد روی سرور اصلی با کاربر ssh (معمولاً oracle)، دستورهایی که مرحله‌ی 9.9 نشان می‌دهد (در فایل «دستورهای شما» همان اجرا هم هست). این دستورها اسکریپت دروازه را می‌نویسند و یک خط اضافه می‌کنند:
 
 ```bash
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
-echo 'from="192.0.2.20",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... dg_standby_setup health stby01' >> ~/.ssh/authorized_keys
+cat > ~/.ssh/dg_health_gate.sh <<'DG_GATE_END'
+...                                   # (متن دروازه با home و SID سرور اصلی شما: از خروجی مرحله کپی کنید)
+DG_GATE_END
+chmod 700 ~/.ssh/dg_health_gate.sh
+touch ~/.ssh/authorized_keys
+sed -i.dg_bak '/ dg_standby_setup health stby01$/d' ~/.ssh/authorized_keys
+echo 'command="$HOME/.ssh/dg_health_gate.sh",from="192.0.2.20",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... dg_standby_setup health stby01' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
-در آخر روی استندبای با root آزمایش کنید. باید بدون پرسیدن رمز OK چاپ کند:
+در آخر روی استندبای با root آزمایش کنید. باید بدون پرسیدن رمز عبارت DG_GATE 1 و بعد home و SID سرور اصلی چاپ شود:
 
 ```bash
 ssh -i /root/.ssh/dg_health_proddb_stby -o BatchMode=yes \
-  -o UserKnownHostsFile=/var/lib/dg_standby_setup/primary_known_hosts oracle@192.0.2.10 echo OK
+  -o UserKnownHostsFile=/var/lib/dg_standby_setup/primary_known_hosts oracle@192.0.2.10 dg_gate_version
 ```
 
 گزینه‌ی from باعث می‌شود کلید فقط از آدرس استندبای پذیرفته شود. گزینه‌ی no-pty و گزینه‌های no-forwarding به آن نه terminal می‌دهند و نه تونل.
+گزینه‌ی command باعث می‌شود هر درخواستی با این کلید به اسکریپت دروازه برسد، و دروازه فقط دستورهای فقط‌خواندنیِ بررسی سلامت را اجرا می‌کند: مالک و فهرست پوشه‌ی inventory (برای سطح patch)، و sqlplus همان home و همان SID با دقیقاً یک SELECT در یک خط (بدون دستور دوم و بدون کلمه‌ای که داده را عوض کند یا کدی اجرا کند). هر چیز دیگری با کد 126 رد می‌شود. مقدار home و SID در دروازه ثابت است: اگر home سرور اصلی عوض شود، مرحله‌ی 9.9 دستورها را دوباره نشان می‌دهد.
+کلیدی که با نسخه‌ی قبل از 5.37 گذاشته شده دروازه ندارد: بررسی سلامت با آن کار می‌کند، ولی مرحله‌ی 9.9 آن را «محدودنشده» نشان می‌دهد و دستورهای جایگزینی خط را می‌دهد.
 وقتی فایل کلید وجود داشته باشد، بررسی سلامت از همان استفاده می‌کند (با IdentityFile و BatchMode، و با همان بررسی کلید میزبان که در راه‌اندازی انجام شد).
-برای برگرداندن: آن خط را روی سرور اصلی پاک کنید و روی استندبای این را اجرا کنید:
+برای برگرداندن: آن خط و فایل dg_health_gate.sh را روی سرور اصلی پاک کنید و روی استندبای این را اجرا کنید:
 
 ```bash
 ./dg_standby_setup.sh --undo 9.9
 ```
+
+#### خروجی JSON و Prometheus
+
+با گزینه‌ی json خروجی بررسی سلامت به‌جای متن یک شیء JSON است (کد خروج همان است): وضعیت کلی، کد خروج، خط خلاصه، فهرست بررسی‌ها (شناسه، وضعیت، متن)، lag به ثانیه (اگر خوانده نشده باشد null)، وضعیت Data Guard، این‌که سرور اصلی بررسی شد یا نه، و مسیر log.
+خطای پیش از شروع بررسی (گزینه‌ی اشتباه، اجرا با کاربری غیر از root) متن ساده با کد 3 است.
+
+```bash
+./dg_standby_setup.sh --health --json
+```
+
+با گزینه‌ی prom-file علاوه بر خروجی، متریک‌ها به قالب متنی Prometheus در یک فایل نوشته می‌شوند (برای textfile collector در node_exporter).
+فایل کامل نوشته و بعد جابه‌جا می‌شود، با mode 644، و فقط در پوشه‌ای که مال root است و دیگران نمی‌توانند در آن بنویسند. اگر فایل نوشته نشود، یک یادداشت در خروجی می‌آید و وضعیت بررسی عوض نمی‌شود.
+
+```bash
+17 * * * *  /root/dg_standby_setup.sh --health --prom-file /var/lib/node_exporter/textfile_collector/dg_standby.prom >/dev/null
+```
+
+متریک‌ها (همه با برچسب standby):
+
+1. dg_health_state: صفر OK، یک WARNING، دو CRITICAL، سه UNKNOWN
+2. dg_health_check_state: همان برای هر بررسی (برچسب check)؛ منفی یک یعنی SKIPPED
+3. dg_health_last_run_timestamp_seconds: زمان آخرین اجرا (اگر کهنه شد هشدار بدهید)
+4. dg_health_primary_checked: یک، وقتی بررسی‌های سرور اصلی انجام شده
+5. dg_transport_lag_seconds و dg_apply_lag_seconds: مقدار lag، وقتی خوانده شده باشد
+6. dg_lag_limit_seconds: مقدار lag قابل قبول
+7. dg_redo_apply_running: یک، وقتی MRP در حال اجراست
 
 ### ۱۳. به‌روزکردن استندبای عقب‌مانده
 
