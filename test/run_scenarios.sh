@@ -2506,9 +2506,9 @@ cat > $T/ut531.sh <<'EOF'
 S=$1; T=$2
 fn() { sed -n "/^$1()/,/^}/p" "$S"; }
 # 1) safe_path: a folder of another user, a folder others can write to and a relative entry are left out
-( source <(fn safe_path)
+( source <(fn path_dir_safe; fn safe_path)
   d=$T/ut531p; rm -rf $d; mkdir -p $d/ok $d/other $d/open; chmod 755 $d $d/ok $d/other; chmod 777 $d/open; chown nobody $d/other
-  PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
+  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
   echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) | sed "s#$T/ut531p#D#g"
 # 2) limit_users: oracle is in the list, a separate grid owner too
 ( source <(fn limit_users); use_grid() { return 0; }; single_owner() { return 1; }
@@ -2520,15 +2520,26 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
   echo "lsnrstop=$(undo_text LSNRSTOP LISTENER 'home=/u01/db user=oracle port=1521') [$(change_word LSNRSTOP)]" )
 EOF
 bash $T/ut531.sh $T/dg_standby_setup.sh $T > $T/ut531.txt 2>&1
-check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other D/open bin' $T/ut531.txt"
+check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt"
 check "unit: the limits of the user oracle are checked like those of the other owners" "grep -qx 'limusers=oracle,grid/oracle' $T/ut531.txt"
 check "unit: a stopped listener of another home is a journal line with the command that starts it again" "grep -qF 'lsnrstop=by hand, only if that listener is still needed (it held port 1521, which the Grid listener uses now), as oracle:  ORACLE_HOME=/u01/db /u01/db/bin/lsnrctl start LISTENER [listener]' $T/ut531.txt"
 rm -rf $T/ut531p
 # ---- a run up to the Grid install: 2.4 looks at oracle, 3.1 prints the checksums ----
 rc=$(DG_TEST_QUIT_AT=3.2 run $T/r31a.txt)
 gz=$(ls $T/stage/*grid*.zip 2>/dev/null | head -n 1)
-check "2.4: the limits of oracle are set or added by the script (no longer 'Not needed' without a look)" "! grep -q 'Not needed: the only Oracle owner is oracle' $T/r31a.txt && [[ \$(res 2.4 $T/r31a.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'oracle' $T/r31a.txt"
-check "3.1: the SHA-256 of every installer file is printed and is in the run log" "grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum \$gz | cut -d' ' -f1)  \$(basename \$gz)\" $T/r31a.txt && grep -q 'MEDIA' $T/log/run_*.log"
+check "2.4: the limits of oracle are looked at: missing ones are named and added to the limits file" "grep -qE 'Missing or too low limits: .*oracle:nofile' $T/r31a.txt && grep -qE '^oracle +hard +nofile +65536' /etc/security/limits.d/oracle-grid.conf && [[ \$(res 2.4 $T/r31a.txt) == DONE ]]"
+dz=$(ls $T/stage/*db*.zip 2>/dev/null | head -n 1)
+check "3.1: the SHA-256 of every installer file is printed and is in the run log" "[[ -n \"$gz\" && -n \"$dz\" ]] && grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum $gz | cut -d' ' -f1)  \$(basename $gz)\" $T/r31a.txt && grep -q \"\$(sha256sum $dz | cut -d' ' -f1)  \$(basename $dz)\" $T/r31a.txt && grep -q '| MEDIA .*sha256: [0-9a-f]\{64\}' $T/log/run_*.log"
+# the PATH the script was started with: a folder of another user in front never runs anything, not even at the start
+ev=$T/ut531evil; rm -rf $ev; mkdir -p $ev; chmod 755 $ev
+for t in dirname basename date stat find mktemp readlink hostname id; do printf '#!/bin/bash\necho "$0" >> %s/ran\nexec /usr/bin/%s "$@"\n' "$ev" "$t" > $ev/$t; done; chmod 755 $ev/*; chown -R nobody $ev
+( cd $T && PATH=$ev:$T/rootbin:$PATH DG_PLAIN=1 DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log timeout 60 ./dg_standby_setup.sh --status > $T/r31p.txt 2>&1 )
+check "PATH: programs in a folder of another user at the front of PATH are never run as root (from the first line on)" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r31p.txt"
+ln -sfn /usr/bin $ev/lnk
+( source <(sed -n '/^path_dir_safe()/,/^}/p; /^safe_path()/,/^}/p' $T/dg_standby_setup.sh); mkdir -p $ev/sub; chown root $ev/sub; chmod 755 $ev/sub
+  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
+check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -qx \"path=/usr/bin:$T/rootbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
+rm -rf $ev
 fi
 if part 5.32; then
 CUR=5.32; echo "== 5.32  The summary page with the arrow keys, and the choice pages"

@@ -30,10 +30,15 @@ set -o pipefail
 # there this check is left off. The script itself never relies on it.
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then set -u; fi
 umask 022
+# The PATH this script was started with can hold folders of the user who became root ("su" without "-"): from
+# the first command on only the system folders are used. safe_path (main) adds back the folders of the caller's
+# PATH that are root's own all the way down.
+ORIG_PATH=${PATH:-}
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.34"
+readonly SCRIPT_VERSION="5.35"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"

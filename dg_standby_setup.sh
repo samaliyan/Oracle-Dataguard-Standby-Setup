@@ -30,10 +30,15 @@ set -o pipefail
 # there this check is left off. The script itself never relies on it.
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then set -u; fi
 umask 022
+# The PATH this script was started with can hold folders of the user who became root ("su" without "-"): from
+# the first command on only the system folders are used. safe_path (main) adds back the folders of the caller's
+# PATH that are root's own all the way down.
+ORIG_PATH=${PATH:-}
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.34"
+readonly SCRIPT_VERSION="5.35"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -7162,7 +7167,7 @@ limit_users() {
   # every Oracle owner. The preinstall package sets limits for the user named "oracle" only; that user is checked
   # as well (the package may be missing or its file changed, and HugePages may need more memlock than it sets)
   printf '%s\n' "$ORACLE_USER"
-  use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
+  use_grid && ! single_owner && printf '%s\n' "$GRID_USER"
   return 0
 }
 LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
@@ -7257,7 +7262,13 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
-  [[ " ${miss[*]}" == *" oracle:"* ]] && NOW+=$'\n'"Its limits for oracle are missing or too low here as well (the package is not installed, or its file was changed)."
+  # for oracle: a value that is not there at all (the package is missing or its file was changed), or one that is
+  # there but lower than this server needs (memlock for the HugePages of the primary's SGA)
+  local mo; for mo in "${miss[@]}"; do
+    [[ "$mo" == oracle:* ]] || continue
+    if [[ "$mo" == *=* ]]; then NOW+=$'\n'"For oracle the value that is set is lower than this server needs: ${mo#oracle:}."
+    else NOW+=$'\n'"For oracle ${mo#oracle:} is not set at all (the preinstall package is not installed, or its file was changed)."; fi
+  done
   [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
@@ -9237,6 +9248,12 @@ c_3_1() {
     NOW="Installer files are known"
     [[ -n "$GRID_MEDIA" ]] && NOW+=$'\n'"Grid:      $GRID_MEDIA"
     [[ -n "$DB_MEDIA" ]] && NOW+=$'\n'"Database:  $DB_MEDIA"
+    # their checksums when they were read before (a file named in the settings by hand has none yet: compare it
+    # yourself with sha256sum)
+    local mf ms
+    for mf in $([[ $need_g -eq 1 ]] && printf '%s' "${GRID_MEDIA//,/ }") $([[ $need_d -eq 1 ]] && printf '%s' "${DB_MEDIA//,/ }"); do
+      ms=$(media_sum "$mf" cached); [[ -n "$ms" ]] && NOW+=$'\n'"SHA-256:   $ms  $(basename "$mf")"
+    done
     return 0
   fi
   [[ $need_g -eq 1 && -n "$GRID_MEDIA" ]] && media_ok "$GRID_MEDIA" && ! media_matches "$GRID_MEDIA" grid && warn "GRID_MEDIA ($GRID_MEDIA) is not a Grid $(want_rel grid) installer. The folders are searched instead."
@@ -9334,25 +9351,47 @@ base_media_name() {
     *) printf 'the %s %s home zip file from edelivery.oracle.com' "$2" "$1" ;;
   esac
 }
+media_sums_file() { printf '%s/media_sums' "$STATE_DIR"; }
+media_sum() {
+  # $1 file -> its SHA-256 (empty when it cannot be read). Kept with the size and time of the file, so a file
+  # of several GB is read once ($2 = cached: only a value that is kept, nothing is read)
+  local f=$1 key sum
+  key="$(stat -c '%s|%Y' -- "$f" 2>/dev/null)|$f"
+  sum=$(awk -F'\t' -v k="$key" '$1 == k {s = $2} END {print s}' "$(media_sums_file)" 2>/dev/null)
+  if [[ ! "$sum" =~ ^[0-9a-f]{64}$ && "${2:-}" != cached ]]; then
+    sum=$(timeout 900 sha256sum -- "$f" 2>/dev/null | awk '{print $1}')
+    if [[ "$sum" =~ ^[0-9a-f]{64}$ && "$MODE" == run ]]; then
+      install -d -m 700 "$STATE_DIR" 2>/dev/null
+      printf '%s\t%s\n' "$key" "$sum" >> "$(media_sums_file)" 2>/dev/null; chmod 600 "$(media_sums_file)" 2>/dev/null
+    fi
+  fi
+  [[ "$sum" =~ ^[0-9a-f]{64}$ ]] && printf '%s' "$sum"
+  return 0
+}
+media_sums_show() {
+  # the checksums of the installer files, for you to compare (the script cannot know the right values: Oracle
+  # shows them on the download page of each file; a gold image has the value sha256sum gave on the primary)
+  local f sum n=0; local -a out=()
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    # (a file of several GB takes a while the first time; its value is kept)
+    [[ -n "$(media_sum "$f" cached)" ]] || say "Reading the checksum of $(basename "$f") ..."
+    sum=$(media_sum "$f"); n=$((n + 1))
+    if [[ -n "$sum" ]]; then out+=("$sum  $(basename "$f")"); else out+=("(could not be read)  $(basename "$f")"); fi
+  done
+  [[ $n -gt 0 ]] || return 0
+  _log MEDIA "sha256: ${out[*]}"
+  say "SHA-256 of the installer files. Compare them with the values on Oracle's download page (a gold image:"
+  say "with  sha256sum <file>  on the primary) before the software is installed:"
+  for f in "${out[@]}"; do say "  $f"; done
+  return 0
+}
 d_3_1() {
   # no question before it (kind ask): it only records the files the check found and showed
   [[ -n "$F_GRID" ]] && GRID_MEDIA=$F_GRID; [[ -n "$F_DB" ]] && DB_MEDIA=$F_DB
   save_settings || return 1
   DONE_MSG="Installer files saved in $SETTINGS_FILE"
-  # their checksums, for you to compare (the script cannot know the right values: Oracle shows them on the
-  # download page of each file; a gold image has the value sha256sum gave on the primary)
-  local f sum lines=""
-  for f in ${F_GRID//,/ } ${F_DB//,/ }; do
-    [[ -f "$f" ]] || continue
-    say "Reading the checksum of $(basename "$f") ..."
-    sum=$(timeout 900 sha256sum -- "$f" 2>/dev/null | awk '{print $1}')
-    [[ "$sum" =~ ^[0-9a-f]{64}$ ]] && lines+=$'\n'"  $sum  $(basename "$f")"
-  done
-  if [[ -n "$lines" ]]; then
-    _log MEDIA "sha256:$lines"
-    say "SHA-256 of the installer files. Compare them with the values on Oracle's download page (a gold image:"
-    say "with  sha256sum <file>  on the primary) before the software is installed:$lines"
-  fi
+  media_sums_show ${F_GRID//,/ } ${F_DB//,/ } ${OPATCH_ZIP:-}
   return 0
 }
 
@@ -11079,7 +11118,8 @@ c_3_9() {
         return 1 ;;
       lsnr_host)
         NOW+=$'\n'"Cause: $L39_LORA has HOST=$L39_BADHOST, which is not this server."
-        cp_add grid "cp -p $L39_LORA $L39_LORA.bak_$RUN_ID"
+        # (a copy made earlier in this run is the original: a second pass does not replace it)
+        cp_add grid "[ -e $L39_LORA.bak_$RUN_ID ] || cp -p $L39_LORA $L39_LORA.bak_$RUN_ID"
         # the old name as a literal in the pattern (escaped with sed: ${X//./\\.} differs between bash 4.2 and 5)
         local besc; besc=$(printf '%s' "$L39_BADHOST" | sed 's#[][\.*^$/+?(){}|]#\\&#g')
         cp_add grid "sed -i -E 's/(HOST *= *)$besc( *\\))/\\1$STANDBY_HOST\\2/I' $L39_LORA" ;;
@@ -11108,12 +11148,18 @@ srvctl start listener -listener $SB_LSNR"
 }
 d_3_9() {
   local hsz=""; [[ "${L39_CAUSE:-}" == hosts ]] && hsz=$(stat -c '%s' /etc/hosts 2>/dev/null)
-  # the changes of the other causes are journaled as well (--show-changes, --undo): the stop of a listener of
-  # another home first (it is stopped even when a later command fails), the edit of listener.ora when it is done
-  [[ "${L39_CAUSE:-}" == port_lsnr ]] && journal LSNRSTOP "$L39_LNAME" "home=$L39_LHOME user=$L39_LUSER port=$PORT"
-  local lrc=0; cp_run || lrc=$?
-  if [[ "${L39_CAUSE:-}" == lsnr_host && -f "$L39_LORA.bak_$RUN_ID" ]] && ! cmp -s "$L39_LORA" "$L39_LORA.bak_$RUN_ID"; then
-    journal EDIT "$L39_LORA" "bak=$L39_LORA.bak_$RUN_ID md5=$(file_md5 "$L39_LORA")"
+  # the changes of the other causes are journaled as well (--show-changes, --undo), also when a later command
+  # fails: the stop of a listener of another home, the edit of listener.ora
+  local lrc=0 lmd5=""; [[ "${L39_CAUSE:-}" == lsnr_host ]] && lmd5=$(file_md5 "$L39_LORA")
+  cp_run || lrc=$?
+  # (only what really happened: the other listener is gone, the file is another one than before)
+  if [[ "${L39_CAUSE:-}" == port_lsnr ]] && num "${L39_PID:-}" && ! kill -0 "$L39_PID" 2>/dev/null; then
+    journal LSNRSTOP "$L39_LNAME" "home=$L39_LHOME user=$L39_LUSER port=$PORT"
+  fi
+  if [[ "${L39_CAUSE:-}" == lsnr_host && -n "$lmd5" && "$(file_md5 "$L39_LORA")" != "$lmd5" ]]; then
+    # the copy of this run is the file from before the first edit of the run: a second edit has no copy of its own
+    if journal_has_file_this_run "$L39_LORA"; then journal EDIT "$L39_LORA" "bak=- md5=$(file_md5 "$L39_LORA")"
+    else journal EDIT "$L39_LORA" "bak=$L39_LORA.bak_$RUN_ID md5=$(file_md5 "$L39_LORA")"; fi
   fi
   [[ $lrc -eq 0 ]] || return 1
   if [[ "${L39_CAUSE:-}" == hosts ]]; then
@@ -19328,22 +19374,50 @@ run_end() {
   fi
   cleanup
 }
+path_dir_safe() {
+  # $1 a resolved folder: 0 when root holds it all the way down from / (every folder on the way belongs to root
+  # and is not writable by group or others; a sticky folder such as /tmp may be, the next one must be root's as
+  # every one is). Else another user could put a program there, or swap the folder.
+  local p=$1 cur="" part st uid mode; local -a parts=()
+  [[ "$p" == /* ]] || return 1
+  IFS=/ read -r -a parts <<< "${p#/}"
+  st=$(stat -c '%u %a' -- / 2>/dev/null) || return 1
+  [[ "${st%% *}" == 0 ]] || return 1
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || continue
+    cur+="/$part"
+    [[ -d "$cur" && ! -L "$cur" ]] || return 1
+    st=$(stat -c '%u %a' -- "$cur" 2>/dev/null) || return 1
+    uid=${st%% *}; mode=${st##* }
+    [[ "$uid" == 0 ]] || return 1
+    if (( 8#$mode & 8#022 )); then
+      # writable by others: only a sticky folder on the way (not the folder itself)
+      [[ "$cur" != "$p" ]] && (( 8#$mode & 8#1000 )) || return 1
+    fi
+  done
+  return 0
+}
 safe_path() {
-  # The commands of this script run as root with the PATH it was started with. After "su" without "-", that PATH
-  # can still start with folders of the user who became root: a program put there under the name of a system
-  # tool would run as root. Only folders that belong to root and that nobody else can write to stay in PATH;
-  # the system folders are always there.
-  local d out="" dropped="" IFS=:
-  for d in $PATH; do
-    [[ "$d" == /* && -d "$d" ]] || { [[ -n "$d" && "$d" != /* ]] && dropped+=" $d"; continue; }   # (a folder that is not there: left out silently)
-    if [[ "$(stat -L -c '%u' -- "$d" 2>/dev/null)" == 0 && -z "$(find -L "$d" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then out+="${out:+:}$d"
-    else dropped+=" $d"; fi
+  # The commands of this script run as root. The PATH it was started with (ORIG_PATH; the script itself runs with
+  # the system folders since its first line) can hold folders of the user who became root: a program put there
+  # under the name of a system tool would run as root. A folder of that PATH is used only when root holds it all
+  # the way down (path_dir_safe), as its real path (a link another user could point elsewhere is not followed
+  # later); the system folders are always there.
+  local d r out="" dropped=""; local -a ents=()
+  IFS=: read -r -a ents <<< "${ORIG_PATH:-}"          # (no word splitting of $PATH: no globbing, spaces kept)
+  for d in "${ents[@]+"${ents[@]}"}"; do
+    [[ -n "$d" ]] || continue
+    if [[ "$d" != /* ]]; then dropped+="${dropped:+, }$d"; continue; fi
+    [[ -d "$d" ]] || continue                         # (a folder that is not there: left out silently)
+    r=$(readlink -f -- "$d" 2>/dev/null) || r=""
+    if [[ -n "$r" && "$r" != *:* ]] && path_dir_safe "$r"; then [[ ":$out:" == *":$r:"* ]] || out+="${out:+:}$r"
+    else dropped+="${dropped:+, }$d"; fi
   done
   for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
     [[ ":$out:" == *":$d:"* ]] || out+="${out:+:}$d"
   done
   export PATH="$out"
-  PATH_DROPPED=${dropped# }
+  PATH_DROPPED=$dropped
 }
 main() {
   # (replaces the plain clean-up trap of the core: the same clean-up, after the END line of the log)

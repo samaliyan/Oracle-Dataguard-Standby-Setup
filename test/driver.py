@@ -121,10 +121,15 @@ def main():
     def pump(t):
         # read what arrives within t seconds (for the screen picture); not a prompt to answer
         nonlocal full
-        end = time.time() + t
-        while time.time() < end:
+        # at least t seconds, and then until nothing has arrived for 0.4 s (at most 5 s): a slow redraw is waited for
+        start = time.time(); last = start
+        while True:
+            now = time.time()
+            if now - start >= t and now - last >= 0.4: break
+            if now - start > 5: break
             rr, _, _ = select.select([fd], [], [], 0.1)
             if fd in rr:
+                last = time.time()
                 try: d = os.read(fd, 65536).decode(errors="replace")
                 except OSError: return
                 if not d: return

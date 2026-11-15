@@ -3,6 +3,27 @@
 The script file of each version is attached to its release on GitHub as `dg_standby_setup-<version>.sh`
 (with a `.sha256` checksum).
 
+## 5.35
+
+An independent review of the versions 5.31 to 5.34 (two reviewers), and what it found.
+
+- PATH (5.31) was not as safe as it said. The script now runs with the system folders from its first line (the
+  first commands ran before the PATH was reduced), and a folder of the caller's PATH is used only when root
+  holds it all the way down from `/` (before: only the folder itself was looked at, so a root folder inside a
+  user's folder, or a link in it, passed). A folder is used by its real path. Names with spaces or `*` in PATH
+  are handled.
+- Step 3.9: the stop of a listener of another home is recorded only when that listener is really gone; the
+  copy of listener.ora made in a run is not replaced by a second pass of the same run.
+- Step 2.4: a Grid owner named `oracle` (with another database owner) is checked too; the text for `oracle`
+  says whether a limit is missing or only lower than this server needs.
+- Step 3.1: the checksums are shown again from the second run on (kept with the size and time of each file,
+  so a file is read once), a file whose checksum cannot be read is named, the OPatch zip is included, and the
+  lines are indented like the text around them.
+- Tests: the mocks stay in PATH whatever the umask; checks of 5.31 that could not fail now test what their
+  title says; a test that a program in a user's folder at the front of PATH is never run; the pictures of the
+  pages are taken when the screen has been quiet. The Oracle Linux 7 job (bash 4.2) also runs the sections
+  5.30 to 5.34.
+
 ## 5.34
 
 - Step 2.13 with the screen layout: the empty disks for a disk group are a list to mark. `↑` `↓` move,

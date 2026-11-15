@@ -219,7 +219,7 @@ limit_users() {
   # every Oracle owner. The preinstall package sets limits for the user named "oracle" only; that user is checked
   # as well (the package may be missing or its file changed, and HugePages may need more memlock than it sets)
   printf '%s\n' "$ORACLE_USER"
-  use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
+  use_grid && ! single_owner && printf '%s\n' "$GRID_USER"
   return 0
 }
 LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
@@ -314,7 +314,13 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
-  [[ " ${miss[*]}" == *" oracle:"* ]] && NOW+=$'\n'"Its limits for oracle are missing or too low here as well (the package is not installed, or its file was changed)."
+  # for oracle: a value that is not there at all (the package is missing or its file was changed), or one that is
+  # there but lower than this server needs (memlock for the HugePages of the primary's SGA)
+  local mo; for mo in "${miss[@]}"; do
+    [[ "$mo" == oracle:* ]] || continue
+    if [[ "$mo" == *=* ]]; then NOW+=$'\n'"For oracle the value that is set is lower than this server needs: ${mo#oracle:}."
+    else NOW+=$'\n'"For oracle ${mo#oracle:} is not set at all (the preinstall package is not installed, or its file was changed)."; fi
+  done
   [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"

@@ -47,6 +47,7 @@ for g in $GROUPS_LIST; do getent group "${g%%:*}" >/dev/null && groupdel "${g%%:
 for g in $GROUPS_LIST; do if getent group "${g%%:*}" >/dev/null; then echo "setup_env: cannot remove group ${g%%:*}" >&2; exit 1; fi; done
 
 mkdir -p "$T/state" "$T/log" "$T/rootbin" "$T/remotebin" "$T/stage" "$T/devs"
+chmod 755 "$T" "$T/rootbin"     # (the script uses only folders of PATH that others cannot write to: the mocks must stay in it)
 chmod 777 "$T/state"
 for f in calls.log primary_sql.log primary_cmds.log primary_UNEXPECTED.log; do : > "$T/state/$f"; chmod 666 "$T/state/$f"; done
 cp "$TD/mock_oracle.py" "$TD/mock_root.py" "$TD/mock_ssh.py" "$TD/mock_installer.py" "$T/"; chmod 755 "$T"/mock_*.py

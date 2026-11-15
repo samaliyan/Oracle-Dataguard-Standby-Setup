@@ -431,22 +431,50 @@ run_end() {
   fi
   cleanup
 }
+path_dir_safe() {
+  # $1 a resolved folder: 0 when root holds it all the way down from / (every folder on the way belongs to root
+  # and is not writable by group or others; a sticky folder such as /tmp may be, the next one must be root's as
+  # every one is). Else another user could put a program there, or swap the folder.
+  local p=$1 cur="" part st uid mode; local -a parts=()
+  [[ "$p" == /* ]] || return 1
+  IFS=/ read -r -a parts <<< "${p#/}"
+  st=$(stat -c '%u %a' -- / 2>/dev/null) || return 1
+  [[ "${st%% *}" == 0 ]] || return 1
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || continue
+    cur+="/$part"
+    [[ -d "$cur" && ! -L "$cur" ]] || return 1
+    st=$(stat -c '%u %a' -- "$cur" 2>/dev/null) || return 1
+    uid=${st%% *}; mode=${st##* }
+    [[ "$uid" == 0 ]] || return 1
+    if (( 8#$mode & 8#022 )); then
+      # writable by others: only a sticky folder on the way (not the folder itself)
+      [[ "$cur" != "$p" ]] && (( 8#$mode & 8#1000 )) || return 1
+    fi
+  done
+  return 0
+}
 safe_path() {
-  # The commands of this script run as root with the PATH it was started with. After "su" without "-", that PATH
-  # can still start with folders of the user who became root: a program put there under the name of a system
-  # tool would run as root. Only folders that belong to root and that nobody else can write to stay in PATH;
-  # the system folders are always there.
-  local d out="" dropped="" IFS=:
-  for d in $PATH; do
-    [[ "$d" == /* && -d "$d" ]] || { [[ -n "$d" && "$d" != /* ]] && dropped+=" $d"; continue; }   # (a folder that is not there: left out silently)
-    if [[ "$(stat -L -c '%u' -- "$d" 2>/dev/null)" == 0 && -z "$(find -L "$d" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then out+="${out:+:}$d"
-    else dropped+=" $d"; fi
+  # The commands of this script run as root. The PATH it was started with (ORIG_PATH; the script itself runs with
+  # the system folders since its first line) can hold folders of the user who became root: a program put there
+  # under the name of a system tool would run as root. A folder of that PATH is used only when root holds it all
+  # the way down (path_dir_safe), as its real path (a link another user could point elsewhere is not followed
+  # later); the system folders are always there.
+  local d r out="" dropped=""; local -a ents=()
+  IFS=: read -r -a ents <<< "${ORIG_PATH:-}"          # (no word splitting of $PATH: no globbing, spaces kept)
+  for d in "${ents[@]+"${ents[@]}"}"; do
+    [[ -n "$d" ]] || continue
+    if [[ "$d" != /* ]]; then dropped+="${dropped:+, }$d"; continue; fi
+    [[ -d "$d" ]] || continue                         # (a folder that is not there: left out silently)
+    r=$(readlink -f -- "$d" 2>/dev/null) || r=""
+    if [[ -n "$r" && "$r" != *:* ]] && path_dir_safe "$r"; then [[ ":$out:" == *":$r:"* ]] || out+="${out:+:}$r"
+    else dropped+="${dropped:+, }$d"; fi
   done
   for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
     [[ ":$out:" == *":$d:"* ]] || out+="${out:+:}$d"
   done
   export PATH="$out"
-  PATH_DROPPED=${dropped# }
+  PATH_DROPPED=$dropped
 }
 main() {
   # (replaces the plain clean-up trap of the core: the same clean-up, after the END line of the log)
