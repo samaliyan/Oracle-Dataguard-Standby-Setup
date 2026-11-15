@@ -2506,9 +2506,9 @@ cat > $T/ut531.sh <<'EOF'
 S=$1; T=$2
 fn() { sed -n "/^$1()/,/^}/p" "$S"; }
 # 1) safe_path: a folder of another user, a folder others can write to and a relative entry are left out
-( source <(fn safe_path)
+( source <(fn path_dir_safe; fn safe_path)
   d=$T/ut531p; rm -rf $d; mkdir -p $d/ok $d/other $d/open; chmod 755 $d $d/ok $d/other; chmod 777 $d/open; chown nobody $d/other
-  PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
+  ORIG_PATH="$d/other:$d/open:bin:$d/ok:/nonexistent_dir:/usr/bin"; safe_path
   echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) | sed "s#$T/ut531p#D#g"
 # 2) limit_users: oracle is in the list, a separate grid owner too
 ( source <(fn limit_users); use_grid() { return 0; }; single_owner() { return 1; }
@@ -2520,28 +2520,42 @@ fn() { sed -n "/^$1()/,/^}/p" "$S"; }
   echo "lsnrstop=$(undo_text LSNRSTOP LISTENER 'home=/u01/db user=oracle port=1521') [$(change_word LSNRSTOP)]" )
 EOF
 bash $T/ut531.sh $T/dg_standby_setup.sh $T > $T/ut531.txt 2>&1
-check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other D/open bin' $T/ut531.txt"
+check "unit: PATH keeps only root's own folders that others cannot write to, and always has the system folders; what is left out is named" "grep -qx 'path=D/ok:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin' $T/ut531.txt && grep -qx 'dropped=D/other, D/open, bin' $T/ut531.txt"
 check "unit: the limits of the user oracle are checked like those of the other owners" "grep -qx 'limusers=oracle,grid/oracle' $T/ut531.txt"
 check "unit: a stopped listener of another home is a journal line with the command that starts it again" "grep -qF 'lsnrstop=by hand, only if that listener is still needed (it held port 1521, which the Grid listener uses now), as oracle:  ORACLE_HOME=/u01/db /u01/db/bin/lsnrctl start LISTENER [listener]' $T/ut531.txt"
 rm -rf $T/ut531p
 # ---- a run up to the Grid install: 2.4 looks at oracle, 3.1 prints the checksums ----
 rc=$(DG_TEST_QUIT_AT=3.2 run $T/r31a.txt)
 gz=$(ls $T/stage/*grid*.zip 2>/dev/null | head -n 1)
-check "2.4: the limits of oracle are set or added by the script (no longer 'Not needed' without a look)" "! grep -q 'Not needed: the only Oracle owner is oracle' $T/r31a.txt && [[ \$(res 2.4 $T/r31a.txt) =~ ^(OK|DONE)\$ ]] && grep -qE 'oracle' $T/r31a.txt"
-check "3.1: the SHA-256 of every installer file is printed and is in the run log" "grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum \$gz | cut -d' ' -f1)  \$(basename \$gz)\" $T/r31a.txt && grep -q 'MEDIA' $T/log/run_*.log"
+# (which limits are missing depends on the machine: a runner may set nofile for everyone; memlock and stack are never there)
+check "2.4: the limits of oracle are looked at: missing ones are named and added to the limits file" "grep -qE 'Missing or too low limits: .*oracle:(nofile|nproc|stack|memlock)' $T/r31a.txt && grep -qE '^oracle +(soft|hard) +(nofile|nproc|stack|memlock) ' /etc/security/limits.d/oracle-grid.conf && [[ \$(res 2.4 $T/r31a.txt) == DONE ]]"
+dz=$(ls $T/stage/*db*.zip 2>/dev/null | head -n 1)
+check "3.1: the SHA-256 of every installer file is printed and is in the run log" "[[ -n \"$gz\" && -n \"$dz\" ]] && grep -q 'SHA-256 of the installer files' $T/r31a.txt && grep -q \"\$(sha256sum $gz | cut -d' ' -f1)  \$(basename $gz)\" $T/r31a.txt && grep -q \"\$(sha256sum $dz | cut -d' ' -f1)  \$(basename $dz)\" $T/r31a.txt && grep -q '| MEDIA .*sha256: [0-9a-f]\{64\}' $T/log/run_*.log"
+# the PATH the script was started with: a folder of another user in front never runs anything, not even at the start
+ev=$T/ut531evil; rm -rf $ev; mkdir -p $ev; chmod 755 $ev
+for t in dirname basename date stat find mktemp readlink hostname id; do printf '#!/bin/bash\necho "$0" >> %s/ran\nexec /usr/bin/%s "$@"\n' "$ev" "$t" > $ev/$t; done; chmod 755 $ev/*; chown -R nobody $ev
+( cd $T && PATH=$ev:$T/rootbin:$PATH DG_PLAIN=1 DG_STATE_DIR=$T/varlib DG_LOG_DIR=$T/log timeout 60 ./dg_standby_setup.sh --status > $T/r31p.txt 2>&1 )
+check "PATH: programs in a folder of another user at the front of PATH are never run as root (from the first line on)" "[[ ! -e $ev/ran ]] && grep -q 'Oracle Data Guard Standby Setup' $T/r31p.txt"
+ln -sfn /usr/bin $ev/lnk
+( source <(sed -n '/^path_dir_safe()/,/^}/p; /^safe_path()/,/^}/p' $T/dg_standby_setup.sh); mkdir -p $ev/sub; chown root $ev/sub; chmod 755 $ev/sub
+  ORIG_PATH="$ev/lnk:$ev/sub:/usr/bin:$T/rootbin:rel/dir"; safe_path; echo "path=$PATH"; echo "dropped=$PATH_DROPPED" ) > $T/ut531b.txt 2>&1
+check "unit: a link of another user to /usr/bin is used as /usr/bin itself (its real path, once); a root folder inside a folder of another user is left out; a folder under /tmp that root holds stays" "grep -qx \"path=/usr/bin:$T/rootbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin\" $T/ut531b.txt && grep -qx \"dropped=$ev/sub, rel/dir\" $T/ut531b.txt"
+rm -rf $ev
 fi
 if part 5.32; then
 CUR=5.32; echo "== 5.32  The summary page with the arrow keys, and the choice pages"
 fresh empty; SN=$T/snaps32; rm -rf $SN
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN DG_TEST_SUMMARY='<SNAP:plain><DOWN><DOWN><DOWN><DOWN><SNAP:marked><ENTER>,<DOWN><SNAP:pick><ENTER>,<SNAP:after>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32a.txt)
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN DG_TEST_SUMMARY='<SNAP:plain><DOWN><DOWN><DOWN><DOWN><SNAP:marked> <ENTER>,<DOWN><SNAP:pick> <ENTER>,<SNAP:after>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32a.txt)
 check "summary page: nothing is marked at first, and the line above the question says what the arrow keys do" "! grep -q '^›' $SN/*_plain.txt && grep -q 'choose a value, Enter changes it     or type its number' $SN/*_plain.txt"
 check "summary page: four times Down marks value 4, and the line above the question names it" "grep -qE '^›  4  Database files go to' $SN/*_marked.txt && [[ \$(grep -c '^›' $SN/*_marked.txt) == 1 ]] && grep -q 'Enter changes: Database files go to' $SN/*_marked.txt"
 check "Enter on the marked value opens its choice page: the choices with their meaning, the mark moved to +DATA by Down" "grep -q '^ Database files go to' $SN/*_pick.txt && grep -qE '^   automatic +the data disk group' $SN/*_pick.txt && grep -qE '^ › \\+DATA +disk group' $SN/*_pick.txt && grep -q '(type it)' $SN/*_pick.txt && ! grep -q '\\[B' $SN/*_pick.txt"
+check "Space before Enter does not become an answer on these pages (the marked value and the marked choice are taken)" "grep -q '^ Database files go to' $SN/*_pick.txt && grep -qx 'DATA_DEST=+DATA' $T/varlib/settings.conf"
 check "Enter takes the marked choice: saved in the settings and shown on the summary page (no mark left, Enter would start)" "grep -qx 'DATA_DEST=+DATA' $T/varlib/settings.conf && grep -qE '^   4  Database files go to +\\+DATA \\(ASM\\)\$' $SN/*_after.txt && ! grep -q '^›' $SN/*_after.txt"
 # typed answers work as before (a number on the summary page, a value on the choice page); Esc changes nothing
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN/b DG_TEST_SUMMARY='11,udev,11,<ESC>,<UP><SNAP:up>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32b.txt)
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=34x110 DG_TEST_SNAPDIR=$SN/b DG_TEST_SUMMARY='11,udev,11,<ESC>,12,<ESC>,<UP><SNAP:up>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32b.txt)
 check "a typed number and a typed value work as before; Esc on a choice page changes nothing" "grep -qx 'ASM_METHOD=udev' $T/varlib/settings.conf"
-check "Up with nothing marked goes to the value that was marked last (11)" "grep -qE '^› 11  ASM disk method +udev' $SN/b/*_up.txt"
+check "Esc on the choice page of a value that asks more (clean-up: time, days) asks nothing more and saves nothing" "grep -qx 'ARCH_CLEANUP=' $T/varlib/settings.conf && ! grep -q 'Time (HH:MM)' $T/r32b.txt"
+check "Up with nothing marked goes to the value that was looked at last (12)" "grep -qE '^› 12  Archived-log clean-up' $SN/b/*_up.txt"
 # a small screen: only the values that are on the page can be marked
 rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/c DG_TEST_SUMMARY='<UP><SNAP:small>q<ENTER>' DG_TEST_TIMEOUT=200 run $T/r32c.txt)
 check "24 rows, 80 columns: Up from nothing marks the last value that is on the page, and the question stays on the last row" "[[ \$(grep -c '^›' $SN/c/*_small.txt) == 1 ]] && tail -n 1 $SN/c/*_small.txt | grep -q 'Enter\\] Start'"
@@ -2568,12 +2582,12 @@ fi
 if part 5.34; then
 CUR=5.34; echo "== 5.34  The disks of step 2.13 as a list to mark, and --show-changes as a list of steps"
 fresh empty; SN=$T/snaps34; rm -rf $SN
-rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_DISK_PICKS='<SNAP:d0><DOWN> <SNAP:d1> <UP> <SNAP:d2><DOWN> <ENTER>,<SNAP:e0><ENTER>' DG_TEST_QUIT_AT=2.14 DG_TEST_TIMEOUT=300 run $T/r34a.txt)
-check "2.13 page: the empty disks with their sizes, the suggested one marked, the size marked against the size needed" "grep -q '^ Empty disks for +DATA' $SN/*_d0.txt && grep -qE '^ › \\[x\\]  1\\) /dev/sdb +200 GB' $SN/*_d0.txt && grep -qE '^   \\[ \\]  2\\) /dev/sdc +100 GB' $SN/*_d0.txt && grep -qE 'Marked: 200 GB +needed: [0-9]+ GB .* enough' $SN/*_d0.txt && tail -n 1 $SN/*_d0.txt | grep -q 'Disk numbers for +DATA (q = stop, nothing is erased) \\[1\\]'"
-check "2.13 page: Down and Space mark the second disk too, and the sum follows (300 GB)" "grep -qE '^   \\[x\\]  1\\) /dev/sdb' $SN/*_d1.txt && grep -qE '^ › \\[x\\]  2\\) /dev/sdc' $SN/*_d1.txt && grep -q 'Marked: 300 GB' $SN/*_d1.txt"
-check "2.13 page: with nothing marked the line says how much is missing" "grep -qE 'Marked: 0 MB +needed: [0-9]+ GB +[0-9]+ GB more to mark' $SN/*_d2.txt && ! grep -q '\\[x\\]' $SN/*_d2.txt"
-check "2.13 page: disks that are too small together are not taken: the page comes back and says why" "grep -qE '! These disks have 100 GB, but \\+DATA needs [0-9]+ GB' $SN/*_e0.txt"
-check "2.13: Enter then takes the suggested disk; both disk groups get their disk, each confirmed by its name as before" "grep -qx 'DATA_1|/dev/sdb1' $T/varlib/asm_disks && grep -qx 'FRA_1|/dev/sdc1' $T/varlib/asm_disks && grep -q 'Type /dev/sdb to continue' $T/r34a.txt"
+rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN DG_TEST_DISK_PICKS='<SNAP:d0><DOWN> <SNAP:d1><ENTER>,<SNAP:e0><DOWN> <UP><SNAP:d2><ENTER>' DG_TEST_QUIT_AT=2.14 DG_TEST_TIMEOUT=300 run $T/r34a.txt)
+check "2.13 page: the empty disks with their sizes, the cursor on the suggested one, nothing marked by the page itself" "grep -q '^ Empty disks for +DATA' $SN/*_d0.txt && grep -qE '^ › \\[ \\]  1\\) /dev/sdb +200 GB' $SN/*_d0.txt && grep -qE '^   \\[ \\]  2\\) /dev/sdc +100 GB' $SN/*_d0.txt && grep -q 'Nothing marked: Enter takes the row of the cursor' $SN/*_d0.txt && tail -n 1 $SN/*_d0.txt | grep -q 'Disk numbers for +DATA (q = stop, nothing is erased) \\[1\\]'"
+check "2.13 page: Down and Space mark the second disk: the line names the marked rows, their size and what is missing" "grep -qE '^   \\[ \\]  1\\) /dev/sdb' $SN/*_d1.txt && grep -qE '^ › \\[x\\]  2\\) /dev/sdc' $SN/*_d1.txt && grep -qE 'Marked: 2 = 100 GB +needed: [0-9]+ GB +[0-9]+ GB more to mark' $SN/*_d1.txt"
+check "2.13 page: a disk that is too small is not taken: the page comes back, says why, and keeps the mark" "grep -qE '! These disks have 100 GB, but \\+DATA needs [0-9]+ GB' $SN/*_e0.txt && grep -qE '\\[x\\]  2\\) /dev/sdc' $SN/*_e0.txt"
+check "2.13 page: the mark taken away again, the cursor on disk 1: nothing is marked" "grep -qE '^ › \\[ \\]  1\\) /dev/sdb' $SN/*_d2.txt && ! grep -q '\\[x\\]' $SN/*_d2.txt"
+check "2.13: Enter with nothing marked takes the disk of the cursor; both disk groups get their disk, each confirmed by its name as before" "grep -qx 'DATA_1|/dev/sdb1' $T/varlib/asm_disks && grep -qx 'FRA_1|/dev/sdc1' $T/varlib/asm_disks && grep -q 'Type /dev/sdb to continue' $T/r34a.txt"
 # ---- --show-changes with the screen layout: the steps as a list, the changes of one, the undo of one ----
 fresh empty
 rc=$(DG_TEST_QUIT_AT=2.11 run $T/r34b.txt)
@@ -2582,7 +2596,7 @@ rc=$(DG_TEST_UI=1 DG_TEST_SIZE=24x80 DG_TEST_SNAPDIR=$SN/c DG_TEST_KEYS='x:d' DG
 check "--show-changes page: the counts, one row per step with its changes and how they are undone, the mark on the first" "grep -q '^ Changes made by this script' $SN/c/*_c0.txt && grep -qE 'On this server +[0-9]+ +\\([0-9]+ undone by --undo, [0-9]+ by hand\\)' $SN/c/*_c0.txt && grep -qE '^ › 2\\.1 +Groups .* 10 by hand' $SN/c/*_c0.txt && grep -qE '^   2\\.5 +Software folders .* auto' $SN/c/*_c0.txt"
 check "--show-changes page: three times Down marks step 2.4; Enter opens its changes with their undo" "grep -qE '^ › 2\\.4 +Limits for the Oracle owners' $SN/c/*_c1.txt && grep -q '^ Changes of step 2.4  Limits for the Oracle owners' $SN/c/*alt*.txt && grep -q 'NEW        /etc/security/limits.d/oracle-grid.conf' $SN/c/*alt*.txt"
 check "--show-changes page: back on the list after the changes of a step; a step without changes is said on the page" "grep -qE '^ › 2\\.4 ' $SN/c/*_c2.txt && grep -q 'No change of step 9.9 is recorded' $SN/c/*_c3.txt"
-check "--show-changes page: u goes on to the undo of the marked step (asked change by change, as --undo)" "[[ $lim_before -eq 1 && ! -e /etc/security/limits.d/oracle-grid.conf && $rc -eq 0 ]] && grep -q 'Undo of step 2.4 finished' $T/r34c.txt"
+check "--show-changes page: u goes on to the undo of the marked step: its changes shown and asked once, then change by change (as from the menu)" "grep -q 'Undo the changes of step 2.4 now?' $T/r34c.txt && [[ $lim_before -eq 1 && ! -e /etc/security/limits.d/oracle-grid.conf && $rc -eq 0 ]] && grep -q 'Undo of step 2.4 finished' $T/r34c.txt"
 # as text when it is not a screen: --plain, and a step named
 rc=$(run $T/r34d.txt --show-changes)
 check "--show-changes without the screen layout: the report as text, as before" "grep -q 'Changes made by this script' $T/r34d.txt && grep -qE '^  Step 2\\.1  Groups' $T/r34d.txt && ! grep -q 'Step (Enter: the marked one)' $T/r34d.txt"

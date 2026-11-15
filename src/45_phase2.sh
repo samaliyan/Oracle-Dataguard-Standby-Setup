@@ -219,7 +219,7 @@ limit_users() {
   # every Oracle owner. The preinstall package sets limits for the user named "oracle" only; that user is checked
   # as well (the package may be missing or its file changed, and HugePages may need more memlock than it sets)
   printf '%s\n' "$ORACLE_USER"
-  use_grid && ! single_owner && [[ "$GRID_USER" != "oracle" ]] && printf '%s\n' "$GRID_USER"
+  use_grid && ! single_owner && printf '%s\n' "$GRID_USER"
   return 0
 }
 LIM_TODO=()        # "user item" pairs that are missing (item: nofile nproc stack memlock)
@@ -314,7 +314,13 @@ c_2_4() {
   fi
   NOW="Missing or too low limits: ${miss[*]}
 The preinstall package sets limits only for the user named oracle."
-  [[ " ${miss[*]}" == *" oracle:"* ]] && NOW+=$'\n'"Its limits for oracle are missing or too low here as well (the package is not installed, or its file was changed)."
+  # for oracle: a value that is not there at all (the package is missing or its file was changed), or one that is
+  # there but lower than this server needs (memlock for the HugePages of the primary's SGA)
+  local mo; for mo in "${miss[@]}"; do
+    [[ "$mo" == oracle:* ]] || continue
+    if [[ "$mo" == *=* ]]; then NOW+=$'\n'"For oracle the value that is set is lower than this server needs: ${mo#oracle:}."
+    else NOW+=$'\n'"For oracle ${mo#oracle:} is not set at all (the preinstall package is not installed, or its file was changed)."; fi
+  done
   [[ -n "$lmnote" ]] && NOW+=$'\n'"$lmnote"
   PLAN="Add these limits to $LIMITS_FILE (lines set by you stay as they are):
 $(for it in "${LIM_TODO[@]}"; do lim_line ${it}; done)"
@@ -1464,6 +1470,7 @@ d_2_13() {
     local nfree=0; for i in "${!disks[@]}"; do [[ "$used" == *" ${disks[$i]%% *} "* ]] || nfree=$((nfree + 1)); done
     local auto1=0; [[ $nfree -eq 1 && ${disks[$((def - 1))]##* } -ge $need_more ]] && auto1=1
     [[ $auto1 -eq 1 ]] && say "Only one empty disk is left, and it is big enough: ${disks[$((def - 1))]%% *} is used for +$dg."
+    local dlast=""
     while true; do
       if [[ $auto1 -eq 1 ]]; then ANSWER=$def; auto1=0
       elif [[ $UI -eq 1 ]]; then
@@ -1475,8 +1482,11 @@ d_2_13() {
           else drows+=(" |${disks[$i]##* }|$(printf '%-14s %9s   %s' "${disks[$i]%% *}" "$(human_mb "${disks[$i]##* }")" "$dmodel")"); fi
         done
         ui_check "Empty disks for +$dg" "Only empty disks are listed. Nothing is erased on this page." \
-          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${drows[@]}"
+          "$need_more" "Disk numbers for +$dg (q = stop, nothing is erased) [$def]" "$def" "${dlast:-}" "${drows[@]}"
         [[ -n "$ANSWER" ]] || { CHECK_NOTE="Mark at least one disk (Space), or type q to stop."; continue; }
+        # h or ?: the help of the step, then the page again
+        if [[ "${ANSWER,,}" == h || "$ANSWER" == "?" ]]; then ui_show "Help  $S_DOT  step 2.13" show_help 2.13; continue; fi
+        dlast=$ANSWER          # (an answer that is not taken: its marks are on the page again)
       else ask_default "Disk numbers for +$dg, separated by spaces (q = stop, nothing is erased)" "$def"; fi
       [[ "${ANSWER,,}" == "q" ]] && { say "Stopped. Nothing was erased."; return 3; }
       nums=" "; total=0; pick=""

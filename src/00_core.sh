@@ -30,10 +30,15 @@ set -o pipefail
 # there this check is left off. The script itself never relies on it.
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then set -u; fi
 umask 022
+# The PATH this script was started with can hold folders of the user who became root ("su" without "-"): from
+# the first command on only the system folders are used. safe_path (main) adds back the folders of the caller's
+# PATH that are root's own all the way down.
+ORIG_PATH=${PATH:-}
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 num() { [[ -n "${1:-}" && "${1:-}" != *[!0-9]* ]]; }   # plain non-negative integer (no regex: keeps BASH_REMATCH)
 
-readonly SCRIPT_VERSION="5.34"
+readonly SCRIPT_VERSION="5.35"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -319,6 +324,9 @@ fatal() {
   if [[ ${HEALTH:-0} -eq 1 ]] && declare -F health_exit >/dev/null; then _log FATAL "$*"; health_exit UNKNOWN "$*"; fi
   tty_restore
   [[ -n "${BATCH_TTY:-}" ]] && { exec 1>&"$BATCH_TTY" 2>&1; BATCH_TTY=""; }
+  # a page that is open without the screen layout (the start menu, --show-changes): left first, so what is said
+  # below is seen
+  [[ ${UI:-0} -eq 0 && ${UI_ALT:-0} -eq 1 ]] && { printf '\e[?1049l'; UI_ALT=0; }
   ui_end
   [[ $STOPPED_BY_USER -eq 1 ]] || bad "$*"
   _log FATAL "$*"
